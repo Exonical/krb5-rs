@@ -71,7 +71,7 @@ fn kdf_hmac_sha2<H: Sha2Hash>(
     context: &[u8],
     out_bits: usize,
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-    if key.is_empty() || out_bits % 8 != 0 || out_bits == 0 {
+    if key.is_empty() || !out_bits.is_multiple_of(8) || out_bits == 0 {
         return Err(CryptoError::BadParams);
     }
     let mut data = Vec::with_capacity(9 + label.len() + context.len());
