@@ -6,8 +6,10 @@
 //! Run with:
 //!   cargo test --test tgs_exchange_integration -- --ignored
 //!
-//! The KDC listens on localhost:10188 with realm TEST.REALM.
-//! A second KDC listens on localhost:10288 with realm OTHER.REALM.
+//! The KDC listens on ${KDC_HOST}:10188 with realm TEST.REALM.
+//! A second KDC listens on ${KDC_HOST}:10288 with realm OTHER.REALM.
+//! Set KDC_HOST when the KDCs are not on localhost (default: 127.0.0.1) —
+//! e.g. `KDC_HOST=<podman-machine-ip>` on Windows/WSL podman setups.
 //! Test principals:
 //!   - testuser@TEST.REALM (password: testpassword)
 //!   - HTTP/server.test.realm@TEST.REALM (keytab, random key)
@@ -26,8 +28,19 @@ use krb5_rs::protocol::{
 use krb5_rs::types::PrincipalName;
 use krb5_rs::Krb5Error;
 
-const KDC_ADDR: &str = "127.0.0.1:10188";
-const KDC_OTHER_ADDR: &str = "127.0.0.1:10288";
+/// KDC host — overridable via KDC_HOST for non-local podman/Docker setups.
+fn kdc_host() -> String {
+    std::env::var("KDC_HOST").unwrap_or_else(|_| "127.0.0.1".into())
+}
+
+fn kdc_addr() -> String {
+    format!("{}:10188", kdc_host())
+}
+
+fn kdc_other_addr() -> String {
+    format!("{}:10288", kdc_host())
+}
+
 const REALM: &str = "TEST.REALM";
 const OTHER_REALM: &str = "OTHER.REALM";
 
@@ -69,14 +82,14 @@ fn kdc_send_to(addr: &str, data: &[u8]) -> std::io::Result<Vec<u8>> {
 
 /// Send to the default (TEST.REALM) KDC.
 fn kdc_send(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    kdc_send_to(KDC_ADDR, data)
+    kdc_send_to(&kdc_addr(), data)
 }
 
 /// Route a TGS request to the correct KDC based on realm.
 fn kdc_send_for_realm(realm: &str, data: &[u8]) -> std::io::Result<Vec<u8>> {
     let addr = match realm {
-        REALM => KDC_ADDR,
-        OTHER_REALM => KDC_OTHER_ADDR,
+        REALM => kdc_addr(),
+        OTHER_REALM => kdc_other_addr(),
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -84,7 +97,7 @@ fn kdc_send_for_realm(realm: &str, data: &[u8]) -> std::io::Result<Vec<u8>> {
             ));
         }
     };
-    kdc_send_to(addr, data)
+    kdc_send_to(&addr, data)
 }
 
 /// Drive the AS exchange to completion and return the TGT credential.

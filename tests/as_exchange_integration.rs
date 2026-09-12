@@ -6,7 +6,9 @@
 //! Run with:
 //!   cargo test --test as_exchange_integration -- --ignored
 //!
-//! The KDC listens on localhost:10188 with realm TEST.REALM.
+//! The KDC listens on ${KDC_HOST}:10188 with realm TEST.REALM.
+//! Set KDC_HOST when the KDC is not on localhost (default: 127.0.0.1) —
+//! e.g. `KDC_HOST=<podman-machine-ip>` on Windows/WSL podman setups.
 //! Test principals:
 //!   - testuser@TEST.REALM (password: testpassword)
 //!   - testuser2@TEST.REALM (password: password2)
@@ -21,7 +23,15 @@ use krb5_rs::protocol::{AsExchange, AsExchangeConfig, ErrorCode, StepResult};
 use krb5_rs::types::PrincipalName;
 use krb5_rs::Krb5Error;
 
-const KDC_ADDR: &str = "127.0.0.1:10188";
+/// KDC host — overridable via KDC_HOST for non-local podman/Docker setups.
+fn kdc_host() -> String {
+    std::env::var("KDC_HOST").unwrap_or_else(|_| "127.0.0.1".into())
+}
+
+fn kdc_addr() -> String {
+    format!("{}:10188", kdc_host())
+}
+
 const REALM: &str = "TEST.REALM";
 
 /// Maximum acceptable KDC response size (1 MiB). Protects against
@@ -30,7 +40,7 @@ const MAX_KDC_RESPONSE_SIZE: usize = 1024 * 1024;
 
 /// Send a message to the KDC via TCP (4-byte big-endian length prefix).
 fn kdc_send(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(KDC_ADDR)?;
+    let mut stream = TcpStream::connect(kdc_addr())?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     // Combine 4-byte length prefix + data into a single write to avoid

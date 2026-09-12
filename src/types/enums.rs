@@ -100,6 +100,7 @@ pub enum PaDataType {
     FxFast = 136,
     EncryptedChallenge = 138,
     ReqEncPaRep = 149,
+    AsFreshness = 150,
     SupportedEtypes = 165,
     PacOptions = 167,
 }
@@ -120,6 +121,7 @@ impl TryFrom<i32> for PaDataType {
             136 => Ok(Self::FxFast),
             138 => Ok(Self::EncryptedChallenge),
             149 => Ok(Self::ReqEncPaRep),
+            150 => Ok(Self::AsFreshness),
             165 => Ok(Self::SupportedEtypes),
             167 => Ok(Self::PacOptions),
             other => Err(other),

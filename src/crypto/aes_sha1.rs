@@ -3,6 +3,7 @@
 //! Both variants share identical logic parameterized by key size,
 //! matching MIT's approach where both use the same encrypt/decrypt functions.
 
+use sha1::Digest;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -10,7 +11,7 @@ use super::aes_cts::{aes_cts_decrypt, aes_cts_encrypt};
 use super::dk::{derive_key, dk};
 use super::hmac_sha1::hmac_sha1_96;
 use super::util::generate_random;
-use super::{CryptoError, EtypeProfile};
+use super::{CryptoError, EtypeProfile, KeyPurpose};
 
 const AES_BLOCK: usize = 16;
 const HMAC_TRAILER: usize = 12; // HMAC-SHA1-96 = 96 bits
@@ -128,6 +129,18 @@ fn aes_random_to_key(random: &[u8], expected: usize) -> Result<Zeroizing<Vec<u8>
     Ok(Zeroizing::new(random.to_vec()))
 }
 
+/// RFC 3961 §5.3 simplified-profile PRF (MIT krb/prf_dk.c:30-67):
+/// tmp = SHA-1(input) truncated to the block size (16); out =
+/// AES-CBC(DK(key, "prf"), IV=0, tmp).
+fn aes_prf(key: &[u8], input: &[u8], key_len: usize) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    validate_exact_key_len(key, key_len)?;
+    let mut tmp = sha1::Sha1::digest(input).to_vec();
+    tmp.truncate(AES_BLOCK);
+    let kp = dk(key, b"prf", key_len, AES_BLOCK)?;
+    let out = aes_cts_encrypt(&kp, &tmp)?;
+    Ok(Zeroizing::new(out))
+}
+
 impl EtypeProfile for Aes128CtsHmacSha196 {
     fn etype(&self) -> i32 {
         17
@@ -180,6 +193,24 @@ impl EtypeProfile for Aes128CtsHmacSha196 {
 
     fn checksum(&self, key: &[u8], key_usage: i32, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
         aes_checksum(key, key_usage, data, self.key_length())
+    }
+
+    fn derive_key(
+        &self,
+        key: &[u8],
+        usage: i32,
+        purpose: KeyPurpose,
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        validate_exact_key_len(key, self.key_length())?;
+        derive_key(key, usage, purpose.byte())
+    }
+
+    fn prf_length(&self) -> usize {
+        AES_BLOCK
+    }
+
+    fn prf(&self, key: &[u8], input: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        aes_prf(key, input, self.key_length())
     }
 
     fn random_to_key(&self, random: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
@@ -239,6 +270,24 @@ impl EtypeProfile for Aes256CtsHmacSha196 {
 
     fn checksum(&self, key: &[u8], key_usage: i32, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
         aes_checksum(key, key_usage, data, self.key_length())
+    }
+
+    fn derive_key(
+        &self,
+        key: &[u8],
+        usage: i32,
+        purpose: KeyPurpose,
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        validate_exact_key_len(key, self.key_length())?;
+        derive_key(key, usage, purpose.byte())
+    }
+
+    fn prf_length(&self) -> usize {
+        AES_BLOCK
+    }
+
+    fn prf(&self, key: &[u8], input: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        aes_prf(key, input, self.key_length())
     }
 
     fn random_to_key(&self, random: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {

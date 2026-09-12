@@ -64,6 +64,10 @@ printf '%s\n%s\n' "$TESTUSER1_PASSWORD" "$TESTUSER1_PASSWORD" | \
 printf '%s\n%s\n' "$TESTUSER2_PASSWORD" "$TESTUSER2_PASSWORD" | \
     kadmin.local -q "addprinc testuser2@TEST.REALM"
 kadmin.local -q "addprinc -randkey HTTP/server.test.realm@TEST.REALM"
+# RFC 8009 (aes-sha2) only principal — exercises etypes 19/20 end to end.
+SHA2USER_PASSWORD="${KDC_SHA2USER_PASSWORD:-sha2pass}"
+printf '%s\n%s\n' "$SHA2USER_PASSWORD" "$SHA2USER_PASSWORD" | \
+    kadmin.local -q "addprinc -e aes256-cts-hmac-sha384-192:normal,aes128-cts-hmac-sha256-128:normal sha2user@TEST.REALM"
 
 # Cross-realm trust: both KDCs need both krbtgt principals with matching keys.
 # TEST.REALM uses krbtgt/OTHER.REALM@TEST.REALM to issue cross-realm TGTs;

@@ -183,6 +183,15 @@ pub(crate) fn build_pa_enc_timestamp(
     })
 }
 
+/// Build an empty (informational) padata element, e.g. PA-AS-FRESHNESS
+/// or PA-REQ-ENC-PA-REP.
+pub(crate) fn build_empty_padata(padata_type: i32) -> PaData {
+    PaData {
+        padata_type,
+        padata_value: Vec::new().into(),
+    }
+}
+
 /// Build a PA-PAC-REQUEST padata element.
 pub(crate) fn build_pa_pac_request(include_pac: bool) -> Result<PaData, Krb5Error> {
     let pac_req = PaPacRequest { include_pac };

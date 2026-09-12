@@ -63,7 +63,7 @@ impl Default for TgsOptions {
             canonicalize: true,
             forwardable: true,
             renewable: true,
-            etypes: vec![18, 17], // AES-256, AES-128
+            etypes: vec![18, 17, 20, 19], // AES-256-SHA1, AES-128-SHA1, AES-256-SHA2, AES-128-SHA2
             max_clock_skew: DEFAULT_MAX_CLOCK_SKEW,
             pac_options: true,
         }
@@ -822,7 +822,7 @@ mod tests {
         assert!(opts.canonicalize);
         assert!(opts.forwardable);
         assert!(opts.renewable);
-        assert_eq!(opts.etypes, vec![18, 17]);
+        assert_eq!(opts.etypes, vec![18, 17, 20, 19]);
         assert!(opts.pac_options);
     }
 

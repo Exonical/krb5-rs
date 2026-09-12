@@ -12,14 +12,16 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{find_etype, key_usage};
 use crate::types::{
-    AsRep, AsReq, EncAsRepPart, EncKdcRepPart, EncTgsRepPart, KdcOptions, KdcRep, KdcReq,
+    AsRep, AsReq, Checksum, EncAsRepPart, EncKdcRepPart, EncTgsRepPart, KdcOptions, KdcRep, KdcReq,
     KdcReqBody, KerberosFlags, KerberosTime, KrbErrorMsg, PaData, PaDataType, PrincipalName,
+    TicketFlags,
 };
 use crate::Krb5Error;
 
 use super::credential::{Credential, TicketTimes};
 use super::preauth::{
-    build_pa_enc_timestamp, build_pa_pac_request, default_salt, extract_preauth_hint, PreauthHint,
+    build_empty_padata, build_pa_enc_timestamp, build_pa_pac_request, default_salt,
+    extract_preauth_hint, PreauthHint,
 };
 use super::validate::{validate_as_reply, DEFAULT_MAX_CLOCK_SKEW, UTC_OFFSET};
 
@@ -29,6 +31,10 @@ use super::error_codes::ErrorCode;
 const KDC_ERR_PREAUTH_REQUIRED: i32 = ErrorCode::PreauthRequired as i32;
 const KRB_ERR_RESPONSE_TOO_BIG: i32 = ErrorCode::ResponseTooBig as i32;
 const KDC_ERR_WRONG_REALM: i32 = ErrorCode::WrongRealm as i32;
+const KDC_ERR_PREAUTH_FAILED: i32 = ErrorCode::PreauthFailed as i32;
+/// RFC 6113 codes not represented in `ErrorCode`.
+const KDC_ERR_PREAUTH_EXPIRED: i32 = 90;
+const KDC_ERR_MORE_PREAUTH_DATA_REQUIRED: i32 = 91;
 
 /// Maximum pre-authentication loop iterations (matches MIT krb5).
 const MAX_PREAUTH_LOOPS: u32 = 16;
@@ -40,7 +46,9 @@ pub struct AsExchangeConfig {
     pub client: PrincipalName,
     /// Kerberos realm.
     pub realm: String,
-    /// Preferred encryption types (in order). Default: [AES-256, AES-128].
+    /// Preferred encryption types (in order). Default:
+    /// [AES-256-SHA1, AES-128-SHA1, AES-256-SHA2, AES-128-SHA2]
+    /// (MIT init_ctx.c:59-66, minus des3/rc4/camellia).
     pub etypes: Vec<i32>,
     /// KDC options flags.
     pub kdc_options: KerberosFlags<KdcOptions>,
@@ -66,7 +74,7 @@ impl Default for AsExchangeConfig {
         Self {
             client: PrincipalName::new_principal(""),
             realm: String::new(),
-            etypes: vec![18, 17], // AES-256, AES-128
+            etypes: vec![18, 17, 20, 19], // AES-256-SHA1, AES-128-SHA1, AES-256-SHA2, AES-128-SHA2
             kdc_options: KerberosFlags::new(
                 KdcOptions::FORWARDABLE | KdcOptions::RENEWABLE | KdcOptions::CANONICALIZE,
             ),
@@ -171,6 +179,21 @@ pub struct AsExchange {
     last_preauth_salt: Option<Vec<u8>>,
     /// Persisted s2kparams from preauth hint (for AS-REP decryption).
     last_s2kparams: Option<Vec<u8>>,
+    /// Persisted etype from preauth hint (for hint-less MORE_PREAUTH_DATA).
+    last_preauth_etype: Option<i32>,
+    /// PA-FX-COOKIE from the most recent KDC error, echoed verbatim in the
+    /// next AS-REQ (MIT preauth2.c:856-884 `copy_cookie`). Not cached:
+    /// an error without a cookie clears it.
+    cookie: Option<Vec<u8>>,
+    /// Whether informational padata (PA-AS-FRESHNESS, PA-REQ-ENC-PA-REP)
+    /// may be sent (MIT get_in_tkt.c:873 `info_pa_permitted`).
+    info_pa_permitted: bool,
+    /// Whether the exchange has already restarted once
+    /// (MIT `ctx->restarted` — only one PREAUTH_FAILED restart allowed).
+    restarted: bool,
+    /// Whether we have sent preauth (PA-ENC-TIMESTAMP) in a request
+    /// (MIT `ctx->selected_preauth_type != KRB5_PADATA_NONE`).
+    preauth_sent: bool,
     /// Loop counter to prevent infinite preauth loops.
     loop_count: u32,
     /// Output credential.
@@ -189,6 +212,11 @@ impl AsExchange {
             last_req_bytes: Vec::new(),
             last_preauth_salt: None,
             last_s2kparams: None,
+            last_preauth_etype: None,
+            cookie: None,
+            info_pa_permitted: true,
+            restarted: false,
+            preauth_sent: false,
             loop_count: 0,
             credential: None,
         }
@@ -249,7 +277,11 @@ impl AsExchange {
         }
 
         match krb_error.error_code {
-            KDC_ERR_PREAUTH_REQUIRED => {
+            // MORE_PREAUTH_DATA_REQUIRED (91) is handled like PREAUTH_REQUIRED
+            // (MIT get_in_tkt.c:1742): its e-data may lack ETYPE-INFO2, in
+            // which case the previously saved etype/salt/s2kparams hint is
+            // reused.
+            KDC_ERR_PREAUTH_REQUIRED | KDC_ERR_MORE_PREAUTH_DATA_REQUIRED => {
                 self.loop_count += 1;
                 if self.loop_count > MAX_PREAUTH_LOOPS {
                     return Err(Krb5Error::PreauthLoopExceeded(MAX_PREAUTH_LOOPS));
@@ -258,14 +290,32 @@ impl AsExchange {
                 let e_data = krb_error.e_data.as_ref().ok_or(Krb5Error::ReplyValidation(
                     "PREAUTH_REQUIRED without e-data",
                 ))?;
-                let hint = extract_preauth_hint(e_data.as_ref(), &self.config.etypes)?;
 
-                // Persist salt and s2kparams for AS-REP decryption later
-                self.last_preauth_salt = hint.salt.clone();
-                self.last_s2kparams = hint.s2kparams.clone();
+                // MIT preauth2.c:856-884 `copy_cookie` — copy the PA-FX-COOKIE
+                // from this error's METHOD-DATA verbatim into the next AS-REQ.
+                self.cookie = extract_cookie(e_data.as_ref());
+
+                let hint = match extract_preauth_hint(e_data.as_ref(), &self.config.etypes) {
+                    Ok(hint) => {
+                        // Persist salt and s2kparams for AS-REP decryption later
+                        self.last_preauth_salt = hint.salt.clone();
+                        self.last_s2kparams = hint.s2kparams.clone();
+                        self.last_preauth_etype = Some(hint.etype);
+                        hint
+                    }
+                    Err(e) => match self.last_preauth_etype {
+                        Some(etype) => PreauthHint {
+                            etype,
+                            salt: self.last_preauth_salt.clone(),
+                            s2kparams: self.last_s2kparams.clone(),
+                        },
+                        None => return Err(e),
+                    },
+                };
 
                 // Build AS-REQ with preauth
                 let pa_timestamp = self.build_preauth_padata(&hint)?;
+                self.preauth_sent = true;
                 let (as_req_der, req_body) = self.build_as_req(Some(pa_timestamp))?;
                 self.last_req_body = Some(req_body);
                 self.last_req_bytes = as_req_der.clone();
@@ -290,28 +340,55 @@ impl AsExchange {
                 let new_realm = String::from_utf8_lossy(krb_error.realm.as_bytes()).to_string();
                 if new_realm != self.config.realm {
                     self.config.realm = new_realm;
-                    // Clear cached preauth state — salt/s2kparams are realm-specific
-                    self.last_preauth_salt = None;
-                    self.last_s2kparams = None;
-                    // Reset preauth loop counter for the new realm
-                    self.loop_count = 0;
-                    // Restart: build a new initial AS-REQ for the new realm
-                    let (as_req_der, req_body) = self.build_as_req(None)?;
-                    self.last_req_body = Some(req_body);
-                    self.last_req_bytes = as_req_der.clone();
-                    return Ok(StepResult::SendToKdc {
-                        data: as_req_der,
-                        realm: self.config.realm.clone(),
-                    });
+                    return self.restart();
                 }
                 // If redirected to the same realm, propagate the original error
                 Err(Krb5Error::from_error_msg(krb_error))
+            }
+            KDC_ERR_PREAUTH_FAILED => {
+                // MIT get_in_tkt.c:1709-1715 — if no preauth was sent yet and
+                // we haven't restarted, the KDC probably disliked the
+                // informational padata; retry once without it.
+                if !self.preauth_sent && !self.restarted {
+                    self.info_pa_permitted = false;
+                    self.restarted = true;
+                    self.restart()
+                } else {
+                    Err(Krb5Error::from_error_msg(krb_error))
+                }
+            }
+            KDC_ERR_PREAUTH_EXPIRED => {
+                // MIT get_in_tkt.c:1716-1720 — we sent an expired KDC cookie;
+                // start over, allowing another restart on PREAUTH_FAILED.
+                self.restarted = false;
+                self.restart()
             }
             _ => {
                 // Other KDC error — propagate
                 Err(Krb5Error::from_error_msg(krb_error))
             }
         }
+    }
+
+    /// Restart the exchange from the initial (no-preauth) request.
+    ///
+    /// MIT `restart_init_creds_loop` (get_in_tkt.c): drops the cookie,
+    /// preauth hint and loop state. `restarted` is caller-managed: the
+    /// PREAUTH_FAILED path sets it, PREAUTH_EXPIRED clears it.
+    fn restart(&mut self) -> Result<StepResult, Krb5Error> {
+        self.cookie = None;
+        self.last_preauth_salt = None;
+        self.last_s2kparams = None;
+        self.last_preauth_etype = None;
+        self.loop_count = 0;
+        self.preauth_sent = false;
+        let (as_req_der, req_body) = self.build_as_req(None)?;
+        self.last_req_body = Some(req_body);
+        self.last_req_bytes = as_req_der.clone();
+        Ok(StepResult::SendToKdc {
+            data: as_req_der,
+            realm: self.config.realm.clone(),
+        })
     }
 
     /// Build an AS-REQ message. Returns (DER bytes, request body for validation).
@@ -371,12 +448,27 @@ impl AsExchange {
             additional_tickets: None,
         };
 
-        // Build padata list
+        // Build padata list: [PA-FX-COOKIE] [preauth] [info padata] [PA-PAC-REQUEST]
         let mut padata: Vec<PaData> = Vec::new();
+
+        // Echo the cookie from the most recent KDC error, if any.
+        if let Some(cookie) = &self.cookie {
+            padata.push(PaData {
+                padata_type: PaDataType::FxCookie as i32,
+                padata_value: cookie.clone().into(),
+            });
+        }
 
         // Add preauth padata if provided
         if let Some(pa_list) = preauth_padata {
             padata.extend(pa_list);
+        }
+
+        // MIT get_in_tkt.c:1365-1372 — empty informational padata while
+        // info_pa_permitted (PA-AS-FRESHNESS then PA-REQ-ENC-PA-REP).
+        if self.info_pa_permitted {
+            padata.push(build_empty_padata(PaDataType::AsFreshness as i32));
+            padata.push(build_empty_padata(PaDataType::ReqEncPaRep as i32));
         }
 
         // Always send PA-PAC-REQUEST; `request_pac` controls `include-pac` value
@@ -439,6 +531,14 @@ impl AsExchange {
     fn process_as_rep(&mut self, as_rep: AsRep) -> Result<StepResult, Krb5Error> {
         let rep = &as_rep.0;
 
+        // MIT get_in_tkt.c:1411-1425 `check_reply_enctype` — the reply
+        // enctype must be one of the etypes we requested.
+        if !self.config.etypes.contains(&rep.enc_part.etype) {
+            return Err(Krb5Error::ReplyValidation(
+                "reply enctype was not requested",
+            ));
+        }
+
         // Determine encryption type from enc-part
         let etype = rep.enc_part.etype;
         let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
@@ -485,6 +585,38 @@ impl AsExchange {
             self.config.max_clock_skew,
             now,
         )?;
+
+        // MIT fast.c:634-675 `krb5int_fast_verify_nego` — when the KDC sets
+        // enc-pa-rep it MUST include a PA-REQ-ENC-PA-REP checksum over the
+        // exact last-sent AS-REQ bytes, keyed with usage KRB5_KEYUSAGE_AS_REQ.
+        // MIT's verify_key rejects a cksumtype outside the key's enctype
+        // family with KRB5_BAD_ENCTYPE; until a checksum-type registry exists
+        // we require the profile's mandatory cksumtype (unkeyed cksumtypes
+        // are therefore rejected as well).
+        if enc_part.flags.contains(TicketFlags::ENC_PA_REP) {
+            let pa = enc_part
+                .encrypted_pa_data
+                .as_ref()
+                .and_then(|list| {
+                    list.iter()
+                        .find(|pa| pa.padata_type == PaDataType::ReqEncPaRep as i32)
+                })
+                .ok_or(Krb5Error::ReplyValidation("PA-REQ-ENC-PA-REP missing"))?;
+            let cksum: Checksum = rasn::der::decode(pa.padata_value.as_ref())?;
+            if cksum.cksumtype != profile.checksum_type() {
+                return Err(Krb5Error::Crypto(
+                    "checksum type does not match reply key enctype".to_string(),
+                ));
+            }
+            profile
+                .verify_checksum(
+                    &key,
+                    key_usage::AS_REQ,
+                    &self.last_req_bytes,
+                    cksum.checksum.as_ref(),
+                )
+                .map_err(|_| Krb5Error::ReplyValidation("PA-REQ-ENC-PA-REP checksum mismatch"))?;
+        }
 
         // Build credential
         let credential = Credential {
@@ -561,6 +693,16 @@ impl AsExchange {
     }
 }
 
+/// Extract the PA-FX-COOKIE value from a KDC error's METHOD-DATA, if present.
+fn extract_cookie(e_data: &[u8]) -> Option<Vec<u8>> {
+    let method_data: Vec<PaData> = rasn::der::decode(e_data).ok()?;
+    let pa = method_data
+        .iter()
+        .find(|pa| pa.padata_type == PaDataType::FxCookie as i32)?;
+    let bytes: &[u8] = pa.padata_value.as_ref();
+    Some(bytes.to_vec())
+}
+
 /// Convert a `Duration` to `i64` seconds, clamping at `i64::MAX` to avoid overflow.
 fn duration_secs_i64(dur: Duration) -> i64 {
     let secs = dur.as_secs();
@@ -591,7 +733,7 @@ mod tests {
     fn test_config_defaults() {
         let config = AsExchangeConfig::new(PrincipalName::new_principal("user"), "EXAMPLE.COM");
         assert_eq!(config.realm, "EXAMPLE.COM");
-        assert_eq!(config.etypes, vec![18, 17]);
+        assert_eq!(config.etypes, vec![18, 17, 20, 19]);
         assert!(config.kdc_options.contains(KdcOptions::FORWARDABLE));
         assert!(config.kdc_options.contains(KdcOptions::RENEWABLE));
         assert!(config.kdc_options.contains(KdcOptions::CANONICALIZE));
@@ -632,7 +774,7 @@ mod tests {
                 // Nonce should be set
                 assert_ne!(as_req.0.req_body.nonce, 0);
                 // Etypes should match config
-                assert_eq!(as_req.0.req_body.etype, vec![18, 17]);
+                assert_eq!(as_req.0.req_body.etype, vec![18, 17, 20, 19]);
             }
             StepResult::Complete | StepResult::RetryTcp { .. } => {
                 panic!("should not be complete or retry on first step")
