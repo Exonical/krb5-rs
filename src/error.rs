@@ -64,6 +64,10 @@ pub enum Krb5Error {
     #[error("AP error: {0}")]
     Ap(#[from] crate::protocol::ap::ApError),
 
+    /// GSS-API error (GSS_S_* major status).
+    #[error("GSS error: {0}")]
+    Gss(#[from] crate::gssapi::GssError),
+
     /// Cryptographic operation failed.
     #[error("crypto error: {0}")]
     Crypto(String),

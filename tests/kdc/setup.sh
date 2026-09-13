@@ -15,12 +15,13 @@ TESTUSER2_PASSWORD="${KDC_TESTUSER2_PASSWORD:-password2}"
 # Install MIT KDC (krb5.conf must not be bind-mounted during install
 # because krb5-config postinst tries to rename it)
 apt-get update -qq
-apt-get install -y -qq krb5-kdc krb5-admin-server
+apt-get install -y -qq krb5-kdc krb5-admin-server krb5-user python3-gssapi
 
 # Write config files (overwrite the defaults created by package install)
 cat > /etc/krb5.conf <<'CONF'
 [libdefaults]
     default_realm = TEST.REALM
+    forwardable = true
     dns_lookup_realm = false
     dns_lookup_kdc = false
 [realms]
@@ -63,7 +64,12 @@ printf '%s\n%s\n' "$TESTUSER1_PASSWORD" "$TESTUSER1_PASSWORD" | \
     kadmin.local -q "addprinc testuser@TEST.REALM"
 printf '%s\n%s\n' "$TESTUSER2_PASSWORD" "$TESTUSER2_PASSWORD" | \
     kadmin.local -q "addprinc testuser2@TEST.REALM"
-kadmin.local -q "addprinc -randkey HTTP/server.test.realm@TEST.REALM"
+# Known password (not -randkey) so the Rust GSS acceptor can derive the
+# service key with string-to-key; -norandkey keeps the keytab at kvno 1.
+HTTP_PASSWORD="${KDC_HTTP_PASSWORD:-httpsecret}"
+printf '%s\n%s\n' "$HTTP_PASSWORD" "$HTTP_PASSWORD" | \
+    kadmin.local -q "addprinc HTTP/server.test.realm@TEST.REALM"
+kadmin.local -q "ktadd -norandkey -k /etc/krb5.keytab HTTP/server.test.realm@TEST.REALM"
 # RFC 8009 (aes-sha2) only principal — exercises etypes 19/20 end to end.
 SHA2USER_PASSWORD="${KDC_SHA2USER_PASSWORD:-sha2pass}"
 printf '%s\n%s\n' "$SHA2USER_PASSWORD" "$SHA2USER_PASSWORD" | \
@@ -90,6 +96,11 @@ cat >> /etc/krb5.conf << 'LOGGING'
     admin_server = STDERR
     default = STDERR
 LOGGING
+
+# MIT GSS-API oracle (python3-gssapi over libgssapi_krb5) for interop tests.
+if [[ -f /gss_oracle.py ]]; then
+    ORACLE_PASSWORD="$TESTUSER1_PASSWORD" python3 /gss_oracle.py &
+fi
 
 # Start KDC in foreground
 exec krb5kdc -n

@@ -25,6 +25,7 @@
 
 pub mod crypto;
 pub mod error;
+pub mod gssapi;
 pub mod protocol;
 pub mod types;
 
