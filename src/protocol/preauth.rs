@@ -19,7 +19,12 @@ use crate::Krb5Error;
 ///
 /// # Implementing a Plugin
 ///
-/// ```rust,ignore
+/// ```
+/// use krb5_rs::protocol::{PreauthContext, PreauthPlugin};
+/// use krb5_rs::types::PaData;
+/// use krb5_rs::Krb5Error;
+/// use rasn::types::OctetString;
+///
 /// struct MyPreauthPlugin;
 ///
 /// impl PreauthPlugin for MyPreauthPlugin {
@@ -29,9 +34,12 @@ use crate::Krb5Error;
 ///         method_data.iter().any(|pa| pa.padata_type == 42)
 ///     }
 ///
-///     fn generate(&self, ctx: &PreauthContext) -> Result<Vec<PaData>, Krb5Error> {
+///     fn generate(&self, _ctx: &PreauthContext) -> Result<Vec<PaData>, Krb5Error> {
 ///         // Build PA-DATA for type 42
-///         Ok(vec![/* ... */])
+///         Ok(vec![PaData {
+///             padata_type: 42,
+///             padata_value: OctetString::from(Vec::new()),
+///         }])
 ///     }
 /// }
 /// ```

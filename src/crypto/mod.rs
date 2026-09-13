@@ -9,7 +9,7 @@ mod aes_sha2;
 mod dk;
 mod hmac_sha1;
 mod nfold;
-mod util;
+pub(crate) mod util;
 
 pub use aes_sha1::{Aes128CtsHmacSha196, Aes256CtsHmacSha196};
 pub use aes_sha2::{Aes128CtsHmacSha256128, Aes256CtsHmacSha384192};

@@ -5,6 +5,8 @@
 //! controls transport — state machines only produce outbound messages
 //! and consume inbound responses.
 
+/// AP exchange and KRB-SAFE/PRIV/CRED (RFC 4120 §5.5-5.8).
+pub mod ap;
 mod as_exchange;
 mod credential;
 mod error_codes;

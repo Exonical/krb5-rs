@@ -149,7 +149,19 @@ enum AsState {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```no_run
+/// use krb5_rs::protocol::{AsExchange, AsExchangeConfig, StepResult};
+/// use krb5_rs::types::PrincipalName;
+/// use krb5_rs::Krb5Error;
+///
+/// # struct Transport;
+/// # impl Transport {
+/// #     async fn send(&self, _realm: &str, _data: &[u8]) -> Result<Vec<u8>, Krb5Error> {
+/// #         Ok(Vec::new())
+/// #     }
+/// # }
+/// # async fn run(transport: &Transport) -> Result<(), Krb5Error> {
+/// let principal = PrincipalName::new_principal("user");
 /// let config = AsExchangeConfig::new(principal, "EXAMPLE.COM");
 /// let mut exchange = AsExchange::new(config, "password");
 /// let mut kdc_reply = Vec::new();
@@ -165,6 +177,8 @@ enum AsState {
 /// }
 ///
 /// let cred = exchange.credential()?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct AsExchange {
     state: AsState,

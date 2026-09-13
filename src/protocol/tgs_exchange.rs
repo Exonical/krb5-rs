@@ -123,7 +123,21 @@ enum ResumeState {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```no_run
+/// use krb5_rs::protocol::{Credential, TgsExchange, TgsOptions, TgsStepResult};
+/// use krb5_rs::types::PrincipalName;
+/// use krb5_rs::Krb5Error;
+///
+/// # struct Transport;
+/// # impl Transport {
+/// #     async fn send(&self, _realm: &str, _data: &[u8]) -> Result<Vec<u8>, Krb5Error> {
+/// #         Ok(Vec::new())
+/// #     }
+/// # }
+/// # fn get_tgt() -> Credential { unimplemented!() }
+/// # async fn run(transport: &Transport) -> Result<(), Krb5Error> {
+/// let tgt = get_tgt();
+/// let target_service = PrincipalName::new_srv_hst("HTTP", "www.example.com");
 /// let mut exchange = TgsExchange::new(tgt, target_service, TgsOptions::default());
 /// let mut kdc_reply = Vec::new();
 ///
@@ -138,6 +152,8 @@ enum ResumeState {
 /// }
 ///
 /// let service_cred = exchange.credential()?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct TgsExchange {
     state: TgsState,

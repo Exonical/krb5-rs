@@ -60,6 +60,10 @@ pub enum Krb5Error {
     #[error("ASN.1 encode error: {0}")]
     Asn1Encode(#[from] rasn::error::EncodeError),
 
+    /// AP exchange error (MIT KRB5KRB_AP_ERR_* / KRB5_* codes).
+    #[error("AP error: {0}")]
+    Ap(#[from] crate::protocol::ap::ApError),
+
     /// Cryptographic operation failed.
     #[error("crypto error: {0}")]
     Crypto(String),
