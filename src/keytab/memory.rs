@@ -1,0 +1,83 @@
+//! MEMORY keytab (kt_memory.c): in-memory entry list.
+
+use super::{get_entry_in, kt_to_ap, Keytab, KeytabEntry, KtError};
+use crate::protocol::ap::{ApError, KeySource};
+use crate::types::{EncryptionKey, PrincipalName};
+
+/// An in-memory keytab.
+#[derive(Default)]
+pub struct MemoryKeytab {
+    entries: Vec<KeytabEntry>,
+}
+
+impl MemoryKeytab {
+    /// An empty keytab.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A keytab pre-populated with `entries` (test helper).
+    pub fn from_entries(entries: Vec<KeytabEntry>) -> Self {
+        Self { entries }
+    }
+}
+
+impl Keytab for MemoryKeytab {
+    fn entries(&self) -> Result<Vec<KeytabEntry>, KtError> {
+        Ok(self.entries.clone())
+    }
+
+    fn get_entry(
+        &self,
+        principal: &PrincipalName,
+        realm: &str,
+        kvno: Option<u32>,
+        etype: Option<i32>,
+    ) -> Result<KeytabEntry, KtError> {
+        get_entry_in(&self.entries, principal, realm, kvno, etype)
+    }
+
+    fn add_entry(&mut self, entry: &KeytabEntry) -> Result<(), KtError> {
+        self.entries.push(entry.clone());
+        Ok(())
+    }
+
+    fn remove_entry(&mut self, entry: &KeytabEntry) -> Result<(), KtError> {
+        match self.entries.iter().position(|e| {
+            e.principal.name_string == entry.principal.name_string
+                && e.realm == entry.realm
+                && e.kvno == entry.kvno
+                && e.key.keytype == entry.key.keytype
+        }) {
+            Some(i) => {
+                self.entries.remove(i);
+                Ok(())
+            }
+            None => Err(KtError::NotFound),
+        }
+    }
+}
+
+impl KeySource for MemoryKeytab {
+    fn get_key(
+        &self,
+        server: &PrincipalName,
+        realm: &[u8],
+        kvno: Option<i32>,
+        etype: i32,
+    ) -> Result<EncryptionKey, ApError> {
+        let realm = String::from_utf8_lossy(realm).to_string();
+        let kvno = kvno.map(|k| k as u32);
+        match self.get_entry(server, &realm, kvno, Some(etype)) {
+            Ok(e) => Ok(e.key),
+            // rd_req_dec.c:255-265 — if the principal (and kvno) exists but
+            // not with the ticket's enctype, the enctype-less retry finds
+            // it and MIT reports BADKEYVER rather than NOKEY.
+            Err(KtError::NotFound) => match self.get_entry(server, &realm, kvno, None) {
+                Ok(_) | Err(KtError::KvnoNotFound) => Err(ApError::BadKeyver),
+                Err(_) => Err(ApError::NoKey),
+            },
+            Err(e) => Err(kt_to_ap(e)),
+        }
+    }
+}

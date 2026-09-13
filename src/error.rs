@@ -82,6 +82,14 @@ pub enum Krb5Error {
     #[error("crypto error: {0}")]
     Crypto(String),
 
+    /// Credential cache error (MIT KRB5_CC_*).
+    #[error("ccache error: {0}")]
+    Ccache(#[from] crate::ccache::CcError),
+
+    /// Keytab error (MIT KRB5_KT_*).
+    #[error("keytab error: {0}")]
+    Keytab(#[from] crate::keytab::KtError),
+
     /// Network/transport error.
     #[error("transport error: {0}")]
     Transport(#[from] std::io::Error),
