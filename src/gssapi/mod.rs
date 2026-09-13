@@ -2,6 +2,7 @@
 
 pub mod krb5;
 pub mod seqstate;
+pub mod spnego;
 pub mod token;
 
 use thiserror::Error;

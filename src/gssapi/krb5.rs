@@ -347,6 +347,12 @@ impl Krb5Initiator {
         }
         self.ctx.ok_or(Krb5Error::Gss(GssError::NoContext))
     }
+
+    /// The established context, for SPNEGO mechListMIC operations
+    /// (spnego_mech.c process_mic uses the inner mech's get_mic/verify_mic).
+    pub(crate) fn ctx_mut(&mut self) -> Option<&mut Krb5Context> {
+        self.ctx.as_mut()
+    }
 }
 
 /// Acceptor-side context establishment (accept_sec_context.c
@@ -614,6 +620,11 @@ impl Krb5Acceptor {
     pub fn delegated_creds(&self) -> Option<&[Credential]> {
         self.delegated.as_deref()
     }
+
+    /// The established context, for SPNEGO mechListMIC operations.
+    pub(crate) fn ctx_mut(&mut self) -> Option<&mut Krb5Context> {
+        self.ctx.as_mut()
+    }
 }
 
 /// Output of [`Krb5Context::unwrap`].  `seq` carries the MIT
@@ -674,6 +685,12 @@ impl Krb5Context {
     /// Established context flags (incl. TRANS and PROT_READY).
     pub fn flags(&self) -> GssFlags {
         self.flags
+    }
+
+    /// SPNEGO reports `ctx_flags & ~GSS_C_PROT_READY_FLAG`
+    /// (spnego_mech.c:1093-1094, :1684).
+    pub(crate) fn clear_prot_ready(&mut self) {
+        self.flags &= !GssFlags::PROT_READY;
     }
 
     /// Initiator principal.

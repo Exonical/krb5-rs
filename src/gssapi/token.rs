@@ -1,7 +1,7 @@
 //! RFC 2743 generic token framing, per MIT generic/util_token.c.
 
 /// DER-encode a tag + length, appending to `out`.
-fn der_taglen(out: &mut Vec<u8>, tag: u8, len: usize) {
+pub(crate) fn der_taglen(out: &mut Vec<u8>, tag: u8, len: usize) {
     out.push(tag);
     if len < 0x80 {
         out.push(len as u8);
@@ -19,7 +19,7 @@ fn der_taglen(out: &mut Vec<u8>, tag: u8, len: usize) {
     }
 }
 
-fn der_value_len(len: usize) -> usize {
+pub(crate) fn der_value_len(len: usize) -> usize {
     1 + len
         + if len < 0x80 {
             1
