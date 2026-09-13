@@ -10,7 +10,7 @@ use crate::crypto::{find_etype, key_usage};
 use crate::types::{
     ApOptions, ApReq, Authenticator, Checksum, EncKdcRepPart, EncTgsRepPart, EncryptedData,
     EncryptionKey, KdcOptions, KdcReq, KdcReqBody, KerberosFlags, KrbErrorMsg, PaData,
-    PrincipalName, TgsRep, TgsReq, TicketFlags,
+    PrincipalName, TgsRep, TicketFlags,
 };
 use crate::Krb5Error;
 use chrono::{Timelike, Utc};
@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 
 use super::credential::{Credential, TicketTimes};
 use super::error_codes::ErrorCode;
+use super::fast::{FastMsgType, FastState};
 use super::validate::{now_kerberos, time_diff, DEFAULT_MAX_CLOCK_SKEW, UTC_OFFSET};
 
 /// Maximum cross-realm referral hops (matches MIT's KRB5_REFERRAL_MAXHOPS).
@@ -175,6 +176,9 @@ pub struct TgsExchange {
     credential: Option<Credential>,
     /// Whether this was a first referral attempt (for fallback to NonReferral).
     first_referral_attempt: bool,
+    /// FAST per-request state (MIT always armors TGS requests with the
+    /// implicit ccache==NULL armor, send_tgs.c:178).
+    fast_state: FastState,
 }
 
 impl TgsExchange {
@@ -194,6 +198,7 @@ impl TgsExchange {
             last_realm: String::new(),
             credential: None,
             first_referral_attempt: true,
+            fast_state: FastState::new(),
         }
     }
 
@@ -303,6 +308,11 @@ impl TgsExchange {
             ));
         }
 
+        // MIT gc_via_tkt.c:185-240 — unwrap a FAST-wrapped error so the
+        // inner KRB-ERROR code drives handling.
+        let fe = self.fast_state.process_error(krb_error)?;
+        let krb_error = fe.err;
+
         match krb_error.error_code {
             KRB_ERR_RESPONSE_TOO_BIG => {
                 // Re-emit the same request for TCP retry
@@ -342,8 +352,30 @@ impl TgsExchange {
     ) -> Result<TgsStepResult, Krb5Error> {
         let rep = &tgs_rep.0;
 
+        // MIT decode_kdc.c:64-76 — process the FAST reply; a missing
+        // PA-FX-FAST (KDC without FAST) is tolerated for TGS.
+        let (mut rep, strengthen_key) = match self
+            .fast_state
+            .process_response(rep.padata.as_deref(), &rep.ticket)
+        {
+            Ok(Some(out)) => {
+                let mut rep = rep.clone();
+                rep.cname = out.client;
+                rep.padata = if out.padata.is_empty() {
+                    None
+                } else {
+                    Some(out.padata)
+                };
+                (rep, out.strengthen_key)
+            }
+            Ok(None) => (rep.clone(), None),
+            Err(Krb5Error::FastRequired) => (rep.clone(), None),
+            Err(e) => return Err(e),
+        };
+        let rep = &mut rep;
+
         // Decrypt EncTgsRepPart: try subkey first (usage 9), fallback to session key (usage 8)
-        let enc_part = self.decrypt_tgs_rep_enc_part(rep)?;
+        let enc_part = self.decrypt_tgs_rep_enc_part(rep, strengthen_key.as_ref())?;
 
         // Validate reply
         self.validate_tgs_reply(rep, &enc_part)?;
@@ -386,14 +418,17 @@ impl TgsExchange {
     fn decrypt_tgs_rep_enc_part(
         &self,
         rep: &crate::types::KdcRep,
+        strengthen: Option<&EncryptionKey>,
     ) -> Result<EncKdcRepPart, Krb5Error> {
         let etype = rep.enc_part.etype;
         let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
 
-        // Try subkey first (key usage 9) if we generated one
+        // Try subkey first (key usage 9) if we generated one; a strengthen
+        // key folds into the reply key (decode_kdc.c:64-76).
         if let Some(ref subkey) = self.subkey {
+            let key = FastState::reply_key(strengthen, subkey)?;
             if let Ok(plaintext) = profile.decrypt(
-                subkey.key_bytes(),
+                key.key_bytes(),
                 key_usage::TGS_REP_ENCPART_SUBKEY,
                 rep.enc_part.cipher.as_ref(),
             ) {
@@ -404,9 +439,10 @@ impl TgsExchange {
         }
 
         // Fallback: TGT session key (key usage 8)
+        let key = FastState::reply_key(strengthen, &self.cur_tgt.session_key)?;
         let plaintext = profile
             .decrypt(
-                self.cur_tgt.session_key.key_bytes(),
+                key.key_bytes(),
                 key_usage::TGS_REP_ENCPART_SESSKEY,
                 rep.enc_part.cipher.as_ref(),
             )
@@ -646,8 +682,15 @@ impl TgsExchange {
         // DER-encode req_body for checksum computation
         let req_body_der = rasn::der::encode(&req_body)?;
 
+        // MIT send_tgs.c:178 — every TGS-REQ is FAST-armored with the
+        // implicit armor derived from subkey + TGT session key.
+        self.fast_state = FastState::new();
+        self.fast_state
+            .tgs_armor(&subkey, &self.cur_tgt.session_key)?;
+
         // Build PA-TGS-REQ (AP-REQ wrapping the TGT)
         let pa_tgs_req = self.build_pa_tgs_req(&req_body_der, &subkey)?;
+        let ap_req_der: Vec<u8> = pa_tgs_req.padata_value.as_ref().to_vec();
 
         // Build padata list
         let mut padata = vec![pa_tgs_req];
@@ -665,8 +708,11 @@ impl TgsExchange {
             req_body,
         };
 
-        let tgs_req = TgsReq(kdc_req);
-        let der = rasn::der::encode(&tgs_req)?;
+        // send_tgs.c:277-283 — the FAST request checksum covers the AP-REQ
+        // DER, not the request body.
+        let der = self
+            .fast_state
+            .prep_req(&kdc_req, &ap_req_der, FastMsgType::Tgs)?;
         self.last_req_bytes = der.clone();
 
         Ok(der)
@@ -780,7 +826,7 @@ mod tests {
     use super::*;
     use crate::types::{
         EncKdcRepPart, EncryptedData, EncryptionKey, Flags, KdcRep, KerberosFlags, KerberosTime,
-        LastReqEntry, PrincipalName, Ticket, TicketFlags,
+        LastReqEntry, PrincipalName, TgsReq, Ticket, TicketFlags,
     };
     use chrono::{FixedOffset, TimeZone, Utc};
     use rasn::types::{GeneralString, OctetString};

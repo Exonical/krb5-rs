@@ -88,13 +88,22 @@ pub(crate) struct PreauthHint {
 ///
 /// The e-data is DER-encoded METHOD-DATA (SEQUENCE OF PA-DATA). We look for
 /// PA-ETYPE-INFO2 (type 19) and select the first entry with a supported etype.
+#[cfg(test)]
 pub(crate) fn extract_preauth_hint(
     e_data: &[u8],
     supported_etypes: &[i32],
 ) -> Result<PreauthHint, Krb5Error> {
     // Decode METHOD-DATA (SEQUENCE OF PA-DATA)
     let method_data: Vec<PaData> = rasn::der::decode(e_data)?;
+    extract_preauth_hint_padata(&method_data, supported_etypes)
+}
 
+/// Extract pre-authentication hints from an already-decoded METHOD-DATA
+/// list (e.g. padata unwrapped from a FAST response).
+pub(crate) fn extract_preauth_hint_padata(
+    method_data: &[PaData],
+    supported_etypes: &[i32],
+) -> Result<PreauthHint, Krb5Error> {
     // First, try PA-ETYPE-INFO2 (padata-type 19)
     if let Some(etype_info2_pa) = method_data
         .iter()

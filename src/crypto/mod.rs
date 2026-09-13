@@ -52,6 +52,18 @@ pub mod key_usage {
     pub const KRB_SAFE_CKSUM: i32 = 15;
     /// PA-REQ-ENC-PA-REP checksum over the AS-REQ (RFC 6806 §11).
     pub const AS_REQ: i32 = 56;
+    /// FAST request checksum over the request body / AP-REQ (RFC 6113 §5.4.2).
+    pub const FAST_REQ_CHKSUM: i32 = 50;
+    /// FAST encrypted KrbFastReq (RFC 6113 §5.4.2).
+    pub const FAST_ENC: i32 = 51;
+    /// FAST encrypted KrbFastResponse (RFC 6113 §5.4.3).
+    pub const FAST_REP: i32 = 52;
+    /// FAST finished ticket checksum (RFC 6113 §5.4.3).
+    pub const FAST_FINISHED: i32 = 53;
+    /// Client-direction encrypted challenge (RFC 6113 §5.4.5).
+    pub const ENC_CHALLENGE_CLIENT: i32 = 54;
+    /// KDC-direction encrypted challenge (RFC 6113 §5.4.5).
+    pub const ENC_CHALLENGE_KDC: i32 = 55;
 }
 
 /// Errors from cryptographic operations.

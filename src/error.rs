@@ -44,6 +44,16 @@ pub enum Krb5Error {
     #[error("exceeded maximum preauth retries ({0})")]
     PreauthLoopExceeded(u32),
 
+    /// The KDC did not include a FAST armored reply although the request
+    /// was FAST-armored (MIT `KRB5_ERR_FAST_REQUIRED`).
+    #[error("KDC reply is not FAST-armored")]
+    FastRequired,
+
+    /// Pre-authentication was required but no offered mechanism succeeded
+    /// (MIT `KRB5_PREAUTH_FAILED`, preauth2.c:715-724).
+    #[error("pre-authentication failed")]
+    PreauthFailed,
+
     /// No mutually supported encryption type.
     #[error("no common encryption type with KDC")]
     NoCommonEtype,

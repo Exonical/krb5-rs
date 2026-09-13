@@ -12,16 +12,19 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{find_etype, key_usage};
 use crate::types::{
-    AsRep, AsReq, Checksum, EncAsRepPart, EncKdcRepPart, EncTgsRepPart, KdcOptions, KdcRep, KdcReq,
-    KdcReqBody, KerberosFlags, KerberosTime, KrbErrorMsg, PaData, PaDataType, PrincipalName,
-    TicketFlags,
+    AsRep, Checksum, EncAsRepPart, EncKdcRepPart, EncTgsRepPart, EncryptionKey, KdcOptions, KdcRep,
+    KdcReq, KdcReqBody, KerberosFlags, KerberosTime, KrbErrorMsg, PaData, PaDataType,
+    PrincipalName, TicketFlags,
 };
 use crate::Krb5Error;
 
 use super::credential::{Credential, TicketTimes};
+use super::fast::{
+    build_pa_encrypted_challenge, verify_kdc_challenge, FastMode, FastMsgType, FastState,
+};
 use super::preauth::{
     build_empty_padata, build_pa_enc_timestamp, build_pa_pac_request, default_salt,
-    extract_preauth_hint, PreauthHint,
+    extract_preauth_hint_padata, PreauthHint,
 };
 use super::validate::{validate_as_reply, DEFAULT_MAX_CLOCK_SKEW, UTC_OFFSET};
 
@@ -63,6 +66,8 @@ pub struct AsExchangeConfig {
     pub request_pac: bool,
     /// Maximum allowed clock skew. Default: 5 minutes.
     pub max_clock_skew: Duration,
+    /// FAST mode (RFC 6113). Default: disabled.
+    pub fast: FastMode,
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -82,6 +87,7 @@ impl Default for AsExchangeConfig {
             renew_lifetime: Duration::from_secs(7 * 24 * 3600), // 7 days
             request_pac: true,
             max_clock_skew: DEFAULT_MAX_CLOCK_SKEW,
+            fast: FastMode::Disabled,
         }
     }
 }
@@ -208,10 +214,40 @@ pub struct AsExchange {
     /// Whether we have sent preauth (PA-ENC-TIMESTAMP) in a request
     /// (MIT `ctx->selected_preauth_type != KRB5_PADATA_NONE`).
     preauth_sent: bool,
+    /// The padata type of the last preauth mechanism we answered with
+    /// (MIT `ctx->selected_preauth_type`).
+    selected_preauth_type: Option<i32>,
+    /// Real preauth types that already failed this exchange
+    /// (MIT `k5_preauth_note_failed`).
+    preauth_failed: Vec<i32>,
+    /// METHOD-DATA accepted from the most recent preauth error
+    /// (MIT `ctx->method_padata`).
+    method_padata: Option<Vec<PaData>>,
+    /// Time offset learned from a KDC error's stime
+    /// (MIT `ctx->pa_offset`/`pa_offset_state`).
+    pa_offset: Option<PaOffset>,
+    /// FAST per-request state (MIT `ctx->fast_state`; rebuilt per restart).
+    fast_state: FastState,
+    /// RFC 6113 §5.4.4 negotiation result: ENC_PA_REP + FAST in enc_padata.
+    fast_avail: bool,
+    /// A KDC encrypted challenge in the reply verified against the
+    /// KDC-direction challenge key.
+    kdc_verified: bool,
     /// Loop counter to prevent infinite preauth loops.
     loop_count: u32,
     /// Output credential.
     credential: Option<Credential>,
+}
+
+/// KDC time offset learned from a preauth error (MIT `pa_offset_state`).
+#[derive(Debug, Clone, Copy)]
+struct PaOffset {
+    /// Whole-second delta (KDC stime − local now at receipt).
+    secs: chrono::TimeDelta,
+    /// Microsecond delta (KDC susec − local usec at receipt).
+    usec: i64,
+    /// True when learned while armored (MIT `AUTH_OFFSET`).
+    auth: bool,
 }
 
 impl AsExchange {
@@ -231,6 +267,13 @@ impl AsExchange {
             info_pa_permitted: true,
             restarted: false,
             preauth_sent: false,
+            selected_preauth_type: None,
+            preauth_failed: Vec::new(),
+            method_padata: None,
+            pa_offset: None,
+            fast_state: FastState::new(),
+            fast_avail: false,
+            kdc_verified: false,
             loop_count: 0,
             credential: None,
         }
@@ -243,7 +286,10 @@ impl AsExchange {
     pub fn step(&mut self, kdc_reply: &[u8]) -> Result<StepResult, Krb5Error> {
         match self.state {
             AsState::Initial => {
-                // First call — build initial AS-REQ (no preauth)
+                // First call — build initial AS-REQ (no preauth). Armor it
+                // when FAST is required (MIT KRB5_FAST_REQUIRED).
+                let required = self.config.fast.required();
+                self.reset_fast_state(required)?;
                 let (as_req_der, req_body) = self.build_as_req(None)?;
                 self.last_req_body = Some(req_body);
                 self.last_req_bytes = as_req_der.clone();
@@ -268,6 +314,34 @@ impl AsExchange {
             .ok_or(Krb5Error::ReplyValidation("exchange not complete"))
     }
 
+    /// Whether the reply negotiated FAST availability (RFC 6806 §11:
+    /// ENC_PA_REP flag set and PA-FX-FAST in the encrypted padata;
+    /// MIT `krb5int_fast_verify_nego`).
+    pub fn fast_avail(&self) -> bool {
+        self.fast_avail
+    }
+
+    /// Whether a KDC encrypted challenge in the reply verified, proving
+    /// the KDC holds the client's long-term key (MIT `ec_process` verify
+    /// path; failure there is non-fatal, so this is a flag not an error).
+    pub fn kdc_verified(&self) -> bool {
+        self.kdc_verified
+    }
+
+    /// Rebuild the FAST request state for a (re)start
+    /// (MIT restart_init_creds_loop: fresh fast_state; arms when DO_FAST).
+    fn reset_fast_state(&mut self, do_fast: bool) -> Result<(), Krb5Error> {
+        self.fast_state = FastState::new();
+        let cred = self.config.fast.armor_credential().cloned();
+        if let Some(cred) = cred {
+            self.fast_state.set_armor_available(true);
+            if do_fast {
+                self.fast_state.armor_ap_request(&cred)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Process a KDC response.
     fn process_kdc_reply(&mut self, kdc_reply: &[u8]) -> Result<StepResult, Krb5Error> {
         if kdc_reply.is_empty() {
@@ -290,54 +364,42 @@ impl AsExchange {
             ));
         }
 
+        // MIT get_in_tkt.c:1694 — unwrap FAST errors first. On success `fe`
+        // carries the inner KRB-ERROR and the FAST response padata (or the
+        // decoded e-data unarmored); on failure of the FAST decode chain the
+        // outer error is returned unchanged with retry = false.
+        let fe = self.fast_state.process_error(krb_error)?;
+        let krb_error = fe.err;
+        let retry = fe.retry;
+        let err_padata = fe.padata;
+
+        // get_in_tkt.c:1700-1707 — KDC advertised FAST and we have armor:
+        // restart once, armored, with a fresh first request.
+        if !self.restarted
+            && self
+                .fast_state
+                .upgrade_to_fast_p(err_padata.as_deref().unwrap_or(&[]))
+        {
+            self.restarted = true;
+            return self.restart(true);
+        }
+
         match krb_error.error_code {
             // MORE_PREAUTH_DATA_REQUIRED (91) is handled like PREAUTH_REQUIRED
             // (MIT get_in_tkt.c:1742): its e-data may lack ETYPE-INFO2, in
             // which case the previously saved etype/salt/s2kparams hint is
             // reused.
-            KDC_ERR_PREAUTH_REQUIRED | KDC_ERR_MORE_PREAUTH_DATA_REQUIRED => {
+            KDC_ERR_PREAUTH_REQUIRED | KDC_ERR_MORE_PREAUTH_DATA_REQUIRED if retry => {
                 self.loop_count += 1;
                 if self.loop_count > MAX_PREAUTH_LOOPS {
                     return Err(Krb5Error::PreauthLoopExceeded(MAX_PREAUTH_LOOPS));
                 }
-                // Extract preauth hints from e-data
-                let e_data = krb_error.e_data.as_ref().ok_or(Krb5Error::ReplyValidation(
-                    "PREAUTH_REQUIRED without e-data",
-                ))?;
-
-                // MIT preauth2.c:856-884 `copy_cookie` — copy the PA-FX-COOKIE
-                // from this error's METHOD-DATA verbatim into the next AS-REQ.
-                self.cookie = extract_cookie(e_data.as_ref());
-
-                let hint = match extract_preauth_hint(e_data.as_ref(), &self.config.etypes) {
-                    Ok(hint) => {
-                        // Persist salt and s2kparams for AS-REP decryption later
-                        self.last_preauth_salt = hint.salt.clone();
-                        self.last_s2kparams = hint.s2kparams.clone();
-                        self.last_preauth_etype = Some(hint.etype);
-                        hint
-                    }
-                    Err(e) => match self.last_preauth_etype {
-                        Some(etype) => PreauthHint {
-                            etype,
-                            salt: self.last_preauth_salt.clone(),
-                            s2kparams: self.last_s2kparams.clone(),
-                        },
-                        None => return Err(e),
-                    },
-                };
-
-                // Build AS-REQ with preauth
-                let pa_timestamp = self.build_preauth_padata(&hint)?;
-                self.preauth_sent = true;
-                let (as_req_der, req_body) = self.build_as_req(Some(pa_timestamp))?;
-                self.last_req_body = Some(req_body);
-                self.last_req_bytes = as_req_der.clone();
-                // Stay in AwaitReply state for next response
-                Ok(StepResult::SendToKdc {
-                    data: as_req_der,
-                    realm: self.config.realm.clone(),
-                })
+                // get_in_tkt.c:1727 — record the KDC time offset.
+                self.note_req_timestamp(krb_error.stime, krb_error.susec);
+                if let Some(pd) = err_padata {
+                    self.method_padata = Some(pd);
+                }
+                self.send_preauth_request()
             }
             KRB_ERR_RESPONSE_TOO_BIG => {
                 // Re-emit the same request for the caller to resend over TCP.
@@ -348,54 +410,184 @@ impl AsExchange {
                     realm: self.config.realm.clone(),
                 })
             }
-            KDC_ERR_WRONG_REALM => {
-                // Realm referral — KDC tells us the correct realm.
-                // Use the server realm field (mandatory) rather than crealm (optional).
-                let new_realm = String::from_utf8_lossy(krb_error.realm.as_bytes()).to_string();
-                if new_realm != self.config.realm {
-                    self.config.realm = new_realm;
-                    return self.restart();
-                }
-                // If redirected to the same realm, propagate the original error
-                Err(Krb5Error::from_error_msg(krb_error))
-            }
-            KDC_ERR_PREAUTH_FAILED => {
+            KDC_ERR_PREAUTH_FAILED if !self.preauth_sent && !self.restarted => {
                 // MIT get_in_tkt.c:1709-1715 — if no preauth was sent yet and
                 // we haven't restarted, the KDC probably disliked the
                 // informational padata; retry once without it.
-                if !self.preauth_sent && !self.restarted {
-                    self.info_pa_permitted = false;
-                    self.restarted = true;
-                    self.restart()
-                } else {
-                    Err(Krb5Error::from_error_msg(krb_error))
+                self.info_pa_permitted = false;
+                self.restarted = true;
+                self.restart(false)
+            }
+            KDC_ERR_PREAUTH_FAILED if retry => {
+                // get_in_tkt.c:1731-1741 — note the failed mechanism and
+                // accept or update method data, then try the next one.
+                self.note_req_timestamp(krb_error.stime, krb_error.susec);
+                if let Some(t) = self.selected_preauth_type.take() {
+                    self.preauth_failed.push(t);
+                }
+                self.preauth_sent = false;
+                if let Some(pd) = err_padata {
+                    self.method_padata = Some(pd);
+                }
+                // get_in_tkt.c:1337-1352 — the KDC error code is saved in
+                // `save` and restored if no remaining real preauth mechanism
+                // can run (k5_preauth's KRB5_PREAUTH_FAILED is superseded by
+                // the KDC-side code, which is what kinit reports).
+                match self.send_preauth_request() {
+                    Err(Krb5Error::PreauthFailed) => Err(Krb5Error::from_error_msg(krb_error)),
+                    other => other,
                 }
             }
             KDC_ERR_PREAUTH_EXPIRED => {
                 // MIT get_in_tkt.c:1716-1720 — we sent an expired KDC cookie;
                 // start over, allowing another restart on PREAUTH_FAILED.
                 self.restarted = false;
-                self.restart()
+                self.restart(false)
             }
-            _ => {
-                // Other KDC error — propagate
+            KDC_ERR_WRONG_REALM if self.config.kdc_options.contains(KdcOptions::CANONICALIZE) => {
+                // Realm referral — KDC tells us the correct realm.
+                // Use the server realm field (mandatory) rather than crealm (optional).
+                let new_realm = String::from_utf8_lossy(krb_error.realm.as_bytes()).to_string();
+                if new_realm != self.config.realm {
+                    self.config.realm = new_realm;
+                    return self.restart(false);
+                }
+                // If redirected to the same realm, propagate the original error
                 Err(Krb5Error::from_error_msg(krb_error))
             }
+            _ => {
+                if retry && self.selected_preauth_type.is_some() {
+                    // get_in_tkt.c:1760-1764 — error + a preauth mechanism
+                    // in flight: retry the loop with stored method data.
+                    self.send_preauth_request()
+                } else {
+                    // error + no hints (or no preauth mech) = give up
+                    Err(Krb5Error::from_error_msg(krb_error))
+                }
+            }
         }
+    }
+
+    /// Build the next AS-REQ carrying preauth answered from
+    /// `self.method_padata` (MIT's k5_preauth over method_padata at
+    /// get_in_tkt.c:1343-1355).
+    fn send_preauth_request(&mut self) -> Result<StepResult, Krb5Error> {
+        let method = self
+            .method_padata
+            .clone()
+            .ok_or(Krb5Error::ReplyValidation(
+                "PREAUTH_REQUIRED without e-data",
+            ))?;
+
+        // MIT preauth2.c:856-884 `copy_cookie` — copy the PA-FX-COOKIE
+        // from the error's METHOD-DATA verbatim into the next AS-REQ.
+        self.cookie = method
+            .iter()
+            .find(|pa| pa.padata_type == PaDataType::FxCookie as i32)
+            .map(|pa| pa.padata_value.as_ref().to_vec());
+
+        // Persist salt and s2kparams for AS-REP decryption later.
+        match extract_preauth_hint_padata(&method, &self.config.etypes) {
+            Ok(hint) => {
+                self.last_preauth_salt = hint.salt.clone();
+                self.last_s2kparams = hint.s2kparams.clone();
+                self.last_preauth_etype = Some(hint.etype);
+            }
+            Err(e) => {
+                if self.last_preauth_etype.is_none() {
+                    return Err(e);
+                }
+            }
+        }
+
+        let pa = self.select_preauth(&method)?;
+        self.preauth_sent = true;
+        let (as_req_der, req_body) = self.build_as_req(Some(vec![pa]))?;
+        self.last_req_body = Some(req_body);
+        self.last_req_bytes = as_req_der.clone();
+        Ok(StepResult::SendToKdc {
+            data: as_req_der,
+            realm: self.config.realm.clone(),
+        })
+    }
+
+    /// Pick the first real preauth mechanism the method data offers that we
+    /// can answer (MIT `process_pa_data` walks the KDC list in order and
+    /// stops at the first real mechanism that succeeds, preauth2.c:650-735).
+    fn select_preauth(&mut self, method: &[PaData]) -> Result<PaData, Krb5Error> {
+        let hint = || PreauthHint {
+            etype: self.last_preauth_etype.unwrap_or(18),
+            salt: self.last_preauth_salt.clone(),
+            s2kparams: self.last_s2kparams.clone(),
+        };
+        for pa in method {
+            match pa.padata_type {
+                t if t == PaDataType::EncryptedChallenge as i32 => {
+                    // ec_process:26-33 — no armor key means we cannot
+                    // answer an encrypted challenge (ENOENT).
+                    let Some(armor_key) = self.fast_state.armor_key().cloned() else {
+                        continue;
+                    };
+                    if self.preauth_failed.contains(&t) {
+                        continue;
+                    }
+                    let hint = hint();
+                    let profile = find_etype(hint.etype)
+                        .map_err(|_| Krb5Error::UnsupportedEtype(hint.etype))?;
+                    let salt = hint.salt.clone().unwrap_or_else(|| self.default_salt());
+                    let as_key = EncryptionKey::new(
+                        hint.etype,
+                        profile
+                            .string_to_key(
+                                self.password.as_bytes(),
+                                &salt,
+                                hint.s2kparams.as_deref(),
+                            )
+                            .map_err(|e| Krb5Error::Crypto(e.to_string()))?
+                            .to_vec(),
+                    );
+                    // Encrypted challenge requires the authenticated offset
+                    // (get_preauth_time allow_unauth=FALSE).
+                    let (ts, usec) = self.preauth_time(false);
+                    let out = build_pa_encrypted_challenge(&armor_key, &as_key, ts, Some(usec))?;
+                    self.selected_preauth_type = Some(t);
+                    return Ok(out);
+                }
+                t if t == PaDataType::EncTimestamp as i32 => {
+                    if self.preauth_failed.contains(&t) {
+                        continue;
+                    }
+                    let pa = self.build_pa_enc_timestamp(&hint())?;
+                    self.selected_preauth_type = Some(t);
+                    return Ok(pa);
+                }
+                _ => continue,
+            }
+        }
+        // MIT preauth2.c:715-724 — must_preauth and no real mechanism
+        // succeeded → KRB5_PREAUTH_FAILED.
+        Err(Krb5Error::PreauthFailed)
     }
 
     /// Restart the exchange from the initial (no-preauth) request.
     ///
     /// MIT `restart_init_creds_loop` (get_in_tkt.c): drops the cookie,
-    /// preauth hint and loop state. `restarted` is caller-managed: the
-    /// PREAUTH_FAILED path sets it, PREAUTH_EXPIRED clears it.
-    fn restart(&mut self) -> Result<StepResult, Krb5Error> {
+    /// preauth hint and loop state, and rebuilds the FAST state — arming
+    /// it when `fast_upgrade` or FAST-required is set. `restarted` is
+    /// caller-managed: the PREAUTH_FAILED path sets it, PREAUTH_EXPIRED
+    /// clears it.
+    fn restart(&mut self, fast_upgrade: bool) -> Result<StepResult, Krb5Error> {
         self.cookie = None;
         self.last_preauth_salt = None;
         self.last_s2kparams = None;
         self.last_preauth_etype = None;
+        self.method_padata = None;
+        self.selected_preauth_type = None;
+        self.preauth_failed.clear();
         self.loop_count = 0;
         self.preauth_sent = false;
+        let do_fast = self.config.fast.required() || fast_upgrade;
+        self.reset_fast_state(do_fast)?;
         let (as_req_der, req_body) = self.build_as_req(None)?;
         self.last_req_body = Some(req_body);
         self.last_req_bytes = as_req_der.clone();
@@ -498,47 +690,81 @@ impl AsExchange {
             req_body: req_body.clone(),
         };
 
-        let as_req = AsReq(kdc_req);
-        let der = rasn::der::encode(&as_req)?;
+        // MIT get_in_tkt.c:836 + :1391-1395 — the checksum input is the
+        // DER-encoded outer request body; the returned bytes are the outer
+        // (possibly FAST-armored) request.
+        let body_der = rasn::der::encode(&req_body)?;
+        let der = self
+            .fast_state
+            .prep_req(&kdc_req, &body_der, FastMsgType::As)?;
 
         Ok((der, req_body))
     }
 
-    /// Build PA-ENC-TIMESTAMP and return as padata vec.
-    fn build_preauth_padata(&self, hint: &PreauthHint) -> Result<Vec<PaData>, Krb5Error> {
-        // Capture a single instant for both timestamp and microseconds
+    /// Current time for preauth, applying the KDC offset when permitted
+    /// (MIT `k5_init_creds_current_time`, get_in_tkt.c:683-697):
+    /// `allow_unauth` permits an offset learned from an unarmored error.
+    fn preauth_time(&self, allow_unauth: bool) -> (KerberosTime, i32) {
         let now_utc = Utc::now();
-        let now = now_utc
+        let adj = match self.pa_offset {
+            Some(o) if allow_unauth || o.auth => {
+                now_utc + o.secs + chrono::Duration::microseconds(o.usec)
+            }
+            _ => now_utc,
+        };
+        let usec = adj.timestamp_subsec_micros() as i32;
+        let ts = adj
             .with_nanosecond(0)
-            .unwrap_or(now_utc)
+            .unwrap_or(adj)
             .with_timezone(&UTC_OFFSET);
-        let usec = now_utc.timestamp_subsec_micros() as i32;
+        (ts, usec)
+    }
+
+    /// Record the KDC time offset from a preauth error
+    /// (MIT `note_req_timestamp`, get_in_tkt.c:1430-1440): the offset is
+    /// authenticated (AUTH_OFFSET) only when the error was FAST-armored.
+    fn note_req_timestamp(&mut self, stime: KerberosTime, susec: i32) {
+        let now_utc = Utc::now();
+        let now_fixed = now_utc.fixed_offset();
+        self.pa_offset = Some(PaOffset {
+            secs: stime.signed_duration_since(now_fixed),
+            usec: susec as i64 - now_utc.timestamp_subsec_micros() as i64,
+            auth: self.fast_state.armor_key().is_some(),
+        });
+    }
+
+    /// Build PA-ENC-TIMESTAMP and return as padata.
+    /// Uses the KDC time offset whenever known (allow_unauth=TRUE, MIT
+    /// preauth_enc_timestamp via get_preauth_time).
+    fn build_pa_enc_timestamp(&self, hint: &PreauthHint) -> Result<PaData, Krb5Error> {
+        let (now, usec) = self.preauth_time(true);
 
         // Compute salt: use hint salt if present, or compute default
         let salt = match &hint.salt {
             Some(s) => s.clone(),
-            None => {
-                let components: Vec<&[u8]> = self
-                    .config
-                    .client
-                    .name_string
-                    .iter()
-                    .map(|s| s.as_bytes())
-                    .collect();
-                default_salt(&self.config.realm, &components)
-            }
+            None => self.default_salt(),
         };
 
-        let pa_timestamp = build_pa_enc_timestamp(
+        build_pa_enc_timestamp(
             self.password.as_bytes(),
             &salt,
             hint.s2kparams.as_deref(),
             hint.etype,
             now,
             Some(usec),
-        )?;
+        )
+    }
 
-        Ok(vec![pa_timestamp])
+    /// Compute default salt from realm and client principal components.
+    fn default_salt(&self) -> Vec<u8> {
+        let components: Vec<&[u8]> = self
+            .config
+            .client
+            .name_string
+            .iter()
+            .map(|s| s.as_bytes())
+            .collect();
+        default_salt(&self.config.realm, &components)
     }
 
     /// Process a successful AS-REP: decrypt enc-part, validate, build credential.
@@ -553,20 +779,48 @@ impl AsExchange {
             ));
         }
 
+        // MIT fast.c:517-568 `krb5int_fast_process_response` — when the
+        // request was FAST-armored, the reply must carry PA-FX-FAST; the
+        // response's finished client and padata replace the reply's.
+        let fast_out = self
+            .fast_state
+            .process_response(rep.padata.as_deref(), &rep.ticket)?;
+        let mut rep = rep.clone();
+        let mut strengthen_key = None;
+        if let Some(out) = fast_out {
+            rep.cname = out.client;
+            rep.padata = if out.padata.is_empty() {
+                None
+            } else {
+                Some(out.padata)
+            };
+            strengthen_key = out.strengthen_key;
+        }
+        let rep = &rep;
+
         // Determine encryption type from enc-part
         let etype = rep.enc_part.etype;
         let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
 
         // Derive key from password, preferring params from AS-REP padata
+        // (which is the FAST response padata when armored — MIT overwrites
+        // resp->padata before the final k5_preauth pass).
         let (salt, s2kparams) = self.compute_reply_key_params(rep);
-        let key = profile
-            .string_to_key(self.password.as_bytes(), &salt, s2kparams.as_deref())
-            .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
+        let as_key = EncryptionKey::new(
+            etype,
+            profile
+                .string_to_key(self.password.as_bytes(), &salt, s2kparams.as_deref())
+                .map_err(|e| Krb5Error::Crypto(e.to_string()))?
+                .to_vec(),
+        );
+
+        // MIT fast.c:570-593 — a strengthen key folds into the reply key.
+        let reply_key = FastState::reply_key(strengthen_key.as_ref(), &as_key)?;
 
         // Decrypt EncAsRepPart (key usage 3)
         let plaintext = profile
             .decrypt(
-                &key,
+                reply_key.key_bytes(),
                 key_usage::AS_REP_ENCPART,
                 rep.enc_part.cipher.as_ref(),
             )
@@ -617,19 +871,45 @@ impl AsExchange {
                 })
                 .ok_or(Krb5Error::ReplyValidation("PA-REQ-ENC-PA-REP missing"))?;
             let cksum: Checksum = rasn::der::decode(pa.padata_value.as_ref())?;
-            if cksum.cksumtype != profile.checksum_type() {
+            let reply_profile = find_etype(reply_key.keytype)
+                .map_err(|_| Krb5Error::UnsupportedEtype(reply_key.keytype))?;
+            if cksum.cksumtype != reply_profile.checksum_type() {
                 return Err(Krb5Error::Crypto(
                     "checksum type does not match reply key enctype".to_string(),
                 ));
             }
-            profile
+            reply_profile
                 .verify_checksum(
-                    &key,
+                    reply_key.key_bytes(),
                     key_usage::AS_REQ,
                     &self.last_req_bytes,
                     cksum.checksum.as_ref(),
                 )
                 .map_err(|_| Krb5Error::ReplyValidation("PA-REQ-ENC-PA-REP checksum mismatch"))?;
+            // fast.c:664-675 — FAST is available when PA-FX-FAST is also
+            // present in the encrypted padata.
+            self.fast_avail = enc_part
+                .encrypted_pa_data
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|pa| pa.padata_type == PaDataType::FxFast as i32);
+        }
+
+        // Final reply padata: a KDC encrypted challenge proves the KDC
+        // holds the long-term key (preauth_ec.c:61-90). MIT treats a
+        // verification failure as non-fatal (must_preauth false), so we
+        // record the outcome instead of failing.
+        if let (Some(armor_key), Some(challenge)) = (
+            self.fast_state.armor_key(),
+            rep.padata
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .find(|pa| pa.padata_type == PaDataType::EncryptedChallenge as i32),
+        ) {
+            self.kdc_verified =
+                verify_kdc_challenge(armor_key, &as_key, challenge.padata_value.as_ref()).is_ok();
         }
 
         // Build credential
@@ -693,28 +973,6 @@ impl AsExchange {
         // Last resort: compute default salt, use persisted s2kparams
         (self.default_salt(), self.last_s2kparams.clone())
     }
-
-    /// Compute default salt from realm and client principal components.
-    fn default_salt(&self) -> Vec<u8> {
-        let components: Vec<&[u8]> = self
-            .config
-            .client
-            .name_string
-            .iter()
-            .map(|s| s.as_bytes())
-            .collect();
-        default_salt(&self.config.realm, &components)
-    }
-}
-
-/// Extract the PA-FX-COOKIE value from a KDC error's METHOD-DATA, if present.
-fn extract_cookie(e_data: &[u8]) -> Option<Vec<u8>> {
-    let method_data: Vec<PaData> = rasn::der::decode(e_data).ok()?;
-    let pa = method_data
-        .iter()
-        .find(|pa| pa.padata_type == PaDataType::FxCookie as i32)?;
-    let bytes: &[u8] = pa.padata_value.as_ref();
-    Some(bytes.to_vec())
 }
 
 /// Convert a `Duration` to `i64` seconds, clamping at `i64::MAX` to avoid overflow.
@@ -742,6 +1000,7 @@ fn now_kerberos() -> KerberosTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AsReq;
 
     #[test]
     fn test_config_defaults() {
@@ -962,10 +1221,18 @@ mod tests {
         }];
         let etype_info2_der = rasn::der::encode(&entries).expect("encode ETYPE-INFO2");
 
-        let method_data = vec![PaData {
-            padata_type: PaDataType::EtypeInfo2 as i32,
-            padata_value: etype_info2_der.into(),
-        }];
+        let method_data = vec![
+            PaData {
+                padata_type: PaDataType::EtypeInfo2 as i32,
+                padata_value: etype_info2_der.into(),
+            },
+            // A real KDC offers PA-ENC-TIMESTAMP in METHOD-DATA; MIT's
+            // client only answers a real preauth type it was offered.
+            PaData {
+                padata_type: PaDataType::EncTimestamp as i32,
+                padata_value: rasn::types::OctetString::from(Vec::new()),
+            },
+        ];
         let e_data = rasn::der::encode(&method_data).expect("encode METHOD-DATA");
 
         let now = now_kerberos();

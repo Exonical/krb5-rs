@@ -10,6 +10,8 @@ pub mod ap;
 mod as_exchange;
 mod credential;
 mod error_codes;
+/// FAST (RFC 6113) armoring and encrypted challenge.
+pub mod fast;
 mod preauth;
 mod tgs_exchange;
 mod validate;
@@ -17,5 +19,6 @@ mod validate;
 pub use as_exchange::{AsExchange, AsExchangeConfig, StepResult};
 pub use credential::{Credential, TicketTimes};
 pub use error_codes::ErrorCode;
+pub use fast::FastMode;
 pub use preauth::{PreauthContext, PreauthPlugin};
 pub use tgs_exchange::{TgsExchange, TgsOptions, TgsStepResult};

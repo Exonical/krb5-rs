@@ -69,6 +69,12 @@ fn method_data(etype_info2: bool, cookie: Option<&[u8]>) -> Vec<u8> {
                 .into(),
         });
     }
+    // A real KDC offers PA-ENC-TIMESTAMP in METHOD-DATA; MIT's client only
+    // answers a real preauth type it was offered (preauth2.c:650-735).
+    padata.push(PaData {
+        padata_type: PA_ENC_TIMESTAMP,
+        padata_value: OctetString::from(Vec::new()),
+    });
     if let Some(c) = cookie {
         padata.push(PaData {
             padata_type: PA_FX_COOKIE,
@@ -513,5 +519,53 @@ fn as_rep_with_unrequested_etype_is_rejected() {
         Err(Krb5Error::ReplyValidation(_)) => {}
         Err(Krb5Error::DecryptionFailed) => panic!("must not be DecryptionFailed"),
         other => panic!("expected ReplyValidation, got: {other:?}"),
+    }
+}
+
+// MIT get_in_tkt.c:1337-1352 — after the KDC rejects the sent preauth with
+// PREAUTH_FAILED and no other real mechanism remains, the saved KDC error
+// code (24) is restored over k5_preauth's generic KRB5_PREAUTH_FAILED. This
+// is what makes kinit print "Password incorrect".
+#[test]
+fn preauth_failed_exhaustion_surfaces_kdc_error_24() {
+    let mut exchange = new_exchange();
+    run_to_preauth_req(&mut exchange);
+    // KDC rejects the PA-ENC-TIMESTAMP (wrong password) and re-offers the
+    // same method data; type 2 is now in the failed-mechanism list.
+    let err = krb_error(24, Some(method_data(true, None)));
+    match exchange.step(&err) {
+        Err(Krb5Error::KdcError(e)) => assert_eq!(e.error_code, 24),
+        other => panic!("expected KdcError(24), got: {other:?}"),
+    }
+}
+
+// Same save/restore path with save.code == 0: PREAUTH_REQUIRED whose method
+// data offers no real mechanism we implement (only PKINIT, type 16) → the
+// generic KRB5_PREAUTH_FAILED.
+#[test]
+fn preauth_required_with_no_supported_mech_is_preauth_failed() {
+    const PA_PKINIT: i32 = 16;
+    let padata = vec![
+        PaData {
+            padata_type: PA_ETYPE_INFO2,
+            padata_value: rasn::der::encode(&vec![EtypeInfo2Entry {
+                etype: 18,
+                salt: Some(GeneralString::from_bytes(SALT).expect("salt")),
+                s2kparams: None,
+            }])
+            .expect("encode ETYPE-INFO2")
+            .into(),
+        },
+        PaData {
+            padata_type: PA_PKINIT,
+            padata_value: OctetString::from(Vec::new()),
+        },
+    ];
+    let md = rasn::der::encode(&padata).expect("encode METHOD-DATA");
+    let mut exchange = new_exchange();
+    unwrap_send(exchange.step(&[]).expect("initial step"));
+    match exchange.step(&krb_error(25, Some(md))) {
+        Err(Krb5Error::PreauthFailed) => {}
+        other => panic!("expected PreauthFailed, got: {other:?}"),
     }
 }
