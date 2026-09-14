@@ -1,3 +1,4 @@
+#![cfg(feature = "client")]
 //! Live integration test for LocatedTransport + KerberosClient against a
 //! real MIT KDC in a container.
 //!

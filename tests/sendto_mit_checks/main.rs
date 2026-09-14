@@ -1,3 +1,4 @@
+#![cfg(feature = "client")]
 //! MIT krb5 1.22.2 k5_sendto/k5_sendto_kdc semantics on tokio: pass
 //! structure, timing, strategy selection (sendto_kdc.c), deltat parsing
 //! (t_deltat.c verbatim), RESPONSE_TOO_BIG retry (get_in_tkt.c), kdclist
