@@ -20,12 +20,17 @@
 //! # }
 //! ```
 
+/// MIT "retry with primary KDCs" rule (get_in_tkt.c:2005-2050).
+pub mod primary;
+
 use crate::protocol::{
     AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
 };
 use crate::transport::KdcTransport;
 use crate::types::PrincipalName;
 use crate::Krb5Error;
+
+pub use primary::{get_tgt, is_unreach, with_primary_fallback};
 
 /// Maximum number of state machine steps before aborting.
 /// Prevents runaway loops in case of protocol bugs.

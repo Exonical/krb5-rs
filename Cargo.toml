@@ -32,7 +32,7 @@ zeroize = { version = "1", features = ["derive"] }
 bitflags = "2"
 
 # Network
-tokio = { version = "1.50", features = ["net", "io-util", "time"], optional = true }
+tokio = { version = "1.50", features = ["net", "io-util", "time", "sync", "rt"], optional = true }
 
 # DNS SRV/URI KDC discovery (optional real resolver)
 hickory-resolver = { version = "0.25.2", optional = true }

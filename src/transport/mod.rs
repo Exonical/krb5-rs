@@ -15,10 +15,17 @@
 //! - [`UdpTcpTransport`] — UDP first, automatic fallback to TCP on
 //!   `KRB_ERR_RESPONSE_TOO_BIG`.
 
+/// Profile/DNS-located KDC transport on top of `sendto`.
+pub mod located;
+/// MIT `k5_sendto`/`k5_sendto_kdc` pass-timing engine.
+pub mod sendto;
+
 mod tcp;
 mod udp;
 mod udp_tcp;
 
+pub use located::LocatedTransport;
+pub use sendto::{sendto, sendto_kdc, KdcReply, SendtoConfig, SendtoError, SendtoTiming, Strategy};
 pub use tcp::TcpTransport;
 pub use udp::UdpTransport;
 pub use udp_tcp::UdpTcpTransport;

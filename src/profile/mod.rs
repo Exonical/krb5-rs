@@ -1,9 +1,11 @@
 //! krb5.conf-style profile tree and query API (MIT util/profile).
 
+mod deltat;
 mod parse;
 
 use std::path::Path;
 
+pub use deltat::string_to_deltat;
 use parse::Node;
 
 /// Errors from profile parsing and typed lookups.
@@ -20,6 +22,8 @@ pub enum ProfileError {
     BadBoolean(String),
     /// PROF_BAD_INTEGER (prof_get.c:282-305).
     BadInteger(String),
+    /// `krb5_string_to_deltat` parse failure.
+    BadDeltat(String),
     /// Filesystem error.
     Io(std::io::Error),
 }
@@ -32,6 +36,7 @@ impl std::fmt::Display for ProfileError {
             }
             ProfileError::BadBoolean(s) => write!(f, "bad boolean value {s:?}"),
             ProfileError::BadInteger(s) => write!(f, "bad integer value {s:?}"),
+            ProfileError::BadDeltat(s) => write!(f, "bad delta-time value {s:?}"),
             ProfileError::Io(e) => write!(f, "profile I/O error: {e}"),
         }
     }
@@ -123,6 +128,15 @@ impl Profile {
             None => return Ok(default),
         };
         conf_boolean(&s).ok_or(ProfileError::BadBoolean(s))
+    }
+
+    /// profile_get_deltat: parse the first value with
+    /// `krb5_string_to_deltat`; absent relation -> `default`.
+    pub fn get_deltat(&self, names: &[&str], default: i32) -> Result<i32, ProfileError> {
+        match self.get_string(names) {
+            Some(s) => string_to_deltat(&s),
+            None => Ok(default),
+        }
     }
 
     /// Names of subsections under the path (e.g. realms under `[realms]`).

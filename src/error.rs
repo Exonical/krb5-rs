@@ -93,6 +93,20 @@ pub enum Krb5Error {
     /// Network/transport error.
     #[error("transport error: {0}")]
     Transport(#[from] std::io::Error),
+
+    /// KDC/service location error (MIT KRB5_REALM_*/KRB5_ERR_NO_SERVICE).
+    #[error("locate error: {0}")]
+    Locate(#[from] crate::locate::LocateError),
+
+    /// k5_sendto send/receive error (MIT KRB5_KDC_UNREACH /
+    /// KRB5_KDCSVC_UNAVAILABLE).
+    #[cfg(feature = "tokio")]
+    #[error("sendto error: {0}")]
+    Sendto(#[from] crate::transport::sendto::SendtoError),
+
+    /// Miscellaneous protocol failure.
+    #[error("protocol error: {0}")]
+    Protocol(String),
 }
 
 impl Krb5Error {
