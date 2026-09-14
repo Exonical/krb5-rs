@@ -34,6 +34,9 @@ bitflags = "2"
 # Network
 tokio = { version = "1.50", features = ["net", "io-util", "time"], optional = true }
 
+# DNS SRV/URI KDC discovery (optional real resolver)
+hickory-resolver = { version = "0.25.2", optional = true }
+
 # Time (rasn's GeneralizedTime = chrono::DateTime<FixedOffset>)
 chrono = "0.4.38"
 
@@ -50,6 +53,7 @@ gssapi = []                # GSSAPI/SPNEGO mechanism
 pkinit = ["dep:x509-parser", "dep:rcgen"]  # PKINIT (X.509 + Kerberos)
 fast = []                  # FAST pre-authentication tunneling
 tokio = ["dep:tokio"]      # Tokio async transport adapter
+dns = ["dep:hickory-resolver", "dep:tokio"]  # Real DNS resolver for KDC location
 
 [dependencies.x509-parser]
 version = "0.18"

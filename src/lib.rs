@@ -28,6 +28,8 @@ pub mod crypto;
 pub mod error;
 pub mod gssapi;
 pub mod keytab;
+pub mod locate;
+pub mod profile;
 pub mod protocol;
 pub mod types;
 
