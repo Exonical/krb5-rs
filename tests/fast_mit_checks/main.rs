@@ -14,7 +14,12 @@ use krb5_rs::protocol::{
 };
 use krb5_rs::types::*;
 use krb5_rs::Krb5Error;
-use rasn::types::{BitString, GeneralString, OctetString};
+use rasn::types::{BitString, OctetString};
+
+#[path = "../common/mod.rs"]
+mod common;
+use common::fixtures::{gs, now, unwrap_send, unwrap_tgs_send};
+use common::krb_error::krb_error_msg;
 
 const PA_TGS_REQ: i32 = 1;
 const PA_ENC_TIMESTAMP: i32 = 2;
@@ -34,14 +39,6 @@ const REALM: &str = "EXAMPLE.COM";
 const CLIENT: &str = "testuser";
 const PASSWORD: &str = "password";
 const SALT: &[u8] = b"EXAMPLE.COMtestuser";
-
-fn now() -> KerberosTime {
-    chrono::Utc::now().fixed_offset()
-}
-
-fn gs(s: &str) -> GeneralString {
-    GeneralString::from_bytes(s.as_bytes()).expect("generalstring")
-}
 
 fn profile18() -> &'static dyn krb5_rs::crypto::EtypeProfile {
     find_etype(18).expect("etype 18")
@@ -93,20 +90,6 @@ fn config_required(tgt: &Credential) -> AsExchangeConfig {
     let mut c = AsExchangeConfig::new(PrincipalName::new_principal(CLIENT), REALM);
     c.fast = FastMode::Required(tgt.clone());
     c
-}
-
-fn unwrap_send(result: StepResult) -> Vec<u8> {
-    match result {
-        StepResult::SendToKdc { data, .. } => data,
-        other => panic!("expected SendToKdc, got: {other:?}"),
-    }
-}
-
-fn unwrap_tgs_send(result: TgsStepResult) -> Vec<u8> {
-    match result {
-        TgsStepResult::SendToKdc { data, .. } => data,
-        other => panic!("expected SendToKdc, got: {other:?}"),
-    }
 }
 
 fn padata_types(padata: &[PaData]) -> Vec<i32> {
@@ -228,21 +211,7 @@ fn fast_error_reply(
 }
 
 fn krb_error(code: i32, stime: KerberosTime, e_data: Option<Vec<u8>>) -> KrbErrorMsg {
-    KrbErrorMsg {
-        pvno: 5,
-        msg_type: 30,
-        ctime: None,
-        cusec: None,
-        stime,
-        susec: 12345,
-        error_code: code,
-        crealm: None,
-        cname: None,
-        realm: gs(REALM),
-        sname: PrincipalName::new_srv_inst("krbtgt", REALM),
-        e_text: None,
-        e_data: e_data.map(OctetString::from),
-    }
+    krb_error_msg(code, REALM, Some(stime), e_data)
 }
 
 fn etype_info2_pa() -> PaData {

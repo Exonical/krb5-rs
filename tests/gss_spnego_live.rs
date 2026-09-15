@@ -10,8 +10,6 @@
 //! `KDC_HOST` overrides the KDC host (default 127.0.0.1, port 10188);
 //! `GSS_ORACLE_ADDR` overrides the oracle (default 127.0.0.1:10189).
 
-use std::net::SocketAddr;
-
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -33,17 +31,9 @@ const SERVICE: &str = "HTTP/server.test.realm";
 const HTTP_PASSWORD: &str = "httpsecret";
 const HTTP_SALT: &str = "TEST.REALMHTTPserver.test.realm";
 
-fn kdc_addr() -> SocketAddr {
-    let host = std::env::var("KDC_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    format!("{host}:10188").parse().expect("parse KDC address")
-}
-
-fn oracle_addr() -> SocketAddr {
-    std::env::var("GSS_ORACLE_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:10189".into())
-        .parse()
-        .expect("parse oracle address")
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::kdc::{kdc_addr, oracle_addr};
 
 fn service() -> PrincipalName {
     PrincipalName::new_srv_hst("HTTP", "server.test.realm")

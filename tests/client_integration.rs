@@ -11,18 +11,15 @@
 //! Set `KDC_HOST` to override the KDC host (default 127.0.0.1), e.g. the
 //! podman machine address on Windows.
 
-use std::net::SocketAddr;
-
 use krb5_rs::client::KerberosClient;
 use krb5_rs::transport::TcpTransport;
 use krb5_rs::Krb5Error;
 
-const REALM: &str = "TEST.REALM";
+#[path = "common/mod.rs"]
+mod common;
+use common::kdc::kdc_addr;
 
-fn kdc_addr() -> SocketAddr {
-    let host = std::env::var("KDC_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    format!("{host}:10188").parse().expect("parse KDC address")
-}
+const REALM: &str = "TEST.REALM";
 
 /// Test: full flow — acquire TGT via KerberosClient.
 #[tokio::test]

@@ -10,10 +10,6 @@
 
 #![cfg(feature = "client")]
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
-
 use krb5_rs::crypto::{find_etype, fx_cf2, key_usage};
 use krb5_rs::gssapi::krb5::{GssFlags, InitStep, Krb5Initiator};
 use krb5_rs::protocol::fast::FastMode;
@@ -31,46 +27,9 @@ const PA_ENC_TIMESTAMP: i32 = 2;
 const PA_FX_FAST: i32 = 136;
 const PA_ENCRYPTED_CHALLENGE: i32 = 138;
 
-fn kdc_addr() -> String {
-    let host = std::env::var("KDC_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    format!("{host}:10188")
-}
-
-fn oracle_addr() -> SocketAddr {
-    std::env::var("GSS_ORACLE_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:10189".into())
-        .parse()
-        .expect("parse oracle address")
-}
-
-const MAX_KDC_RESPONSE_SIZE: usize = 1024 * 1024;
-
-/// Send a message to the KDC via TCP (4-byte big-endian length prefix).
-fn kdc_send(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(kdc_addr())?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let len_u32: u32 = data.len().try_into().map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "KDC request too large")
-    })?;
-    let mut msg = Vec::with_capacity(4 + data.len());
-    msg.extend_from_slice(&len_u32.to_be_bytes());
-    msg.extend_from_slice(data);
-    stream.write_all(&msg)?;
-    stream.flush()?;
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let resp_len = u32::from_be_bytes(len_buf) as usize;
-    if resp_len > MAX_KDC_RESPONSE_SIZE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("KDC response too large: {resp_len}"),
-        ));
-    }
-    let mut resp = vec![0u8; resp_len];
-    stream.read_exact(&mut resp)?;
-    Ok(resp)
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::kdc::{kdc_send, oracle_addr};
 
 /// Drive an AS exchange, returning (sent requests, last KDC reply).
 fn drive_as(exchange: &mut AsExchange) -> Result<(Vec<Vec<u8>>, Vec<u8>), Krb5Error> {

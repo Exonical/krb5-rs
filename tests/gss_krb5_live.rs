@@ -11,16 +11,12 @@
 //! `GSS_ORACLE_ADDR` overrides the oracle (default 127.0.0.1:10189).
 //! One GSS context per TCP connection.
 
-use std::net::SocketAddr;
-
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use krb5_rs::client::KerberosClient;
 use krb5_rs::crypto::find_etype;
-use krb5_rs::gssapi::krb5::{
-    AcceptStep, ChannelBindings, GssFlags, InitStep, Krb5Acceptor, Krb5Initiator,
-};
+use krb5_rs::gssapi::krb5::{ChannelBindings, GssFlags, Krb5Acceptor, Krb5Initiator};
 use krb5_rs::gssapi::seqstate::SeqStatus;
 use krb5_rs::gssapi::GssError;
 use krb5_rs::protocol::ap::{ApError, KeySource};
@@ -35,17 +31,10 @@ const HTTP_PASSWORD: &str = "httpsecret";
 /// (MIT default: realm || principal name, kadmin "normal" keysalts).
 const HTTP_SALT: &str = "TEST.REALMHTTPserver.test.realm";
 
-fn kdc_addr() -> SocketAddr {
-    let host = std::env::var("KDC_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    format!("{host}:10188").parse().expect("parse KDC address")
-}
-
-fn oracle_addr() -> SocketAddr {
-    std::env::var("GSS_ORACLE_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:10189".into())
-        .parse()
-        .expect("parse oracle address")
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::fixtures::{accept_complete, init_complete, unwrap_step};
+use common::kdc::{kdc_addr, oracle_addr};
 
 fn service() -> PrincipalName {
     PrincipalName::new_srv_hst("HTTP", "server.test.realm")
@@ -217,27 +206,6 @@ fn json_int(json: &str, key: &str) -> Option<u32> {
         .map(|i| i + start)
         .unwrap_or(json.len());
     json[start..end].parse().ok()
-}
-
-fn unwrap_step(s: InitStep) -> Option<Vec<u8>> {
-    match s {
-        InitStep::Complete(t) => t,
-        InitStep::Continue(t) => Some(t),
-    }
-}
-
-fn init_complete(s: InitStep) -> Option<Vec<u8>> {
-    match s {
-        InitStep::Complete(t) => t,
-        _ => panic!("expected Complete"),
-    }
-}
-
-fn accept_complete(s: AcceptStep) -> Option<Vec<u8>> {
-    match s {
-        AcceptStep::Complete { token } => token,
-        _ => panic!("expected Complete"),
-    }
 }
 
 /// (a) Rust initiator → MIT acceptor, non-mutual.

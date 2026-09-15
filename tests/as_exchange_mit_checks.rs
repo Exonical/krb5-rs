@@ -8,6 +8,11 @@ use krb5_rs::types::*;
 use krb5_rs::Krb5Error;
 use rasn::types::{GeneralString, OctetString};
 
+#[path = "common/mod.rs"]
+mod common;
+use common::fixtures::{now, unwrap_send};
+use common::krb_error::krb_error_der;
+
 const PA_ENC_TIMESTAMP: i32 = 2;
 const PA_FX_COOKIE: i32 = 133;
 const PA_REQ_ENC_PA_REP: i32 = 149;
@@ -19,10 +24,6 @@ const CLIENT: &str = "testuser";
 const PASSWORD: &str = "password";
 const SALT: &[u8] = b"EXAMPLE.COMtestuser";
 
-fn now() -> KerberosTime {
-    chrono::Utc::now().fixed_offset()
-}
-
 fn new_exchange() -> AsExchange {
     let config = AsExchangeConfig::new(PrincipalName::new_principal(CLIENT), REALM);
     AsExchange::new(config, PASSWORD)
@@ -30,22 +31,7 @@ fn new_exchange() -> AsExchange {
 
 /// Build a DER-encoded KRB-ERROR for the given realm.
 fn krb_error_realm(code: i32, realm: &str, e_data: Option<Vec<u8>>) -> Vec<u8> {
-    let krb_error = KrbErrorMsg {
-        pvno: 5,
-        msg_type: 30,
-        ctime: None,
-        cusec: None,
-        stime: now(),
-        susec: 0,
-        error_code: code,
-        crealm: None,
-        cname: None,
-        realm: GeneralString::from_bytes(realm.as_bytes()).expect("realm"),
-        sname: PrincipalName::new_srv_inst("krbtgt", realm),
-        e_text: None,
-        e_data: e_data.map(OctetString::from),
-    };
-    rasn::der::encode(&krb_error).expect("encode KRB-ERROR")
+    krb_error_der(code, realm, Some(now()), e_data)
 }
 
 /// Build a DER-encoded KRB-ERROR for EXAMPLE.COM.
@@ -242,13 +228,6 @@ fn run_to_preauth_req(exchange: &mut AsExchange) -> Vec<u8> {
             .step(&krb_error(25, Some(method_data(true, None))))
             .expect("PREAUTH_REQUIRED step"),
     )
-}
-
-fn unwrap_send(result: StepResult) -> Vec<u8> {
-    match result {
-        StepResult::SendToKdc { data, .. } => data,
-        other => panic!("expected SendToKdc, got: {other:?}"),
-    }
 }
 
 // MIT get_in_tkt.c:1365-1372 — every AS-REQ carries empty PA-AS-FRESHNESS

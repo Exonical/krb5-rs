@@ -12,6 +12,7 @@ mod credential;
 mod error_codes;
 /// FAST (RFC 6113) armoring and encrypted challenge.
 pub mod fast;
+mod kdc_rep;
 mod preauth;
 mod tgs_exchange;
 mod validate;

@@ -8,13 +8,12 @@ use krb5_rs::client::KerberosClient;
 use krb5_rs::profile::Profile;
 use krb5_rs::transport::located::LocatedTransport;
 use krb5_rs::transport::sendto::SendtoConfig;
-use std::env;
 use std::sync::Arc;
 use std::time::Instant;
 
-fn kdc_host() -> String {
-    env::var("KDC_HOST").unwrap_or_else(|_| "127.0.0.1".into())
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::kdc::kdc_host;
 
 /// AS exchange through LocatedTransport with a dead KDC listed first:
 /// MIT sendto must fall through to the live KDC, which must not be

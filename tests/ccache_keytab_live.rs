@@ -6,118 +6,25 @@
 //! Run with:
 //!   cargo test --all-features --test ccache_keytab_live -- --ignored --nocapture
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::process::Command;
-use std::time::Duration;
-
 use krb5_rs::ccache::*;
 use krb5_rs::crypto::find_etype;
 use krb5_rs::keytab::*;
 use krb5_rs::protocol::ap::{ApReqOptions, AuthContext};
-use krb5_rs::protocol::{
-    AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
-};
+use krb5_rs::protocol::Credential;
 use krb5_rs::types::*;
-use krb5_rs::Krb5Error;
-use rasn::types::GeneralString;
 
-const KDC: &str = "krb5-rs-kdc-1";
+#[path = "common/mod.rs"]
+mod common;
+use common::fixtures::gs;
+use common::kdc::{acquire_tgt, cp_in, cp_out, exec_kdc, get_service_ticket, tmp};
+
 const REALM: &str = "TEST.REALM";
-const MAX_KDC_RESPONSE_SIZE: usize = 1024 * 1024;
-
-fn kdc_addr() -> String {
-    format!(
-        "{}:10188",
-        std::env::var("KDC_HOST").unwrap_or_else(|_| "127.0.0.1".into())
-    )
-}
-
-fn pod(args: &[&str]) -> std::process::Output {
-    Command::new("podman").args(args).output().expect("podman")
-}
-
-fn exec_kdc(cmd: &str) -> String {
-    let out = pod(&["exec", KDC, "bash", "-c", cmd]);
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
-}
-
-fn tmp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("krb5rs_live_{}_{}", std::process::id(), name))
-}
-
-fn cp_out(cpath: &str, name: &str) -> std::path::PathBuf {
-    let local = tmp(name);
-    let _ = std::fs::remove_file(&local);
-    let out = pod(&["cp", &format!("{KDC}:{cpath}"), &local.to_string_lossy()]);
-    assert!(out.status.success(), "podman cp out failed");
-    local
-}
-
-fn cp_in(local: &std::path::Path, cpath: &str) {
-    let out = pod(&["cp", &local.to_string_lossy(), &format!("{KDC}:{cpath}")]);
-    assert!(out.status.success(), "podman cp in failed");
-}
-
-fn gs(b: &[u8]) -> GeneralString {
-    GeneralString::from_bytes(b).expect("general string")
-}
 
 fn p2(a: &str, b: &str) -> PrincipalName {
     PrincipalName {
         name_type: 2,
         name_string: vec![gs(a.as_bytes()), gs(b.as_bytes())],
     }
-}
-
-fn kdc_send(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(kdc_addr())?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut msg = Vec::with_capacity(4 + data.len());
-    msg.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    msg.extend_from_slice(data);
-    stream.write_all(&msg)?;
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let resp_len = u32::from_be_bytes(len_buf) as usize;
-    assert!(resp_len <= MAX_KDC_RESPONSE_SIZE);
-    let mut resp = vec![0u8; resp_len];
-    stream.read_exact(&mut resp)?;
-    Ok(resp)
-}
-
-fn acquire_tgt(principal: &str, password: &str) -> Result<Credential, Krb5Error> {
-    let config = AsExchangeConfig::new(PrincipalName::new_principal(principal), REALM);
-    let mut exchange = AsExchange::new(config, password);
-    let mut kdc_reply = Vec::new();
-    for _ in 0..32 {
-        match exchange.step(&kdc_reply)? {
-            StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } => {
-                kdc_reply = kdc_send(&data).map_err(Krb5Error::Transport)?;
-            }
-            StepResult::Complete => return exchange.credential().cloned(),
-        }
-    }
-    Err(Krb5Error::ReplyValidation("AS exchange did not complete"))
-}
-
-fn get_service_ticket(tgt: &Credential, target: PrincipalName) -> Result<Credential, Krb5Error> {
-    let mut exchange = TgsExchange::new(tgt.clone(), target, TgsOptions::default());
-    let mut kdc_reply = Vec::new();
-    for _ in 0..32 {
-        match exchange.step(&kdc_reply)? {
-            TgsStepResult::SendToKdc { data, .. } | TgsStepResult::RetryTcp { data, .. } => {
-                kdc_reply = kdc_send(&data).map_err(Krb5Error::Transport)?;
-            }
-            TgsStepResult::Complete => return exchange.credential().cloned(),
-        }
-    }
-    Err(Krb5Error::ReplyValidation("TGS exchange did not complete"))
 }
 
 fn s2k_18(password: &str, salt: &str) -> Vec<u8> {
@@ -167,7 +74,7 @@ fn read_mit_ccache_and_tgs() {
 #[test]
 #[ignore = "requires KDC: podman compose -f docker-compose.test.yml up -d"]
 fn write_ccache_mit_klist_kvno() {
-    let cred = acquire_tgt("testuser", "testpassword").expect("as exchange");
+    let cred = acquire_tgt("testuser", "testpassword", REALM).expect("as exchange");
 
     let path = tmp("rs_cc_out");
     let _ = std::fs::remove_file(&path);
@@ -217,7 +124,7 @@ fn read_mit_keytab_and_ap_req() {
     let expect = s2k_18("httpsecret", "TEST.REALMHTTPserver.test.realm");
     assert_eq!(e.key.key_bytes(), &expect[..]);
 
-    let tgt = acquire_tgt("testuser", "testpassword").expect("as");
+    let tgt = acquire_tgt("testuser", "testpassword", REALM).expect("as");
     let svc = get_service_ticket(&tgt, p.clone()).expect("tgs");
     let mut ctx = AuthContext::new();
     let req = ctx

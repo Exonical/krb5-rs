@@ -53,24 +53,14 @@ impl AsExchange {
         // MIT fast.c:570-593 — a strengthen key folds into the reply key.
         let reply_key = FastState::reply_key(strengthen_key.as_ref(), &as_key)?;
 
-        // Decrypt EncAsRepPart (key usage 3)
-        let plaintext = profile
-            .decrypt(
-                reply_key.key_bytes(),
-                key_usage::AS_REP_ENCPART,
-                rep.enc_part.cipher.as_ref(),
-            )
-            .map_err(|_| Krb5Error::DecryptionFailed)?;
-
-        // Try EncAsRepPart (APPLICATION 25) first, then EncTgsRepPart (APPLICATION 26)
-        // Some KDCs (Heimdal) use APPLICATION 26 for AS-REP enc-part
-        let enc_part: EncKdcRepPart = match rasn::der::decode::<EncAsRepPart>(&plaintext) {
-            Ok(enc_as) => enc_as.0,
-            Err(_) => {
-                let enc_tgs: EncTgsRepPart = rasn::der::decode(&plaintext)?;
-                enc_tgs.0
-            }
-        };
+        // Decrypt EncAsRepPart (key usage 3); some KDCs (Heimdal) tag the
+        // enc-part as EncTgsRepPart [APPLICATION 26] — handled inside the
+        // shared decoder.
+        let enc_part = crate::protocol::kdc_rep::decrypt_enc_kdc_rep_part(
+            &[(reply_key.clone(), key_usage::AS_REP_ENCPART)],
+            &rep.enc_part,
+            crate::protocol::kdc_rep::decode_enc_as_rep_part,
+        )?;
 
         // Validate the reply
         let now = now_kerberos();
@@ -149,25 +139,9 @@ impl AsExchange {
         }
 
         // Build credential
-        let credential = Credential {
-            client: rep.cname.clone(),
-            crealm: String::from_utf8_lossy(rep.crealm.as_bytes()).to_string(),
-            server: enc_part.sname.clone(),
-            srealm: String::from_utf8_lossy(enc_part.srealm.as_bytes()).to_string(),
-            session_key: enc_part.key.clone(),
-            times: TicketTimes {
-                authtime: enc_part.authtime,
-                starttime: enc_part.starttime,
-                endtime: enc_part.endtime,
-                renew_till: enc_part.renew_till,
-            },
-            ticket: rep.ticket.clone(),
-            flags: enc_part.flags,
-            addresses: enc_part.caddr.clone(),
-            authdata: None,
-        };
-
-        self.credential = Some(credential);
+        self.credential = Some(crate::protocol::kdc_rep::credential_from_rep(
+            rep, &enc_part,
+        ));
         self.state = AsState::Complete;
         Ok(StepResult::Complete)
     }
@@ -208,5 +182,35 @@ impl AsExchange {
 
         // Last resort: compute default salt, use persisted s2kparams
         (self.default_salt(), self.last_s2kparams.clone())
+    }
+}
+
+impl AsExchange {
+    /// Restart the exchange from the initial (no-preauth) request.
+    ///
+    /// MIT `restart_init_creds_loop` (get_in_tkt.c): drops the cookie,
+    /// preauth hint and loop state, and rebuilds the FAST state — arming
+    /// it when `fast_upgrade` or FAST-required is set. `restarted` is
+    /// caller-managed: the PREAUTH_FAILED path sets it, PREAUTH_EXPIRED
+    /// clears it.
+    pub(super) fn restart(&mut self, fast_upgrade: bool) -> Result<StepResult, Krb5Error> {
+        self.cookie = None;
+        self.last_preauth_salt = None;
+        self.last_s2kparams = None;
+        self.last_preauth_etype = None;
+        self.method_padata = None;
+        self.selected_preauth_type = None;
+        self.preauth_failed.clear();
+        self.loop_count = 0;
+        self.preauth_sent = false;
+        let do_fast = self.config.fast.required() || fast_upgrade;
+        self.reset_fast_state(do_fast)?;
+        let (as_req_der, req_body) = self.build_as_req(None)?;
+        self.last_req_body = Some(req_body);
+        self.last_req_bytes = as_req_der.clone();
+        Ok(StepResult::SendToKdc {
+            data: as_req_der,
+            realm: self.config.realm.clone(),
+        })
     }
 }

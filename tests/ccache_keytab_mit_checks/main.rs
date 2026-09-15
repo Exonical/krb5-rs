@@ -53,9 +53,9 @@ const CRED2S: [&[u8]; 4] = [V1_CRED2, V2_CRED2, V3_CRED2, V4_CRED2];
 // Shared fixture builders
 // ---------------------------------------------------------------------------
 
-fn gs(b: &[u8]) -> GeneralString {
-    GeneralString::from_bytes(b).expect("general string")
-}
+#[path = "../common/mod.rs"]
+mod common;
+use common::fixtures::gs;
 
 /// testclient@KRBTEST.COM (the default principal of the test caches).
 fn test_princ() -> (PrincipalName, String) {
@@ -71,7 +71,7 @@ fn test_princ() -> (PrincipalName, String) {
 fn princ(comps: &[&[u8]], name_type: i32) -> PrincipalName {
     PrincipalName {
         name_type,
-        name_string: comps.iter().map(|c| gs(c)).collect(),
+        name_string: comps.iter().map(gs).collect(),
     }
 }
 

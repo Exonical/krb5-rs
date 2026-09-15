@@ -8,7 +8,6 @@
 //! acc_ctx_vfy_oid:1424, acc_ctx_call_acc:1471, negotiate_mech:3551,
 //! is_kerb_mech:3814 + gss_mech_set_krb5_both in krb5/gssapi_krb5.c:188).
 
-use krb5_rs::crypto::find_etype;
 use krb5_rs::gssapi::krb5::{
     AcceptStep, GssFlags, InitStep, Krb5Acceptor, Krb5Initiator, MECH_KRB5,
 };
@@ -19,94 +18,18 @@ use krb5_rs::gssapi::spnego::{
 };
 use krb5_rs::gssapi::token::{make_token_header, parse_token_header};
 use krb5_rs::gssapi::GssError;
-use krb5_rs::protocol::ap::{encrypt_ticket_part, ApError, KeySource};
-use krb5_rs::protocol::{Credential, TicketTimes};
+use krb5_rs::protocol::ap::{ApError, KeySource};
+use krb5_rs::protocol::Credential;
 use krb5_rs::types::*;
 use krb5_rs::Krb5Error;
-use rasn::types::{GeneralString, OctetString};
 
-const REALM: &str = "EXAMPLE.COM";
+#[path = "../common/mod.rs"]
+mod common;
+use common::fixtures::{
+    accept_complete, init_complete, random_key, service, svc_cred as svc_cred_full,
+};
+
 const HINT_NAME: &[u8] = b"not_defined_in_RFC4178@please_ignore";
-
-fn realm() -> Realm {
-    GeneralString::from_bytes(REALM.as_bytes()).expect("realm")
-}
-
-fn alice() -> PrincipalName {
-    PrincipalName::new_principal("alice")
-}
-
-fn service() -> PrincipalName {
-    PrincipalName::new_srv_hst("HTTP", "www.example.com")
-}
-
-fn now() -> KerberosTime {
-    use chrono::Timelike;
-    let t = chrono::Utc::now();
-    t.with_nanosecond(0).unwrap_or(t).fixed_offset()
-}
-
-fn secs(n: i64) -> KerberosTime {
-    use chrono::Timelike;
-    (chrono::Utc::now() + chrono::Duration::seconds(n))
-        .with_nanosecond(0)
-        .expect("time")
-        .fixed_offset()
-}
-
-fn random_key(etype: i32) -> EncryptionKey {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let profile = find_etype(etype).expect("etype");
-    let tag = COUNTER.fetch_add(1, Ordering::Relaxed) as u8;
-    let rnd: Vec<u8> = (0..profile.key_bytes())
-        .map(|i| (i as u8).wrapping_mul(41).wrapping_add(tag))
-        .collect();
-    EncryptionKey::new(etype, profile.random_to_key(&rnd).expect("r2k").to_vec())
-}
-
-fn mint(
-    service_key: &EncryptionKey,
-    session_key: &EncryptionKey,
-    sname: PrincipalName,
-    flags: TicketFlags,
-) -> Credential {
-    let part = EncTicketPart {
-        flags: KerberosFlags::new(flags),
-        key: session_key.clone(),
-        crealm: realm(),
-        cname: alice(),
-        transited: TransitedEncoding {
-            tr_type: 1,
-            contents: OctetString::from(Vec::new()),
-        },
-        authtime: now(),
-        starttime: None,
-        endtime: secs(3600),
-        renew_till: None,
-        caddr: None,
-        authorization_data: None,
-    };
-    let ticket =
-        encrypt_ticket_part(service_key, Some(1), REALM, sname.clone(), &part).expect("mint");
-    Credential {
-        client: alice(),
-        crealm: REALM.to_string(),
-        server: sname,
-        srealm: REALM.to_string(),
-        session_key: session_key.clone(),
-        times: TicketTimes {
-            authtime: part.authtime,
-            starttime: None,
-            endtime: part.endtime,
-            renew_till: None,
-        },
-        ticket,
-        flags: KerberosFlags::new(flags),
-        addresses: None,
-        authdata: None,
-    }
-}
 
 struct OneKey(EncryptionKey);
 impl KeySource for OneKey {
@@ -122,8 +45,7 @@ impl KeySource for OneKey {
 }
 
 fn svc_cred(service_key: &EncryptionKey, session_etype: i32) -> Credential {
-    let session = random_key(session_etype);
-    mint(service_key, &session, service(), TicketFlags::empty())
+    svc_cred_full(service_key, session_etype).0
 }
 
 fn gss_err(e: Krb5Error) -> GssError {
@@ -153,20 +75,6 @@ fn cont(s: InitStep) -> Vec<u8> {
     match s {
         InitStep::Continue(t) => t,
         other => panic!("expected Continue, got {other:?}"),
-    }
-}
-
-fn init_complete(s: InitStep) -> Option<Vec<u8>> {
-    match s {
-        InitStep::Complete(t) => t,
-        other => panic!("expected Complete, got {other:?}"),
-    }
-}
-
-fn accept_complete(s: AcceptStep) -> Option<Vec<u8>> {
-    match s {
-        AcceptStep::Complete { token } => token,
-        other => panic!("expected Complete, got {other:?}"),
     }
 }
 

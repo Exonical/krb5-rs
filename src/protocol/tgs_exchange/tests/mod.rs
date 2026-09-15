@@ -1,58 +1,13 @@
 use super::*;
 use crate::types::{
     EncKdcRepPart, EncryptedData, EncryptionKey, Flags, KdcRep, KerberosFlags, KerberosTime,
-    LastReqEntry, PrincipalName, TgsReq, Ticket, TicketFlags,
+    KrbErrorMsg, LastReqEntry, PrincipalName, TgsReq, Ticket, TicketFlags,
 };
 use chrono::{FixedOffset, TimeZone, Utc};
 use rasn::types::{GeneralString, OctetString};
 
-fn make_time(secs: i64) -> KerberosTime {
-    let utc = FixedOffset::east_opt(0).expect("UTC");
-    Utc.timestamp_opt(secs, 0)
-        .single()
-        .expect("valid")
-        .with_timezone(&utc)
-}
-
-fn make_realm(s: &str) -> GeneralString {
-    GeneralString::from_bytes(s.as_bytes()).expect("valid realm")
-}
-
-fn make_enc_key(etype: i32, len: usize) -> EncryptionKey {
-    EncryptionKey::new(etype, vec![0xABu8; len])
-}
-
-fn make_tgt(realm: &str) -> Credential {
-    Credential {
-        client: PrincipalName::new_principal("user"),
-        crealm: realm.to_string(),
-        server: PrincipalName::new_srv_inst("krbtgt", realm),
-        srealm: realm.to_string(),
-        session_key: make_enc_key(18, 32),
-        times: TicketTimes {
-            authtime: make_time(1_700_000_000),
-            starttime: Some(make_time(1_700_000_000)),
-            endtime: make_time(1_700_036_000),
-            renew_till: None,
-        },
-        ticket: Ticket {
-            tkt_vno: 5,
-            realm: make_realm(realm),
-            sname: PrincipalName::new_srv_inst("krbtgt", realm),
-            enc_part: EncryptedData {
-                etype: 18,
-                kvno: Some(1),
-                cipher: OctetString::from(vec![0u8; 64]),
-            },
-        },
-        flags: KerberosFlags::new(
-            TicketFlags::FORWARDABLE | TicketFlags::RENEWABLE | TicketFlags::INITIAL,
-        ),
-        addresses: None,
-        authdata: None,
-    }
-}
-
+mod helpers;
+use helpers::*;
 #[test]
 fn test_tgs_options_default() {
     let opts = TgsOptions::default();
@@ -343,44 +298,12 @@ fn test_referral_loop_detection() {
     let mut exchange = TgsExchange::new(tgt, target, TgsOptions::default());
 
     let now = make_time(1_700_000_000);
-    let rep = KdcRep {
-        pvno: 5,
-        msg_type: 13,
-        padata: None,
-        crealm: make_realm("EXAMPLE.COM"),
-        cname: PrincipalName::new_principal("user"),
-        ticket: Ticket {
-            tkt_vno: 5,
-            realm: make_realm("EXAMPLE.COM"),
-            sname: PrincipalName::new_srv_inst("krbtgt", "EXAMPLE.COM"),
-            enc_part: EncryptedData {
-                etype: 18,
-                kvno: Some(1),
-                cipher: OctetString::from(vec![0u8; 64]),
-            },
-        },
-        enc_part: EncryptedData {
-            etype: 18,
-            kvno: None,
-            cipher: OctetString::from(vec![0u8; 64]),
-        },
-    };
-
-    let enc_part = EncKdcRepPart {
-        key: make_enc_key(18, 32),
-        last_req: vec![],
-        nonce: 0,
-        key_expiration: None,
-        flags: KerberosFlags::new(TicketFlags::FORWARDABLE),
-        authtime: now,
-        starttime: None,
-        endtime: make_time(1_700_036_000),
-        renew_till: None,
-        srealm: make_realm("EXAMPLE.COM"),
-        sname: PrincipalName::new_srv_inst("krbtgt", "EXAMPLE.COM"),
-        caddr: None,
-        encrypted_pa_data: None,
-    };
+    let rep = make_referral_rep("EXAMPLE.COM");
+    let enc_part = make_referral_enc_part(
+        "EXAMPLE.COM",
+        now,
+        KerberosFlags::new(TicketFlags::FORWARDABLE),
+    );
 
     // Simulate referral back to EXAMPLE.COM (already seen)
     let resume = ResumeState::Referrals {
@@ -399,44 +322,12 @@ fn test_referral_limit_exceeded() {
     let mut exchange = TgsExchange::new(tgt, target, TgsOptions::default());
 
     let now = make_time(1_700_000_000);
-    let rep = KdcRep {
-        pvno: 5,
-        msg_type: 13,
-        padata: None,
-        crealm: make_realm("EXAMPLE.COM"),
-        cname: PrincipalName::new_principal("user"),
-        ticket: Ticket {
-            tkt_vno: 5,
-            realm: make_realm("EXAMPLE.COM"),
-            sname: PrincipalName::new_srv_inst("krbtgt", "REALM-11"),
-            enc_part: EncryptedData {
-                etype: 18,
-                kvno: Some(1),
-                cipher: OctetString::from(vec![0u8; 64]),
-            },
-        },
-        enc_part: EncryptedData {
-            etype: 18,
-            kvno: None,
-            cipher: OctetString::from(vec![0u8; 64]),
-        },
-    };
-
-    let enc_part = EncKdcRepPart {
-        key: make_enc_key(18, 32),
-        last_req: vec![],
-        nonce: 0,
-        key_expiration: None,
-        flags: KerberosFlags::new(TicketFlags::FORWARDABLE),
-        authtime: now,
-        starttime: None,
-        endtime: make_time(1_700_036_000),
-        renew_till: None,
-        srealm: make_realm("EXAMPLE.COM"),
-        sname: PrincipalName::new_srv_inst("krbtgt", "REALM-11"),
-        caddr: None,
-        encrypted_pa_data: None,
-    };
+    let rep = make_referral_rep("REALM-11");
+    let enc_part = make_referral_enc_part(
+        "REALM-11",
+        now,
+        KerberosFlags::new(TicketFlags::FORWARDABLE),
+    );
 
     let resume = ResumeState::Referrals {
         realms_seen: (0..10).map(|i| format!("REALM-{i}")).collect(),
@@ -462,45 +353,14 @@ fn test_ok_as_delegate_stripped_when_cross_realm_tgt_lacks_it() {
     let mut exchange = TgsExchange::new(tgt, target, TgsOptions::default());
 
     let now = make_time(1_700_000_000);
-    let rep = KdcRep {
-        pvno: 5,
-        msg_type: 13,
-        padata: None,
-        crealm: make_realm("EXAMPLE.COM"),
-        cname: PrincipalName::new_principal("user"),
-        ticket: Ticket {
-            tkt_vno: 5,
-            realm: make_realm("EXAMPLE.COM"),
-            sname: PrincipalName::new_srv_inst("krbtgt", "OTHER.COM"),
-            enc_part: EncryptedData {
-                etype: 18,
-                kvno: Some(1),
-                cipher: OctetString::from(vec![0u8; 64]),
-            },
-        },
-        enc_part: EncryptedData {
-            etype: 18,
-            kvno: None,
-            cipher: OctetString::from(vec![0u8; 64]),
-        },
-    };
+    let rep = make_referral_rep("OTHER.COM");
 
     // Referral TGT has OK_AS_DELEGATE set by the foreign KDC
-    let enc_part = EncKdcRepPart {
-        key: make_enc_key(18, 32),
-        last_req: vec![],
-        nonce: 0,
-        key_expiration: None,
-        flags: KerberosFlags::new(TicketFlags::FORWARDABLE | TicketFlags::OK_AS_DELEGATE),
-        authtime: now,
-        starttime: None,
-        endtime: make_time(1_700_036_000),
-        renew_till: None,
-        srealm: make_realm("EXAMPLE.COM"),
-        sname: PrincipalName::new_srv_inst("krbtgt", "OTHER.COM"),
-        caddr: None,
-        encrypted_pa_data: None,
-    };
+    let enc_part = make_referral_enc_part(
+        "OTHER.COM",
+        now,
+        KerberosFlags::new(TicketFlags::FORWARDABLE | TicketFlags::OK_AS_DELEGATE),
+    );
 
     let resume = ResumeState::Referrals {
         realms_seen: vec!["EXAMPLE.COM".to_string()],
@@ -528,44 +388,13 @@ fn test_ok_as_delegate_preserved_when_cross_realm_tgt_has_it() {
     let mut exchange = TgsExchange::new(tgt, target, TgsOptions::default());
 
     let now = make_time(1_700_000_000);
-    let rep = KdcRep {
-        pvno: 5,
-        msg_type: 13,
-        padata: None,
-        crealm: make_realm("EXAMPLE.COM"),
-        cname: PrincipalName::new_principal("user"),
-        ticket: Ticket {
-            tkt_vno: 5,
-            realm: make_realm("EXAMPLE.COM"),
-            sname: PrincipalName::new_srv_inst("krbtgt", "OTHER.COM"),
-            enc_part: EncryptedData {
-                etype: 18,
-                kvno: Some(1),
-                cipher: OctetString::from(vec![0u8; 64]),
-            },
-        },
-        enc_part: EncryptedData {
-            etype: 18,
-            kvno: None,
-            cipher: OctetString::from(vec![0u8; 64]),
-        },
-    };
+    let rep = make_referral_rep("OTHER.COM");
 
-    let enc_part = EncKdcRepPart {
-        key: make_enc_key(18, 32),
-        last_req: vec![],
-        nonce: 0,
-        key_expiration: None,
-        flags: KerberosFlags::new(TicketFlags::FORWARDABLE | TicketFlags::OK_AS_DELEGATE),
-        authtime: now,
-        starttime: None,
-        endtime: make_time(1_700_036_000),
-        renew_till: None,
-        srealm: make_realm("EXAMPLE.COM"),
-        sname: PrincipalName::new_srv_inst("krbtgt", "OTHER.COM"),
-        caddr: None,
-        encrypted_pa_data: None,
-    };
+    let enc_part = make_referral_enc_part(
+        "OTHER.COM",
+        now,
+        KerberosFlags::new(TicketFlags::FORWARDABLE | TicketFlags::OK_AS_DELEGATE),
+    );
 
     let resume = ResumeState::Referrals {
         realms_seen: vec!["EXAMPLE.COM".to_string()],
@@ -579,25 +408,4 @@ fn test_ok_as_delegate_preserved_when_cross_realm_tgt_has_it() {
         exchange.cur_tgt.flags.contains(TicketFlags::OK_AS_DELEGATE),
         "OK_AS_DELEGATE should be preserved when cross-realm TGT also has it"
     );
-}
-
-/// Helper: build a DER-encoded KRB-ERROR.
-fn build_krb_error(error_code: i32, realm: &str) -> Vec<u8> {
-    let now = now_kerberos();
-    let krb_error = KrbErrorMsg {
-        pvno: 5,
-        msg_type: 30,
-        ctime: None,
-        cusec: None,
-        stime: now,
-        susec: 0,
-        error_code,
-        crealm: None,
-        cname: None,
-        realm: make_realm(realm),
-        sname: PrincipalName::new_srv_inst("krbtgt", realm),
-        e_text: None,
-        e_data: None,
-    };
-    rasn::der::encode(&krb_error).expect("encode KRB-ERROR")
 }

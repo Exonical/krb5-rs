@@ -12,13 +12,12 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{find_etype, key_usage};
 use crate::types::{
-    AsRep, Checksum, EncAsRepPart, EncKdcRepPart, EncTgsRepPart, EncryptionKey, KdcOptions, KdcRep,
-    KdcReq, KdcReqBody, KerberosFlags, KerberosTime, KrbErrorMsg, PaData, PaDataType,
-    PrincipalName, TicketFlags,
+    AsRep, Checksum, EncryptionKey, KdcOptions, KdcRep, KdcReq, KdcReqBody, KerberosFlags,
+    KerberosTime, PaData, PaDataType, PrincipalName, TicketFlags,
 };
 use crate::Krb5Error;
 
-use super::credential::{Credential, TicketTimes};
+use super::credential::Credential;
 use super::fast::{
     build_pa_encrypted_challenge, verify_kdc_challenge, FastMode, FastMsgType, FastState,
 };
@@ -151,7 +150,8 @@ enum AsState {
     Complete,
 }
 
-/// Step-based AS exchange state machine.
+/// Step-based AS exchange state machine: feed each KDC reply to `step`
+/// until it returns `StepResult::Complete`.
 ///
 /// # Usage
 ///
@@ -357,12 +357,7 @@ impl AsExchange {
         }
 
         // Try to decode as KRB-ERROR
-        let krb_error: KrbErrorMsg = rasn::der::decode(kdc_reply)?;
-        if krb_error.pvno != 5 || krb_error.msg_type != 30 {
-            return Err(Krb5Error::ReplyValidation(
-                "invalid KRB-ERROR pvno/msg_type",
-            ));
-        }
+        let krb_error = crate::protocol::kdc_rep::decode_krb_error(kdc_reply)?;
 
         // MIT get_in_tkt.c:1694 — unwrap FAST errors first. On success `fe`
         // carries the inner KRB-ERROR and the FAST response padata (or the
@@ -568,34 +563,6 @@ impl AsExchange {
         // succeeded → KRB5_PREAUTH_FAILED.
         Err(Krb5Error::PreauthFailed)
     }
-
-    /// Restart the exchange from the initial (no-preauth) request.
-    ///
-    /// MIT `restart_init_creds_loop` (get_in_tkt.c): drops the cookie,
-    /// preauth hint and loop state, and rebuilds the FAST state — arming
-    /// it when `fast_upgrade` or FAST-required is set. `restarted` is
-    /// caller-managed: the PREAUTH_FAILED path sets it, PREAUTH_EXPIRED
-    /// clears it.
-    fn restart(&mut self, fast_upgrade: bool) -> Result<StepResult, Krb5Error> {
-        self.cookie = None;
-        self.last_preauth_salt = None;
-        self.last_s2kparams = None;
-        self.last_preauth_etype = None;
-        self.method_padata = None;
-        self.selected_preauth_type = None;
-        self.preauth_failed.clear();
-        self.loop_count = 0;
-        self.preauth_sent = false;
-        let do_fast = self.config.fast.required() || fast_upgrade;
-        self.reset_fast_state(do_fast)?;
-        let (as_req_der, req_body) = self.build_as_req(None)?;
-        self.last_req_body = Some(req_body);
-        self.last_req_bytes = as_req_der.clone();
-        Ok(StepResult::SendToKdc {
-            data: as_req_der,
-            realm: self.config.realm.clone(),
-        })
-    }
 }
 
 /// Convert a `Duration` to `i64` seconds, clamping at `i64::MAX` to avoid overflow.
@@ -608,17 +575,7 @@ fn duration_secs_i64(dur: Duration) -> i64 {
     }
 }
 
-/// Get current time as KerberosTime (chrono DateTime<FixedOffset> in UTC).
-///
-/// Truncates to whole seconds — RFC 4120 says implementations SHOULD NOT
-/// send fractional seconds in GeneralizedTime, and MIT KDC rejects them.
-fn now_kerberos() -> KerberosTime {
-    let now = Utc::now();
-    // with_nanosecond(0) can only fail if value > 1_999_999_999; 0 always succeeds.
-    // unwrap_or keeps sub-second precision as safe fallback (KDC may still accept it).
-    let truncated = now.with_nanosecond(0).unwrap_or(now);
-    truncated.with_timezone(&UTC_OFFSET)
-}
+pub(crate) use crate::protocol::validate::now_kerberos;
 
 mod reply;
 mod request;

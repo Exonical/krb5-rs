@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use rasn::types::GeneralString;
 
-use super::{get_entry_in, kt_to_ap, Keytab, KeytabEntry, KtError};
+use super::{get_entry_in, Keytab, KeytabEntry, KtError};
 use crate::protocol::ap::{ApError, KeySource};
 use crate::types::{EncryptionKey, PrincipalName};
 
@@ -297,18 +297,6 @@ impl KeySource for FileKeytab {
         kvno: Option<i32>,
         etype: i32,
     ) -> Result<EncryptionKey, ApError> {
-        let realm = String::from_utf8_lossy(realm).to_string();
-        let kvno = kvno.map(|k| k as u32);
-        match self.get_entry(server, &realm, kvno, Some(etype)) {
-            Ok(e) => Ok(e.key),
-            // rd_req_dec.c:255-265 — if the principal (and kvno) exists but
-            // not with the ticket's enctype, the enctype-less retry finds
-            // it and MIT reports BADKEYVER rather than NOKEY.
-            Err(KtError::NotFound) => match self.get_entry(server, &realm, kvno, None) {
-                Ok(_) | Err(KtError::KvnoNotFound) => Err(ApError::BadKeyver),
-                Err(_) => Err(ApError::NoKey),
-            },
-            Err(e) => Err(kt_to_ap(e)),
-        }
+        super::ap_key_for(self, server, realm, kvno, etype)
     }
 }

@@ -178,16 +178,6 @@ impl TgsExchange {
     }
 }
 
-/// Decode EncTgsRepPart, trying APPLICATION 26 first, then EncKdcRepPart bare.
-pub(super) fn decode_enc_tgs_rep_part(plaintext: &[u8]) -> Result<EncKdcRepPart, Krb5Error> {
-    // Try EncTgsRepPart (APPLICATION 26) first
-    if let Ok(enc_tgs) = rasn::der::decode::<EncTgsRepPart>(plaintext) {
-        return Ok(enc_tgs.0);
-    }
-    // Some KDCs may send EncKdcRepPart without APPLICATION tag
-    rasn::der::decode::<EncKdcRepPart>(plaintext).map_err(Krb5Error::Asn1Decode)
-}
-
 /// Build PA-PAC-OPTIONS padata with Branch Aware flag.
 pub(super) fn build_pa_pac_options() -> Result<PaData, Krb5Error> {
     use crate::types::PaPacOptions;
@@ -202,4 +192,91 @@ pub(super) fn build_pa_pac_options() -> Result<PaData, Krb5Error> {
         padata_type: PA_PAC_OPTIONS,
         padata_value: der.into(),
     })
+}
+
+impl TgsExchange {
+    /// Handle a referral TGT response.
+    pub(super) fn handle_referral(
+        &mut self,
+        rep: &crate::types::KdcRep,
+        enc_part: &EncKdcRepPart,
+        resume: ResumeState,
+    ) -> Result<TgsStepResult, Krb5Error> {
+        let (mut realms_seen, referral_count) = match resume {
+            ResumeState::Referrals {
+                realms_seen,
+                referral_count,
+            } => (realms_seen, referral_count),
+            ResumeState::NonReferral => {
+                // Got a referral in non-referral mode — treat as error
+                return Err(Krb5Error::ReplyValidation(
+                    "unexpected referral in non-referral mode",
+                ));
+            }
+        };
+
+        let new_count = referral_count + 1;
+        if new_count > MAX_REFERRAL_HOPS {
+            return Err(Krb5Error::ReferralLimitExceeded(MAX_REFERRAL_HOPS));
+        }
+
+        // Extract the referral realm from the TGT's sname (krbtgt/REALM)
+        let referral_realm =
+            String::from_utf8_lossy(enc_part.sname.name_string[1].as_bytes()).to_string();
+
+        // Loop detection
+        if realms_seen.contains(&referral_realm) {
+            return Err(Krb5Error::ReferralLoop {
+                realm: referral_realm,
+            });
+        }
+        realms_seen.push(referral_realm.clone());
+
+        // Build a Credential from the referral TGT.
+        //
+        // ok-as-delegate propagation (per MIT krb5 behavior):
+        // Strip OK_AS_DELEGATE from the referral TGT unless the
+        // cross-realm TGT we used to make this request also had it.
+        // This prevents a foreign KDC from unilaterally granting
+        // delegation rights.
+        let mut referral_flags = enc_part.flags;
+        if !self.cur_tgt.flags.contains(TicketFlags::OK_AS_DELEGATE) {
+            *referral_flags &= !TicketFlags::OK_AS_DELEGATE;
+        }
+
+        let referral_tgt = Credential {
+            client: rep.cname.clone(),
+            crealm: String::from_utf8_lossy(rep.crealm.as_bytes()).to_string(),
+            server: enc_part.sname.clone(),
+            srealm: String::from_utf8_lossy(enc_part.srealm.as_bytes()).to_string(),
+            session_key: enc_part.key.clone(),
+            times: TicketTimes {
+                authtime: enc_part.authtime,
+                starttime: enc_part.starttime,
+                endtime: enc_part.endtime,
+                renew_till: enc_part.renew_till,
+            },
+            ticket: rep.ticket.clone(),
+            flags: referral_flags,
+            addresses: enc_part.caddr.clone(),
+            authdata: None,
+        };
+
+        // Use the referral TGT for the next request
+        self.cur_tgt = referral_tgt;
+
+        // Send TGS-REQ to the referral realm
+        let tgs_req = self.build_tgs_req(true)?;
+        self.state = TgsState::AwaitReply {
+            resume: ResumeState::Referrals {
+                realms_seen,
+                referral_count: new_count,
+            },
+        };
+        self.last_realm = referral_realm.clone();
+        Ok(TgsStepResult::SendToKdc {
+            data: tgs_req,
+            realm: referral_realm,
+        })
+    }
 }

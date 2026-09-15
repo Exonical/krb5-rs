@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::AsReq;
+use crate::types::{AsReq, KrbErrorMsg};
 
 #[test]
 fn test_config_defaults() {

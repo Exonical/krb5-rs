@@ -232,15 +232,7 @@ impl SpnegoInitiator {
     /// Extract the established context; fails while the SPNEGO exchange
     /// is incomplete.
     pub fn context(self) -> Result<Krb5Context, Krb5Error> {
-        if !self.opened {
-            return Err(gss(GssError::NoContext));
-        }
-        let mut ctx = self
-            .inner
-            .ok_or_else(|| gss(GssError::NoContext))?
-            .context()?;
-        ctx.clear_prot_ready();
-        Ok(ctx)
+        spnego_context(self.opened, self.inner)
     }
 
     /// The negotiated mechanism OID (optimistic until the first reply).

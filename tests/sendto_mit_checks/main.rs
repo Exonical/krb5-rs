@@ -14,7 +14,11 @@ use krb5_rs::locate::*;
 use krb5_rs::profile::*;
 use krb5_rs::transport::sendto::*;
 use krb5_rs::transport::{KdcTransport, LocatedTransport};
-use krb5_rs::types::{KerberosTime, KrbErrorMsg, PrincipalName, Realm};
+use krb5_rs::types::KerberosTime;
+
+#[path = "../common/mod.rs"]
+mod common;
+use common::krb_error::krb_error_der;
 
 include!("strategy.rs");
 include!("deltat.rs");
@@ -161,20 +165,5 @@ fn krb_error(code: i32) -> Vec<u8> {
     let t: KerberosTime = chrono::DateTime::from_timestamp(1_700_000_000, 0)
         .unwrap()
         .with_timezone(&chrono::FixedOffset::east_opt(0).unwrap());
-    let msg = KrbErrorMsg {
-        pvno: 5,
-        msg_type: 30,
-        ctime: None,
-        cusec: None,
-        stime: t,
-        susec: 0,
-        error_code: code,
-        crealm: None,
-        cname: None,
-        realm: Realm::try_from("R".as_bytes().to_vec()).unwrap(),
-        sname: PrincipalName::new_srv_inst("krbtgt", "R"),
-        e_text: None,
-        e_data: None,
-    };
-    rasn::der::encode(&msg).unwrap()
+    krb_error_der(code, "R", Some(t), None)
 }

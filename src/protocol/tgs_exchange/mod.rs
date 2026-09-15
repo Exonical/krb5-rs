@@ -8,9 +8,8 @@ use std::time::Duration;
 
 use crate::crypto::{find_etype, key_usage};
 use crate::types::{
-    ApOptions, ApReq, Authenticator, Checksum, EncKdcRepPart, EncTgsRepPart, EncryptedData,
-    EncryptionKey, KdcOptions, KdcReq, KdcReqBody, KerberosFlags, KrbErrorMsg, PaData,
-    PrincipalName, TgsRep, TicketFlags,
+    ApOptions, ApReq, Authenticator, Checksum, EncKdcRepPart, EncryptedData, EncryptionKey,
+    KdcOptions, KdcReq, KdcReqBody, KerberosFlags, PaData, PrincipalName, TgsRep, TicketFlags,
 };
 use crate::Krb5Error;
 use chrono::{Timelike, Utc};
@@ -120,7 +119,8 @@ enum ResumeState {
     NonReferral,
 }
 
-/// Step-based TGS exchange state machine.
+/// Step-based TGS exchange state machine: feed each KDC reply to `step`
+/// until it returns `TgsStepResult::Complete`.
 ///
 /// # Usage
 ///
@@ -301,12 +301,7 @@ impl TgsExchange {
         }
 
         // Try to decode as KRB-ERROR
-        let krb_error: KrbErrorMsg = rasn::der::decode(kdc_reply)?;
-        if krb_error.pvno != 5 || krb_error.msg_type != 30 {
-            return Err(Krb5Error::ReplyValidation(
-                "invalid KRB-ERROR pvno/msg_type",
-            ));
-        }
+        let krb_error = crate::protocol::kdc_rep::decode_krb_error(kdc_reply)?;
 
         // MIT gc_via_tkt.c:185-240 — unwrap a FAST-wrapped error so the
         // inner KRB-ERROR code drives handling.
@@ -388,25 +383,9 @@ impl TgsExchange {
         }
 
         // Service ticket — build credential and complete
-        let credential = Credential {
-            client: rep.cname.clone(),
-            crealm: String::from_utf8_lossy(rep.crealm.as_bytes()).to_string(),
-            server: enc_part.sname.clone(),
-            srealm: String::from_utf8_lossy(enc_part.srealm.as_bytes()).to_string(),
-            session_key: enc_part.key.clone(),
-            times: TicketTimes {
-                authtime: enc_part.authtime,
-                starttime: enc_part.starttime,
-                endtime: enc_part.endtime,
-                renew_till: enc_part.renew_till,
-            },
-            ticket: rep.ticket.clone(),
-            flags: enc_part.flags,
-            addresses: enc_part.caddr.clone(),
-            authdata: None,
-        };
-
-        self.credential = Some(credential);
+        self.credential = Some(crate::protocol::kdc_rep::credential_from_rep(
+            rep, &enc_part,
+        ));
         self.state = TgsState::Complete;
         Ok(TgsStepResult::Complete)
     }
@@ -415,40 +394,29 @@ impl TgsExchange {
     ///
     /// Per RFC 4120 and MIT krb5: try subkey first (key usage 9),
     /// then fall back to TGT session key (key usage 8) for Heimdal interop.
+    /// A FAST strengthen key folds into each reply key
+    /// (decode_kdc.c:64-76).
     fn decrypt_tgs_rep_enc_part(
         &self,
         rep: &crate::types::KdcRep,
         strengthen: Option<&EncryptionKey>,
     ) -> Result<EncKdcRepPart, Krb5Error> {
-        let etype = rep.enc_part.etype;
-        let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
-
-        // Try subkey first (key usage 9) if we generated one; a strengthen
-        // key folds into the reply key (decode_kdc.c:64-76).
+        let mut candidates: Vec<(EncryptionKey, i32)> = Vec::new();
         if let Some(ref subkey) = self.subkey {
-            let key = FastState::reply_key(strengthen, subkey)?;
-            if let Ok(plaintext) = profile.decrypt(
-                key.key_bytes(),
+            candidates.push((
+                FastState::reply_key(strengthen, subkey)?,
                 key_usage::TGS_REP_ENCPART_SUBKEY,
-                rep.enc_part.cipher.as_ref(),
-            ) {
-                if let Ok(enc_part) = decode_enc_tgs_rep_part(&plaintext) {
-                    return Ok(enc_part);
-                }
-            }
+            ));
         }
-
-        // Fallback: TGT session key (key usage 8)
-        let key = FastState::reply_key(strengthen, &self.cur_tgt.session_key)?;
-        let plaintext = profile
-            .decrypt(
-                key.key_bytes(),
-                key_usage::TGS_REP_ENCPART_SESSKEY,
-                rep.enc_part.cipher.as_ref(),
-            )
-            .map_err(|_| Krb5Error::DecryptionFailed)?;
-
-        decode_enc_tgs_rep_part(&plaintext)
+        candidates.push((
+            FastState::reply_key(strengthen, &self.cur_tgt.session_key)?,
+            key_usage::TGS_REP_ENCPART_SESSKEY,
+        ));
+        crate::protocol::kdc_rep::decrypt_enc_kdc_rep_part(
+            &candidates,
+            &rep.enc_part,
+            crate::protocol::kdc_rep::decode_enc_tgs_rep_part,
+        )
     }
 
     /// Validate TGS-REP fields.
@@ -534,96 +502,9 @@ impl TgsExchange {
         // It's a krbtgt for a different realm → referral
         true
     }
-
-    /// Handle a referral TGT response.
-    fn handle_referral(
-        &mut self,
-        rep: &crate::types::KdcRep,
-        enc_part: &EncKdcRepPart,
-        resume: ResumeState,
-    ) -> Result<TgsStepResult, Krb5Error> {
-        let (mut realms_seen, referral_count) = match resume {
-            ResumeState::Referrals {
-                realms_seen,
-                referral_count,
-            } => (realms_seen, referral_count),
-            ResumeState::NonReferral => {
-                // Got a referral in non-referral mode — treat as error
-                return Err(Krb5Error::ReplyValidation(
-                    "unexpected referral in non-referral mode",
-                ));
-            }
-        };
-
-        let new_count = referral_count + 1;
-        if new_count > MAX_REFERRAL_HOPS {
-            return Err(Krb5Error::ReferralLimitExceeded(MAX_REFERRAL_HOPS));
-        }
-
-        // Extract the referral realm from the TGT's sname (krbtgt/REALM)
-        let referral_realm =
-            String::from_utf8_lossy(enc_part.sname.name_string[1].as_bytes()).to_string();
-
-        // Loop detection
-        if realms_seen.contains(&referral_realm) {
-            return Err(Krb5Error::ReferralLoop {
-                realm: referral_realm,
-            });
-        }
-        realms_seen.push(referral_realm.clone());
-
-        // Build a Credential from the referral TGT.
-        //
-        // ok-as-delegate propagation (per MIT krb5 behavior):
-        // Strip OK_AS_DELEGATE from the referral TGT unless the
-        // cross-realm TGT we used to make this request also had it.
-        // This prevents a foreign KDC from unilaterally granting
-        // delegation rights.
-        let mut referral_flags = enc_part.flags;
-        if !self.cur_tgt.flags.contains(TicketFlags::OK_AS_DELEGATE) {
-            *referral_flags &= !TicketFlags::OK_AS_DELEGATE;
-        }
-
-        let referral_tgt = Credential {
-            client: rep.cname.clone(),
-            crealm: String::from_utf8_lossy(rep.crealm.as_bytes()).to_string(),
-            server: enc_part.sname.clone(),
-            srealm: String::from_utf8_lossy(enc_part.srealm.as_bytes()).to_string(),
-            session_key: enc_part.key.clone(),
-            times: TicketTimes {
-                authtime: enc_part.authtime,
-                starttime: enc_part.starttime,
-                endtime: enc_part.endtime,
-                renew_till: enc_part.renew_till,
-            },
-            ticket: rep.ticket.clone(),
-            flags: referral_flags,
-            addresses: enc_part.caddr.clone(),
-            authdata: None,
-        };
-
-        // Use the referral TGT for the next request
-        self.cur_tgt = referral_tgt;
-
-        // Send TGS-REQ to the referral realm
-        let tgs_req = self.build_tgs_req(true)?;
-        self.state = TgsState::AwaitReply {
-            resume: ResumeState::Referrals {
-                realms_seen,
-                referral_count: new_count,
-            },
-        };
-        self.last_realm = referral_realm.clone();
-        Ok(TgsStepResult::SendToKdc {
-            data: tgs_req,
-            realm: referral_realm,
-        })
-    }
 }
 
 mod request;
-
-use request::decode_enc_tgs_rep_part;
 
 #[cfg(test)]
 mod tests;

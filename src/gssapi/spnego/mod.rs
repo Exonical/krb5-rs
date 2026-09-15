@@ -155,6 +155,41 @@ fn handle_mic(
     })
 }
 
+/// Inner mechanism that can yield its established Kerberos context once
+/// the SPNEGO exchange completes.
+pub(crate) trait IntoKrb5Context {
+    fn into_context(self) -> Result<Krb5Context, Krb5Error>;
+}
+
+/// Shared `context()` body for [`SpnegoAcceptor`] and
+/// [`SpnegoInitiator`]: fails while the exchange is incomplete, then
+/// clears prot_ready on the inner Kerberos context.
+pub(crate) fn spnego_context<I: IntoKrb5Context>(
+    opened: bool,
+    inner: Option<I>,
+) -> Result<Krb5Context, Krb5Error> {
+    if !opened {
+        return Err(gss(GssError::NoContext));
+    }
+    let mut ctx = inner
+        .ok_or_else(|| gss(GssError::NoContext))?
+        .into_context()?;
+    ctx.clear_prot_ready();
+    Ok(ctx)
+}
+
+impl IntoKrb5Context for Krb5Acceptor {
+    fn into_context(self) -> Result<Krb5Context, Krb5Error> {
+        self.context()
+    }
+}
+
+impl IntoKrb5Context for Krb5Initiator {
+    fn into_context(self) -> Result<Krb5Context, Krb5Error> {
+        self.context()
+    }
+}
+
 mod acceptor;
 mod der;
 mod initiator;

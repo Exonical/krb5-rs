@@ -3,7 +3,7 @@
 
 use rasn::types::{BitString, OctetString};
 
-use crate::crypto::{find_etype, fx_cf2, key_usage};
+use crate::crypto::{find_etype, fx_cf2, key_usage, EtypeProfile};
 use crate::types::{
     AsReq, Checksum, EncryptedData, EncryptionKey, KdcReq, KerberosTime, KrbErrorMsg, KrbFastArmor,
     KrbFastArmoredReq, KrbFastReq, KrbFastResponse, PaData, PaDataType, PaEncTsEnc, PaFxFastReply,
@@ -256,6 +256,33 @@ impl FastState {
         encode_kdc_req(&outer, msg_type)
     }
 
+    /// Decrypt the PA-FX-FAST-REPLY armored data into a KrbFastResponse
+    /// and check the echoed nonce (fast.c:464-495).
+    fn decrypt_fast_response(
+        &self,
+        fx_pa: &PaData,
+        armor_key: &EncryptionKey,
+    ) -> Result<(KrbFastResponse, &'static dyn EtypeProfile), Krb5Error> {
+        let reply: PaFxFastReply = rasn::der::decode(fx_pa.padata_value.as_ref())?;
+        let PaFxFastReply::ArmoredData(armored) = reply;
+        let profile =
+            find_etype(armor_key.keytype).map_err(|e| Krb5Error::Crypto(e.to_string()))?;
+        let plain = profile
+            .decrypt(
+                armor_key.key_bytes(),
+                key_usage::FAST_REP,
+                armored.enc_fast_rep.cipher.as_ref(),
+            )
+            .map_err(|_| Krb5Error::DecryptionFailed)?;
+        let resp: KrbFastResponse = rasn::der::decode(&plain)?;
+        if resp.nonce != self.nonce {
+            return Err(Krb5Error::ReplyValidation(
+                "nonce modified in FAST response",
+            ));
+        }
+        Ok((resp, profile))
+    }
+
     /// Decrypt and validate the FAST padata of a KRB-ERROR
     /// (MIT `krb5int_fast_process_error`, fast.c:426-515).
     pub fn process_error(&self, err: KrbErrorMsg) -> Result<FastError, Krb5Error> {
@@ -275,24 +302,8 @@ impl FastState {
                 .iter()
                 .find(|pa| pa.padata_type == PaDataType::FxFast as i32)
                 .ok_or(Krb5Error::FastRequired)?;
-            let reply: PaFxFastReply = rasn::der::decode(fx_pa.padata_value.as_ref())?;
-            let PaFxFastReply::ArmoredData(armored) = reply;
-            let profile =
-                find_etype(armor_key.keytype).map_err(|e| Krb5Error::Crypto(e.to_string()))?;
-            let plain = profile
-                .decrypt(
-                    armor_key.key_bytes(),
-                    key_usage::FAST_REP,
-                    armored.enc_fast_rep.cipher.as_ref(),
-                )
-                .map_err(|_| Krb5Error::DecryptionFailed)?;
-            let resp: KrbFastResponse = rasn::der::decode(&plain)?;
-            if resp.nonce != self.nonce {
-                return Err(Krb5Error::ReplyValidation(
-                    "nonce modified in FAST response",
-                ));
-            }
-            Ok(resp)
+            self.decrypt_fast_response(fx_pa, armor_key)
+                .map(|(resp, _)| resp)
         })();
 
         let fast_response = match fast_response {
@@ -345,23 +356,7 @@ impl FastState {
             .iter()
             .find(|pa| pa.padata_type == PaDataType::FxFast as i32)
             .ok_or(Krb5Error::FastRequired)?;
-        let reply: PaFxFastReply = rasn::der::decode(fx_pa.padata_value.as_ref())?;
-        let PaFxFastReply::ArmoredData(armored) = reply;
-        let profile =
-            find_etype(armor_key.keytype).map_err(|e| Krb5Error::Crypto(e.to_string()))?;
-        let plain = profile
-            .decrypt(
-                armor_key.key_bytes(),
-                key_usage::FAST_REP,
-                armored.enc_fast_rep.cipher.as_ref(),
-            )
-            .map_err(|_| Krb5Error::DecryptionFailed)?;
-        let resp: KrbFastResponse = rasn::der::decode(&plain)?;
-        if resp.nonce != self.nonce {
-            return Err(Krb5Error::ReplyValidation(
-                "nonce modified in FAST response",
-            ));
-        }
+        let (resp, profile) = self.decrypt_fast_response(fx_pa, armor_key)?;
         let finished = resp.finished.as_ref().ok_or(Krb5Error::ReplyValidation(
             "FAST response missing finish message",
         ))?;
