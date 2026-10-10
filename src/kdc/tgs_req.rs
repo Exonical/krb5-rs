@@ -5,7 +5,8 @@ use chrono::{DateTime, Utc};
 use rasn::types::OctetString;
 
 use super::db::KvnoSel;
-use super::error::{ap_error_code, ErrorContext, KdcError};
+use super::error::{ap_error_code, general_string, ErrorContext, KdcError};
+use super::fast::{anonymous_client, FastInputs};
 use super::policy::{
     check_tgs_opts, check_tgs_svc_policy, check_tgs_times, get_ticket_endtime, get_ticket_flags,
     get_ticket_renewtime, kerberos_time, select_session_keytype, ts, HeaderRenewal, Times,
@@ -190,9 +191,31 @@ impl<S: PrincipalStore> Kdc<S> {
         let raw_body = raw_req_body(raw).map_err(|_| KdcError::generic(STATUS))?;
         comp_cksum(&header.key, raw_body, cksum)?;
 
-        // FAST: handled in kdc::fast (next milestone); kdc_find_fast
-        // (do_tgs_req.c:634) would replace `req` with the inner request.
+        // kdc_find_fast (do_tgs_req.c:631-639): implicit or AP-REQ armor, the
+        // inner request replaces the outer one.
+        let inner = self
+            .find_fast(
+                req,
+                FastInputs {
+                    checksummed: ap_bytes,
+                    tgs_subkey: auth.subkey.as_ref(),
+                    tgs_session: Some(&header.key),
+                },
+                now,
+                &mut ctx.fast,
+            )
+            .map_err(|e| KdcError {
+                e_text: Some("FIND_FAST".into()),
+                ..e
+            })?;
+        let req = inner.as_ref().unwrap_or(req);
         let body = &req.req_body;
+        let fast_ctx = ctx.fast.take();
+        let (crealm, cname) = (ctx.crealm.take(), ctx.cname.take());
+        *ctx = self.request_context(req, false);
+        ctx.crealm = crealm;
+        ctx.cname = cname;
+        ctx.fast = fast_ctx;
         let opts: KdcOptions = *body.kdc_options;
         let sname = body
             .sname
@@ -321,17 +344,16 @@ impl<S: PrincipalStore> Kdc<S> {
             .find_key(None, KvnoSel::Highest, &permitted)
             .ok_or_else(|| KdcError::generic("FINDING_SERVER_KEY"))?;
 
-        let reply_key = auth.subkey.clone().unwrap_or_else(|| header.key.clone());
+        let initial_reply_key = auth.subkey.clone().unwrap_or_else(|| header.key.clone());
         let reply_usage = if auth.subkey.is_some() {
             key_usage::TGS_REP_ENCPART_SUBKEY
         } else {
             key_usage::TGS_REP_ENCPART_SESSKEY
         };
 
-        let mut enc_padata = Vec::new();
-        if find_padata(req.padata.as_deref(), PaDataType::ReqEncPaRep).is_some() {
+        let want_enc_pa_rep = find_padata(req.padata.as_deref(), PaDataType::ReqEncPaRep).is_some();
+        if want_enc_pa_rep {
             flags |= TicketFlags::ENC_PA_REP;
-            enc_padata.push(enc_pa_rep_padata(&reply_key, raw)?);
         }
 
         let (ticket_caddr, reply_caddr) = if !opts.contains(KdcOptions::RENEW)
@@ -371,6 +393,34 @@ impl<S: PrincipalStore> Kdc<S> {
             &part,
         )?;
 
+        // kdc_fast_response_handle_padata / kdc_fast_handle_reply_key
+        // (do_tgs_req.c:1090-1097).
+        let mut outer_cname = header.cname.clone();
+        let mut outer_crealm = header.crealm.clone();
+        let (outer_padata, reply_key) = match ctx.fast.as_mut().filter(|f| f.armor_key.is_some()) {
+            Some(fast) => {
+                let outer = fast.wrap_reply(
+                    Vec::new(),
+                    &ticket,
+                    (&realm_string(&header.crealm), &header.cname),
+                    initial_reply_key.keytype,
+                    now,
+                )?;
+                if fast.hide_client() {
+                    let (r, n) = anonymous_client()?;
+                    outer_crealm = general_string(&r)?;
+                    outer_cname = n;
+                }
+                (Some(outer), fast.reply_key(&initial_reply_key)?)
+            }
+            None => (None, initial_reply_key),
+        };
+        let enc_padata = if want_enc_pa_rep {
+            enc_pa_rep_padata(&reply_key, raw)?
+        } else {
+            Vec::new()
+        };
+
         let enc = EncTgsRepPart(EncKdcRepPart {
             key: session_key,
             last_req: vec![LastReqEntry {
@@ -402,9 +452,9 @@ impl<S: PrincipalStore> Kdc<S> {
         let rep = TgsRep(KdcRep {
             pvno: 5,
             msg_type: 13,
-            padata: None,
-            crealm: header.crealm.clone(),
-            cname: header.cname.clone(),
+            padata: outer_padata,
+            crealm: outer_crealm,
+            cname: outer_cname,
             ticket,
             enc_part: EncryptedData {
                 etype: reply_key.keytype,

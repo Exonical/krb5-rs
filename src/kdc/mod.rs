@@ -7,11 +7,13 @@
 //!
 //! Single realm only; no PKINIT, PAC/authdata, cross-realm, S4U, user-to-user,
 //! postdating, validation, proxy tickets, lockout or lookaside cache.
-//! FAST is handled by a later `kdc::fast` module.
+//! FAST (RFC 6113) armor, encrypted challenge and armored replies/errors are
+//! handled in the `fast` module.
 
 mod as_req;
 mod db;
 mod error;
+mod fast;
 mod policy;
 mod preauth;
 mod reqbody;
@@ -149,6 +151,7 @@ impl<S: PrincipalStore> Kdc<S> {
             }),
             crealm: None,
             cname: None,
+            fast: None,
         }
     }
 
@@ -172,6 +175,7 @@ impl<S: PrincipalStore> Kdc<S> {
             },
             realm,
             sname,
+            fast: None,
         }
     }
 

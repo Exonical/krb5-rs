@@ -7,7 +7,7 @@ use rasn::types::{GeneralString, OctetString};
 
 use crate::protocol::ap::ApError;
 use crate::types::error_codes::*;
-use crate::types::{KrbErrorMsg, PrincipalName};
+use crate::types::{KrbErrorMsg, PaData, PrincipalName};
 use crate::Krb5Error;
 
 /// KRB_AP_ERR_ILL_CR_TKT (not in [`crate::types::error_codes`]).
@@ -100,6 +100,8 @@ pub(crate) struct ErrorContext {
     pub crealm: Option<String>,
     /// Client name, if known.
     pub cname: Option<PrincipalName>,
+    /// FAST state once an armor key exists (errors are then armored).
+    pub fast: Option<super::fast::KdcFastState>,
 }
 
 /// A failure bundled with the context for its KRB-ERROR.
@@ -125,25 +127,51 @@ pub(crate) fn krbtgt_name(realm: &str) -> Result<PrincipalName, KdcError> {
 }
 
 /// Build a DER KRB-ERROR (MIT krb5_mk_error as used by prepare_error_as /
-/// prepare_error_tgs: ctime/cusec unset, stime/susec = KDC time).
+/// prepare_error_tgs: ctime/cusec unset, stime/susec = KDC time). With an
+/// armor key the error is wrapped per `kdc_fast_handle_error`
+/// (fast_util.c:364-424) and, if requested, the client is hidden
+/// (do_as_req.c:831-832, do_tgs_req.c:235-236).
 pub(crate) fn build_krb_error(err: &KdcError, ctx: &ErrorContext, now: DateTime<Utc>) -> Vec<u8> {
     let fallback = |s: &str| GeneralString::from_bytes(s.as_bytes()).unwrap_or_default();
-    let msg = KrbErrorMsg {
-        pvno: 5,
-        msg_type: 30,
-        ctime: None,
-        cusec: None,
-        stime: now.fixed_offset(),
-        susec: i32::try_from(now.timestamp_subsec_micros()).unwrap_or(0),
-        error_code: err.code,
-        crealm: ctx.crealm.as_deref().map(fallback),
-        cname: ctx.cname.clone(),
-        realm: fallback(&ctx.realm),
-        sname: ctx.sname.clone(),
-        e_text: err.e_text.as_deref().map(fallback),
-        e_data: err.e_data.clone().map(OctetString::from),
+    let make = |crealm: Option<&str>, cname: Option<&PrincipalName>, e_data: Option<Vec<u8>>| {
+        KrbErrorMsg {
+            pvno: 5,
+            msg_type: 30,
+            ctime: None,
+            cusec: None,
+            stime: now.fixed_offset(),
+            susec: i32::try_from(now.timestamp_subsec_micros()).unwrap_or(0),
+            error_code: err.code,
+            crealm: crealm.map(fallback),
+            cname: cname.cloned(),
+            realm: fallback(&ctx.realm),
+            sname: ctx.sname.clone(),
+            e_text: err.e_text.as_deref().map(fallback),
+            e_data: e_data.map(OctetString::from),
+        }
     };
-    rasn::der::encode(&msg).unwrap_or_default()
+
+    let mut crealm = ctx.crealm.clone();
+    let mut cname = ctx.cname.clone();
+    let mut e_data = err.e_data.clone();
+    if let Some(state) = ctx.fast.as_ref().filter(|s| s.armor_key.is_some()) {
+        let in_padata: Vec<PaData> = err
+            .e_data
+            .as_deref()
+            .and_then(|d| rasn::der::decode(d).ok())
+            .unwrap_or_default();
+        let inner = make(ctx.crealm.as_deref(), ctx.cname.as_ref(), None);
+        if let Ok(outer) = super::fast::wrap_error(state, &inner, in_padata) {
+            e_data = Some(outer);
+            if state.hide_client() && cname.is_some() {
+                if let Ok((realm, name)) = super::fast::anonymous_client() {
+                    crealm = Some(realm);
+                    cname = Some(name);
+                }
+            }
+        }
+    }
+    rasn::der::encode(&make(crealm.as_deref(), cname.as_ref(), e_data)).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -167,6 +195,7 @@ mod tests {
             sname: krbtgt_name("R").expect("name"),
             crealm: None,
             cname: None,
+            fast: None,
         };
         let der = build_krb_error(&KdcError::new(6, "CLIENT_NOT_FOUND"), &ctx, Utc::now());
         let got: KrbErrorMsg = rasn::der::decode(&der).expect("decode");

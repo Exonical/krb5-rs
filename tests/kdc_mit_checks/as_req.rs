@@ -23,10 +23,12 @@ fn as_exchange_preauth_user_completes_after_preauth_required() {
     // MIT hint order: PA-ETYPE-INFO2 then an empty PA-ENC-TIMESTAMP.
     let hints = method_data(&err);
     let types: Vec<i32> = hints.iter().map(|p| p.padata_type).collect();
-    assert_eq!(types, vec![19, 2]);
-    assert!(hints[1].padata_value.is_empty());
+    assert_eq!(types, vec![136, 19, 2, 133]);
+    assert!(hints[0].padata_value.is_empty());
+    assert!(hints[2].padata_value.is_empty());
+    assert_eq!(hints[3].padata_value.as_ref(), b"MIT");
     let info: Vec<EtypeInfo2Entry> =
-        rasn::der::decode(hints[0].padata_value.as_ref()).expect("ETYPE-INFO2");
+        rasn::der::decode(hints[1].padata_value.as_ref()).expect("ETYPE-INFO2");
     assert_eq!(info.len(), 1);
     assert_eq!(info[0].etype, 18);
     assert_eq!(
@@ -80,7 +82,7 @@ fn as_exchange_wrong_password_surfaces_preauth_failed() {
     let failed = krb_error(run.replies.last().expect("reply"));
     assert_eq!(failed.error_code, 24);
     let types: Vec<i32> = method_data(&failed).iter().map(|p| p.padata_type).collect();
-    assert_eq!(types, vec![19, 2]);
+    assert_eq!(types, vec![136, 19, 2, 133]);
 }
 
 #[test]

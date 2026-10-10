@@ -7,7 +7,7 @@ use rasn::types::OctetString;
 
 use super::db::{KeyEntry, KvnoSel, PrincipalEntry};
 use super::error::{general_string, KdcError};
-use crate::crypto::{find_etype, key_usage};
+use crate::crypto::{find_etype, fx_cf2, key_usage};
 use crate::types::error_codes::*;
 use crate::types::{
     Checksum, EncryptedData, EncryptionKey, EtypeInfo2Entry, PaData, PaDataType, PaEncTsEnc,
@@ -111,43 +111,52 @@ pub(crate) fn etype_info2_padata(
 }
 
 /// Hint METHOD-DATA for PREAUTH_REQUIRED / PREAUTH_FAILED e-data
-/// (MIT `get_preauth_hint_list`, kdc_preauth.c:974-1014): PA-ETYPE-INFO2
-/// when a client key was selected, then an empty PA-ENC-TIMESTAMP (enc_ts_get,
-/// kdc_preauth_encts.c:31-44: requires client keys, no FAST armor). With
-/// `hw_only` (REQUIRES_HW_AUTH) only hardware mechanisms are listed, so
-/// PA-ENC-TIMESTAMP is omitted.
-///
-// FAST: the leading empty PA-FX-FAST advertisement (kdc_preauth.c:999-1001)
-// is added by kdc::fast in the next milestone.
+/// (MIT `get_preauth_hint_list`, kdc_preauth.c:974-1014, plus the cookie
+/// added by `prepare_error_as`, do_as_req.c:785-796): an empty PA-FX-FAST,
+/// PA-ETYPE-INFO2 when a client key was selected, then each mechanism's
+/// hint. With a client key (`have_client_keys`, kdc_preauth.c:435-447) that
+/// is an empty PA-ENCRYPTED-CHALLENGE inside FAST (ec_edata,
+/// kdc_preauth_ec.c:37-49) or an empty PA-ENC-TIMESTAMP outside it
+/// (enc_ts_get, kdc_preauth_encts.c:31-44). With `hw_only`
+/// (REQUIRES_HW_AUTH) only hardware mechanisms are listed, so neither is.
+/// The trailing PA-FX-COOKIE is the trivial "MIT" cookie
+/// (kdc_fast_make_cookie, fast_util.c:673-676; no cookie state is kept).
 pub(crate) fn hint_list(
     client: &PrincipalEntry,
     key: Option<&ClientKey>,
     hw_only: bool,
+    armored: bool,
 ) -> Result<Vec<u8>, KdcError> {
-    let mut list = Vec::new();
+    let empty = |t: PaDataType| PaData {
+        padata_type: t as i32,
+        padata_value: OctetString::from(Vec::new()),
+    };
+    let mut list = vec![empty(PaDataType::FxFast)];
     if let Some(k) = key {
         list.push(etype_info2_padata(client, k)?);
+        if !hw_only {
+            list.push(empty(if armored {
+                PaDataType::EncryptedChallenge
+            } else {
+                PaDataType::EncTimestamp
+            }));
+        }
     }
-    if !hw_only && !client.keys.is_empty() {
-        list.push(PaData {
-            padata_type: PaDataType::EncTimestamp as i32,
-            padata_value: OctetString::from(Vec::new()),
-        });
-    }
+    list.push(PaData {
+        padata_type: PaDataType::FxCookie as i32,
+        padata_value: OctetString::from(b"MIT".to_vec()),
+    });
     Ok(rasn::der::encode(&list)?)
 }
 
-/// PA-REQ-ENC-PA-REP (MIT `kdc_handle_protected_negotiation`,
-/// kdc_util.c:1767-1807): checksum of the raw request keyed with the
-/// reply key (usage `KRB5_KEYUSAGE_AS_REQ`), default checksum type of the
-/// key's enctype.
-///
-// FAST: the trailing empty PA-FX-FAST element (kdc_util.c:1800-1801) is
-// added by kdc::fast in the next milestone.
+/// PA-REQ-ENC-PA-REP and the empty PA-FX-FAST that follows it (MIT
+/// `kdc_handle_protected_negotiation`, kdc_util.c:1767-1807): checksum of
+/// the raw request keyed with the reply key (usage `KRB5_KEYUSAGE_AS_REQ`),
+/// default checksum type of the key's enctype.
 pub(crate) fn enc_pa_rep_padata(
     reply_key: &EncryptionKey,
     raw_request: &[u8],
-) -> Result<PaData, KdcError> {
+) -> Result<Vec<PaData>, KdcError> {
     let profile = find_etype(reply_key.keytype).map_err(|_| KdcError::generic("NO_ETYPE"))?;
     let checksum = profile
         .checksum(reply_key.key_bytes(), key_usage::AS_REQ, raw_request)
@@ -156,9 +165,114 @@ pub(crate) fn enc_pa_rep_padata(
         cksumtype: profile.checksum_type(),
         checksum: OctetString::from(checksum),
     })?;
+    Ok(vec![
+        PaData {
+            padata_type: PaDataType::ReqEncPaRep as i32,
+            padata_value: OctetString::from(der),
+        },
+        PaData {
+            padata_type: PaDataType::FxFast as i32,
+            padata_value: OctetString::from(Vec::new()),
+        },
+    ])
+}
+
+/// Verify PA-ENCRYPTED-CHALLENGE (MIT `ec_verify`, kdc_preauth_ec.c:51-152,
+/// with `filter_preauth_error`). Requires an armor key (ENOENT outside FAST
+/// surfaces as PREAUTH_FAILED). Tries each permitted client key for the
+/// request etypes in order (`client_keys`, kdc_preauth.c:353-383) with
+/// challenge key cf2(armor, "clientchallengearmor", key,
+/// "challengelongterm"), usage 54. Returns the KDC-direction challenge key
+/// and the matching client key etype on success.
+pub(crate) fn verify_encrypted_challenge(
+    pa: &PaData,
+    client: &PrincipalEntry,
+    requested: &[i32],
+    permitted: &dyn Fn(i32) -> bool,
+    armor_key: Option<&EncryptionKey>,
+    now: i64,
+    clockskew: Duration,
+) -> Result<EncryptionKey, KdcError> {
+    let failed = || KdcError::new(KDC_ERR_PREAUTH_FAILED, "PREAUTH_FAILED");
+    let armor = armor_key.ok_or_else(failed)?;
+    let enc: EncryptedData = rasn::der::decode(pa.padata_value.as_ref()).map_err(|_| failed())?;
+
+    let mut matched = None;
+    for &etype in requested {
+        if find_etype(etype).is_err() {
+            continue;
+        }
+        let Some(entry) = client.find_key(Some(etype), KvnoSel::Highest, permitted) else {
+            continue;
+        };
+        let Ok(challenge_key) = fx_cf2(
+            armor,
+            b"clientchallengearmor",
+            &entry.key,
+            b"challengelongterm",
+        ) else {
+            continue;
+        };
+        if enc.etype != challenge_key.keytype {
+            continue;
+        }
+        let Ok(profile) = find_etype(challenge_key.keytype) else {
+            continue;
+        };
+        if let Ok(plain) = profile.decrypt(
+            challenge_key.key_bytes(),
+            key_usage::ENC_CHALLENGE_CLIENT,
+            enc.cipher.as_ref(),
+        ) {
+            matched = Some((entry, plain));
+            break;
+        }
+    }
+    let (entry, plain) = matched.ok_or_else(failed)?;
+
+    let ts: PaEncTsEnc = rasn::der::decode(&plain).map_err(|_| failed())?;
+    let skew = i64::try_from(clockskew.as_secs()).unwrap_or(i64::MAX);
+    if (ts.patimestamp.timestamp() - now).abs() > skew {
+        return Err(KdcError::new(KRB_AP_ERR_SKEW, "PREAUTH_FAILED"));
+    }
+    fx_cf2(
+        armor,
+        b"kdcchallengearmor",
+        &entry.key,
+        b"challengelongterm",
+    )
+    .map_err(|_| failed())
+}
+
+/// KDC-direction PA-ENCRYPTED-CHALLENGE (MIT `ec_return`,
+/// kdc_preauth_ec.c:154-205): the current time encrypted with the KDC
+/// challenge key, usage 55.
+pub(crate) fn encrypted_challenge_padata(
+    kdc_challenge_key: &EncryptionKey,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<PaData, KdcError> {
+    use chrono::Timelike;
+    let ts = PaEncTsEnc {
+        patimestamp: now.with_nanosecond(0).unwrap_or(now).fixed_offset(),
+        pausec: Some(i32::try_from(now.timestamp_subsec_micros()).unwrap_or(0)),
+    };
+    let profile = find_etype(kdc_challenge_key.keytype)
+        .map_err(|_| KdcError::generic("ENC_CHALLENGE_RETURN"))?;
+    let cipher = profile
+        .encrypt(
+            kdc_challenge_key.key_bytes(),
+            key_usage::ENC_CHALLENGE_KDC,
+            &rasn::der::encode(&ts)?,
+        )
+        .map_err(|_| KdcError::generic("ENC_CHALLENGE_RETURN"))?;
+    let enc = EncryptedData {
+        etype: kdc_challenge_key.keytype,
+        kvno: None,
+        cipher: OctetString::from(cipher),
+    };
     Ok(PaData {
-        padata_type: PaDataType::ReqEncPaRep as i32,
-        padata_value: OctetString::from(der),
+        padata_type: PaDataType::EncryptedChallenge as i32,
+        padata_value: OctetString::from(rasn::der::encode(&enc)?),
     })
 }
 
@@ -262,39 +376,71 @@ mod tests {
         assert_eq!(err.code, KDC_ERR_PREAUTH_FAILED);
     }
 
+    fn hint_types(
+        c: &PrincipalEntry,
+        key: Option<&ClientKey>,
+        hw: bool,
+        armored: bool,
+    ) -> Vec<i32> {
+        let der = hint_list(c, key, hw, armored).expect("hints");
+        let list: Vec<PaData> = rasn::der::decode(&der).expect("decode");
+        list.iter().map(|p| p.padata_type).collect()
+    }
+
     #[test]
-    fn hint_list_orders_etype_info2_before_enc_timestamp() {
+    fn hint_list_unarmored_orders_fast_etype_info2_enc_timestamp_cookie() {
         let c = client_with_password();
         let key = select_client_key(&c, &[23, 18], &permit).expect("key");
         assert_eq!(key.etype, 18);
-        let der = hint_list(&c, Some(&key), false).expect("hints");
+        assert_eq!(
+            hint_types(&c, Some(&key), false, false),
+            vec![136, 19, 2, 133]
+        );
+        let der = hint_list(&c, Some(&key), false, false).expect("hints");
         let list: Vec<PaData> = rasn::der::decode(&der).expect("decode");
-        let types: Vec<i32> = list.iter().map(|p| p.padata_type).collect();
-        assert_eq!(types, vec![19, 2]);
         let info: Vec<EtypeInfo2Entry> =
-            rasn::der::decode(list[0].padata_value.as_ref()).expect("info2");
+            rasn::der::decode(list[1].padata_value.as_ref()).expect("info2");
         assert_eq!(info.len(), 1);
         assert_eq!(info[0].etype, 18);
         assert_eq!(
             info[0].salt.as_ref().map(|s| s.as_bytes().to_vec()),
             Some(b"Ru".to_vec())
         );
+        assert_eq!(list[3].padata_value.as_ref(), b"MIT");
     }
 
     #[test]
-    fn hint_list_hw_only_omits_enc_timestamp() {
+    fn hint_list_armored_offers_encrypted_challenge_not_enc_timestamp() {
         let c = client_with_password();
-        let der = hint_list(&c, None, true).expect("hints");
-        let list: Vec<PaData> = rasn::der::decode(&der).expect("decode");
-        assert!(list.is_empty());
+        let key = select_client_key(&c, &[18], &permit).expect("key");
+        assert_eq!(
+            hint_types(&c, Some(&key), false, true),
+            vec![136, 19, 138, 133]
+        );
     }
 
     #[test]
-    fn enc_pa_rep_padata_checksum_covers_raw_request() {
+    fn hint_list_without_client_key_has_no_mechanism_hints() {
+        let c = client_with_password();
+        assert_eq!(hint_types(&c, None, false, false), vec![136, 133]);
+    }
+
+    #[test]
+    fn hint_list_hw_only_omits_mechanism_hints() {
+        let c = client_with_password();
+        let key = select_client_key(&c, &[18], &permit).expect("key");
+        assert_eq!(hint_types(&c, Some(&key), true, false), vec![136, 19, 133]);
+    }
+
+    #[test]
+    fn enc_pa_rep_padata_checksum_covers_raw_request_and_adds_empty_fast() {
         let key = EncryptionKey::new(18, vec![3; 32]);
-        let pa = enc_pa_rep_padata(&key, b"raw-request").expect("padata");
-        assert_eq!(pa.padata_type, 149);
-        let ck: Checksum = rasn::der::decode(pa.padata_value.as_ref()).expect("checksum");
+        let list = enc_pa_rep_padata(&key, b"raw-request").expect("padata");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].padata_type, 149);
+        assert_eq!(list[1].padata_type, 136);
+        assert!(list[1].padata_value.is_empty());
+        let ck: Checksum = rasn::der::decode(list[0].padata_value.as_ref()).expect("checksum");
         assert_eq!(ck.cksumtype, 16);
         find_etype(18)
             .expect("etype")
@@ -305,5 +451,117 @@ mod tests {
                 ck.checksum.as_ref(),
             )
             .expect("valid");
+    }
+
+    fn challenge_pa(armor: &EncryptionKey, client: &PrincipalEntry, at: i64) -> PaData {
+        let ts = PaEncTsEnc {
+            patimestamp: crate::kdc::policy::kerberos_time(at),
+            pausec: Some(0),
+        };
+        let ck = fx_cf2(
+            armor,
+            b"clientchallengearmor",
+            &client.keys[0].key,
+            b"challengelongterm",
+        )
+        .expect("cf2");
+        let cipher = find_etype(ck.keytype)
+            .expect("etype")
+            .encrypt(
+                ck.key_bytes(),
+                key_usage::ENC_CHALLENGE_CLIENT,
+                &rasn::der::encode(&ts).expect("encode"),
+            )
+            .expect("encrypt");
+        let enc = EncryptedData {
+            etype: ck.keytype,
+            kvno: None,
+            cipher: OctetString::from(cipher),
+        };
+        PaData {
+            padata_type: 138,
+            padata_value: OctetString::from(rasn::der::encode(&enc).expect("encode")),
+        }
+    }
+
+    #[test]
+    fn verify_encrypted_challenge_valid_challenge_returns_kdc_challenge_key() {
+        let c = client_with_password();
+        let armor = EncryptionKey::new(18, vec![4; 32]);
+        let pa = challenge_pa(&armor, &c, NOW);
+        let key = verify_encrypted_challenge(
+            &pa,
+            &c,
+            &[18],
+            &permit,
+            Some(&armor),
+            NOW,
+            Duration::from_secs(300),
+        )
+        .expect("verified");
+        let expected = fx_cf2(
+            &armor,
+            b"kdcchallengearmor",
+            &c.keys[0].key,
+            b"challengelongterm",
+        )
+        .expect("cf2");
+        assert_eq!(key.key_bytes(), expected.key_bytes());
+        let out = encrypted_challenge_padata(&key, chrono::Utc::now()).expect("reply");
+        assert_eq!(out.padata_type, 138);
+    }
+
+    #[test]
+    fn verify_encrypted_challenge_without_armor_is_preauth_failed() {
+        let c = client_with_password();
+        let armor = EncryptionKey::new(18, vec![4; 32]);
+        let pa = challenge_pa(&armor, &c, NOW);
+        let err = verify_encrypted_challenge(
+            &pa,
+            &c,
+            &[18],
+            &permit,
+            None,
+            NOW,
+            Duration::from_secs(300),
+        )
+        .expect_err("no armor");
+        assert_eq!(err.code, KDC_ERR_PREAUTH_FAILED);
+    }
+
+    #[test]
+    fn verify_encrypted_challenge_skewed_timestamp_is_skew_error() {
+        let c = client_with_password();
+        let armor = EncryptionKey::new(18, vec![4; 32]);
+        let pa = challenge_pa(&armor, &c, NOW - 400);
+        let err = verify_encrypted_challenge(
+            &pa,
+            &c,
+            &[18],
+            &permit,
+            Some(&armor),
+            NOW,
+            Duration::from_secs(300),
+        )
+        .expect_err("skew");
+        assert_eq!(err.code, KRB_AP_ERR_SKEW);
+    }
+
+    #[test]
+    fn verify_encrypted_challenge_wrong_armor_is_preauth_failed() {
+        let c = client_with_password();
+        let pa = challenge_pa(&EncryptionKey::new(18, vec![4; 32]), &c, NOW);
+        let other = EncryptionKey::new(18, vec![5; 32]);
+        let err = verify_encrypted_challenge(
+            &pa,
+            &c,
+            &[18],
+            &permit,
+            Some(&other),
+            NOW,
+            Duration::from_secs(300),
+        )
+        .expect_err("wrong armor");
+        assert_eq!(err.code, KDC_ERR_PREAUTH_FAILED);
     }
 }

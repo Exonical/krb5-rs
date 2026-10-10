@@ -20,6 +20,7 @@ use rasn::types::{GeneralString, OctetString};
 
 mod as_req;
 mod errors;
+mod fast;
 mod tgs_req;
 
 const REALM: &str = "TEST.REALM";
@@ -167,6 +168,15 @@ struct Run<T> {
 }
 
 fn run_as(kdc: &Kdc<MemoryStore>, config: AsExchangeConfig, password: &str) -> Run<Credential> {
+    run_as_keep(kdc, config, password).1
+}
+
+/// [`run_as`] that also returns the exchange for accessor checks.
+fn run_as_keep(
+    kdc: &Kdc<MemoryStore>,
+    config: AsExchangeConfig,
+    password: &str,
+) -> (AsExchange, Run<Credential>) {
     let mut exchange = AsExchange::new(config, password);
     let mut replies: Vec<Vec<u8>> = Vec::new();
     let mut input: Vec<u8> = Vec::new();
@@ -180,7 +190,7 @@ fn run_as(kdc: &Kdc<MemoryStore>, config: AsExchangeConfig, password: &str) -> R
             Err(e) => break Err(e),
         }
     };
-    Run { result, replies }
+    (exchange, Run { result, replies })
 }
 
 fn as_config(name: &str) -> AsExchangeConfig {

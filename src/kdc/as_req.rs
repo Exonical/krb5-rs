@@ -6,15 +6,17 @@ use chrono::{DateTime, Utc};
 use rasn::types::OctetString;
 
 use super::db::{KvnoSel, PrincipalAttributes, PrincipalEntry};
-use super::error::{ErrorContext, KdcError};
+use super::error::{general_string, ErrorContext, KdcError};
+use super::fast::{anonymous_client, FastInputs};
 use super::policy::{
     get_ticket_endtime, get_ticket_flags, get_ticket_renewtime, kerberos_time,
     select_session_keytype, ts, validate_as_request, Times, KDC_INFINITY,
 };
 use super::preauth::{
-    enc_pa_rep_padata, etype_info2_padata, find_padata, hint_list, select_client_key,
-    verify_enc_timestamp,
+    enc_pa_rep_padata, encrypted_challenge_padata, etype_info2_padata, find_padata, hint_list,
+    select_client_key, verify_enc_timestamp, verify_encrypted_challenge,
 };
+use super::reqbody::raw_req_body;
 use super::{is_tgs_principal, random_key, Kdc, PrincipalStore};
 use crate::crypto::{find_etype, key_usage};
 use crate::protocol::ap::encrypt_ticket_part;
@@ -46,16 +48,39 @@ impl<S: PrincipalStore> Kdc<S> {
         req: &KdcReq,
         raw: &[u8],
         now: DateTime<Utc>,
-        _ctx: &mut ErrorContext,
+        ctx: &mut ErrorContext,
     ) -> Result<Vec<u8>, KdcError> {
         let kdc_time = now.timestamp();
         if req.msg_type != 10 {
             return Err(KdcError::generic("VALIDATE_MESSAGE_TYPE"));
         }
 
-        // FAST: handled in kdc::fast (next milestone); kdc_find_fast
-        // (do_as_req.c:531) would replace `request` with the inner request.
-        let request = req;
+        // kdc_find_fast (do_as_req.c:526-536): later processing uses the inner
+        // request; the PA-REQ-ENC-PA-REP checksum still covers `raw`.
+        let outer_body =
+            raw_req_body(raw).map_err(|_| KdcError::new(KRB_ERR_GENERIC, "FIND_FAST"))?;
+        let inner = self
+            .find_fast(
+                req,
+                FastInputs {
+                    checksummed: outer_body,
+                    tgs_subkey: None,
+                    tgs_session: None,
+                },
+                now,
+                &mut ctx.fast,
+            )
+            .map_err(|e| KdcError {
+                e_text: Some("FIND_FAST".into()),
+                ..e
+            })?;
+        let request = inner.as_ref().unwrap_or(req);
+        let fast = ctx.fast.take();
+        *ctx = self.request_context(request, true);
+        ctx.fast = fast;
+        if request.req_body.realm.as_bytes() != self.config.realm.as_bytes() {
+            return Err(KdcError::new(KDC_ERR_WRONG_REALM, "WRONG_REALM"));
+        }
         let body = &request.req_body;
         let realm = &self.config.realm;
         let opts: KdcOptions = *body.kdc_options;
@@ -133,18 +158,35 @@ impl<S: PrincipalStore> Kdc<S> {
         let client_key = select_client_key(&client, &body.etype, &permitted);
 
         // check_padata (kdc_preauth.c:1336-1377, 1176-1207).
+        let armored = ctx.fast.as_ref().and_then(|f| f.armor_key.clone());
         let mut pa_found = false;
         let mut pa_ok = false;
         let mut saved: Option<KdcError> = None;
+        let mut kdc_challenge_key = None;
         for pa in request.padata.iter().flatten() {
-            if pa.padata_type != PaDataType::EncTimestamp as i32 {
+            let verified = if pa.padata_type == PaDataType::EncTimestamp as i32 {
+                verify_enc_timestamp(pa, &client, &permitted, kdc_time, self.config.clockskew)
+                    .map(|()| None)
+            } else if pa.padata_type == PaDataType::EncryptedChallenge as i32 {
+                verify_encrypted_challenge(
+                    pa,
+                    &client,
+                    &body.etype,
+                    &permitted,
+                    armored.as_ref(),
+                    kdc_time,
+                    self.config.clockskew,
+                )
+                .map(Some)
+            } else {
                 continue;
-            }
+            };
             pa_found = true;
-            match verify_enc_timestamp(pa, &client, &permitted, kdc_time, self.config.clockskew) {
-                Ok(()) => {
+            match verified {
+                Ok(challenge_key) => {
                     pa_ok = true;
                     flags |= TicketFlags::PRE_AUTHENT;
+                    kdc_challenge_key = kdc_challenge_key.or(challenge_key);
                 }
                 Err(e) => {
                     saved.get_or_insert(e);
@@ -154,11 +196,17 @@ impl<S: PrincipalStore> Kdc<S> {
         let hw_only = client
             .attributes
             .contains(PrincipalAttributes::REQUIRES_HW_AUTH);
+        let is_armored = armored.is_some();
         if let (true, false, Some(mut err)) = (pa_found, pa_ok, saved) {
             // finish_preauth (do_as_req.c:434-466): PREAUTH_FAILED carries
             // the hint list.
             if err.code == KDC_ERR_PREAUTH_FAILED {
-                err = err.with_e_data(hint_list(&client, client_key.as_ref(), hw_only)?);
+                err = err.with_e_data(hint_list(
+                    &client,
+                    client_key.as_ref(),
+                    hw_only,
+                    is_armored,
+                )?);
             }
             return Err(err);
         }
@@ -181,6 +229,7 @@ impl<S: PrincipalStore> Kdc<S> {
                     &client,
                     client_key.as_ref(),
                     hw_only,
+                    is_armored,
                 )?),
             );
         }
@@ -190,18 +239,18 @@ impl<S: PrincipalStore> Kdc<S> {
             .ok_or_else(|| KdcError::generic("FINDING_SERVER_KEY"))?;
         let client_key = client_key
             .ok_or_else(|| KdcError::new(KDC_ERR_ETYPE_NOSUPP, "CANT_FIND_CLIENT_KEY"))?;
-        let reply_key = client_key.entry.key.clone();
 
-        // return_padata (kdc_preauth.c:1486-1493): etype-info2 for the key.
-        let reply_padata = vec![etype_info2_padata(&client, &client_key)?];
+        // return_padata (kdc_preauth.c:1438-1493): module padata (the KDC
+        // challenge), then etype-info2 for the key.
+        let mut reply_padata = Vec::new();
+        if let Some(key) = &kdc_challenge_key {
+            reply_padata.push(encrypted_challenge_padata(key, now)?);
+        }
+        reply_padata.push(etype_info2_padata(&client, &client_key)?);
 
-        // return_enc_padata (kdc_preauth.c:1636-1663).
-        let mut enc_padata = Vec::new();
         if find_padata(request.padata.as_deref(), PaDataType::ReqEncPaRep).is_some() {
             flags |= TicketFlags::ENC_PA_REP;
-            enc_padata.push(enc_pa_rep_padata(&reply_key, raw)?);
         }
-
         let tkt_flags = KerberosFlags::new(flags);
         let part = EncTicketPart {
             flags: tkt_flags,
@@ -223,6 +272,37 @@ impl<S: PrincipalStore> Kdc<S> {
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;
         let ticket =
             encrypt_ticket_part(&server_key.key, Some(kvno), realm, tkt_sname.clone(), &part)?;
+
+        // kdc_fast_response_handle_padata / kdc_fast_handle_reply_key
+        // (do_as_req.c:301-313).
+        let mut outer_cname = tkt_cname.clone();
+        let mut outer_crealm = body.realm.clone();
+        let (outer_padata, reply_key) = match ctx.fast.as_mut().filter(|f| f.armor_key.is_some()) {
+            Some(fast) => {
+                let outer = fast.wrap_reply(
+                    reply_padata,
+                    &ticket,
+                    (realm, &tkt_cname),
+                    client_key.etype,
+                    now,
+                )?;
+                if fast.hide_client() {
+                    let (r, n) = anonymous_client()?;
+                    outer_crealm = general_string(&r)?;
+                    outer_cname = n;
+                }
+                (outer, fast.reply_key(&client_key.entry.key)?)
+            }
+            None => (reply_padata, client_key.entry.key.clone()),
+        };
+
+        // return_enc_padata (kdc_preauth.c:1636-1663) with the final reply key.
+        let enc_padata =
+            if find_padata(request.padata.as_deref(), PaDataType::ReqEncPaRep).is_some() {
+                enc_pa_rep_padata(&reply_key, raw)?
+            } else {
+                Vec::new()
+            };
 
         let enc = EncAsRepPart(EncKdcRepPart {
             key: session_key,
@@ -256,9 +336,9 @@ impl<S: PrincipalStore> Kdc<S> {
         let rep = AsRep(KdcRep {
             pvno: 5,
             msg_type: 11,
-            padata: Some(reply_padata),
-            crealm: body.realm.clone(),
-            cname: tkt_cname,
+            padata: Some(outer_padata),
+            crealm: outer_crealm,
+            cname: outer_cname,
             ticket,
             // do_as_req.c:329-330 sets the kvno after encoding, so the
             // wire enc-part carries none.
