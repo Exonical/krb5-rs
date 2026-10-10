@@ -345,3 +345,40 @@ Criterion benchmarks cover:
 - apply throughput.
 
 No performance claims are made without benchmark numbers.
+
+### Recorded results
+
+These are from `cargo bench -p krb5-rs-kdb-turso` (criterion, release
+build). They were run on one Windows development machine against a replica
+with 1000 principals, Turso 0.8.1 in MVCC mode. Each iteration is N
+concurrent tasks doing 20 lookups each. Variance between runs is large, so
+treat these as indicative.
+
+| Case | Throughput |
+|---|---|
+| Lookup, 1 task | ~43.6K lookups/s |
+| Lookup, 8 tasks | ~149K lookups/s |
+| Lookup, 64 tasks | ~150K lookups/s |
+| Lookup while apply runs flat out, 1 task | ~2.6K lookups/s |
+| Lookup while apply runs flat out, 8 tasks | ~13.9K lookups/s |
+| Lookup while apply runs flat out, 64 tasks | ~52.4K lookups/s |
+| Apply, batch of 1 principal | ~255 principals/s |
+| Apply, batch of 10 | ~770 principals/s |
+| Apply, batch of 100 | ~235 principals/s |
+| Apply, batch of 1000 | ~181 principals/s |
+
+Open findings, not yet explained:
+
+- **Replication writes slow reads.** When the writer applies batches
+  continuously, reads slow down by about 15× at 1 task and 3× at 64 tasks.
+  Real replication writes are rare: an administrative change, then a short
+  burst. Latency must be re-measured at a realistic write rate, reporting
+  p50 and p99, before claiming reads and writes are isolated.
+- **Apply is slow per principal.** Each upsert runs about 5 statements, and
+  throughput does not improve with batch size. This puts the bootstrap of
+  large realms in the minutes range, so the bulk rebuild path needs
+  optimising.
+- **Turso 0.8.1 drops autocommit writes in MVCC mode.** In our probe, an
+  autocommit `INSERT` was not visible after reopening the database; the
+  same insert inside an explicit `BEGIN CONCURRENT … COMMIT` was. Every write
+  in the module therefore uses an explicit transaction.
