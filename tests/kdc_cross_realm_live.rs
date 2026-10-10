@@ -11,9 +11,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 
-use krb5_rs::kdc::{
-    serve_tcp, serve_udp, Kdc, KdcConfig, MemoryStore, PrincipalAttributes, PrincipalStore,
-};
+use krb5_rs::kdc::{serve_tcp, serve_udp, Kdc, KdcConfig, MemoryStore, PrincipalAttributes};
 use krb5_rs::keytab::{FileKeytab, Keytab, KeytabEntry};
 use krb5_rs::profile::Profile;
 use krb5_rs::types::PrincipalName;
@@ -81,10 +79,7 @@ fn live() -> &'static Live {
         let keytab = common::kdc::tmp("cross_service.keytab");
         let _ = std::fs::remove_file(&keytab);
         let mut kt = FileKeytab::new(&keytab);
-        let entry = store
-            .lookup(&service(), REALM)
-            .expect("lookup")
-            .expect("entry");
+        let entry = store.get(&service(), REALM).expect("entry");
         for k in &entry.keys {
             kt.add_entry(&KeytabEntry {
                 principal: service(),

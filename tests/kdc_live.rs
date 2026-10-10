@@ -16,9 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use krb5_rs::kdc::{
-    serve_tcp, serve_udp, Kdc, KdcConfig, MemoryStore, PrincipalAttributes, PrincipalStore,
-};
+use krb5_rs::kdc::{serve_tcp, serve_udp, Kdc, KdcConfig, MemoryStore, PrincipalAttributes};
 use krb5_rs::keytab::{FileKeytab, Keytab, KeytabEntry};
 use krb5_rs::types::PrincipalName;
 use tokio::net::{TcpListener, UdpSocket};
@@ -78,10 +76,7 @@ fn live() -> &'static Live {
         let keytab_path = common::kdc::tmp("service.keytab");
         let _ = std::fs::remove_file(&keytab_path);
         let mut keytab = FileKeytab::new(&keytab_path);
-        let entry = store
-            .lookup(&service(), REALM)
-            .expect("lookup")
-            .expect("service entry");
+        let entry = store.get(&service(), REALM).expect("service entry");
         for k in &entry.keys {
             keytab
                 .add_entry(&KeytabEntry {
@@ -101,7 +96,7 @@ fn live() -> &'static Live {
             PrincipalName::new_principal("alice"),
             service(),
         ] {
-            let e = store.lookup(&name, REALM).expect("lookup").expect("entry");
+            let e = store.get(&name, REALM).expect("entry");
             second.insert(e);
         }
 

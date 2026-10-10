@@ -9,15 +9,22 @@ use chrono::{DateTime, Utc};
 
 use super::file::{FileStore, PrincipalRecord};
 use crate::crypto::{enctype_name, SaltType};
-use crate::kdc::db::{
-    keys_from_password, random_keys, PrincipalAttributes, PrincipalEntry, StoreError,
-};
+use crate::kdc::db::{keys_from_password, random_keys, PrincipalAttributes, PrincipalEntry};
 use crate::kdc::policy::kerberos_time;
+use crate::kdc::store::{Policy, StoreError};
 use crate::keytab::{FileKeytab, Keytab, KeytabEntry};
 use crate::types::{KerberosTime, PrincipalName};
 
 fn err(msg: impl Into<String>) -> StoreError {
-    StoreError(msg.into())
+    StoreError::backend(msg)
+}
+
+fn missing(what: impl std::fmt::Display) -> StoreError {
+    StoreError::not_found(format!("{what} does not exist"))
+}
+
+fn duplicate(what: impl std::fmt::Display) -> StoreError {
+    StoreError::conflict(format!("Principal or policy already exists: {what}"))
 }
 
 /// MIT flag table (str_conv.c:44-92): spec, bits, inverted (an `allow_*`
@@ -187,6 +194,12 @@ pub struct PrincipalOptions {
     pub clear_delegate_from: bool,
     /// Principals added to the RBCD delegator list (`-allow_delegate_from`).
     pub delegate_from: Vec<String>,
+    /// `-policy NAME` (`Some(Some)`) or `-clearpolicy` (`Some(None)`)
+    /// (kadmin.c:`kadmin_parse_princ_args`).
+    pub policy: Option<Option<String>>,
+    /// `-unlock` (kadmin.c:1020-1041): restart lockout counting. Records the
+    /// time of the unlock, which `locked_check_p` honours.
+    pub unlock: bool,
 }
 
 fn update_list(list: &mut Vec<String>, clear: bool, add: &[String], realm: &str) {
@@ -221,10 +234,21 @@ impl<'a> Admin<'a> {
     fn require(&self, name: &PrincipalName, realm: &str) -> Result<PrincipalRecord, StoreError> {
         self.store
             .get_record(name, realm)?
-            .ok_or_else(|| err(format!("Principal {name}@{realm} does not exist")))
+            .ok_or_else(|| missing(format!("Principal {name}@{realm}")))
     }
 
-    fn apply_options(entry: &mut PrincipalEntry, opts: &PrincipalOptions) {
+    /// Apply `opts`; returns whether anything security-relevant changed
+    /// (attributes, expirations, delegation lists, policy, unlock), in which
+    /// case `security_epoch` is bumped (docs/architecture/kdb.md §3).
+    fn apply_options(entry: &mut PrincipalEntry, opts: &PrincipalOptions) -> bool {
+        let before = (
+            entry.attributes,
+            entry.expiration,
+            entry.pw_expiration,
+            entry.allowed_to_delegate_to.clone(),
+            entry.allowed_to_delegate_from.clone(),
+            entry.policy.clone(),
+        );
         entry.attributes = opts.attributes.apply(entry.attributes);
         if let Some(v) = &opts.max_life {
             entry.max_life = *v;
@@ -251,6 +275,36 @@ impl<'a> Admin<'a> {
             &opts.delegate_from,
             &realm,
         );
+        if let Some(p) = &opts.policy {
+            entry.policy = p.clone();
+        }
+        if opts.unlock {
+            entry.last_admin_unlock = Some(kerberos_time(Utc::now().timestamp()));
+        }
+        let after = (
+            entry.attributes,
+            entry.expiration,
+            entry.pw_expiration,
+            entry.allowed_to_delegate_to.clone(),
+            entry.allowed_to_delegate_from.clone(),
+            entry.policy.clone(),
+        );
+        let changed = before != after || opts.unlock;
+        if changed {
+            entry.security_epoch += 1;
+        }
+        changed
+    }
+
+    /// `KADM5_UNK_POLICY` for a `-policy` naming a policy that does not exist
+    /// (svr_principal.c:117).
+    fn check_policy(&self, opts: &PrincipalOptions) -> Result<(), StoreError> {
+        if let Some(Some(name)) = &opts.policy {
+            if self.store.get_policy(name)?.is_none() {
+                return Err(missing(format!("Policy \"{name}\"")));
+            }
+        }
+        Ok(())
     }
 
     /// `addprinc` (`kadm5_create_principal`): kvno 1, keys from `password`
@@ -263,10 +317,9 @@ impl<'a> Admin<'a> {
         opts: &PrincipalOptions,
     ) -> Result<(), StoreError> {
         if self.store.get_record(name, realm)?.is_some() {
-            return Err(err(format!(
-                "Principal or policy already exists: {name}@{realm}"
-            )));
+            return Err(duplicate(format!("{name}@{realm}")));
         }
+        self.check_policy(opts)?;
         let keys = match password {
             Some(pw) => keys_from_password(name, realm, pw, 1, &self.keysalts),
             None => random_keys(1, &self.etypes()),
@@ -275,6 +328,9 @@ impl<'a> Admin<'a> {
         let mut entry = PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
             name: name.clone(),
             realm: realm.to_string(),
             attributes: PrincipalAttributes::empty(),
@@ -285,6 +341,7 @@ impl<'a> Admin<'a> {
             keys,
         };
         Self::apply_options(&mut entry, opts);
+        entry.security_epoch = 1;
         self.store.put(entry)
     }
 
@@ -303,7 +360,7 @@ impl<'a> Admin<'a> {
         if self.store.delete(name, realm)? {
             Ok(())
         } else {
-            Err(err(format!("Principal {name}@{realm} does not exist")))
+            Err(missing(format!("Principal {name}@{realm}")))
         }
     }
 
@@ -332,6 +389,11 @@ impl<'a> Admin<'a> {
         entry
             .attributes
             .remove(PrincipalAttributes::REQUIRES_PWCHANGE);
+        // A new key is a key rotation or password reset: bump the epoch. MIT
+        // also zeroes `fail_auth_count` (svr_principal.c:1343, 1473); the
+        // counter lives in the KDC process here, so record an unlock time.
+        entry.security_epoch += 1;
+        entry.last_admin_unlock = Some(kerberos_time(Utc::now().timestamp()));
         self.store
             .put_record(entry, Some(kerberos_time(Utc::now().timestamp())))?;
         Ok(kvno)
@@ -344,10 +406,64 @@ impl<'a> Admin<'a> {
         realm: &str,
         opts: &PrincipalOptions,
     ) -> Result<(), StoreError> {
+        self.check_policy(opts)?;
         let rec = self.require(name, realm)?;
         let mut entry = rec.entry;
         Self::apply_options(&mut entry, opts);
         self.store.put_record(entry, rec.last_pwd_change)
+    }
+
+    /// `add_policy` (`kadm5_create_policy`, svr_policy.c:59-180).
+    pub fn add_policy(&self, policy: Policy) -> Result<(), StoreError> {
+        validate_policy(&policy)?;
+        if self.store.get_policy(&policy.name)?.is_some() {
+            return Err(duplicate(format!("policy {}", policy.name)));
+        }
+        self.store.put_policy(Policy {
+            security_epoch: 1,
+            ..policy
+        })
+    }
+
+    /// `modify_policy` (`kadm5_modify_policy`, svr_policy.c:254-380): the
+    /// changed policy gets a higher `security_epoch`.
+    pub fn modify_policy(&self, name: &str, change: &PolicyChange) -> Result<(), StoreError> {
+        let mut policy = self
+            .store
+            .get_policy(name)?
+            .ok_or_else(|| missing(format!("Policy \"{name}\"")))?;
+        change.apply(&mut policy);
+        validate_policy(&policy)?;
+        policy.security_epoch += 1;
+        self.store.put_policy(policy)
+    }
+
+    /// `delete_policy` (`kadm5_delete_policy`, svr_policy.c:183-208). Like
+    /// MIT's db2 module it does not refuse a policy that principals still
+    /// name; such a name then counts as no policy.
+    pub fn delete_policy(&self, name: &str) -> Result<(), StoreError> {
+        if self.store.delete_policy(name)? {
+            Ok(())
+        } else {
+            Err(missing(format!("Policy \"{name}\"")))
+        }
+    }
+
+    /// `get_policy`.
+    pub fn get_policy(&self, name: &str) -> Result<Policy, StoreError> {
+        self.store
+            .get_policy(name)?
+            .ok_or_else(|| missing(format!("Policy \"{name}\"")))
+    }
+
+    /// `list_policies`, sorted by name.
+    pub fn list_policies(&self) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .store
+            .list_policies()?
+            .into_iter()
+            .map(|p| p.name)
+            .collect())
     }
 
     /// `getprinc` data.
@@ -404,6 +520,118 @@ impl<'a> Admin<'a> {
     }
 }
 
+/// Changes for [`Admin::modify_policy`] (kadmin.c:1646-1695 options).
+#[derive(Debug, Clone, Default)]
+pub struct PolicyChange {
+    /// `-maxlife`.
+    pub pw_max_life: Option<u32>,
+    /// `-minlife`.
+    pub pw_min_life: Option<u32>,
+    /// `-minlength`.
+    pub pw_min_length: Option<u32>,
+    /// `-minclasses`.
+    pub pw_min_classes: Option<u32>,
+    /// `-history`.
+    pub pw_history_num: Option<u32>,
+    /// `-maxfailure`.
+    pub pw_max_fail: Option<u32>,
+    /// `-failurecountinterval`.
+    pub pw_failcnt_interval: Option<u32>,
+    /// `-lockoutduration`.
+    pub pw_lockout_duration: Option<u32>,
+    /// `-allowedkeysalts` (`Some(None)` for `-`, which clears it).
+    pub allowed_keysalts: Option<Option<String>>,
+}
+
+impl PolicyChange {
+    /// Apply the changes to `policy`.
+    pub fn apply(&self, policy: &mut Policy) {
+        macro_rules! set {
+            ($f:ident) => {
+                if let Some(v) = self.$f {
+                    policy.$f = v;
+                }
+            };
+        }
+        set!(pw_max_life);
+        set!(pw_min_life);
+        set!(pw_min_length);
+        set!(pw_min_classes);
+        set!(pw_history_num);
+        set!(pw_max_fail);
+        set!(pw_failcnt_interval);
+        set!(pw_lockout_duration);
+        if let Some(v) = &self.allowed_keysalts {
+            policy.allowed_keysalts = v.clone();
+        }
+    }
+
+    /// A new policy called `name` with these settings.
+    pub fn into_policy(self, name: &str) -> Policy {
+        let mut policy = Policy {
+            name: name.to_string(),
+            ..Policy::default()
+        };
+        self.apply(&mut policy);
+        policy
+    }
+}
+
+/// `kadm5_create_policy` name and lifetime checks (svr_policy.c:70-110).
+fn validate_policy(p: &Policy) -> Result<(), StoreError> {
+    if p.name.is_empty() || p.name.bytes().any(|b| !(b' '..=b'~').contains(&b)) {
+        return Err(err(format!("bad policy name {:?}", p.name)));
+    }
+    if p.pw_min_life > p.pw_max_life && p.pw_max_life != 0 {
+        return Err(err(
+            "minimum password life is greater than the maximum (KADM5_BAD_MIN_PASS_LIFE)",
+        ));
+    }
+    Ok(())
+}
+
+/// Describe a policy in `get_policy` style (kadmin.c:1799-1815).
+pub fn format_policy(p: &Policy) -> String {
+    let dur = |s: u32| {
+        if s == 0 {
+            "[none]".to_string()
+        } else {
+            format!(
+                "{} days {:02}:{:02}:{:02}",
+                s / 86400,
+                s % 86400 / 3600,
+                s % 3600 / 60,
+                s % 60
+            )
+        }
+    };
+    let mut out = format!("Policy: {}\n", p.name);
+    out += &format!("Maximum password life: {}\n", dur(p.pw_max_life));
+    out += &format!("Minimum password life: {}\n", dur(p.pw_min_life));
+    out += &format!("Minimum password length: {}\n", p.pw_min_length);
+    out += &format!(
+        "Minimum number of password character classes: {}\n",
+        p.pw_min_classes
+    );
+    out += &format!("Number of old keys kept: {}\n", p.pw_history_num);
+    out += &format!(
+        "Maximum password failures before lockout: {}\n",
+        p.pw_max_fail
+    );
+    out += &format!(
+        "Password failure count reset interval: {}\n",
+        dur(p.pw_failcnt_interval)
+    );
+    out += &format!(
+        "Password lockout duration: {}\n",
+        dur(p.pw_lockout_duration)
+    );
+    if let Some(k) = &p.allowed_keysalts {
+        out += &format!("Allowed key/salt types: {k}\n");
+    }
+    out
+}
+
 /// Describe a record in `getprinc` style (MIT kadmin.c:`kadmin_getprinc`);
 /// keys are never printed.
 pub fn format_principal(rec: &PrincipalRecord) -> String {
@@ -455,7 +683,10 @@ pub fn format_principal(rec: &PrincipalRecord) -> String {
     }
     out += "MKey: vno 1\n";
     out += &format!("Attributes: {}\n", attribute_names(e.attributes));
-    out += "Policy: [none]\n";
+    match &e.policy {
+        Some(p) => out += &format!("Policy: {p}\n"),
+        None => out += "Policy: [none]\n",
+    }
     out
 }
 

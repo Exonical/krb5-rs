@@ -132,7 +132,7 @@ impl Run {
     }
 }
 
-fn run_with(
+async fn run_with(
     kdc: &Kdc<MemoryStore>,
     config: AsExchangeConfig,
     password: &str,
@@ -145,7 +145,7 @@ fn run_with(
         match ex.step(&input) {
             Ok(StepResult::SendToKdc { data, .. }) | Ok(StepResult::RetryTcp { data, .. }) => {
                 let data = tamper.map_or(data.clone(), |t| t(&data));
-                input = kdc.handle(&data);
+                input = kdc.handle(&data).await;
                 replies.push(input.clone());
             }
             Ok(StepResult::Complete) => break ex.credential().cloned(),
@@ -155,8 +155,8 @@ fn run_with(
     Run { result, replies }
 }
 
-fn run(kdc: &Kdc<MemoryStore>, config: AsExchangeConfig) -> Run {
-    run_with(kdc, config, "wrong-password", None)
+async fn run(kdc: &Kdc<MemoryStore>, config: AsExchangeConfig) -> Run {
+    run_with(kdc, config, "wrong-password", None).await
 }
 
 fn pkinit_cfg(identity: Identity, w: &World) -> ClientConfig {
@@ -179,27 +179,28 @@ fn tamper_pkinit(req: &[u8], f: impl Fn(&mut PaPkAsReq)) -> Vec<u8> {
 
 // ------------------------------------------------------------------ success
 
-#[test]
-fn rsa_client_logs_in_with_dh2048_and_the_default_kdf() {
+#[tokio::test]
+async fn rsa_client_logs_in_with_dh2048_and_the_default_kdf() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     let cred = run(
         &kdc,
         as_config("alice", pkinit_cfg(client_identity(&w, "alice", 10), &w)),
     )
+    .await
     .ok();
     assert_eq!(cred.client, name("alice"));
     assert!(cred.flags.contains(TicketFlags::PRE_AUTHENT));
 }
 
-#[test]
-fn every_group_negotiates_and_each_kdf_derives_the_same_key_on_both_sides() {
+#[tokio::test]
+async fn every_group_negotiates_and_each_kdf_derives_the_same_key_on_both_sides() {
     let w = world();
     for group in Group::ALL {
         let kdc = kdc_with(&w, |s| s.dh_min_bits = 1024);
         let mut cfg = pkinit_cfg(client_identity(&w, "alice", 10), &w);
         cfg.dh_group = group;
-        let r = run(&kdc, as_config("alice", cfg));
+        let r = run(&kdc, as_config("alice", cfg)).await;
         assert!(r.result.is_ok(), "{}: {:?}", group.name(), r.result.err());
     }
     for kdfs in [
@@ -212,25 +213,25 @@ fn every_group_negotiates_and_each_kdf_derives_the_same_key_on_both_sides() {
         let kdc = kdc_with(&w, |_| {});
         let mut cfg = pkinit_cfg(client_identity(&w, "alice", 10), &w);
         cfg.kdfs = kdfs.clone();
-        let r = run(&kdc, as_config("alice", cfg));
+        let r = run(&kdc, as_config("alice", cfg)).await;
         assert!(r.result.is_ok(), "{kdfs:?}: {:?}", r.result.err());
     }
 }
 
-#[test]
-fn ec_client_certificates_work() {
+#[tokio::test]
+async fn ec_client_certificates_work() {
     let w = world();
     for key in [TestKey::p256(), TestKey::p384(), TestKey::p521()] {
         let kdc = kdc_with(&w, |_| {});
         let (id, _) = w.ca.client(11, "alice", REALM, &key);
         let mut cfg = pkinit_cfg(id, &w);
         cfg.dh_group = Group::P256;
-        assert!(run(&kdc, as_config("alice", cfg)).result.is_ok());
+        assert!(run(&kdc, as_config("alice", cfg)).await.result.is_ok());
     }
 }
 
-#[test]
-fn ec_kdc_certificate_works() {
+#[tokio::test]
+async fn ec_kdc_certificate_works() {
     let w = world();
     let key = TestKey::p256();
     let mut server = ServerConfig::new(w.ca.kdc(101, REALM, &key), w.ca.store());
@@ -239,11 +240,11 @@ fn ec_kdc_certificate_works() {
     config.pkinit = Some(Arc::new(server));
     let kdc = Kdc::new(config, store());
     let cfg = pkinit_cfg(client_identity(&w, "alice", 10), &w);
-    assert!(run(&kdc, as_config("alice", cfg)).result.is_ok());
+    assert!(run(&kdc, as_config("alice", cfg)).await.result.is_ok());
 }
 
-#[test]
-fn fast_armored_pkinit_logs_in() {
+#[tokio::test]
+async fn fast_armored_pkinit_logs_in() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     let armor_tgt = run_with(
@@ -252,41 +253,42 @@ fn fast_armored_pkinit_logs_in() {
         PW,
         None,
     )
+    .await
     .ok();
     let mut cfg = as_config("alice", pkinit_cfg(client_identity(&w, "alice", 10), &w));
     cfg.fast = FastMode::Required(armor_tgt);
-    let cred = run(&kdc, cfg).ok();
+    let cred = run(&kdc, cfg).await.ok();
     assert_eq!(cred.client, name("alice"));
 }
 
-#[test]
-fn a_key_from_the_password_is_not_used_when_pkinit_succeeds() {
+#[tokio::test]
+async fn a_key_from_the_password_is_not_used_when_pkinit_succeeds() {
     // Same credentials, KDC without PKINIT: the wrong password now fails.
     let w = world();
     let kdc = kdc_without_pkinit();
     let cfg = as_config("alice", pkinit_cfg(client_identity(&w, "alice", 10), &w));
-    assert!(run(&kdc, cfg).result.is_err());
+    assert!(run(&kdc, cfg).await.result.is_err());
 }
 
-#[test]
-fn client_falls_back_to_the_password_when_the_kdc_has_no_pkinit() {
+#[tokio::test]
+async fn client_falls_back_to_the_password_when_the_kdc_has_no_pkinit() {
     let w = world();
     let kdc = kdc_without_pkinit();
     let cfg = as_config("alice", pkinit_cfg(client_identity(&w, "alice", 10), &w));
-    assert!(run_with(&kdc, cfg, PW, None).result.is_ok());
+    assert!(run_with(&kdc, cfg, PW, None).await.result.is_ok());
 }
 
 // ------------------------------------------------------------------- hints
 
-#[test]
-fn preauth_required_hints_list_pkinit_and_a_freshness_token_on_request() {
+#[tokio::test]
+async fn preauth_required_hints_list_pkinit_and_a_freshness_token_on_request() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     let mut ex = AsExchange::new(AsExchangeConfig::new(name("alice"), REALM), PW);
     let StepResult::SendToKdc { data, .. } = ex.step(&[]).expect("step") else {
         panic!("expected a request");
     };
-    let reply = kdc.handle(&data);
+    let reply = kdc.handle(&data).await;
     let err: KrbErrorMsg = rasn::der::decode(&reply).expect("KRB-ERROR");
     assert_eq!(err.error_code, 25);
     let hints: Vec<PaData> =
@@ -298,7 +300,7 @@ fn preauth_required_hints_list_pkinit_and_a_freshness_token_on_request() {
 
     // Without PKINIT configured there are no PKINIT hints.
     let plain = kdc_without_pkinit();
-    let reply = plain.handle(&data);
+    let reply = plain.handle(&data).await;
     let err: KrbErrorMsg = rasn::der::decode(&reply).expect("KRB-ERROR");
     let hints: Vec<PaData> =
         rasn::der::decode(err.e_data.expect("e-data").as_ref()).expect("METHOD-DATA");
@@ -309,35 +311,35 @@ fn preauth_required_hints_list_pkinit_and_a_freshness_token_on_request() {
 
 // ---------------------------------------------------------------- freshness
 
-#[test]
-fn required_freshness_is_satisfied_through_the_hint_token() {
+#[tokio::test]
+async fn required_freshness_is_satisfied_through_the_hint_token() {
     let w = world();
     let kdc = kdc_with(&w, |s| s.require_freshness = true);
     let cfg = pkinit_cfg(client_identity(&w, "alice", 10), &w);
-    assert!(run(&kdc, as_config("alice", cfg)).result.is_ok());
+    assert!(run(&kdc, as_config("alice", cfg)).await.result.is_ok());
 }
 
-#[test]
-fn missing_freshness_when_required_is_preauth_failed() {
+#[tokio::test]
+async fn missing_freshness_when_required_is_preauth_failed() {
     let w = world();
     let kdc = kdc_with(&w, |s| s.require_freshness = true);
     let mut cfg = pkinit_cfg(client_identity(&w, "alice", 10), &w);
     cfg.disable_freshness = true;
-    let r = run(&kdc, as_config("alice", cfg));
+    let r = run(&kdc, as_config("alice", cfg)).await;
     assert_eq!(r.code(), 24);
 }
 
 // ---------------------------------------------------------- certificate trust
 
-#[test]
-fn untrusted_ca_is_cant_verify_certificate_with_trusted_certifiers() {
+#[tokio::test]
+async fn untrusted_ca_is_cant_verify_certificate_with_trusted_certifiers() {
     let w = world();
     let other = Ca::new("Some Other CA", RsaSlot::Client2);
     let kdc = kdc_with(&w, |_| {});
     let (id, _) = other.client(10, "alice", REALM, &w.client_key);
     let mut cfg = pkinit_cfg(id, &w);
     cfg.store.anchors = vec![w.ca.cert.clone()];
-    let r = run(&kdc, as_config("alice", cfg));
+    let r = run(&kdc, as_config("alice", cfg)).await;
     assert_eq!(r.code(), 70);
     let KrbErrorMsg { e_data, .. } =
         rasn::der::decode(r.replies.last().expect("reply")).expect("error");
@@ -347,25 +349,25 @@ fn untrusted_ca_is_cant_verify_certificate_with_trusted_certifiers() {
     assert_eq!(typed.last().expect("cookie").0, 133);
 }
 
-#[test]
-fn same_ca_name_with_a_different_key_is_invalid_certificate() {
+#[tokio::test]
+async fn same_ca_name_with_a_different_key_is_invalid_certificate() {
     let w = world();
     let impostor = Ca::new("Test CA", RsaSlot::Client2);
     let kdc = kdc_with(&w, |_| {});
     let (id, _) = impostor.client(10, "alice", REALM, &w.client_key);
-    let r = run(&kdc, as_config("alice", pkinit_cfg(id, &w)));
+    let r = run(&kdc, as_config("alice", pkinit_cfg(id, &w))).await;
     assert_eq!(r.code(), 71);
 }
 
-#[test]
-fn expired_client_certificate_is_invalid_certificate() {
+#[tokio::test]
+async fn expired_client_certificate_is_invalid_certificate() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     let mut spec = CertSpec::client("alice", 10, &name("alice"), REALM);
     spec.not_before = Utc::now() - chrono::Duration::days(3);
     spec.not_after = Utc::now() - chrono::Duration::days(2);
     let id = w.ca.identity(&spec, &w.client_key);
-    let r = run(&kdc, as_config("alice", pkinit_cfg(id, &w)));
+    let r = run(&kdc, as_config("alice", pkinit_cfg(id, &w))).await;
     assert_eq!(r.code(), 71);
     let KrbErrorMsg { e_data, .. } =
         rasn::der::decode(r.replies.last().expect("reply")).expect("error");
@@ -374,8 +376,8 @@ fn expired_client_certificate_is_invalid_certificate() {
     assert_eq!(typed[0].0, 105);
 }
 
-#[test]
-fn revoked_certificate_with_a_crl_is_revoked_certificate() {
+#[tokio::test]
+async fn revoked_certificate_with_a_crl_is_revoked_certificate() {
     let w = world();
     let now = Utc::now();
     let crl = pki::issue_crl(
@@ -391,24 +393,27 @@ fn revoked_certificate_with_a_crl_is_revoked_certificate() {
     let r = run(
         &kdc,
         as_config("alice", pkinit_cfg(client_identity(&w, "alice", 10), &w)),
-    );
+    )
+    .await;
     assert_eq!(r.code(), 72);
     // Another serial is fine.
     let r = run(
         &kdc,
         as_config("alice", pkinit_cfg(client_identity(&w, "alice", 11), &w)),
-    );
+    )
+    .await;
     assert!(r.result.is_ok());
 }
 
-#[test]
-fn required_crl_checking_without_a_crl_is_revocation_status_unknown() {
+#[tokio::test]
+async fn required_crl_checking_without_a_crl_is_revocation_status_unknown() {
     let w = world();
     let kdc = kdc_with(&w, |s| s.require_crl_checking = true);
     let r = run(
         &kdc,
         as_config("alice", pkinit_cfg(client_identity(&w, "alice", 10), &w)),
-    );
+    )
+    .await;
     assert_eq!(r.code(), 73);
 }
 
@@ -418,8 +423,8 @@ fn spec_for(user: &str) -> CertSpec {
     CertSpec::client(user, 10, &name(user), REALM)
 }
 
-#[test]
-fn eku_rules_follow_pkinit_eku_checking() {
+#[tokio::test]
+async fn eku_rules_follow_pkinit_eku_checking() {
     let w = world();
     let mut no_eku = spec_for("alice");
     no_eku.eku = None;
@@ -438,7 +443,7 @@ fn eku_rules_follow_pkinit_eku_checking() {
         ("no KU", &no_ku),
     ] {
         let id = w.ca.identity(spec, &w.client_key);
-        let r = run(&default_kdc, as_config("alice", pkinit_cfg(id, &w)));
+        let r = run(&default_kdc, as_config("alice", pkinit_cfg(id, &w))).await;
         assert_eq!(r.code(), 77, "{label}");
     }
 
@@ -446,6 +451,7 @@ fn eku_rules_follow_pkinit_eku_checking() {
     let none = kdc_with(&w, |s| s.require_eku = false);
     let id = w.ca.identity(&no_eku, &w.client_key);
     assert!(run(&none, as_config("alice", pkinit_cfg(id, &w)))
+        .await
         .result
         .is_ok());
 
@@ -453,33 +459,49 @@ fn eku_rules_follow_pkinit_eku_checking() {
     let sc = kdc_with(&w, |s| s.accept_secondary_eku = true);
     let id = w.ca.identity(&sc_logon, &w.client_key);
     assert!(run(&sc, as_config("alice", pkinit_cfg(id, &w)))
+        .await
         .result
         .is_ok());
 }
 
-#[test]
-fn san_must_match_the_client_principal() {
+#[tokio::test]
+async fn san_must_match_the_client_principal() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     // A certificate for bob presented as alice.
     let id = client_identity(&w, "bob", 10);
-    assert_eq!(run(&kdc, as_config("alice", pkinit_cfg(id, &w))).code(), 75);
+    assert_eq!(
+        run(&kdc, as_config("alice", pkinit_cfg(id, &w)))
+            .await
+            .code(),
+        75
+    );
 
     // No SAN at all.
     let mut spec = spec_for("alice");
     spec.sans.clear();
     let id = w.ca.identity(&spec, &w.client_key);
-    assert_eq!(run(&kdc, as_config("alice", pkinit_cfg(id, &w))).code(), 75);
+    assert_eq!(
+        run(&kdc, as_config("alice", pkinit_cfg(id, &w)))
+            .await
+            .code(),
+        75
+    );
 
     // The right name in the wrong realm.
     let mut spec = spec_for("alice");
     spec.sans = vec![SanSpec::Pkinit(name("alice"), "OTHER.REALM".into())];
     let id = w.ca.identity(&spec, &w.client_key);
-    assert_eq!(run(&kdc, as_config("alice", pkinit_cfg(id, &w))).code(), 75);
+    assert_eq!(
+        run(&kdc, as_config("alice", pkinit_cfg(id, &w)))
+            .await
+            .code(),
+        75
+    );
 }
 
-#[test]
-fn upn_san_needs_pkinit_allow_upn() {
+#[tokio::test]
+async fn upn_san_needs_pkinit_allow_upn() {
     let w = world();
     let mut spec = spec_for("upnuser");
     spec.sans = vec![SanSpec::Upn(format!("upnuser@{REALM}"))];
@@ -487,19 +509,22 @@ fn upn_san_needs_pkinit_allow_upn() {
 
     let off = kdc_with(&w, |_| {});
     assert_eq!(
-        run(&off, as_config("upnuser", pkinit_cfg(id(&w), &w))).code(),
+        run(&off, as_config("upnuser", pkinit_cfg(id(&w), &w)))
+            .await
+            .code(),
         75
     );
     let on = kdc_with(&w, |s| s.allow_upn = true);
     assert!(run(&on, as_config("upnuser", pkinit_cfg(id(&w), &w)))
+        .await
         .result
         .is_ok());
 }
 
 // ------------------------------------------------------- request tampering
 
-#[test]
-fn bad_cms_signature_is_invalid_sig() {
+#[tokio::test]
+async fn bad_cms_signature_is_invalid_sig() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     let cfg = as_config("alice", pkinit_cfg(client_identity(&w, "alice", 10), &w));
@@ -511,12 +536,12 @@ fn bad_cms_signature_is_invalid_sig() {
             p.signed_auth_pack = OctetString::from(bytes);
         })
     };
-    let r = run_with(&kdc, cfg, "x", Some(&tamper));
+    let r = run_with(&kdc, cfg, "x", Some(&tamper)).await;
     assert_eq!(r.code(), 64);
 }
 
-#[test]
-fn changed_request_body_fails_the_pa_checksum() {
+#[tokio::test]
+async fn changed_request_body_fails_the_pa_checksum() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     let cfg = as_config("alice", pkinit_cfg(client_identity(&w, "alice", 10), &w));
@@ -535,12 +560,12 @@ fn changed_request_body_fails_the_pa_checksum() {
     };
     // AP_ERR_MODIFIED is not one of the codes filter_preauth_error passes
     // through (kdc_preauth.c:1092-1134), so the client sees PREAUTH_FAILED.
-    let r = run_with(&kdc, cfg, "x", Some(&tamper));
+    let r = run_with(&kdc, cfg, "x", Some(&tamper)).await;
     assert_eq!(r.code(), 24);
 }
 
-#[test]
-fn unsigned_request_from_a_non_anonymous_client_is_preauth_failed() {
+#[tokio::test]
+async fn unsigned_request_from_a_non_anonymous_client_is_preauth_failed() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     let store = w.ca.store();
@@ -558,19 +583,19 @@ fn unsigned_request_from_a_non_anonymous_client_is_preauth_failed() {
             p.signed_auth_pack = OctetString::from(cms::content_info(&OID_AUTHDATA, &v.data));
         })
     };
-    let r = run_with(&kdc, cfg, "x", Some(&tamper));
+    let r = run_with(&kdc, cfg, "x", Some(&tamper)).await;
     assert_eq!(r.code(), 24);
 }
 
 // ------------------------------------------------------------ DH negotiation
 
-#[test]
-fn dh_group_below_the_minimum_is_negotiated_up_via_td_dh_parameters() {
+#[tokio::test]
+async fn dh_group_below_the_minimum_is_negotiated_up_via_td_dh_parameters() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     let mut cfg = pkinit_cfg(client_identity(&w, "alice", 10), &w);
     cfg.dh_group = Group::Modp1024;
-    let r = run(&kdc, as_config("alice", cfg));
+    let r = run(&kdc, as_config("alice", cfg)).await;
     assert!(
         r.error_codes_seen().contains(&65),
         "{:?}",
@@ -610,13 +635,13 @@ fn dh_group_below_the_minimum_is_negotiated_up_via_td_dh_parameters() {
     );
 }
 
-#[test]
-fn a_kdc_demanding_a_stronger_group_than_the_client_allows_ends_the_exchange() {
+#[tokio::test]
+async fn a_kdc_demanding_a_stronger_group_than_the_client_allows_ends_the_exchange() {
     let w = world();
     let kdc = kdc_with(&w, |s| s.dh_min_bits = 4096);
     let mut cfg = pkinit_cfg(client_identity(&w, "alice", 10), &w);
     cfg.dh_group = Group::Modp1024;
-    let r = run(&kdc, as_config("alice", cfg));
+    let r = run(&kdc, as_config("alice", cfg)).await;
     // 1024 -> (P-256 is at least as strong) -> succeeds after retry.
     assert!(r.result.is_ok());
 }
@@ -630,15 +655,15 @@ fn kdc_with_identity(w: &World, identity: Identity) -> Kdc<MemoryStore> {
     Kdc::new(config, store())
 }
 
-#[test]
-fn kdc_certificate_san_must_name_the_realm_tgs_or_a_configured_hostname() {
+#[tokio::test]
+async fn kdc_certificate_san_must_name_the_realm_tgs_or_a_configured_hostname() {
     let w = world();
     let client = || pkinit_cfg(client_identity(&w, "alice", 10), &w);
 
     // SAN krbtgt/OTHER.REALM@OTHER.REALM.
     let wrong =
         w.ca.identity(&CertSpec::kdc("kdc", 101, "OTHER.REALM"), &w.kdc_key);
-    let r = run(&kdc_with_identity(&w, wrong), as_config("alice", client()));
+    let r = run(&kdc_with_identity(&w, wrong), as_config("alice", client())).await;
     assert!(
         r.crypto_error().contains("error 76"),
         "{}",
@@ -649,11 +674,11 @@ fn kdc_certificate_san_must_name_the_realm_tgs_or_a_configured_hostname() {
     let mut dns = CertSpec::kdc("kdc", 102, REALM);
     dns.sans = vec![SanSpec::Dns("kdc.example.com".into())];
     let kdc = || kdc_with_identity(&w, w.ca.identity(&dns, &w.kdc_key));
-    let r = run(&kdc(), as_config("alice", client()));
+    let r = run(&kdc(), as_config("alice", client())).await;
     assert!(r.crypto_error().contains("error 76"));
     let mut cfg = client();
     cfg.kdc_hostnames = vec!["KDC.example.com".into()];
-    assert!(run(&kdc(), as_config("alice", cfg)).result.is_ok());
+    assert!(run(&kdc(), as_config("alice", cfg)).await.result.is_ok());
 
     // dNSName with a wrong EKU is rejected unless EKU checking is off.
     let mut bad_eku = dns.clone();
@@ -662,7 +687,7 @@ fn kdc_certificate_san_must_name_the_realm_tgs_or_a_configured_hostname() {
     let kdc = || kdc_with_identity(&w, w.ca.identity(&bad_eku, &w.kdc_key));
     let mut cfg = client();
     cfg.kdc_hostnames = vec!["kdc.example.com".into()];
-    let r = run(&kdc(), as_config("alice", cfg));
+    let r = run(&kdc(), as_config("alice", cfg)).await;
     assert!(
         r.crypto_error().contains("error 77"),
         "{}",
@@ -671,15 +696,15 @@ fn kdc_certificate_san_must_name_the_realm_tgs_or_a_configured_hostname() {
     let mut cfg = client();
     cfg.kdc_hostnames = vec!["kdc.example.com".into()];
     cfg.accept_secondary_eku = true;
-    assert!(run(&kdc(), as_config("alice", cfg)).result.is_ok());
+    assert!(run(&kdc(), as_config("alice", cfg)).await.result.is_ok());
     let mut cfg = client();
     cfg.kdc_hostnames = vec!["kdc.example.com".into()];
     cfg.require_eku = false;
-    assert!(run(&kdc(), as_config("alice", cfg)).result.is_ok());
+    assert!(run(&kdc(), as_config("alice", cfg)).await.result.is_ok());
 }
 
-#[test]
-fn client_rejects_a_kdc_certificate_from_an_untrusted_ca() {
+#[tokio::test]
+async fn client_rejects_a_kdc_certificate_from_an_untrusted_ca() {
     let w = world();
     let other = Ca::new("Some Other CA", RsaSlot::Client2);
     let id = other.kdc(104, REALM, &w.kdc_key);
@@ -687,7 +712,7 @@ fn client_rejects_a_kdc_certificate_from_an_untrusted_ca() {
     // The KDC trusts our CA (for the client); the client does not trust the
     // KDC certificate's issuer.
     let cfg = pkinit_cfg(client_identity(&w, "alice", 10), &w);
-    let r = run(&kdc, as_config("alice", cfg));
+    let r = run(&kdc, as_config("alice", cfg)).await;
     assert!(
         r.crypto_error().contains("error 70") || r.crypto_error().contains("error 71"),
         "{}",
@@ -695,13 +720,13 @@ fn client_rejects_a_kdc_certificate_from_an_untrusted_ca() {
     );
 }
 
-#[test]
-fn trust_store_is_required() {
+#[tokio::test]
+async fn trust_store_is_required() {
     let w = world();
     let kdc = kdc_with(&w, |_| {});
     let id = client_identity(&w, "alice", 10);
     let cfg = ClientConfig::new(id, TrustStore::default());
-    let r = run(&kdc, as_config("alice", cfg));
+    let r = run(&kdc, as_config("alice", cfg)).await;
     assert!(
         r.crypto_error().contains("pkinit_anchors"),
         "{}",
@@ -711,8 +736,8 @@ fn trust_store_is_required() {
 
 // ------------------------------------------------------------- kdc.conf
 
-#[test]
-fn realm_config_reads_the_pkinit_relations_with_mit_defaults_and_overrides() {
+#[tokio::test]
+async fn realm_config_reads_the_pkinit_relations_with_mit_defaults_and_overrides() {
     use krb5_rs::kdc::RealmConfig;
     use krb5_rs::profile::Profile;
 
@@ -761,7 +786,7 @@ fn realm_config_reads_the_pkinit_relations_with_mit_defaults_and_overrides() {
     assert_eq!(server.indicators, vec!["pkinit".to_string()]);
     let kdc = Kdc::new(custom.kdc, store());
     let cfg = pkinit_cfg(client_identity(&w, "alice", 10), &w);
-    assert!(run(&kdc, as_config("alice", cfg)).result.is_ok());
+    assert!(run(&kdc, as_config("alice", cfg)).await.result.is_ok());
 
     // No pkinit_identity: PKINIT stays off. No anchors: configuration error.
     let off = Profile::parse(&format!("[realms]\n {REALM} = {{\n }}\n")).expect("conf");

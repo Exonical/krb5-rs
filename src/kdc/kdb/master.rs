@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use rasn::types::GeneralString;
 
 use crate::crypto::find_etype;
-use crate::kdc::db::StoreError;
+use crate::kdc::store::StoreError;
 use crate::keytab::{FileKeytab, Keytab, KeytabEntry};
 use crate::protocol::preauth::default_salt;
 use crate::types::{EncryptionKey, PrincipalName};
@@ -15,7 +15,7 @@ use crate::types::{EncryptionKey, PrincipalName};
 const MASTER_NAME: &str = "K/M";
 
 fn err(msg: impl Into<String>) -> StoreError {
-    StoreError(msg.into())
+    StoreError::backend(msg)
 }
 
 /// The master principal `K/M@REALM` name components.

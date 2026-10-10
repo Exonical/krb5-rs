@@ -43,13 +43,34 @@ fn optional_time(t: i64) -> Option<crate::types::KerberosTime> {
 
 impl<S: PrincipalStore> Kdc<S> {
     /// MIT `process_as_req` (do_as_req.c:470-767) and
-    /// `finish_process_as_req` (:194-423).
-    pub(super) fn process_as_req(
+    /// `finish_process_as_req` (:194-423), then the KDB audit hook
+    /// (`log_as_req` -> `krb5_db_audit_as_req`, kdc_log.c:93): lockout
+    /// counters see every outcome once the client is known.
+    pub(super) async fn process_as_req(
         &self,
         req: &KdcReq,
         raw: &[u8],
         now: DateTime<Utc>,
         ctx: &mut ErrorContext,
+    ) -> Result<Vec<u8>, KdcError> {
+        let mut audited: Option<PrincipalEntry> = None;
+        let result = self
+            .process_as_req_inner(req, raw, now, ctx, &mut audited)
+            .await;
+        if let Some(client) = audited {
+            let code = result.as_ref().map_or_else(|e| e.code, |_| 0);
+            self.audit_as(&client, now.timestamp(), code).await;
+        }
+        result
+    }
+
+    async fn process_as_req_inner(
+        &self,
+        req: &KdcReq,
+        raw: &[u8],
+        now: DateTime<Utc>,
+        ctx: &mut ErrorContext,
+        audited: &mut Option<PrincipalEntry>,
     ) -> Result<Vec<u8>, KdcError> {
         let kdc_time = now.timestamp();
         if req.msg_type != 10 {
@@ -71,6 +92,7 @@ impl<S: PrincipalStore> Kdc<S> {
                 now,
                 &mut ctx.fast,
             )
+            .await
             .map_err(|e| KdcError {
                 e_text: Some("FIND_FAST".into()),
                 ..e
@@ -96,14 +118,21 @@ impl<S: PrincipalStore> Kdc<S> {
             .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "NULL_SERVER"))?;
 
         let client = self
-            .lookup(cname, realm, "LOOKING_UP_CLIENT")?
+            .lookup(cname, realm, "LOOKING_UP_CLIENT")
+            .await?
             .ok_or_else(|| KdcError::new(KDC_ERR_C_PRINCIPAL_UNKNOWN, "CLIENT_NOT_FOUND"))?;
+        *audited = Some(client.clone());
         let server = self
-            .lookup(sname, realm, "LOOKING_UP_SERVER")?
+            .lookup(sname, realm, "LOOKING_UP_SERVER")
+            .await?
             .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "SERVER_NOT_FOUND"))?;
-        let local_tgt = self.require_local_tgt()?;
+        let local_tgt = self.require_local_tgt().await?;
+        self.consistency_gate(&[&client, &server]).await?;
 
         validate_as_request(opts, &client, &server, kdc_time)?;
+        // krb5_db_check_policy_as, the last step of validate_as_request
+        // (kdc_util.c:801).
+        self.check_lockout(&client, kdc_time).await?;
 
         let permitted = self.permitted();
         let session_etype = select_session_keytype(&server, &body.etype, &permitted)

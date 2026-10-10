@@ -5,9 +5,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use krb5_rs::kdc::{
-    serve_tcp, serve_udp, Kdc, KdcConfig, MemoryStore, PrincipalAttributes, PrincipalStore,
-};
+use krb5_rs::kdc::{serve_tcp, serve_udp, Kdc, KdcConfig, MemoryStore, PrincipalAttributes};
 use krb5_rs::protocol::{
     AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
 };
@@ -53,7 +51,7 @@ async fn start(max_dgram: Option<usize>) -> Server {
     store
         .add_random_key(service(), REALM, 1, &[18], PrincipalAttributes::empty())
         .expect("service");
-    assert!(store.lookup(&service(), REALM).expect("lookup").is_some());
+    assert!(store.get(&service(), REALM).is_some());
     let mut config = KdcConfig::new(REALM);
     if let Some(m) = max_dgram {
         config.max_dgram_reply_size = m;

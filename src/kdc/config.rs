@@ -342,6 +342,24 @@ impl RealmConfig {
         kdc.reject_bad_transit =
             kdc_conf.get_boolean(&["realms", realm, "reject_bad_transit"], true)?;
         kdc.disable_pac = kdc_conf.get_boolean(&["realms", realm, "disable_pac"], false)?;
+        // The db2 module options live in `[dbmodules]` under the realm's
+        // `database_module`, which defaults to the realm name (MIT
+        // kdb5.c `get_conf_section`; kdb_db2.c:267-277).
+        let module = r("database_module").unwrap_or_else(|| realm.to_string());
+        for (key, slot) in [
+            ("disable_lockout", &mut kdc.disable_lockout),
+            ("disable_last_success", &mut kdc.disable_last_success),
+        ] {
+            let path = ["dbmodules", module.as_str(), key];
+            *slot = match (
+                kdc_conf.get_string(&path),
+                krb5_conf.and_then(|p| p.get_string(&path)),
+            ) {
+                (None, None) => false,
+                (Some(_), _) => kdc_conf.get_boolean(&path, false)?,
+                (None, Some(_)) => krb5_conf.map_or(Ok(false), |p| p.get_boolean(&path, false))?,
+            };
+        }
         #[cfg(feature = "pkinit")]
         {
             kdc.pkinit = pkinit_settings(kdc_conf, realm)?;
@@ -680,5 +698,42 @@ mod propagation_tests {
         )
         .is_err());
         assert!(settings("  kprop_poll_interval = 0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod dbmodule_tests {
+    use super::*;
+
+    fn config(text: &str, krb5: Option<&str>) -> RealmConfig {
+        let kdc = Profile::parse(text).expect("kdc.conf");
+        let krb5 = krb5.map(|t| Profile::parse(t).expect("krb5.conf"));
+        RealmConfig::from_profiles(&kdc, krb5.as_ref(), "R").expect("config")
+    }
+
+    #[test]
+    fn lockout_options_default_to_off_and_read_dbmodules_by_realm_name() {
+        let c = config("[realms]\n R = {\n }\n", None);
+        assert!(!c.kdc.disable_lockout && !c.kdc.disable_last_success && c.kdc.tgs_recheck_client);
+        let c = config(
+            "[realms]\n R = {\n }\n[dbmodules]\n R = {\n  disable_lockout = true\n }\n",
+            None,
+        );
+        assert!(c.kdc.disable_lockout && !c.kdc.disable_last_success);
+    }
+
+    #[test]
+    fn database_module_selects_the_dbmodules_section_and_krb5_conf_is_consulted() {
+        let c = config(
+            "[realms]\n R = {\n  database_module = other\n }\n[dbmodules]\n R = {\n  disable_lockout = true\n }\n \
+             other = {\n  disable_last_success = true\n }\n",
+            None,
+        );
+        assert!(!c.kdc.disable_lockout && c.kdc.disable_last_success);
+        let c = config(
+            "[realms]\n R = {\n }\n",
+            Some("[dbmodules]\n R = {\n  disable_lockout = true\n }\n"),
+        );
+        assert!(c.kdc.disable_lockout);
     }
 }

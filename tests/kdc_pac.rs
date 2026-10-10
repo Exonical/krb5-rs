@@ -3,7 +3,7 @@
 //! `handle_pac`, kdc_util.c `get_verified_pac`, tgs_policy.c
 //! `check_normal_tgs_pac`).
 
-use krb5_rs::kdc::{Kdc, KdcConfig, MemoryStore, PrincipalAttributes, PrincipalStore};
+use krb5_rs::kdc::{Kdc, KdcConfig, MemoryStore, PrincipalAttributes};
 use krb5_rs::pac::{
     ticket_pac, verify_ticket_pac, Pac, PAC_CLIENT_INFO, PAC_FULL_CHECKSUM, PAC_PRIVSVR_CHECKSUM,
     PAC_SERVER_CHECKSUM, PAC_TICKET_CHECKSUM,
@@ -50,7 +50,7 @@ struct Fix {
     noauth_key: EncryptionKey,
 }
 
-fn fixture(tweak: impl FnOnce(&mut KdcConfig)) -> Fix {
+async fn fixture(tweak: impl FnOnce(&mut KdcConfig)) -> Fix {
     let mut store = MemoryStore::new();
     let none = PrincipalAttributes::empty();
     store
@@ -71,15 +71,7 @@ fn fixture(tweak: impl FnOnce(&mut KdcConfig)) -> Fix {
             PrincipalAttributes::NO_AUTH_DATA_REQUIRED,
         )
         .expect("noauth svc");
-    let key = |name: &PrincipalName| {
-        store
-            .lookup(name, REALM)
-            .expect("lookup")
-            .expect("entry")
-            .keys[0]
-            .key
-            .clone()
-    };
+    let key = |name: &PrincipalName| store.get(name, REALM).expect("entry").keys[0].key.clone();
     let (tgs_key, svc_key, noauth_key) = (key(&tgs_name()), key(&svc()), key(&noauth_svc()));
     let mut config = KdcConfig::new(REALM);
     tweak(&mut config);
@@ -92,7 +84,7 @@ fn fixture(tweak: impl FnOnce(&mut KdcConfig)) -> Fix {
 }
 
 impl Fix {
-    fn login_with(&self, request_pac: bool) -> Credential {
+    async fn login_with(&self, request_pac: bool) -> Credential {
         let mut config = AsExchangeConfig::new(alice(), REALM);
         config.request_pac = request_pac;
         let mut ex = AsExchange::new(config, PASSWORD);
@@ -100,22 +92,22 @@ impl Fix {
         while let StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } =
             ex.step(&reply).expect("AS step")
         {
-            reply = self.kdc.handle(&data);
+            reply = self.kdc.handle(&data).await;
         }
         ex.credential().expect("TGT").clone()
     }
 
-    fn login(&self) -> Credential {
-        self.login_with(true)
+    async fn login(&self) -> Credential {
+        self.login_with(true).await
     }
 
-    fn tgs(&self, tgt: &Credential, target: PrincipalName) -> Result<Credential, Krb5Error> {
+    async fn tgs(&self, tgt: &Credential, target: PrincipalName) -> Result<Credential, Krb5Error> {
         let mut ex = TgsExchange::new(tgt.clone(), target, TgsOptions::default());
         let mut reply = Vec::new();
         loop {
             match ex.step(&reply)? {
                 TgsStepResult::SendToKdc { data, .. } | TgsStepResult::RetryTcp { data, .. } => {
-                    reply = self.kdc.handle(&data);
+                    reply = self.kdc.handle(&data).await;
                 }
                 TgsStepResult::Complete => return Ok(ex.credential().expect("cred").clone()),
             }
@@ -166,10 +158,10 @@ fn pac_container(pac_bytes: Vec<u8>) -> AuthorizationDataElement {
     }])
 }
 
-#[test]
-fn as_tgt_carries_pac_verifiable_with_the_krbtgt_key() {
-    let f = fixture(|_| {});
-    let tgt = f.login();
+#[tokio::test]
+async fn as_tgt_carries_pac_verifiable_with_the_krbtgt_key() {
+    let f = fixture(|_| {}).await;
+    let tgt = f.login().await;
     let part = f.tgt_part(&tgt);
 
     let authdata = part.authorization_data.as_ref().expect("authdata");
@@ -196,11 +188,11 @@ fn as_tgt_carries_pac_verifiable_with_the_krbtgt_key() {
     assert_eq!(pac.client_info().expect("client info").name, "alice");
 }
 
-#[test]
-fn tgs_service_ticket_carries_pac_signed_for_service_and_kdc() {
-    let f = fixture(|_| {});
-    let tgt = f.login();
-    let cred = f.tgs(&tgt, svc()).expect("service ticket");
+#[tokio::test]
+async fn tgs_service_ticket_carries_pac_signed_for_service_and_kdc() {
+    let f = fixture(|_| {}).await;
+    let tgt = f.login().await;
+    let cred = f.tgs(&tgt, svc()).await.expect("service ticket");
     let part = decrypt_ticket(&f.svc_key, &cred.ticket).expect("decrypt");
     let pac = pac_of(&part);
     assert_eq!(
@@ -239,10 +231,10 @@ fn tgs_service_ticket_carries_pac_signed_for_service_and_kdc() {
     assert_eq!(part.authtime, f.tgt_part(&tgt).authtime);
 }
 
-#[test]
-fn tampered_pac_in_tgt_is_rejected_with_ap_err_modified() {
-    let f = fixture(|_| {});
-    let tgt = f.login();
+#[tokio::test]
+async fn tampered_pac_in_tgt_is_rejected_with_ap_err_modified() {
+    let f = fixture(|_| {}).await;
+    let tgt = f.login().await;
     let mut part = f.tgt_part(&tgt);
     let mut bytes = pac_of(&part).encode();
     // Flip a bit in the client info name.
@@ -258,14 +250,14 @@ fn tampered_pac_in_tgt_is_rejected_with_ap_err_modified() {
     bytes[at + name.len() - 1] ^= 1;
     part.authorization_data = Some(vec![pac_container(bytes)]);
     let bad = f.reissue_tgt(&tgt, &part);
-    let err = f.tgs(&bad, svc()).expect_err("must fail");
+    let err = f.tgs(&bad, svc()).await.expect_err("must fail");
     assert_eq!(kdc_code(&err), 41);
 }
 
-#[test]
-fn pac_signed_for_another_client_is_rejected_as_bad_option() {
-    let f = fixture(|_| {});
-    let tgt = f.login();
+#[tokio::test]
+async fn pac_signed_for_another_client_is_rejected_as_bad_option() {
+    let f = fixture(|_| {}).await;
+    let tgt = f.login().await;
     let mut part = f.tgt_part(&tgt);
     let mut forged = Pac::new();
     let mallory = PrincipalName::new_principal("mallory");
@@ -279,14 +271,14 @@ fn pac_signed_for_another_client_is_rejected_as_bad_option() {
         .expect("sign");
     part.authorization_data = Some(vec![pac_container(bytes)]);
     let bad = f.reissue_tgt(&tgt, &part);
-    let err = f.tgs(&bad, svc()).expect_err("must fail");
+    let err = f.tgs(&bad, svc()).await.expect_err("must fail");
     assert_eq!(kdc_code(&err), 13);
 }
 
-#[test]
-fn pac_with_wrong_authtime_is_rejected_as_bad_option() {
-    let f = fixture(|_| {});
-    let tgt = f.login();
+#[tokio::test]
+async fn pac_with_wrong_authtime_is_rejected_as_bad_option() {
+    let f = fixture(|_| {}).await;
+    let tgt = f.login().await;
     let mut part = f.tgt_part(&tgt);
     let mut forged = Pac::new();
     let bytes = forged
@@ -299,43 +291,46 @@ fn pac_with_wrong_authtime_is_rejected_as_bad_option() {
         .expect("sign");
     part.authorization_data = Some(vec![pac_container(bytes)]);
     let bad = f.reissue_tgt(&tgt, &part);
-    assert_eq!(kdc_code(&f.tgs(&bad, svc()).expect_err("must fail")), 13);
+    assert_eq!(
+        kdc_code(&f.tgs(&bad, svc()).await.expect_err("must fail")),
+        13
+    );
 }
 
-#[test]
-fn tgt_without_pac_yields_service_ticket_without_pac() {
-    let f = fixture(|_| {});
-    let tgt = f.login_with(false);
+#[tokio::test]
+async fn tgt_without_pac_yields_service_ticket_without_pac() {
+    let f = fixture(|_| {}).await;
+    let tgt = f.login_with(false).await;
     assert!(f.tgt_part(&tgt).authorization_data.is_none());
-    let cred = f.tgs(&tgt, svc()).expect("service ticket");
+    let cred = f.tgs(&tgt, svc()).await.expect("service ticket");
     let part = decrypt_ticket(&f.svc_key, &cred.ticket).expect("decrypt");
     assert!(part.authorization_data.is_none());
 }
 
-#[test]
-fn disable_pac_issues_no_pac() {
-    let f = fixture(|c| c.disable_pac = true);
-    let tgt = f.login();
+#[tokio::test]
+async fn disable_pac_issues_no_pac() {
+    let f = fixture(|c| c.disable_pac = true).await;
+    let tgt = f.login().await;
     assert!(f.tgt_part(&tgt).authorization_data.is_none());
-    let cred = f.tgs(&tgt, svc()).expect("service ticket");
+    let cred = f.tgs(&tgt, svc()).await.expect("service ticket");
     let part = decrypt_ticket(&f.svc_key, &cred.ticket).expect("decrypt");
     assert!(part.authorization_data.is_none());
 }
 
-#[test]
-fn no_auth_data_required_server_gets_no_pac() {
-    let f = fixture(|_| {});
-    let tgt = f.login();
+#[tokio::test]
+async fn no_auth_data_required_server_gets_no_pac() {
+    let f = fixture(|_| {}).await;
+    let tgt = f.login().await;
     assert!(f.tgt_part(&tgt).authorization_data.is_some());
-    let cred = f.tgs(&tgt, noauth_svc()).expect("service ticket");
+    let cred = f.tgs(&tgt, noauth_svc()).await.expect("service ticket");
     let part = decrypt_ticket(&f.noauth_key, &cred.ticket).expect("decrypt");
     assert!(part.authorization_data.is_none());
 }
 
-#[test]
-fn non_pac_header_authdata_is_copied_after_the_new_pac() {
-    let f = fixture(|_| {});
-    let tgt = f.login();
+#[tokio::test]
+async fn non_pac_header_authdata_is_copied_after_the_new_pac() {
+    let f = fixture(|_| {}).await;
+    let tgt = f.login().await;
     let mut part = f.tgt_part(&tgt);
     let extra = if_relevant(&[AuthorizationDataElement {
         ad_type: 77,
@@ -351,6 +346,7 @@ fn non_pac_header_authdata_is_copied_after_the_new_pac() {
         .extend([extra.clone(), kdc_issued]);
     let cred = f
         .tgs(&f.reissue_tgt(&tgt, &part), svc())
+        .await
         .expect("service ticket");
     let issued = decrypt_ticket(&f.svc_key, &cred.ticket).expect("decrypt");
     let list = issued.authorization_data.expect("authdata");
@@ -366,10 +362,10 @@ fn decode_pac(container: &AuthorizationDataElement) -> Vec<u8> {
     inner[0].ad_data.to_vec()
 }
 
-#[test]
-fn mandatory_for_kdc_header_authdata_is_refused() {
-    let f = fixture(|_| {});
-    let tgt = f.login();
+#[tokio::test]
+async fn mandatory_for_kdc_header_authdata_is_refused() {
+    let f = fixture(|_| {}).await;
+    let tgt = f.login().await;
     let mut part = f.tgt_part(&tgt);
     part.authorization_data
         .as_mut()
@@ -380,6 +376,7 @@ fn mandatory_for_kdc_header_authdata_is_refused() {
         });
     let err = f
         .tgs(&f.reissue_tgt(&tgt, &part), svc())
+        .await
         .expect_err("must fail");
     assert_eq!(kdc_code(&err), 12);
 }

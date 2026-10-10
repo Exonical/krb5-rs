@@ -195,3 +195,76 @@ fn init_is_idempotent_and_reads_secrets_only_from_files() {
     );
     assert_eq!(env.run(&["init"], "").status.code(), Some(1));
 }
+
+#[test]
+fn policy_commands_and_principal_policy_options() {
+    let env = Env::new("policy");
+    env.ok(&["create", "-s"], "master\n");
+
+    let out = env.ok(
+        &[
+            "addpol",
+            "-maxfailure",
+            "3",
+            "-failurecountinterval",
+            "10m",
+            "-lockoutduration",
+            "1h",
+            "-minlength",
+            "8",
+            "strict",
+        ],
+        "",
+    );
+    assert!(out.contains("Policy \"strict\" created."), "{out}");
+    let out = env.ok(&["getpol", "strict"], "");
+    assert!(out.contains("Policy: strict"), "{out}");
+    assert!(
+        out.contains("Maximum password failures before lockout: 3"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Password failure count reset interval: 0 days 00:10:00"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Password lockout duration: 0 days 01:00:00"),
+        "{out}"
+    );
+    assert!(out.contains("Minimum password length: 8"), "{out}");
+    // -terse: name, max life, min life, length, classes, history, 0,
+    // max failures, interval, duration, keysalts (kadmin.c:1813).
+    let terse = env.ok(&["getpol", "-terse", "strict"], "");
+    assert_eq!(
+        terse.trim(),
+        "\"strict\"\t0\t0\t8\t0\t0\t0\t3\t600\t3600\t-"
+    );
+
+    env.ok(&["modpol", "-maxfailure", "5", "strict"], "");
+    assert!(env
+        .ok(&["getpol", "strict"], "")
+        .contains("Maximum password failures before lockout: 5"));
+    assert!(env.ok(&["listpols"], "").contains("strict"));
+
+    // Duplicate and unknown policies are errors.
+    assert_eq!(env.run(&["addpol", "strict"], "").status.code(), Some(1));
+    assert_eq!(env.run(&["modpol", "nope"], "").status.code(), Some(1));
+    assert_eq!(env.run(&["getpol", "nope"], "").status.code(), Some(1));
+
+    // -policy / -clearpolicy / -unlock.
+    assert_eq!(
+        env.run(&["addprinc", "-policy", "nope", "bob"], "pw\n")
+            .status
+            .code(),
+        Some(1)
+    );
+    env.ok(&["addprinc", "-policy", "strict", "bob"], "pw\n");
+    assert!(env.ok(&["getprinc", "bob"], "").contains("Policy: strict"));
+    env.ok(&["modprinc", "-unlock", "bob"], "");
+    env.ok(&["modprinc", "-clearpolicy", "bob"], "");
+    assert!(env.ok(&["getprinc", "bob"], "").contains("Policy: [none]"));
+
+    env.ok(&["delpol", "strict"], "");
+    assert_eq!(env.run(&["delpol", "strict"], "").status.code(), Some(1));
+    assert!(!env.ok(&["listpols"], "").contains("strict"));
+}

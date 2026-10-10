@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bitflags::bitflags;
 
+use super::store::{HealthCheck, Policy, PolicyStore, PrincipalStore, StoreError};
 use crate::crypto::util::generate_random;
 use crate::crypto::{find_etype, SaltType};
 use crate::keytab::Keytab;
@@ -95,6 +96,15 @@ pub struct PrincipalEntry {
     /// Services allowed to delegate to this one with resource-based
     /// constrained delegation, as unparsed names.
     pub allowed_to_delegate_from: Vec<String>,
+    /// The policy this principal is under (kadmin `-policy`), by name.
+    pub policy: Option<String>,
+    /// Bumped by every security-sensitive administrative change: disable,
+    /// password reset, key rotation, unlock, policy assignment
+    /// (docs/architecture/kdb.md §3). krb5-rs extension, not in MIT.
+    pub security_epoch: u64,
+    /// Time of the last administrative unlock (MIT
+    /// `KRB5_TL_LAST_ADMIN_UNLOCK`, kdb.h): lockout counting restarts after it.
+    pub last_admin_unlock: Option<KerberosTime>,
 }
 
 /// Which key version [`PrincipalEntry::find_key`] should match
@@ -205,32 +215,6 @@ pub fn random_keys(kvno: u32, etypes: &[i32]) -> Result<Vec<KeyEntry>, Krb5Error
     Ok(keys)
 }
 
-/// Principal store error.
-#[derive(Debug, thiserror::Error)]
-#[error("principal store error: {0}")]
-pub struct StoreError(pub String);
-
-/// Read access to the principal database.
-pub trait PrincipalStore: Send + Sync {
-    /// Look up a principal; name comparison ignores the name type (MIT
-    /// princ_comp.c).
-    fn lookup(
-        &self,
-        name: &PrincipalName,
-        realm: &str,
-    ) -> Result<Option<PrincipalEntry>, StoreError>;
-}
-
-impl<T: PrincipalStore + ?Sized> PrincipalStore for std::sync::Arc<T> {
-    fn lookup(
-        &self,
-        name: &PrincipalName,
-        realm: &str,
-    ) -> Result<Option<PrincipalEntry>, StoreError> {
-        (**self).lookup(name, realm)
-    }
-}
-
 pub(crate) type StoreKey = (Vec<Vec<u8>>, String);
 
 pub(crate) fn store_key(name: &PrincipalName, realm: &str) -> StoreKey {
@@ -241,6 +225,7 @@ pub(crate) fn store_key(name: &PrincipalName, realm: &str) -> StoreKey {
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     entries: HashMap<StoreKey, PrincipalEntry>,
+    policies: HashMap<String, Policy>,
 }
 
 impl MemoryStore {
@@ -258,6 +243,17 @@ impl MemoryStore {
             .insert(store_key(&entry.name, &entry.realm), entry);
     }
 
+    /// The entry for a principal, without going through the async store
+    /// trait (a synchronous convenience for tests and embedding).
+    pub fn get(&self, name: &PrincipalName, realm: &str) -> Option<PrincipalEntry> {
+        self.entries.get(&store_key(name, realm)).cloned()
+    }
+
+    /// Add or replace a policy.
+    pub fn insert_policy(&mut self, policy: Policy) {
+        self.policies.insert(policy.name.clone(), policy);
+    }
+
     fn new_entry(
         name: PrincipalName,
         realm: &str,
@@ -267,6 +263,9 @@ impl MemoryStore {
         PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
             name,
             realm: realm.to_string(),
             attributes,
@@ -349,8 +348,23 @@ impl PrincipalStore for MemoryStore {
         &self,
         name: &PrincipalName,
         realm: &str,
-    ) -> Result<Option<PrincipalEntry>, StoreError> {
-        Ok(self.entries.get(&store_key(name, realm)).cloned())
+    ) -> impl std::future::Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
+        std::future::ready(Ok(self.entries.get(&store_key(name, realm)).cloned()))
+    }
+}
+
+impl PolicyStore for MemoryStore {
+    fn policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Policy>, StoreError>> + Send {
+        std::future::ready(Ok(self.policies.get(name).cloned()))
+    }
+}
+
+impl HealthCheck for MemoryStore {
+    fn health(&self) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(Ok(()))
     }
 }
 
@@ -366,6 +380,9 @@ mod tests {
         PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
             name: PrincipalName::new_principal("u"),
             realm: "R".into(),
             attributes: PrincipalAttributes::empty(),
@@ -419,32 +436,37 @@ mod tests {
         assert_eq!(key.map(|k| k.key.keytype), Some(17));
     }
 
-    #[test]
-    fn memory_store_lookup_ignores_name_type() {
+    #[tokio::test]
+    async fn memory_store_lookup_ignores_name_type() {
         let mut store = MemoryStore::new();
         let mut e = entry(vec![(1, 18)]);
         e.name = PrincipalName::new_srv_hst("HTTP", "h.example");
         e.realm = "R".into();
         store.insert(e);
         let probe = PrincipalName::new_srv_inst("HTTP", "h.example");
-        assert!(store.lookup(&probe, "R").expect("lookup").is_some());
-        assert!(store.lookup(&probe, "OTHER").expect("lookup").is_none());
+        assert!(store.lookup(&probe, "R").await.expect("lookup").is_some());
+        assert!(store
+            .lookup(&probe, "OTHER")
+            .await
+            .expect("lookup")
+            .is_none());
     }
 
-    #[test]
-    fn insert_orders_keys_by_descending_kvno() {
+    #[tokio::test]
+    async fn insert_orders_keys_by_descending_kvno() {
         let mut store = MemoryStore::new();
         store.insert(entry(vec![(1, 17), (3, 18), (2, 17)]));
         let got = store
             .lookup(&PrincipalName::new_principal("u"), "R")
+            .await
             .expect("lookup")
             .expect("present");
         let kvnos: Vec<u32> = got.keys.iter().map(|k| k.kvno).collect();
         assert_eq!(kvnos, vec![3, 2, 1]);
     }
 
-    #[test]
-    fn add_with_password_uses_default_salt_keys() {
+    #[tokio::test]
+    async fn add_with_password_uses_default_salt_keys() {
         let mut store = MemoryStore::new();
         store
             .add_with_password(
@@ -458,6 +480,7 @@ mod tests {
             .expect("add");
         let got = store
             .lookup(&PrincipalName::new_principal("u"), "R")
+            .await
             .expect("lookup")
             .expect("present");
         assert_eq!(got.keys.len(), 2);

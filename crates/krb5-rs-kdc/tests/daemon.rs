@@ -414,3 +414,84 @@ async fn master_password_file_replaces_the_stash() {
         .expect("run");
     assert!(!out.status.success());
 }
+
+fn kdb_run(conf: &Path, args: &[&str], stdin: &str) {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdb"))
+        .args(["--config", &conf.to_string_lossy(), "--realm", REALM])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn krb5-rs-kdb");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stdin.as_bytes())
+        .expect("stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// One AS attempt as `user`; Ok on a ticket, else the KDC error code.
+async fn attempt(addr: std::net::SocketAddr, user: &str, password: &str) -> Result<(), i32> {
+    let t = TcpTransport::new(addr);
+    let config = AsExchangeConfig::new(PrincipalName::new_principal(user), REALM);
+    let mut exchange = AsExchange::new(config, password);
+    let mut reply = Vec::new();
+    loop {
+        match exchange.step(&reply) {
+            Ok(StepResult::SendToKdc { data, realm })
+            | Ok(StepResult::RetryTcp { data, realm }) => {
+                reply = t.send_recv(&realm, &data).await.expect("KDC reply");
+            }
+            Ok(StepResult::Complete) => return Ok(()),
+            Err(Krb5Error::KdcError(m)) => return Err(m.error_code),
+            Err(e) => panic!("unexpected error {e:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn lockout_policy_from_the_database_applies_in_the_daemon() {
+    let dir = TempDir::new("lockout");
+    let conf = make_realm(&dir);
+    kdb_run(
+        &conf,
+        &[
+            "addpol",
+            "-maxfailure",
+            "2",
+            "-lockoutduration",
+            "1h",
+            "tight",
+        ],
+        "",
+    );
+    kdb_run(
+        &conf,
+        &["addprinc", "+requires_preauth", "-policy", "tight", "carol"],
+        "carol-pw\n",
+    );
+    let daemon = Daemon::start(&conf, &[]);
+    assert_eq!(attempt(daemon.tcp, "carol", "wrong").await, Err(24));
+    assert_eq!(attempt(daemon.tcp, "carol", "wrong").await, Err(24));
+    // Locked out now, even with the right password.
+    assert_eq!(attempt(daemon.tcp, "carol", "carol-pw").await, Err(18));
+    assert!(daemon
+        .snapshot()
+        .iter()
+        .any(|l| l.contains("LOCKED_OUT: carol@")));
+
+    // An administrator unlocks; the daemon sees it on its next request.
+    kdb_run(&conf, &["modprinc", "-unlock", "carol"], "");
+    assert_eq!(attempt(daemon.tcp, "carol", "carol-pw").await, Ok(()));
+    // alice (no policy) is unaffected by any of this.
+    assert_eq!(attempt(daemon.tcp, "alice", PASSWORD).await, Ok(()));
+}

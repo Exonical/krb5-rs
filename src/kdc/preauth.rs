@@ -309,6 +309,9 @@ mod tests {
         PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
             name,
             realm: "R".into(),
             attributes: PrincipalAttributes::empty(),

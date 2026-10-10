@@ -9,19 +9,19 @@ const RENEWABLE_TGT: TicketFlags = TicketFlags::INITIAL
     .union(TicketFlags::FORWARDABLE)
     .union(TicketFlags::RENEWABLE);
 
-fn tgs_error_code(f: &Fixture, req: &[u8]) -> i32 {
-    krb_error(&f.kdc.handle(req)).error_code
+async fn tgs_error_code(f: &Fixture, req: &[u8]) -> i32 {
+    krb_error(&f.kdc.handle(req).await).error_code
 }
 
-fn plain_tgs(f: &Fixture, tgt: &Credential) -> Run<Credential> {
-    run_tgs(&f.kdc, tgt, service(), TgsOptions::default())
+async fn plain_tgs(f: &Fixture, tgt: &Credential) -> Run<Credential> {
+    run_tgs(&f.kdc, tgt, service(), TgsOptions::default()).await
 }
 
-#[test]
-fn tgs_exchange_service_ticket_decrypts_with_service_key() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
-    let run = plain_tgs(&f, &tgt);
+#[tokio::test]
+async fn tgs_exchange_service_ticket_decrypts_with_service_key() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
+    let run = plain_tgs(&f, &tgt).await;
     let cred = run.result.expect("TGS exchange");
 
     let part = decrypt_ticket(&f.service_key, &cred.ticket).expect("decrypt service ticket");
@@ -38,11 +38,11 @@ fn tgs_exchange_service_ticket_decrypts_with_service_key() {
     assert!(part.flags.contains(TicketFlags::TRANSITED_POLICY_CHECKED));
 }
 
-#[test]
-fn tgs_exchange_service_ticket_authenticates_in_ap_exchange() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
-    let cred = plain_tgs(&f, &tgt).result.expect("TGS exchange");
+#[tokio::test]
+async fn tgs_exchange_service_ticket_authenticates_in_ap_exchange() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
+    let cred = plain_tgs(&f, &tgt).await.result.expect("TGS exchange");
 
     let mut client = AuthContext::new();
     let ap_req = client
@@ -65,9 +65,9 @@ fn tgs_exchange_service_ticket_authenticates_in_ap_exchange() {
     assert_eq!(rd.authenticator.cname, user());
 }
 
-#[test]
-fn tgs_exchange_endtime_is_capped_by_tgt_endtime() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_exchange_endtime_is_capped_by_tgt_endtime() {
+    let f = fixture().await;
     let tgt = mint_tgt(
         &f,
         RENEWABLE_TGT,
@@ -76,16 +76,17 @@ fn tgs_exchange_endtime_is_capped_by_tgt_endtime() {
         at(1800),
         Some(at(86400)),
     );
-    let cred = plain_tgs(&f, &tgt).result.expect("TGS exchange");
+    let cred = plain_tgs(&f, &tgt).await.result.expect("TGS exchange");
     assert_eq!(cred.times.endtime, tgt.times.endtime);
 }
 
-#[test]
-fn tgs_exchange_realm_max_life_caps_service_ticket() {
+#[tokio::test]
+async fn tgs_exchange_realm_max_life_caps_service_ticket() {
     let f = fixture_with(FixtureOptions {
         max_life: Some(Duration::from_secs(900)),
         ..FixtureOptions::default()
-    });
+    })
+    .await;
     let tgt = mint_tgt(
         &f,
         RENEWABLE_TGT,
@@ -94,7 +95,7 @@ fn tgs_exchange_realm_max_life_caps_service_ticket() {
         at(7200),
         Some(at(86400)),
     );
-    let cred = plain_tgs(&f, &tgt).result.expect("TGS exchange");
+    let cred = plain_tgs(&f, &tgt).await.result.expect("TGS exchange");
     let start = cred
         .times
         .starttime
@@ -103,10 +104,10 @@ fn tgs_exchange_realm_max_life_caps_service_ticket() {
     assert_eq!(cred.times.endtime.timestamp() - start, 900);
 }
 
-#[test]
-fn tgs_exchange_unknown_service_returns_s_principal_unknown() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_exchange_unknown_service_returns_s_principal_unknown() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let options = TgsOptions {
         canonicalize: false,
         ..TgsOptions::default()
@@ -116,84 +117,85 @@ fn tgs_exchange_unknown_service_returns_s_principal_unknown() {
         &tgt,
         PrincipalName::new_srv_hst("HTTP", "missing.test.realm"),
         options,
-    );
+    )
+    .await;
     assert_eq!(kdc_code(&run.result.expect_err("must fail")), 7);
     let err = krb_error(run.replies.last().expect("reply"));
     assert_eq!(err.cname.as_ref().map(|n| n.to_string()), Some(USER.into()));
 }
 
-#[test]
-fn tgs_req_tampered_body_returns_bad_integrity() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_tampered_body_returns_bad_integrity() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let mut spec = TgsReqSpec::new(service(), KdcOptions::FORWARDABLE);
     spec.tamper = Some(|b| b.nonce ^= 1);
     let (req, _) = build_tgs_req(&tgt, spec);
     // MIT comp_cksum (kdc_util.c:136-137) reports a failed verify as
     // KRB5KRB_AP_ERR_BAD_INTEGRITY.
-    assert_eq!(tgs_error_code(&f, &req), 31);
+    assert_eq!(tgs_error_code(&f, &req).await, 31);
 }
 
-#[test]
-fn tgs_req_tampered_till_returns_bad_integrity() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_tampered_till_returns_bad_integrity() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let mut spec = TgsReqSpec::new(service(), KdcOptions::empty());
     spec.tamper = Some(|b| b.till += chrono::Duration::hours(5));
     let (req, _) = build_tgs_req(&tgt, spec);
-    assert_eq!(tgs_error_code(&f, &req), 31);
+    assert_eq!(tgs_error_code(&f, &req).await, 31);
 }
 
-#[test]
-fn tgs_req_untampered_hand_built_request_succeeds() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_untampered_hand_built_request_succeeds() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let (req, subkey) = build_tgs_req(&tgt, TgsReqSpec::new(service(), KdcOptions::FORWARDABLE));
-    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
     assert_eq!(enc.nonce, 0x1234_5678);
     assert_eq!(rep.cname, user());
     assert!(rep.padata.is_none());
     assert_eq!(enc.sname, service());
 }
 
-#[test]
-fn tgs_req_unkeyed_checksum_returns_inapp_cksum() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_unkeyed_checksum_returns_inapp_cksum() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let mut spec = TgsReqSpec::new(service(), KdcOptions::empty());
     spec.checksum = Some(Some(Checksum {
         cksumtype: 7,
         checksum: OctetString::from(vec![0u8; 16]),
     }));
     let (req, _) = build_tgs_req(&tgt, spec);
-    assert_eq!(tgs_error_code(&f, &req), 50);
+    assert_eq!(tgs_error_code(&f, &req).await, 50);
 }
 
-#[test]
-fn tgs_req_missing_checksum_returns_inapp_cksum() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_missing_checksum_returns_inapp_cksum() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let mut spec = TgsReqSpec::new(service(), KdcOptions::empty());
     spec.checksum = Some(None);
     let (req, _) = build_tgs_req(&tgt, spec);
-    assert_eq!(tgs_error_code(&f, &req), 50);
+    assert_eq!(tgs_error_code(&f, &req).await, 50);
 }
 
-#[test]
-fn tgs_req_corrupt_ticket_ciphertext_returns_bad_integrity() {
-    let f = fixture();
-    let mut tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_corrupt_ticket_ciphertext_returns_bad_integrity() {
+    let f = fixture().await;
+    let mut tgt = get_tgt(&f).await;
     let mut cipher = tgt.ticket.enc_part.cipher.to_vec();
     let mid = cipher.len() / 2;
     cipher[mid] ^= 0xFF;
     tgt.ticket.enc_part.cipher = OctetString::from(cipher);
     let (req, _) = build_tgs_req(&tgt, TgsReqSpec::new(service(), KdcOptions::empty()));
-    assert_eq!(tgs_error_code(&f, &req), 31);
+    assert_eq!(tgs_error_code(&f, &req).await, 31);
 }
 
-#[test]
-fn tgs_req_expired_tgt_returns_tkt_expired() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_expired_tgt_returns_tkt_expired() {
+    let f = fixture().await;
     let tgt = mint_tgt(
         &f,
         RENEWABLE_TGT,
@@ -203,23 +205,23 @@ fn tgs_req_expired_tgt_returns_tkt_expired() {
         None,
     );
     let (req, _) = build_tgs_req(&tgt, TgsReqSpec::new(service(), KdcOptions::empty()));
-    assert_eq!(tgs_error_code(&f, &req), 32);
+    assert_eq!(tgs_error_code(&f, &req).await, 32);
 }
 
-#[test]
-fn tgs_req_without_pa_tgs_req_returns_padata_type_nosupp() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_without_pa_tgs_req_returns_padata_type_nosupp() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let (req, _) = build_tgs_req(&tgt, TgsReqSpec::new(service(), KdcOptions::empty()));
     let mut decoded: TgsReq = rasn::der::decode(&req).expect("decode");
     decoded.0.padata = None;
     let der = rasn::der::encode(&decoded).expect("encode");
-    assert_eq!(tgs_error_code(&f, &der), 16);
+    assert_eq!(tgs_error_code(&f, &der).await, 16);
 }
 
-#[test]
-fn tgs_req_service_ticket_as_header_without_options_returns_not_us() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_service_ticket_as_header_without_options_returns_not_us() {
+    let f = fixture().await;
     let st = mint_ticket(
         &f.service_key,
         service(),
@@ -230,12 +232,12 @@ fn tgs_req_service_ticket_as_header_without_options_returns_not_us() {
         None,
     );
     let (req, _) = build_tgs_req(&st, TgsReqSpec::new(service(), KdcOptions::empty()));
-    assert_eq!(tgs_error_code(&f, &req), 35);
+    assert_eq!(tgs_error_code(&f, &req).await, 35);
 }
 
-#[test]
-fn tgs_req_unsupported_options_return_badoption() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_unsupported_options_return_badoption() {
+    let f = fixture().await;
     let tgt = mint_tgt(
         &f,
         RENEWABLE_TGT | TicketFlags::MAY_POSTDATE | TicketFlags::PROXIABLE,
@@ -256,13 +258,13 @@ fn tgs_req_unsupported_options_return_badoption() {
             spec.from = Some(at(600));
         }
         let (req, _) = build_tgs_req(&tgt, spec);
-        assert_eq!(tgs_error_code(&f, &req), 13, "{opt:?}");
+        assert_eq!(tgs_error_code(&f, &req).await, 13, "{opt:?}");
     }
 }
 
-#[test]
-fn tgs_req_forwarded_from_non_forwardable_tgt_returns_badoption() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_forwarded_from_non_forwardable_tgt_returns_badoption() {
+    let f = fixture().await;
     let tgt = mint_tgt(
         &f,
         TicketFlags::INITIAL | TicketFlags::PRE_AUTHENT,
@@ -275,12 +277,12 @@ fn tgs_req_forwarded_from_non_forwardable_tgt_returns_badoption() {
         &tgt,
         TgsReqSpec::new(krbtgt(), KdcOptions::FORWARDED | KdcOptions::FORWARDABLE),
     );
-    assert_eq!(tgs_error_code(&f, &req), 13);
+    assert_eq!(tgs_error_code(&f, &req).await, 13);
 }
 
-#[test]
-fn tgs_req_forwarded_from_forwardable_tgt_copies_request_addresses() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_forwarded_from_forwardable_tgt_copies_request_addresses() {
+    let f = fixture().await;
     let tgt = mint_tgt(
         &f,
         RENEWABLE_TGT,
@@ -296,7 +298,7 @@ fn tgs_req_forwarded_from_forwardable_tgt_copies_request_addresses() {
     let mut spec = TgsReqSpec::new(krbtgt(), KdcOptions::FORWARDED | KdcOptions::FORWARDABLE);
     spec.addresses = Some(vec![addr.clone()]);
     let (req, subkey) = build_tgs_req(&tgt, spec);
-    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
 
     assert!(enc
         .flags
@@ -308,9 +310,9 @@ fn tgs_req_forwarded_from_forwardable_tgt_copies_request_addresses() {
     assert_eq!(part.authtime, tgt.times.authtime);
 }
 
-#[test]
-fn tgs_req_renew_non_renewable_tgt_returns_badoption() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_renew_non_renewable_tgt_returns_badoption() {
+    let f = fixture().await;
     let tgt = mint_tgt(
         &f,
         TicketFlags::INITIAL | TicketFlags::FORWARDABLE,
@@ -320,12 +322,12 @@ fn tgs_req_renew_non_renewable_tgt_returns_badoption() {
         None,
     );
     let (req, _) = build_tgs_req(&tgt, TgsReqSpec::new(krbtgt(), KdcOptions::RENEW));
-    assert_eq!(tgs_error_code(&f, &req), 13);
+    assert_eq!(tgs_error_code(&f, &req).await, 13);
 }
 
-#[test]
-fn tgs_req_renew_past_renew_till_returns_tkt_expired() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_renew_past_renew_till_returns_tkt_expired() {
+    let f = fixture().await;
     let tgt = mint_tgt(
         &f,
         RENEWABLE_TGT,
@@ -338,12 +340,12 @@ fn tgs_req_renew_past_renew_till_returns_tkt_expired() {
         &tgt,
         TgsReqSpec::new(krbtgt(), KdcOptions::RENEW | KdcOptions::RENEWABLE),
     );
-    assert_eq!(tgs_error_code(&f, &req), 32);
+    assert_eq!(tgs_error_code(&f, &req).await, 32);
 }
 
-#[test]
-fn tgs_req_renew_renewable_tgt_keeps_authtime_and_extends_endtime() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_renew_renewable_tgt_keeps_authtime_and_extends_endtime() {
+    let f = fixture().await;
     let authtime = at(-3 * 3600);
     let tgt = mint_tgt(
         &f,
@@ -357,7 +359,7 @@ fn tgs_req_renew_renewable_tgt_keeps_authtime_and_extends_endtime() {
         &tgt,
         TgsReqSpec::new(krbtgt(), KdcOptions::RENEW | KdcOptions::RENEWABLE),
     );
-    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
 
     assert_eq!(enc.authtime, authtime);
     // New life = original life (4h) from now, capped by renew_till (24h).
@@ -375,9 +377,9 @@ fn tgs_req_renew_renewable_tgt_keeps_authtime_and_extends_endtime() {
     assert_ne!(part.key.key_bytes(), tgt.session_key.key_bytes());
 }
 
-#[test]
-fn tgs_req_renew_endtime_is_capped_by_renew_till() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_renew_endtime_is_capped_by_renew_till() {
+    let f = fixture().await;
     let authtime = at(-3 * 3600);
     let renew_till = at(1800);
     let tgt = mint_tgt(
@@ -392,16 +394,16 @@ fn tgs_req_renew_endtime_is_capped_by_renew_till() {
         &tgt,
         TgsReqSpec::new(krbtgt(), KdcOptions::RENEW | KdcOptions::RENEWABLE),
     );
-    let (_, enc) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let (_, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
     assert_eq!(enc.endtime, renew_till);
     // RENEWABLE was requested, so MIT keeps it even though renew_till == endtime.
     assert!(enc.flags.contains(TicketFlags::RENEWABLE));
     assert_eq!(enc.renew_till, Some(renew_till));
 }
 
-#[test]
-fn tgs_req_renew_with_renewable_option_keeps_renewable_and_renew_till() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_renew_with_renewable_option_keeps_renewable_and_renew_till() {
+    let f = fixture().await;
     let authtime = at(-3600);
     let renew_till = at(24 * 3600);
     let tgt = mint_tgt(
@@ -416,7 +418,7 @@ fn tgs_req_renew_with_renewable_option_keeps_renewable_and_renew_till() {
         &tgt,
         TgsReqSpec::new(krbtgt(), KdcOptions::RENEW | KdcOptions::RENEWABLE),
     );
-    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
     assert!(enc.flags.contains(TicketFlags::RENEWABLE));
     assert_eq!(enc.renew_till, Some(renew_till));
     assert_eq!(enc.authtime, authtime);
@@ -427,9 +429,9 @@ fn tgs_req_renew_with_renewable_option_keeps_renewable_and_renew_till() {
     assert_eq!(part.renew_till, Some(renew_till));
 }
 
-#[test]
-fn tgs_req_renew_without_renewable_option_drops_renewable() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_renew_without_renewable_option_drops_renewable() {
+    let f = fixture().await;
     let authtime = at(-3600);
     let tgt = mint_tgt(
         &f,
@@ -440,7 +442,7 @@ fn tgs_req_renew_without_renewable_option_drops_renewable() {
         Some(at(24 * 3600)),
     );
     let (req, subkey) = build_tgs_req(&tgt, TgsReqSpec::new(krbtgt(), KdcOptions::RENEW));
-    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
     assert!(!enc.flags.contains(TicketFlags::RENEWABLE));
     assert!(enc.renew_till.is_none());
     let part = decrypt_ticket(&f.tgs_key, &rep.ticket).expect("decrypt renewed TGT");
@@ -448,9 +450,9 @@ fn tgs_req_renew_without_renewable_option_drops_renewable() {
     assert!(part.renew_till.is_none());
 }
 
-#[test]
-fn tgs_req_renew_service_ticket_uses_ticket_as_header() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_renew_service_ticket_uses_ticket_as_header() {
+    let f = fixture().await;
     let authtime = at(-3600);
     let st = mint_ticket(
         &f.service_key,
@@ -465,16 +467,16 @@ fn tgs_req_renew_service_ticket_uses_ticket_as_header() {
         &st,
         TgsReqSpec::new(service(), KdcOptions::RENEW | KdcOptions::RENEWABLE),
     );
-    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
     assert_eq!(enc.sname, service());
     assert_eq!(enc.authtime, authtime);
     let part = decrypt_ticket(&f.service_key, &rep.ticket).expect("decrypt renewed ticket");
     assert!(part.flags.contains(TicketFlags::PRE_AUTHENT));
 }
 
-#[test]
-fn tgs_req_renew_with_mismatched_server_returns_server_nomatch() {
-    let f = fixture();
+#[tokio::test]
+async fn tgs_req_renew_with_mismatched_server_returns_server_nomatch() {
+    let f = fixture().await;
     let tgt = mint_tgt(
         &f,
         RENEWABLE_TGT,
@@ -487,18 +489,18 @@ fn tgs_req_renew_with_mismatched_server_returns_server_nomatch() {
         &tgt,
         TgsReqSpec::new(service(), KdcOptions::RENEW | KdcOptions::RENEWABLE),
     );
-    assert_eq!(tgs_error_code(&f, &req), 26);
+    assert_eq!(tgs_error_code(&f, &req).await, 26);
 }
 
-#[test]
-fn tgs_req_disable_transited_check_is_rejected_by_policy() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_disable_transited_check_is_rejected_by_policy() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let (req, _) = build_tgs_req(
         &tgt,
         TgsReqSpec::new(service(), KdcOptions::DISABLE_TRANSITED_CHECK),
     );
-    assert_eq!(tgs_error_code(&f, &req), 12);
+    assert_eq!(tgs_error_code(&f, &req).await, 12);
 }
 
 fn pac_in(part: &EncTicketPart) -> krb5_rs::pac::Pac {
@@ -507,15 +509,15 @@ fn pac_in(part: &EncTicketPart) -> krb5_rs::pac::Pac {
         .expect("PAC present")
 }
 
-#[test]
-fn tgs_req_renew_of_tgt_keeps_a_valid_pac() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_renew_of_tgt_keeps_a_valid_pac() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let (req, subkey) = build_tgs_req(
         &tgt,
         TgsReqSpec::new(krbtgt(), KdcOptions::RENEW | KdcOptions::RENEWABLE),
     );
-    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
     assert!(enc.flags.contains(TicketFlags::RENEWABLE));
     let part = decrypt_ticket(&f.tgs_key, &rep.ticket).expect("decrypt renewed TGT");
     let pac = pac_in(&part);
@@ -528,13 +530,13 @@ fn tgs_req_renew_of_tgt_keeps_a_valid_pac() {
     .expect("renewed TGT PAC verifies");
 }
 
-#[test]
-fn tgs_req_renew_of_service_ticket_resigns_pac_with_ticket_checksums() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
-    let svc = plain_tgs(&f, &tgt).result.expect("service ticket");
+#[tokio::test]
+async fn tgs_req_renew_of_service_ticket_resigns_pac_with_ticket_checksums() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
+    let svc = plain_tgs(&f, &tgt).await.result.expect("service ticket");
     let (req, subkey) = build_tgs_req(&svc, TgsReqSpec::new(service(), KdcOptions::RENEW));
-    let (rep, _) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let (rep, _) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
     let part = decrypt_ticket(&f.service_key, &rep.ticket).expect("decrypt renewed ticket");
     krb5_rs::pac::verify_ticket_pac(&part, &service(), &f.service_key, Some(&f.tgs_key))
         .expect("ticket, server, KDC and full checksums")

@@ -9,7 +9,7 @@ use rasn::types::{BitString, OctetString};
 use super::db::KvnoSel;
 use super::error::{general_string, krbtgt_name, KdcError};
 use super::preauth::find_padata;
-use super::{names_equal, random_key, Kdc, PrincipalStore};
+use super::{names_equal, random_key, Kdc, PrincipalEntry, PrincipalStore};
 use crate::crypto::{find_cksumtype, find_etype, fx_cf2, key_usage};
 use crate::protocol::ap::{ApError, AuthContext, AuthContextFlags, KeySource};
 use crate::types::error_codes::*;
@@ -191,32 +191,29 @@ pub(crate) struct FastInputs<'a> {
     pub tgs_session: Option<&'a EncryptionKey>,
 }
 
-/// KeySource over the principal store, standing in for MIT's realm keytab
-/// in `armor_ap_request` (fast_util.c:52-54).
-struct StoreKeySource<'a, S: PrincipalStore>(&'a Kdc<S>);
+/// KeySource over a principal entry fetched from the store before `rd_req`
+/// runs (which is synchronous), standing in for MIT's realm keytab in
+/// `armor_ap_request` (fast_util.c:52-54).
+struct StoreKeySource<'a, S: PrincipalStore> {
+    kdc: &'a Kdc<S>,
+    entry: Option<PrincipalEntry>,
+}
 
 impl<S: PrincipalStore> KeySource for StoreKeySource<'_, S> {
     fn get_key(
         &self,
-        server: &PrincipalName,
-        realm: &[u8],
+        _server: &PrincipalName,
+        _realm: &[u8],
         kvno: Option<i32>,
         etype: i32,
     ) -> Result<EncryptionKey, ApError> {
-        let realm = String::from_utf8_lossy(realm);
-        let entry = self
-            .0
-            .store
-            .lookup(server, &realm)
-            .ok()
-            .flatten()
-            .ok_or(ApError::NoKey)?;
+        let entry = self.entry.as_ref().ok_or(ApError::NoKey)?;
         let sel = match kvno {
             Some(k) if k > 0 => KvnoSel::Exact(u32::try_from(k).map_err(|_| ApError::BadKeyver)?),
             _ => KvnoSel::Any,
         };
         entry
-            .find_key(Some(etype), sel, &self.0.permitted())
+            .find_key(Some(etype), sel, &self.kdc.permitted())
             .map(|k| k.key.clone())
             .ok_or(ApError::BadKeyver)
     }
@@ -224,7 +221,7 @@ impl<S: PrincipalStore> KeySource for StoreKeySource<'_, S> {
 
 impl<S: PrincipalStore> Kdc<S> {
     /// `armor_ap_request` (MIT fast_util.c:35-90).
-    fn armor_ap_request(
+    async fn armor_ap_request(
         &self,
         armor: &KrbFastArmor,
         now: DateTime<Utc>,
@@ -235,8 +232,22 @@ impl<S: PrincipalStore> Kdc<S> {
         auth_ctx.set_time_offset(now - Utc::now());
         auth_ctx.set_permitted_etypes(Some(self.config.supported_enctypes.clone()));
         let ap_bytes = armor.armor_value.as_ref();
+        // rd_req looks the key up synchronously: fetch the ticket server's
+        // entry first (the ticket names it in the clear).
+        let entry = match rasn::der::decode::<ApReq>(ap_bytes) {
+            Ok(ap) => self
+                .store
+                .lookup(
+                    &ap.ticket.sname,
+                    &String::from_utf8_lossy(ap.ticket.realm.as_bytes()),
+                )
+                .await
+                .ok()
+                .flatten(),
+            Err(_) => None,
+        };
         let rd = auth_ctx
-            .rd_req(ap_bytes, None, &StoreKeySource(self))
+            .rd_req(ap_bytes, None, &StoreKeySource { kdc: self, entry })
             .map_err(|e| match e {
                 Krb5Error::Ap(a) => KdcError::new(super::error::ap_error_code(a), "FIND_FAST"),
                 _ => KdcError::generic("FIND_FAST"),
@@ -260,7 +271,7 @@ impl<S: PrincipalStore> Kdc<S> {
     /// `kdc_find_fast` (MIT fast_util.c:126-247). Returns the inner request
     /// when PA-FX-FAST was present and accepted. The armor key is recorded
     /// in `fast` as soon as it exists, so later failures are armored.
-    pub(super) fn find_fast(
+    pub(super) async fn find_fast(
         &self,
         req: &KdcReq,
         inputs: FastInputs<'_>,
@@ -285,7 +296,7 @@ impl<S: PrincipalStore> Kdc<S> {
                             "Ap-request armor not permitted with TGS",
                         ));
                     }
-                    armor_key = Some(self.armor_ap_request(armor, now)?);
+                    armor_key = Some(self.armor_ap_request(armor, now).await?);
                 }
                 other => {
                     return Err(KdcError::new(
@@ -487,31 +498,33 @@ mod tests {
         }
     }
 
-    fn run(
+    async fn run(
         built: &Built,
         checksummed: &[u8],
         subkey: Option<&EncryptionKey>,
         session: Option<&EncryptionKey>,
     ) -> (Result<Option<KdcReq>, KdcError>, Option<KdcFastState>) {
         let mut state = None;
-        let res = kdc().find_fast(
-            &built.outer,
-            FastInputs {
-                checksummed,
-                tgs_subkey: subkey,
-                tgs_session: session,
-            },
-            Utc::now(),
-            &mut state,
-        );
+        let res = kdc()
+            .find_fast(
+                &built.outer,
+                FastInputs {
+                    checksummed,
+                    tgs_subkey: subkey,
+                    tgs_session: session,
+                },
+                Utc::now(),
+                &mut state,
+            )
+            .await;
         (res, state)
     }
 
-    #[test]
-    fn find_fast_implicit_armor_derives_cf2_key_and_returns_inner_request() {
+    #[tokio::test]
+    async fn find_fast_implicit_armor_derives_cf2_key_and_returns_inner_request() {
         let (sub, sess) = (key(1), key(2));
         let built = build(&sub, &sess, b"pa-tgs-req", None, &[0x40, 0, 0, 0]);
-        let (res, state) = run(&built, b"pa-tgs-req", Some(&sub), Some(&sess));
+        let (res, state) = run(&built, b"pa-tgs-req", Some(&sub), Some(&sess)).await;
         let inner = res.expect("ok").expect("inner request");
         assert_eq!(inner.req_body.nonce, 77);
         assert_eq!(inner.msg_type, 12);
@@ -524,8 +537,8 @@ mod tests {
         assert_eq!(state.nonce, 77);
     }
 
-    #[test]
-    fn find_fast_without_fast_padata_returns_none() {
+    #[tokio::test]
+    async fn find_fast_without_fast_padata_returns_none() {
         let mut state = None;
         let req = KdcReq {
             pvno: 5,
@@ -533,67 +546,69 @@ mod tests {
             padata: None,
             req_body: body(1),
         };
-        let res = kdc().find_fast(
-            &req,
-            FastInputs {
-                checksummed: &[],
-                tgs_subkey: None,
-                tgs_session: None,
-            },
-            Utc::now(),
-            &mut state,
-        );
+        let res = kdc()
+            .find_fast(
+                &req,
+                FastInputs {
+                    checksummed: &[],
+                    tgs_subkey: None,
+                    tgs_session: None,
+                },
+                Utc::now(),
+                &mut state,
+            )
+            .await;
         assert!(res.expect("ok").is_none());
         assert!(state.is_none());
     }
 
-    #[test]
-    fn find_fast_tampered_checksummed_data_is_modified_and_armored() {
+    #[tokio::test]
+    async fn find_fast_tampered_checksummed_data_is_modified_and_armored() {
         let (sub, sess) = (key(1), key(2));
         let built = build(&sub, &sess, b"pa-tgs-req", None, &[]);
-        let (res, state) = run(&built, b"pa-tgs-reQ", Some(&sub), Some(&sess));
+        let (res, state) = run(&built, b"pa-tgs-reQ", Some(&sub), Some(&sess)).await;
         assert_eq!(res.expect_err("tampered").code, KRB_AP_ERR_MODIFIED);
         assert!(state.expect("armor recorded").armor_key.is_some());
     }
 
-    #[test]
-    fn find_fast_unknown_armor_type_is_preauth_failed_and_unarmored() {
+    #[tokio::test]
+    async fn find_fast_unknown_armor_type_is_preauth_failed_and_unarmored() {
         let (sub, sess) = (key(1), key(2));
         let armor = KrbFastArmor {
             armor_type: 2,
             armor_value: OctetString::from(Vec::new()),
         };
         let built = build(&sub, &sess, b"x", Some(armor), &[]);
-        let (res, state) = run(&built, b"x", None, None);
+        let (res, state) = run(&built, b"x", None, None).await;
         assert_eq!(res.expect_err("armor").code, KDC_ERR_PREAUTH_FAILED);
         assert!(state.is_none());
     }
 
-    #[test]
-    fn find_fast_no_armor_and_no_subkey_is_preauth_failed() {
+    #[tokio::test]
+    async fn find_fast_no_armor_and_no_subkey_is_preauth_failed() {
         let (sub, sess) = (key(1), key(2));
         let built = build(&sub, &sess, b"x", None, &[]);
-        let (res, _) = run(&built, b"x", None, None);
+        let (res, _) = run(&built, b"x", None, None).await;
         assert_eq!(res.expect_err("no armor").code, KDC_ERR_PREAUTH_FAILED);
     }
 
-    #[test]
-    fn find_fast_ap_request_armor_with_tgs_subkey_is_preauth_failed() {
+    #[tokio::test]
+    async fn find_fast_ap_request_armor_with_tgs_subkey_is_preauth_failed() {
         let (sub, sess) = (key(1), key(2));
         let armor = KrbFastArmor {
             armor_type: 1,
             armor_value: OctetString::from(vec![0x6E, 0]),
         };
         let built = build(&sub, &sess, b"x", Some(armor), &[]);
-        let (res, _) = run(&built, b"x", Some(&sub), Some(&sess));
+        let (res, _) = run(&built, b"x", Some(&sub), Some(&sess)).await;
         assert_eq!(res.expect_err("armor").code, KDC_ERR_PREAUTH_FAILED);
     }
 
-    #[test]
-    fn find_fast_critical_option_bit_is_unknown_critical_option() {
+    #[tokio::test]
+    async fn find_fast_critical_option_bit_is_unknown_critical_option() {
         let (sub, sess) = (key(1), key(2));
         let built = build(&sub, &sess, b"x", None, &[0x80, 0, 0, 0]);
-        let (res, state) = run(&built, b"x", Some(&sub), Some(&sess));
+        let (res, state) = run(&built, b"x", Some(&sub), Some(&sess)).await;
         assert_eq!(
             res.expect_err("critical").code,
             KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTION
@@ -601,11 +616,11 @@ mod tests {
         assert!(!state.expect("state").hide_client());
     }
 
-    #[test]
-    fn find_fast_non_critical_option_bit_is_accepted() {
+    #[tokio::test]
+    async fn find_fast_non_critical_option_bit_is_accepted() {
         let (sub, sess) = (key(1), key(2));
         let built = build(&sub, &sess, b"x", None, &[0, 0, 0x80, 0]);
-        let (res, _) = run(&built, b"x", Some(&sub), Some(&sess));
+        let (res, _) = run(&built, b"x", Some(&sub), Some(&sess)).await;
         assert!(res.expect("ok").is_some());
     }
 

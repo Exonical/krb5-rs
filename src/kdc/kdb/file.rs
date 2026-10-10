@@ -14,17 +14,60 @@ use std::time::{Duration, SystemTime};
 use chrono::Utc;
 use rasn::types::{GeneralString, OctetString};
 
-use super::format::{KdbFile, KdbKey, KdbPrincipal, MAGIC, VERSION};
+use super::format::{KdbFile, KdbKey, KdbPolicy, KdbPrincipal, MAGIC, VERSION};
 use super::master::{decrypt_key, encrypt_key, master_principal};
 use crate::kdc::db::{
-    random_keys, store_key, KeyEntry, PrincipalAttributes, PrincipalEntry, PrincipalStore,
-    StoreError, StoreKey,
+    random_keys, store_key, KeyEntry, PrincipalAttributes, PrincipalEntry, StoreKey,
 };
 use crate::kdc::policy::kerberos_time;
+use crate::kdc::store::{
+    AdminStore, HealthCheck, Policy, PolicyStore, PrincipalStore, StoreError, StoreErrorKind,
+};
 use crate::types::{EncryptionKey, KerberosTime, PrincipalName};
 
 fn err(msg: impl Into<String>) -> StoreError {
-    StoreError(msg.into())
+    StoreError::backend(msg)
+}
+
+fn policy_from_record(p: &KdbPolicy) -> Policy {
+    Policy {
+        name: String::from_utf8_lossy(p.name.as_bytes()).to_string(),
+        pw_min_life: p.pw_min_life,
+        pw_max_life: p.pw_max_life,
+        pw_min_length: p.pw_min_length,
+        pw_min_classes: p.pw_min_classes,
+        pw_history_num: p.pw_history_num,
+        pw_max_fail: p.pw_max_fail,
+        pw_failcnt_interval: p.pw_failcnt_interval,
+        pw_lockout_duration: p.pw_lockout_duration,
+        attributes: p.attributes,
+        max_life: p.max_life,
+        max_renewable_life: p.max_renewable_life,
+        allowed_keysalts: p
+            .allowed_keysalts
+            .as_ref()
+            .map(|g| String::from_utf8_lossy(g.as_bytes()).to_string()),
+        security_epoch: p.security_epoch.unwrap_or(0),
+    }
+}
+
+fn policy_to_record(p: &Policy) -> Result<KdbPolicy, StoreError> {
+    Ok(KdbPolicy {
+        name: general(&p.name)?,
+        pw_min_life: p.pw_min_life,
+        pw_max_life: p.pw_max_life,
+        pw_min_length: p.pw_min_length,
+        pw_min_classes: p.pw_min_classes,
+        pw_history_num: p.pw_history_num,
+        pw_max_fail: p.pw_max_fail,
+        pw_failcnt_interval: p.pw_failcnt_interval,
+        pw_lockout_duration: p.pw_lockout_duration,
+        attributes: p.attributes,
+        max_life: p.max_life,
+        max_renewable_life: p.max_renewable_life,
+        allowed_keysalts: p.allowed_keysalts.as_deref().map(general).transpose()?,
+        security_epoch: Some(p.security_epoch),
+    })
 }
 
 fn general(s: &str) -> Result<GeneralString, StoreError> {
@@ -66,6 +109,7 @@ struct Cache {
     stamp: Option<Stamp>,
     serial: u64,
     records: HashMap<StoreKey, KdbPrincipal>,
+    policies: HashMap<String, Policy>,
 }
 
 /// Persistent [`PrincipalStore`] in this crate's own file format (not MIT's
@@ -172,6 +216,9 @@ impl FileStore {
         let km = PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
             name: master_principal()?,
             realm: realm.to_string(),
             attributes: PrincipalAttributes::DISALLOW_ALL_TIX
@@ -190,6 +237,9 @@ impl FileStore {
         let tgs = PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
             name: tgs_name,
             realm: realm.to_string(),
             attributes: PrincipalAttributes::empty(),
@@ -208,6 +258,7 @@ impl FileStore {
             realm: general(realm)?,
             principals,
             serial: Some(1),
+            policies: None,
         };
         write_atomic(path, &file)?;
         store.refresh(true)?;
@@ -311,6 +362,9 @@ impl FileStore {
             keys,
             allowed_to_delegate_to: general_list(&e.allowed_to_delegate_to)?,
             allowed_to_delegate_from: general_list(&e.allowed_to_delegate_from)?,
+            policy: e.policy.as_deref().map(general).transpose()?,
+            security_epoch: (e.security_epoch != 0).then_some(e.security_epoch),
+            last_admin_unlock: e.last_admin_unlock,
         })
     }
 
@@ -336,6 +390,12 @@ impl FileStore {
                 keys,
                 allowed_to_delegate_to: string_list(&r.allowed_to_delegate_to),
                 allowed_to_delegate_from: string_list(&r.allowed_to_delegate_from),
+                policy: r
+                    .policy
+                    .as_ref()
+                    .map(|g| String::from_utf8_lossy(g.as_bytes()).to_string()),
+                security_epoch: r.security_epoch.unwrap_or(0),
+                last_admin_unlock: r.last_admin_unlock,
             },
             last_pwd_change: to_time(&r.last_pwd_change),
             mod_time: to_time(&r.mod_time),
@@ -361,11 +421,21 @@ impl FileStore {
                 (store_key(&p.name, &realm), p)
             })
             .collect();
+        let policies = file
+            .policies
+            .iter()
+            .flatten()
+            .map(|p| {
+                let policy = policy_from_record(p);
+                (policy.name.clone(), policy)
+            })
+            .collect();
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
         *cache = Cache {
             stamp: Some(stamp),
             serial: file.serial.unwrap_or(0),
             records,
+            policies,
         };
         Ok(())
     }
@@ -402,9 +472,17 @@ impl FileStore {
         &self,
         f: impl FnOnce(&mut Vec<KdbPrincipal>) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
+        self.modify_file(|file| f(&mut file.principals))
+    }
+
+    /// Run `f` over the whole on-disk file under the write lock.
+    fn modify_file<R>(
+        &self,
+        f: impl FnOnce(&mut KdbFile) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
         let _guard = self.lock()?;
         let (_, mut file) = read_file(&self.path)?;
-        let out = f(&mut file.principals)?;
+        let out = f(&mut file)?;
         file.serial = Some(file.serial.unwrap_or(0) + 1);
         write_atomic(&self.path, &file)?;
         self.refresh(true)?;
@@ -457,6 +535,43 @@ impl FileStore {
         })
     }
 
+    /// The policy called `name`.
+    pub fn get_policy(&self, name: &str) -> Result<Option<Policy>, StoreError> {
+        self.refresh(false)?;
+        Ok(self.read_cache().policies.get(name).cloned())
+    }
+
+    /// Insert or replace a policy.
+    pub fn put_policy(&self, policy: Policy) -> Result<(), StoreError> {
+        let record = policy_to_record(&policy)?;
+        self.modify_file(|file| {
+            let list = file.policies.get_or_insert_with(Vec::new);
+            list.retain(|p| p.name.as_bytes() != record.name.as_bytes());
+            list.push(record);
+            Ok(())
+        })
+    }
+
+    /// Remove a policy; returns whether it existed.
+    pub fn delete_policy(&self, name: &str) -> Result<bool, StoreError> {
+        self.modify_file(|file| {
+            let Some(list) = file.policies.as_mut() else {
+                return Ok(false);
+            };
+            let before = list.len();
+            list.retain(|p| p.name.as_bytes() != name.as_bytes());
+            Ok(list.len() != before)
+        })
+    }
+
+    /// Every policy, sorted by name.
+    pub fn list_policies(&self) -> Result<Vec<Policy>, StoreError> {
+        self.refresh(false)?;
+        let mut all: Vec<Policy> = self.read_cache().policies.values().cloned().collect();
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(all)
+    }
+
     /// Every principal with decrypted keys.
     pub fn list(&self) -> Result<Vec<PrincipalEntry>, StoreError> {
         self.refresh(false)?;
@@ -472,8 +587,86 @@ impl PrincipalStore for FileStore {
         &self,
         name: &PrincipalName,
         realm: &str,
-    ) -> Result<Option<PrincipalEntry>, StoreError> {
-        Ok(self.get_record(name, realm)?.map(|r| r.entry))
+    ) -> impl std::future::Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
+        std::future::ready(self.get_record(name, realm).map(|r| r.map(|r| r.entry)))
+    }
+}
+
+impl PolicyStore for FileStore {
+    fn policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Policy>, StoreError>> + Send {
+        std::future::ready(self.get_policy(name))
+    }
+}
+
+impl HealthCheck for FileStore {
+    fn health(&self) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(
+            self.refresh(false)
+                .map_err(|e| StoreError::new(StoreErrorKind::Unavailable, e.message().to_string())),
+        )
+    }
+}
+
+/// The file backend applies each operation under its write lock; the futures
+/// complete immediately.
+impl AdminStore for FileStore {
+    fn get_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl std::future::Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
+        std::future::ready(self.get_record(name, realm).map(|r| r.map(|r| r.entry)))
+    }
+
+    fn put_principal(
+        &self,
+        entry: PrincipalEntry,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(self.put(entry))
+    }
+
+    fn delete_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+        std::future::ready(self.delete(name, realm))
+    }
+
+    fn list_principals(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<PrincipalEntry>, StoreError>> + Send {
+        std::future::ready(self.list())
+    }
+
+    fn get_policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Policy>, StoreError>> + Send {
+        std::future::ready(FileStore::get_policy(self, name))
+    }
+
+    fn put_policy(
+        &self,
+        policy: Policy,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(FileStore::put_policy(self, policy))
+    }
+
+    fn delete_policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+        std::future::ready(FileStore::delete_policy(self, name))
+    }
+
+    fn list_policies(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<Policy>, StoreError>> + Send {
+        std::future::ready(FileStore::list_policies(self))
     }
 }
 
@@ -501,6 +694,9 @@ mod tests {
             keys: random_keys(1, &[18]).expect("keys"),
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
         }
     }
 

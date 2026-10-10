@@ -32,7 +32,8 @@ use krb5_rs::kdc::kdb::propagation::{
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, FileStore};
 use krb5_rs::kdc::{
     default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
-    MemoryStore, PrincipalAttributes, PrincipalStore, RealmConfig, RequestLogger, ServeOptions,
+    MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig, RequestLogger,
+    ServeOptions, StoreError,
 };
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
@@ -93,13 +94,34 @@ struct Listen {
     tcp: Vec<SocketAddr>,
 }
 
-type DynKdc = Kdc<Arc<dyn PrincipalStore>>;
+/// The store this process serves: the bootstrap keytab or the database file.
+/// (The store traits use native async, so they are not trait objects; the
+/// daemon picks the backend with an enum.)
+enum DaemonStore {
+    Memory(Arc<MemoryStore>),
+    File(Arc<FileStore>),
+}
+
+impl PrincipalStore for DaemonStore {
+    async fn lookup(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<PrincipalEntry>, StoreError> {
+        match self {
+            DaemonStore::Memory(s) => s.lookup(name, realm).await,
+            DaemonStore::File(s) => s.lookup(name, realm).await,
+        }
+    }
+}
+
+type DynKdc = Kdc<DaemonStore>;
 
 fn io_err(msg: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(msg.to_string())
 }
 
-fn keytab_mode(cli: &Cli, keytab: &Path) -> std::io::Result<(DynKdc, Listen)> {
+async fn keytab_mode(cli: &Cli, keytab: &Path) -> std::io::Result<(DynKdc, Listen)> {
     let realm = cli
         .realm
         .clone()
@@ -113,7 +135,7 @@ fn keytab_mode(cli: &Cli, keytab: &Path) -> std::io::Result<(DynKdc, Listen)> {
         .map_err(|e| io_err(format!("reading keytab {}: {e}", keytab.display())))?;
 
     let tgs = PrincipalName::new_srv_inst("krbtgt", &realm);
-    if store.lookup(&tgs, &realm).ok().flatten().is_none() {
+    if store.lookup(&tgs, &realm).await.ok().flatten().is_none() {
         warn!(
             "no krbtgt/{realm}@{realm} in keytab; generated a random one \
              (issued tickets will not survive a restart)"
@@ -136,9 +158,8 @@ fn keytab_mode(cli: &Cli, keytab: &Path) -> std::io::Result<(DynKdc, Listen)> {
         cli.listen.join(",")
     };
     let addrs = parse_listen_addresses(&spec, 88).map_err(io_err)?;
-    let store: Arc<dyn PrincipalStore> = Arc::new(store);
     Ok((
-        Kdc::new(config, store),
+        Kdc::new(config, DaemonStore::Memory(Arc::new(store))),
         Listen {
             udp: addrs.clone(),
             tcp: addrs,
@@ -272,7 +293,12 @@ async fn config_mode(
     let store = Arc::new(FileStore::open(&cfg.database_name, &master).map_err(io_err)?);
     if !cfg.propagation.listen.is_empty() {
         let service = principal(&cfg.propagation.service, &realm)?;
-        if store.lookup(&service, &realm).map_err(io_err)?.is_none() {
+        if store
+            .lookup(&service, &realm)
+            .await
+            .map_err(io_err)?
+            .is_none()
+        {
             return Err(io_err(format!(
                 "kprop service principal {} is not in the database",
                 cfg.propagation.service
@@ -283,7 +309,6 @@ async fn config_mode(
         server.logger = Some(prop_logger());
         parts.server = Some((Arc::clone(&store), server, cfg.propagation.listen.clone()));
     }
-    let kdc_store: Arc<dyn PrincipalStore> = store;
     let (udp, tcp) = if cli.listen.is_empty() {
         (cfg.udp_listen, cfg.tcp_listen)
     } else {
@@ -291,7 +316,9 @@ async fn config_mode(
         (addrs.clone(), addrs)
     };
     Ok(Some((
-        Kdc::new(cfg.kdc, kdc_store),
+        Kdc::builder(cfg.kdc, DaemonStore::File(Arc::clone(&store)))
+            .policies(Arc::clone(&store))
+            .build(),
         Listen { udp, tcp },
         parts,
     )))
@@ -331,7 +358,7 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
             if config_explicit {
                 return Err(io_err("--keytab and --config are mutually exclusive"));
             }
-            let (kdc, addrs) = keytab_mode(&cli, kt)?;
+            let (kdc, addrs) = keytab_mode(&cli, kt).await?;
             (kdc, addrs, PropParts::default())
         }
         None => {

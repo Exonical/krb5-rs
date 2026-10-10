@@ -412,10 +412,12 @@ impl KeySource for StoreKeys<'_> {
         {
             return Err(ApError::NotUs);
         }
-        let entry =
-            crate::kdc::PrincipalStore::lookup(self.store, self.service, self.store.realm())
-                .map_err(|_| ApError::NoKey)?
-                .ok_or(ApError::NoKey)?;
+        let entry = self
+            .store
+            .get_record(self.service, self.store.realm())
+            .map_err(|_| ApError::NoKey)?
+            .ok_or(ApError::NoKey)?
+            .entry;
         let mut etype_seen = false;
         for k in &entry.keys {
             if k.key.keytype != etype {

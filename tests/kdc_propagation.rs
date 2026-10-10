@@ -15,7 +15,7 @@ use krb5_rs::kdc::kdb::propagation::{
     PropEvent, PropSecret, PropServerConfig, PullOutcome,
 };
 use krb5_rs::kdc::kdb::{master_key_from_password, FileStore};
-use krb5_rs::kdc::{serve_tcp, Kdc, KdcConfig, PrincipalStore};
+use krb5_rs::kdc::{serve_tcp, Kdc, KdcConfig};
 use krb5_rs::keytab::{key_for_principal, FileKeytab, Keytab, KeytabEntry};
 use krb5_rs::protocol::ap::{ApReqOptions, AuthContext, AuthContextFlags};
 use krb5_rs::protocol::{
@@ -100,7 +100,7 @@ async fn start(tag: &str, acl: &[&str]) -> Env {
 
     let (shutdown, rx) = watch::channel(false);
 
-    let kdc_store: Arc<dyn PrincipalStore> = primary.clone();
+    let kdc_store = primary.clone();
     let kdc = Arc::new(Kdc::new(KdcConfig::new(REALM), kdc_store));
     let kdc_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let kdc_addr = kdc_listener.local_addr().expect("addr");
@@ -215,7 +215,7 @@ async fn login(addr: SocketAddr, user: &str, password: &str) -> Result<Credentia
 /// A KDC (on the replica's database) that answers over TCP.
 async fn replica_kdc(db: &Path) -> SocketAddr {
     let store = FileStore::open(db, &master()).expect("replica database opens");
-    let store: Arc<dyn PrincipalStore> = Arc::new(store);
+    let store = Arc::new(store);
     let kdc = Arc::new(Kdc::new(KdcConfig::new(REALM), store));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

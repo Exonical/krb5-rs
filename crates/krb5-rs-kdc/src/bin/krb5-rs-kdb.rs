@@ -13,8 +13,8 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use krb5_rs::kdc::kdb::admin::{
-    format_principal, parse_lifetime, parse_principal, parse_time, Admin, AttrChange,
-    PrincipalOptions,
+    format_policy, format_principal, parse_lifetime, parse_principal, parse_time, Admin,
+    AttrChange, PolicyChange, PrincipalOptions,
 };
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, write_stash, FileStore};
 use krb5_rs::kdc::{default_realm, RealmConfig};
@@ -26,7 +26,9 @@ fn usage() -> ! {
          commands:\n  init --master-password-file F [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash\n  \
          addprinc [-randkey] [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
          delprinc NAME\n  cpw [-randkey] [-keepold] NAME\n  \
-         modprinc [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] [-allow_delegate_to P]... [-allow_delegate_from P]... [-clear_delegate_to] [-clear_delegate_from] NAME\n  \
+         modprinc [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] [-allow_delegate_to P]... [-allow_delegate_from P]... [-clear_delegate_to] [-clear_delegate_from] [-policy P | -clearpolicy] [-unlock] NAME\n  \
+         addpol|modpol [-maxlife T] [-minlife T] [-minlength N] [-minclasses N] [-history N] [-maxfailure N] [-failurecountinterval T] [-lockoutduration T] [-allowedkeysalts K] POLICY\n  \
+         delpol POLICY\n  getpol [-terse] POLICY\n  listpols\n  \
          getprinc NAME\n  listprincs\n  ktadd -k PATH [-norandkey] NAME..."
     );
     std::process::exit(2);
@@ -125,6 +127,42 @@ fn init(args: Vec<String>, cfg: &RealmConfig, realm: &str) {
     }
 }
 
+/// Parse addpol/modpol options (kadmin.c:1646-1695); the policy name is the
+/// last argument.
+fn policy_change(args: Vec<String>) -> (PolicyChange, String) {
+    let mut change = PolicyChange::default();
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    let interval = |s: String| -> u32 {
+        let d = ok(parse_lifetime(&s));
+        d.map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
+    };
+    let number = |s: String| -> u32 {
+        s.parse()
+            .unwrap_or_else(|_| fail(format!("{s:?} is not a number")))
+    };
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-maxlife" => change.pw_max_life = Some(interval(next(&mut it))),
+            "-minlife" => change.pw_min_life = Some(interval(next(&mut it))),
+            "-minlength" => change.pw_min_length = Some(number(next(&mut it))),
+            "-minclasses" => change.pw_min_classes = Some(number(next(&mut it))),
+            "-history" => change.pw_history_num = Some(number(next(&mut it))),
+            "-maxfailure" => change.pw_max_fail = Some(number(next(&mut it))),
+            "-failurecountinterval" => change.pw_failcnt_interval = Some(interval(next(&mut it))),
+            "-lockoutduration" => change.pw_lockout_duration = Some(interval(next(&mut it))),
+            "-allowedkeysalts" => {
+                let v = next(&mut it);
+                change.allowed_keysalts = Some((v != "-").then_some(v));
+            }
+            s if s.starts_with('-') => usage(),
+            _ => rest.push(a),
+        }
+    }
+    let [name] = rest.as_slice() else { usage() };
+    (change, name.clone())
+}
+
 fn next(it: &mut std::vec::IntoIter<String>) -> String {
     it.next().unwrap_or_else(|| usage())
 }
@@ -147,6 +185,9 @@ fn principal_options(args: Vec<String>, randkey: &mut bool) -> (PrincipalOptions
             "-allow_delegate_from" => opts.delegate_from.push(next(&mut it)),
             "-clear_delegate_to" => opts.clear_delegate_to = true,
             "-clear_delegate_from" => opts.clear_delegate_from = true,
+            "-policy" => opts.policy = Some(Some(next(&mut it))),
+            "-clearpolicy" => opts.policy = Some(None),
+            "-unlock" => opts.unlock = true,
             s if s.starts_with('+')
                 || (s.starts_with('-') && s.len() > 1 && !s.starts_with("-r")) =>
             {
@@ -201,7 +242,10 @@ fn main() {
         .unwrap_or_else(|| fail("no realm given and no default realm found"));
     let cfg = ok(RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm));
 
-    let read_only_command = matches!(cmd.as_str(), "getprinc" | "listprincs" | "stash");
+    let read_only_command = matches!(
+        cmd.as_str(),
+        "getprinc" | "listprincs" | "getpol" | "listpols" | "stash"
+    );
     if cfg.propagation.is_replica() && !read_only_command && !force {
         fail(format!(
             "this is a replica of {} (kprop_primary is set), so its database is read-only; \nrun `{cmd}` on the primary, or pass --force to override",
@@ -288,6 +332,50 @@ fn main() {
             let (name, r) = principal(name);
             ok(admin.modify_principal(&name, &r, &opts));
             println!("Principal \"{name}@{r}\" modified.");
+        }
+        "addpol" => {
+            let (change, name) = policy_change(args);
+            ok(admin.add_policy(change.into_policy(&name)));
+            println!("Policy \"{name}\" created.");
+        }
+        "modpol" => {
+            let (change, name) = policy_change(args);
+            ok(admin.modify_policy(&name, &change));
+            println!("Policy \"{name}\" modified.");
+        }
+        "delpol" => {
+            let [name] = args.as_slice() else { usage() };
+            ok(admin.delete_policy(name));
+            println!("Policy \"{name}\" deleted.");
+        }
+        "getpol" => {
+            let terse = args.first().is_some_and(|a| a == "-terse");
+            let names: Vec<&String> = args.iter().filter(|a| *a != "-terse").collect();
+            let [name] = names.as_slice() else { usage() };
+            let p = ok(admin.get_policy(name));
+            if terse {
+                // kadmin.c:1813-1822 (policy_refcnt is always 0).
+                println!(
+                    "\"{}\"\t{}\t{}\t{}\t{}\t{}\t0\t{}\t{}\t{}\t{}",
+                    p.name,
+                    p.pw_max_life,
+                    p.pw_min_life,
+                    p.pw_min_length,
+                    p.pw_min_classes,
+                    p.pw_history_num,
+                    p.pw_max_fail,
+                    p.pw_failcnt_interval,
+                    p.pw_lockout_duration,
+                    p.allowed_keysalts.as_deref().unwrap_or("-")
+                );
+            } else {
+                print!("{}", format_policy(&p));
+            }
+        }
+        "listpols" => {
+            for p in ok(admin.list_policies()) {
+                println!("{p}");
+            }
         }
         "getprinc" => {
             let [name] = args.as_slice() else { usage() };

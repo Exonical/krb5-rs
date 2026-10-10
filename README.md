@@ -58,6 +58,12 @@ krb5-rs-kdc --config kdc.conf
 
 `deploy/docker/Dockerfile` builds a static, distroless, nonroot image with both binaries (`podman build -f deploy/docker/Dockerfile .`). The container user cannot bind port 88: configure `kdc_ports = 8888` and map 88 to 8888 outside.
 
+### Store interfaces, policies and lockout
+
+The KDC reads its data through async store traits in `krb5_rs::kdc::store` (`PrincipalStore`, `PolicyStore`, `AuthStateStore`, `AdminStore`, `AuthoritativeState`, `LockoutReporter`, `HealthCheck`, `ConsistencyGate`; design in `docs/architecture/kdb.md`). `Kdc::handle*` are therefore `async`. `Kdc::new(config, store)` keeps its old behaviour; `Kdc::builder(config, store)` injects policies, authentication state, a consistency gate and a lockout reporter.
+
+`krb5-rs-kdb` has MIT kadmin policy commands (`addpol`, `modpol`, `delpol`, `getpol [-terse]`, `listpols`; `-maxfailure`, `-failurecountinterval`, `-lockoutduration`, ...) and `addprinc`/`modprinc` `-policy NAME`, `-clearpolicy`, `-unlock`. A principal under a policy with `pw_max_fail` set is locked out after that many failed pre-authentications, following MIT's db2 lockout (`KDC_ERR_CLIENT_REVOKED`, status `LOCKED_OUT`). Failure counters are per KDC process and in memory for the File and Memory backends (not persisted); policies and administrative unlocks are persisted. `disable_lockout` / `disable_last_success` in `[dbmodules]` work as in MIT. Not in MIT: the KDC re-checks a local client at TGS time (disabled, expired, locked out), controllable with `KdcConfig::tgs_recheck_client`.
+
 ### Replicas (database propagation)
 
 For HA, one primary keeps the writable database and any number of stateless replicas pull it. This is MIT kprop/kpropd's idea reversed into a pull model (protocol `KRB5RS-PROP-1`, documented in `src/kdc/kdb/propagation.rs`): a replica authenticates to the primary's `kprop/primary` service with a Kerberos ticket (AP-REQ with mutual authentication), asks for the database naming the serial it already has, and receives the raw database file in KRB-PRIV blocks protected by the negotiated subkeys, unless it is current. The replica verifies size, SHA-256, format, realm and its master key, and only then renames the file over its database.

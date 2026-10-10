@@ -67,6 +67,10 @@ pub struct RequestSummary {
     pub reply_etype: Option<i32>,
     /// Enctype of the issued ticket (`tkt=`).
     pub ticket_etype: Option<i32>,
+    /// The consistency gate refused the request (`KDC_ERR_SVC_UNAVAILABLE`,
+    /// the only source of that code here): the hook for a
+    /// rejected-for-staleness metric.
+    pub gate_rejected: bool,
 }
 
 impl RequestSummary {
@@ -142,6 +146,10 @@ impl RequestSummary {
             },
         };
 
+        let gate_rejected = matches!(
+            outcome,
+            Outcome::Error { code, .. } if code == crate::types::error_codes::KDC_ERR_SVC_UNAVAILABLE
+        );
         Self {
             kind,
             transport,
@@ -151,6 +159,7 @@ impl RequestSummary {
             outcome,
             reply_etype,
             ticket_etype,
+            gate_rejected,
         }
     }
 
@@ -249,8 +258,8 @@ mod tests {
         "192.0.2.7:4000".parse().expect("addr")
     }
 
-    #[test]
-    fn preauth_required_is_summarised_with_mits_status_and_code() {
+    #[tokio::test]
+    async fn preauth_required_is_summarised_with_mits_status_and_code() {
         let kdc = kdc();
         let mut ex = AsExchange::new(
             AsExchangeConfig::new(PrincipalName::new_principal("alice"), REALM),
@@ -259,7 +268,7 @@ mod tests {
         let StepResult::SendToKdc { data, .. } = ex.step(&[]).expect("step") else {
             panic!("expected a request");
         };
-        let (_, s) = kdc.handle_summarized(&data, Transport::Udp);
+        let (_, s) = kdc.handle_summarized(&data, Transport::Udp).await;
         assert_eq!(s.kind, RequestKind::As);
         assert_eq!(s.client.as_deref(), Some("alice@R"));
         assert_eq!(s.server.as_deref(), Some("krbtgt/R@R"));
@@ -278,8 +287,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn issued_as_and_tgs_requests_report_the_client_and_enctypes() {
+    #[tokio::test]
+    async fn issued_as_and_tgs_requests_report_the_client_and_enctypes() {
         let kdc = kdc();
         let mut ex = AsExchange::new(
             AsExchangeConfig::new(PrincipalName::new_principal("alice"), REALM),
@@ -290,7 +299,7 @@ mod tests {
         while let StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } =
             ex.step(&input).expect("step")
         {
-            let (reply, s) = kdc.handle_summarized(&data, Transport::Tcp);
+            let (reply, s) = kdc.handle_summarized(&data, Transport::Tcp).await;
             input = reply;
             last = Some(s);
         }
@@ -313,7 +322,7 @@ mod tests {
         while let TgsStepResult::SendToKdc { data, .. } | TgsStepResult::RetryTcp { data, .. } =
             tgs.step(&input).expect("step")
         {
-            let (reply, s) = kdc.handle_summarized(&data, Transport::Udp);
+            let (reply, s) = kdc.handle_summarized(&data, Transport::Udp).await;
             input = reply;
             last = Some(s);
         }
@@ -324,9 +333,9 @@ mod tests {
         assert_eq!(s.server.as_deref(), Some("HTTP/h.r@R"));
     }
 
-    #[test]
-    fn garbage_is_an_unknown_request_error() {
-        let (reply, s) = kdc().handle_summarized(&[1, 2, 3], Transport::Udp);
+    #[tokio::test]
+    async fn garbage_is_an_unknown_request_error() {
+        let (reply, s) = kdc().handle_summarized(&[1, 2, 3], Transport::Udp).await;
         assert!(!reply.is_empty());
         assert_eq!(s.kind, RequestKind::Unknown);
         assert_eq!(

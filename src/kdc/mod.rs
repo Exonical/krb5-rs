@@ -10,8 +10,9 @@
 //! transited-path policy follow MIT (see [`KdcConfig::realm_profile`]). Tickets
 //! carry an MS-PAC with client info and signatures, issued, verified and
 //! re-signed as MIT's `handle_pac` does (see [`crate::pac`]); there is no
-//! logon-information source. No PKINIT, S4U, user-to-user, postdating,
-//! validation, proxy tickets, lockout or lookaside cache.
+//! logon-information source. No user-to-user, postdating, validation, proxy
+//! tickets or lookaside cache. Principal lockout follows MIT's db2 module
+//! (see [`lockout`]).
 //! FAST (RFC 6113) armor, encrypted challenge and armored replies/errors are
 //! handled in the `fast` module.
 
@@ -22,6 +23,7 @@ mod db;
 mod error;
 mod fast;
 pub mod kdb;
+pub mod lockout;
 mod pkinit;
 mod policy;
 mod preauth;
@@ -29,6 +31,7 @@ mod reqbody;
 mod s4u;
 #[cfg(feature = "tokio")]
 mod server;
+pub mod store;
 mod summary;
 mod tgs_req;
 
@@ -50,8 +53,18 @@ pub use config::{
 };
 pub use db::{
     keys_from_password, random_keys, salt_bytes, KeyEntry, MemoryStore, PrincipalAttributes,
-    PrincipalEntry, PrincipalStore, StoreError,
+    PrincipalEntry,
 };
+pub use store::{
+    AdminStore, AlwaysAllow, AuthState, AuthStateStore, AuthStateUpdate, AuthoritativeState,
+    ConsistencyGate, GateDecision, HealthCheck, LockoutReport, LockoutReporter, MemoryAuthState,
+    NoPolicies, NoopLockoutReporter, Policy, PolicyStore, PrincipalStore, SecurityState,
+    StoreError, StoreErrorKind,
+};
+
+use std::sync::Arc;
+
+use store::{DynAuthState, DynGate, DynPolicies};
 
 use db::KvnoSel;
 use error::{build_krb_error, krbtgt_name, ErrorContext, Failure, KdcError};
@@ -99,6 +112,16 @@ pub struct KdcConfig {
     /// MIT `disable_pac` (kdc.conf realm relation, kdc/main.c:338): never
     /// issue a PAC.
     pub disable_pac: bool,
+    /// MIT db2 `disable_lockout` (`[dbmodules]`, kdb_db2.c:273-277): never
+    /// check or count failed authentications.
+    pub disable_lockout: bool,
+    /// MIT db2 `disable_last_success` (kdb_db2.c:267-271): do not record the
+    /// time of the last successful authentication.
+    pub disable_last_success: bool,
+    /// krb5-rs extension (not in MIT, whose TGS path never re-reads the header
+    /// ticket's client): re-check a local client at TGS time and refuse it
+    /// when it is now disabled, expired or locked out. Default true.
+    pub tgs_recheck_client: bool,
     /// PKINIT settings; `None` leaves PKINIT off (MIT: no `pkinit_identity`).
     #[cfg(feature = "pkinit")]
     pub pkinit: Option<std::sync::Arc<crate::pkinit::server::ServerConfig>>,
@@ -122,6 +145,9 @@ impl KdcConfig {
             no_host_referral: Vec::new(),
             reject_bad_transit: true,
             disable_pac: false,
+            disable_lockout: false,
+            disable_last_success: false,
+            tgs_recheck_client: true,
             #[cfg(feature = "pkinit")]
             pkinit: None,
         }
@@ -132,23 +158,97 @@ impl KdcConfig {
 pub struct Kdc<S: PrincipalStore> {
     config: KdcConfig,
     store: S,
+    policies: Arc<dyn DynPolicies>,
+    auth_state: Arc<dyn DynAuthState>,
+    gate: Arc<dyn DynGate>,
+    reporter: Arc<dyn LockoutReporter>,
+}
+
+/// Builds a [`Kdc`] with injected services (docs/architecture/kdb.md §3).
+///
+/// The principal store is a generic parameter of [`Kdc`] (the hot path stays
+/// statically dispatched); the other services are type-erased through private
+/// object-safe adapters, so the public API is one family of native async
+/// traits. Every service defaults to the behaviour `Kdc::new` always had:
+/// no policies (lockout inert), in-memory authentication state, an
+/// always-allow consistency gate and a no-op lockout reporter.
+pub struct KdcBuilder<S: PrincipalStore> {
+    config: KdcConfig,
+    store: S,
+    policies: Arc<dyn DynPolicies>,
+    auth_state: Arc<dyn DynAuthState>,
+    gate: Arc<dyn DynGate>,
+    reporter: Arc<dyn LockoutReporter>,
+}
+
+impl<S: PrincipalStore> KdcBuilder<S> {
+    /// Use `policies` to resolve a principal's policy name (lockout
+    /// parameters).
+    pub fn policies(mut self, policies: impl PolicyStore + 'static) -> Self {
+        self.policies = Arc::new(policies);
+        self
+    }
+
+    /// Keep failure counters and last-success times in `state`.
+    pub fn auth_state(mut self, state: impl AuthStateStore + 'static) -> Self {
+        self.auth_state = Arc::new(state);
+        self
+    }
+
+    /// Consult `gate` before issuing tickets (replica freshness, strict
+    /// authoritative checks).
+    pub fn consistency(mut self, gate: impl ConsistencyGate + 'static) -> Self {
+        self.gate = Arc::new(gate);
+        self
+    }
+
+    /// Report tripped lockouts to `reporter`.
+    pub fn lockout_reporter(mut self, reporter: impl LockoutReporter + 'static) -> Self {
+        self.reporter = Arc::new(reporter);
+        self
+    }
+
+    /// Finish.
+    pub fn build(self) -> Kdc<S> {
+        Kdc {
+            config: self.config,
+            store: self.store,
+            policies: self.policies,
+            auth_state: self.auth_state,
+            gate: self.gate,
+            reporter: self.reporter,
+        }
+    }
 }
 
 impl<S: PrincipalStore> Kdc<S> {
-    /// Create a KDC. The store must hold `krbtgt/REALM@REALM`.
+    /// Create a KDC. The store must hold `krbtgt/REALM@REALM`. Equivalent to
+    /// `Kdc::builder(config, store).build()`.
     pub fn new(config: KdcConfig, store: S) -> Self {
-        Self { config, store }
+        Self::builder(config, store).build()
+    }
+
+    /// Start a [`KdcBuilder`].
+    pub fn builder(config: KdcConfig, store: S) -> KdcBuilder<S> {
+        KdcBuilder {
+            config,
+            store,
+            policies: Arc::new(NoPolicies),
+            auth_state: Arc::new(MemoryAuthState::new()),
+            gate: Arc::new(AlwaysAllow),
+            reporter: Arc::new(NoopLockoutReporter),
+        }
     }
 
     /// Process one DER request at the current time; always returns DER
     /// (AS-REP, TGS-REP or KRB-ERROR).
-    pub fn handle(&self, request: &[u8]) -> Vec<u8> {
-        self.handle_at(request, Utc::now())
+    pub async fn handle(&self, request: &[u8]) -> Vec<u8> {
+        self.handle_at(request, Utc::now()).await
     }
 
     /// [`Kdc::handle`] with an injectable clock.
-    pub fn handle_at(&self, request: &[u8], now: DateTime<Utc>) -> Vec<u8> {
-        match self.dispatch(request, now) {
+    pub async fn handle_at(&self, request: &[u8], now: DateTime<Utc>) -> Vec<u8> {
+        match self.dispatch(request, now).await {
             Ok(reply) => reply,
             Err(f) => build_krb_error(&f.err, &f.ctx, now),
         }
@@ -157,13 +257,13 @@ impl<S: PrincipalStore> Kdc<S> {
     /// [`Kdc::handle`] for a UDP datagram: a reply longer than
     /// `max_dgram_reply_size` is replaced by `KRB_ERR_RESPONSE_TOO_BIG`
     /// (MIT `finish_dispatch`, dispatch.c:54-63).
-    pub fn handle_udp(&self, request: &[u8]) -> Vec<u8> {
-        self.handle_udp_at(request, Utc::now())
+    pub async fn handle_udp(&self, request: &[u8]) -> Vec<u8> {
+        self.handle_udp_at(request, Utc::now()).await
     }
 
     /// [`Kdc::handle_udp`] with an injectable clock.
-    pub fn handle_udp_at(&self, request: &[u8], now: DateTime<Utc>) -> Vec<u8> {
-        let reply = self.handle_at(request, now);
+    pub async fn handle_udp_at(&self, request: &[u8], now: DateTime<Utc>) -> Vec<u8> {
+        let reply = self.handle_at(request, now).await;
         if reply.len() > self.config.max_dgram_reply_size {
             return self.bare_error(KRB_ERR_RESPONSE_TOO_BIG, now);
         }
@@ -172,14 +272,14 @@ impl<S: PrincipalStore> Kdc<S> {
 
     /// Process one request like [`Kdc::handle`] (or [`Kdc::handle_udp`] for
     /// [`Transport::Udp`]) and summarise it for logging.
-    pub fn handle_summarized(
+    pub async fn handle_summarized(
         &self,
         request: &[u8],
         transport: Transport,
     ) -> (Vec<u8>, RequestSummary) {
         let reply = match transport {
-            Transport::Udp => self.handle_udp(request),
-            Transport::Tcp => self.handle(request),
+            Transport::Udp => self.handle_udp(request).await,
+            Transport::Tcp => self.handle(request).await,
         };
         let summary = RequestSummary::new(request, &reply, transport);
         (reply, summary)
@@ -199,7 +299,7 @@ impl<S: PrincipalStore> Kdc<S> {
     }
 
     /// MIT `dispatch` (dispatch.c:89-175).
-    fn dispatch(&self, request: &[u8], now: DateTime<Utc>) -> Result<Vec<u8>, Box<Failure>> {
+    async fn dispatch(&self, request: &[u8], now: DateTime<Utc>) -> Result<Vec<u8>, Box<Failure>> {
         let local = self.local_context();
         let fail = |err: KdcError, ctx: &ErrorContext| {
             Box::new(Failure {
@@ -237,9 +337,9 @@ impl<S: PrincipalStore> Kdc<S> {
         }
 
         let result = if is_as {
-            self.process_as_req(&decoded, request, now, &mut ctx)
+            self.process_as_req(&decoded, request, now, &mut ctx).await
         } else {
-            self.process_tgs_req(&decoded, request, now, &mut ctx)
+            self.process_tgs_req(&decoded, request, now, &mut ctx).await
         };
         result.map_err(|err| Box::new(Failure { err, ctx }))
     }
@@ -293,24 +393,45 @@ impl<S: PrincipalStore> Kdc<S> {
         }
     }
 
-    fn lookup(
+    async fn lookup(
         &self,
         name: &PrincipalName,
         realm: &str,
         status: &str,
     ) -> Result<Option<PrincipalEntry>, KdcError> {
+        // A store that cannot be reached (or is too stale) is an unavailable
+        // service, so clients move on to another KDC: MIT maps
+        // KRB5_KDB_CANTLOCK_DB the same way (do_as_req.c:578-579, 597-598).
         self.store
             .lookup(name, realm)
-            .map_err(|_| KdcError::generic(status))
+            .await
+            .map_err(|e| match e.kind() {
+                StoreErrorKind::Unavailable | StoreErrorKind::Stale => {
+                    KdcError::new(KDC_ERR_SVC_UNAVAILABLE, status)
+                }
+                _ => KdcError::generic(status),
+            })
+    }
+
+    /// Ask the consistency gate whether tickets involving `principals` may
+    /// be issued (docs/architecture/kdb.md §7); a rejection is
+    /// `KDC_ERR_SVC_UNAVAILABLE` with the gate's reason as status, which lets
+    /// clients fail over to another KDC.
+    async fn consistency_gate(&self, principals: &[&PrincipalEntry]) -> Result<(), KdcError> {
+        match self.gate.check(principals).await {
+            GateDecision::Allow => Ok(()),
+            GateDecision::Reject { reason } => Err(KdcError::new(KDC_ERR_SVC_UNAVAILABLE, &reason)),
+        }
     }
 
     /// `get_local_tgt` (MIT kdc_util.c:485-525): the local krbtgt must exist
     /// and have a usable current key.
-    fn require_local_tgt(&self) -> Result<PrincipalEntry, KdcError> {
+    async fn require_local_tgt(&self) -> Result<PrincipalEntry, KdcError> {
         const STATUS: &str = "GET_LOCAL_TGT";
         let name = krbtgt_name(&self.config.realm)?;
         let tgt = self
-            .lookup(&name, &self.config.realm, STATUS)?
+            .lookup(&name, &self.config.realm, STATUS)
+            .await?
             .ok_or_else(|| KdcError::generic(STATUS))?;
         tgt.find_key(None, KvnoSel::Highest, &self.permitted())
             .ok_or_else(|| KdcError::generic(STATUS))?;
@@ -353,18 +474,18 @@ mod tests {
         rasn::der::decode(der).expect("KRB-ERROR")
     }
 
-    #[test]
-    fn handle_udp_reply_within_limit_is_unchanged() {
-        let reply = kdc(4096).handle_udp(&[1, 2, 3]);
+    #[tokio::test]
+    async fn handle_udp_reply_within_limit_is_unchanged() {
+        let reply = kdc(4096).handle_udp(&[1, 2, 3]).await;
         assert_eq!(decode(&reply).error_code, KRB_AP_ERR_MSG_TYPE);
     }
 
-    #[test]
-    fn handle_udp_oversize_reply_becomes_response_too_big() {
+    #[tokio::test]
+    async fn handle_udp_oversize_reply_becomes_response_too_big() {
         let k = kdc(10);
-        let full = k.handle(&[1, 2, 3]);
+        let full = k.handle(&[1, 2, 3]).await;
         assert!(full.len() > 10);
-        let err = decode(&k.handle_udp(&[1, 2, 3]));
+        let err = decode(&k.handle_udp(&[1, 2, 3]).await);
         assert_eq!(err.error_code, KRB_ERR_RESPONSE_TOO_BIG);
         assert!(err.cname.is_none() && err.crealm.is_none());
         assert!(err.e_text.is_none() && err.e_data.is_none());
@@ -372,10 +493,10 @@ mod tests {
         assert_eq!(err.sname.to_string(), "krbtgt/R");
     }
 
-    #[test]
-    fn handle_udp_reply_exactly_at_limit_is_not_replaced() {
-        let probe = kdc(4096).handle(&[1, 2, 3]);
-        let reply = kdc(probe.len()).handle_udp(&[1, 2, 3]);
+    #[tokio::test]
+    async fn handle_udp_reply_exactly_at_limit_is_not_replaced() {
+        let probe = kdc(4096).handle(&[1, 2, 3]).await;
+        let reply = kdc(probe.len()).handle_udp(&[1, 2, 3]).await;
         assert_eq!(decode(&reply).error_code, KRB_AP_ERR_MSG_TYPE);
     }
 }
