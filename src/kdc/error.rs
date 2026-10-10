@@ -1,0 +1,181 @@
+//! Internal KDC error type and KRB-ERROR construction (MIT do_as_req.c
+//! `prepare_error_as`, do_tgs_req.c `prepare_error_tgs`, kdc_util.c
+//! `errcode_to_protocol`).
+
+use chrono::{DateTime, Utc};
+use rasn::types::{GeneralString, OctetString};
+
+use crate::protocol::ap::ApError;
+use crate::types::error_codes::*;
+use crate::types::{KrbErrorMsg, PrincipalName};
+use crate::Krb5Error;
+
+/// KRB_AP_ERR_ILL_CR_TKT (not in [`crate::types::error_codes`]).
+const KRB_AP_ERR_ILL_CR_TKT: i32 = 43;
+
+/// A KDC processing failure: protocol error code plus optional text/e-data.
+#[derive(Debug, Clone)]
+pub(crate) struct KdcError {
+    /// KRB-ERROR error-code.
+    pub code: i32,
+    /// KRB-ERROR e-text (MIT status string).
+    pub e_text: Option<String>,
+    /// KRB-ERROR e-data.
+    pub e_data: Option<Vec<u8>>,
+}
+
+impl KdcError {
+    /// An error with a short status string.
+    pub(crate) fn new(code: i32, text: &str) -> Self {
+        Self {
+            code,
+            e_text: Some(text.to_string()),
+            e_data: None,
+        }
+    }
+
+    /// `KRB_ERR_GENERIC` with a status string.
+    pub(crate) fn generic(text: &str) -> Self {
+        Self::new(KRB_ERR_GENERIC, text)
+    }
+
+    /// Attach e-data.
+    pub(crate) fn with_e_data(mut self, e_data: Vec<u8>) -> Self {
+        self.e_data = Some(e_data);
+        self
+    }
+}
+
+impl From<rasn::error::EncodeError> for KdcError {
+    fn from(_: rasn::error::EncodeError) -> Self {
+        Self::generic("ENCODE_FAILURE")
+    }
+}
+
+impl From<Krb5Error> for KdcError {
+    fn from(e: Krb5Error) -> Self {
+        match e {
+            Krb5Error::Ap(a) => Self::new(ap_error_code(a), "AP_ERROR"),
+            _ => Self::generic("INTERNAL_ERROR"),
+        }
+    }
+}
+
+/// Protocol code for an AP-layer error (`errcode_to_protocol`, kdc_util.c:
+/// 692-698; codes outside the protocol range become `KRB_ERR_GENERIC`).
+pub(crate) fn ap_error_code(e: ApError) -> i32 {
+    match e {
+        ApError::BadIntegrity => KRB_AP_ERR_BAD_INTEGRITY,
+        ApError::TktExpired => KRB_AP_ERR_TKT_EXPIRED,
+        ApError::TktNyv | ApError::TktInvalid => KRB_AP_ERR_TKT_NYV,
+        ApError::Repeat => KRB_AP_ERR_REPEAT,
+        ApError::NotUs => KRB_AP_ERR_NOT_US,
+        ApError::BadMatch => KRB_AP_ERR_BADMATCH,
+        ApError::Skew => KRB_AP_ERR_SKEW,
+        ApError::BadAddr => KRB_AP_ERR_BADADDR,
+        ApError::BadVersion => KRB_AP_ERR_BADVERSION,
+        ApError::MsgType => KRB_AP_ERR_MSG_TYPE,
+        ApError::Modified => KRB_AP_ERR_MODIFIED,
+        ApError::BadOrder => KRB_AP_ERR_BADORDER,
+        ApError::BadKeyver => KRB_AP_ERR_BADKEYVER,
+        ApError::NoKey => KRB_AP_ERR_NOKEY,
+        ApError::MutualFailed => KRB_AP_ERR_MUT_FAIL,
+        ApError::InappCksum => KRB_AP_ERR_INAPP_CKSUM,
+        ApError::SumTypeNoSupp => KDC_ERR_SUMTYPE_NOSUPP,
+        ApError::IllCrTkt => KRB_AP_ERR_ILL_CR_TKT,
+        ApError::NoPermEtype | ApError::LocalAddrRequired | ApError::NoTktSupplied => {
+            KRB_ERR_GENERIC
+        }
+    }
+}
+
+/// Request-derived fields echoed in a KRB-ERROR.
+#[derive(Debug, Clone)]
+pub(crate) struct ErrorContext {
+    /// Server realm (KRB-ERROR `realm`).
+    pub realm: String,
+    /// Server name (KRB-ERROR `sname`).
+    pub sname: PrincipalName,
+    /// Client realm, if known.
+    pub crealm: Option<String>,
+    /// Client name, if known.
+    pub cname: Option<PrincipalName>,
+}
+
+/// A failure bundled with the context for its KRB-ERROR.
+#[derive(Debug, Clone)]
+pub(crate) struct Failure {
+    /// The error.
+    pub err: KdcError,
+    /// KRB-ERROR echo fields.
+    pub ctx: ErrorContext,
+}
+
+/// Convert text to a GeneralString.
+pub(crate) fn general_string(s: &str) -> Result<GeneralString, KdcError> {
+    GeneralString::from_bytes(s.as_bytes()).map_err(|_| KdcError::generic("INVALID_STRING"))
+}
+
+/// `krbtgt/REALM` (name type NT-SRV-INST).
+pub(crate) fn krbtgt_name(realm: &str) -> Result<PrincipalName, KdcError> {
+    Ok(PrincipalName {
+        name_type: 2,
+        name_string: vec![general_string("krbtgt")?, general_string(realm)?],
+    })
+}
+
+/// Build a DER KRB-ERROR (MIT krb5_mk_error as used by prepare_error_as /
+/// prepare_error_tgs: ctime/cusec unset, stime/susec = KDC time).
+pub(crate) fn build_krb_error(err: &KdcError, ctx: &ErrorContext, now: DateTime<Utc>) -> Vec<u8> {
+    let fallback = |s: &str| GeneralString::from_bytes(s.as_bytes()).unwrap_or_default();
+    let msg = KrbErrorMsg {
+        pvno: 5,
+        msg_type: 30,
+        ctime: None,
+        cusec: None,
+        stime: now.fixed_offset(),
+        susec: i32::try_from(now.timestamp_subsec_micros()).unwrap_or(0),
+        error_code: err.code,
+        crealm: ctx.crealm.as_deref().map(fallback),
+        cname: ctx.cname.clone(),
+        realm: fallback(&ctx.realm),
+        sname: ctx.sname.clone(),
+        e_text: err.e_text.as_deref().map(fallback),
+        e_data: err.e_data.clone().map(OctetString::from),
+    };
+    rasn::der::encode(&msg).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ap_error_code_maps_protocol_codes() {
+        assert_eq!(ap_error_code(ApError::TktExpired), 32);
+        assert_eq!(ap_error_code(ApError::BadIntegrity), 31);
+        assert_eq!(ap_error_code(ApError::Skew), 37);
+        assert_eq!(ap_error_code(ApError::BadKeyver), 44);
+        assert_eq!(ap_error_code(ApError::NoKey), 45);
+        assert_eq!(ap_error_code(ApError::NoPermEtype), 60);
+    }
+
+    #[test]
+    fn build_krb_error_roundtrips_fields() {
+        let ctx = ErrorContext {
+            realm: "R".into(),
+            sname: krbtgt_name("R").expect("name"),
+            crealm: None,
+            cname: None,
+        };
+        let der = build_krb_error(&KdcError::new(6, "CLIENT_NOT_FOUND"), &ctx, Utc::now());
+        let got: KrbErrorMsg = rasn::der::decode(&der).expect("decode");
+        assert_eq!(got.error_code, 6);
+        assert_eq!(got.msg_type, 30);
+        assert!(got.ctime.is_none() && got.cusec.is_none());
+        assert_eq!(
+            got.e_text.as_ref().map(|t| t.as_bytes().to_vec()),
+            Some(b"CLIENT_NOT_FOUND".to_vec())
+        );
+    }
+}

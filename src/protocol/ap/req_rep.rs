@@ -168,7 +168,11 @@ impl AuthContext {
         let plain = session_profile
             .decrypt(
                 session.key_bytes(),
-                key_usage::AP_REQ_AUTH,
+                if self.tgs_req {
+                    key_usage::TGS_REQ_AUTH
+                } else {
+                    key_usage::AP_REQ_AUTH
+                },
                 &req.authenticator.cipher,
             )
             .map_err(|_| Krb5Error::Ap(ApError::BadIntegrity))?;
@@ -217,7 +221,7 @@ impl AuthContext {
         self.validate_times(enc_part.authtime, enc_part.starttime, enc_part.endtime)?;
         self.check_clockskew(auth.ctime)?;
 
-        if enc_part.flags.contains(TicketFlags::INVALID) {
+        if !self.tgs_req && enc_part.flags.contains(TicketFlags::INVALID) {
             return Err(ApError::TktInvalid.into());
         }
 
