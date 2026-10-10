@@ -112,6 +112,8 @@ mod kdc {
         let name = PrincipalName::new_principal("p");
         store
             .put(krb5_rs::kdc::PrincipalEntry {
+                allowed_to_delegate_to: Vec::new(),
+                allowed_to_delegate_from: Vec::new(),
                 name,
                 realm: "R".into(),
                 attributes: krb5_rs::kdc::PrincipalAttributes::empty(),

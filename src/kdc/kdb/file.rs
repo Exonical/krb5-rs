@@ -31,6 +31,23 @@ fn general(s: &str) -> Result<GeneralString, StoreError> {
     GeneralString::from_bytes(s.as_bytes()).map_err(|_| err(format!("invalid string {s:?}")))
 }
 
+fn general_list(l: &[String]) -> Result<Option<Vec<GeneralString>>, StoreError> {
+    if l.is_empty() {
+        return Ok(None);
+    }
+    l.iter()
+        .map(|s| general(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn string_list(l: &Option<Vec<GeneralString>>) -> Vec<String> {
+    l.iter()
+        .flatten()
+        .map(|g| String::from_utf8_lossy(g.as_bytes()).to_string())
+        .collect()
+}
+
 /// A database record: the principal plus bookkeeping the KDC does not use.
 #[derive(Debug, Clone)]
 pub struct PrincipalRecord {
@@ -147,6 +164,8 @@ impl FileStore {
             s2kparams: None,
         };
         let km = PrincipalEntry {
+            allowed_to_delegate_to: Vec::new(),
+            allowed_to_delegate_from: Vec::new(),
             name: master_principal()?,
             realm: realm.to_string(),
             attributes: PrincipalAttributes::DISALLOW_ALL_TIX
@@ -163,6 +182,8 @@ impl FileStore {
             name_string: vec![general("krbtgt")?, general(realm)?],
         };
         let tgs = PrincipalEntry {
+            allowed_to_delegate_to: Vec::new(),
+            allowed_to_delegate_from: Vec::new(),
             name: tgs_name,
             realm: realm.to_string(),
             attributes: PrincipalAttributes::empty(),
@@ -242,6 +263,8 @@ impl FileStore {
             last_pwd_change,
             mod_time,
             keys,
+            allowed_to_delegate_to: general_list(&e.allowed_to_delegate_to)?,
+            allowed_to_delegate_from: general_list(&e.allowed_to_delegate_from)?,
         })
     }
 
@@ -265,6 +288,8 @@ impl FileStore {
                 expiration: to_time(&r.expiration),
                 pw_expiration: to_time(&r.pw_expiration),
                 keys,
+                allowed_to_delegate_to: string_list(&r.allowed_to_delegate_to),
+                allowed_to_delegate_from: string_list(&r.allowed_to_delegate_from),
             },
             last_pwd_change: to_time(&r.last_pwd_change),
             mod_time: to_time(&r.mod_time),

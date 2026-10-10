@@ -571,7 +571,12 @@ impl Pac {
 /// `krb5_unparse_name_flags`: components joined by `/`, escaping `\`, `/`
 /// and `@` (and control characters) unless `display`; the realm follows `@`
 /// unless `no_realm`.
-fn unparse_name(name: &PrincipalName, realm: &str, display: bool, with_realm: bool) -> String {
+pub(crate) fn unparse_name(
+    name: &PrincipalName,
+    realm: &str,
+    display: bool,
+    with_realm: bool,
+) -> String {
     let esc = |s: &str| -> String {
         if display {
             return s.to_string();
@@ -647,7 +652,9 @@ pub fn ticket_pac(enc_part: &EncTicketPart) -> Result<Option<Pac>> {
     Ok(found)
 }
 
+mod ndr;
 mod ticket;
+pub use ndr::DelegationInfo;
 #[cfg(any(feature = "kdc", test))]
 pub(crate) use ticket::kdc_sign_ticket;
 pub(crate) use ticket::kdc_verify_ticket;

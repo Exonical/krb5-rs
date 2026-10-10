@@ -177,6 +177,32 @@ pub struct PrincipalOptions {
     pub expiration: Option<Option<KerberosTime>>,
     /// Password expiration.
     pub pw_expiration: Option<Option<KerberosTime>>,
+    /// Clear the traditional S4U2Proxy target list first.
+    pub clear_delegate_to: bool,
+    /// Principals added to the traditional S4U2Proxy target list
+    /// (`-allow_delegate_to`; this tool's own option, MIT has no kadmin
+    /// equivalent outside LDAP).
+    pub delegate_to: Vec<String>,
+    /// Clear the resource-based (RBCD) delegator list first.
+    pub clear_delegate_from: bool,
+    /// Principals added to the RBCD delegator list (`-allow_delegate_from`).
+    pub delegate_from: Vec<String>,
+}
+
+fn update_list(list: &mut Vec<String>, clear: bool, add: &[String], realm: &str) {
+    if clear {
+        list.clear();
+    }
+    for name in add {
+        let full = if name.contains('@') {
+            name.clone()
+        } else {
+            format!("{name}@{realm}")
+        };
+        if !list.contains(&full) {
+            list.push(full);
+        }
+    }
 }
 
 /// Administration operations over a [`FileStore`].
@@ -212,6 +238,19 @@ impl<'a> Admin<'a> {
         if let Some(v) = &opts.pw_expiration {
             entry.pw_expiration = *v;
         }
+        let realm = entry.realm.clone();
+        update_list(
+            &mut entry.allowed_to_delegate_to,
+            opts.clear_delegate_to,
+            &opts.delegate_to,
+            &realm,
+        );
+        update_list(
+            &mut entry.allowed_to_delegate_from,
+            opts.clear_delegate_from,
+            &opts.delegate_from,
+            &realm,
+        );
     }
 
     /// `addprinc` (`kadm5_create_principal`): kvno 1, keys from `password`
@@ -234,6 +273,8 @@ impl<'a> Admin<'a> {
         }
         .map_err(|e| err(e.to_string()))?;
         let mut entry = PrincipalEntry {
+            allowed_to_delegate_to: Vec::new(),
+            allowed_to_delegate_from: Vec::new(),
             name: name.clone(),
             realm: realm.to_string(),
             attributes: PrincipalAttributes::empty(),
@@ -391,6 +432,14 @@ pub fn format_principal(rec: &PrincipalRecord) -> String {
     out += &format!("Maximum ticket life: {}\n", life(e.max_life));
     out += &format!("Maximum renewable life: {}\n", life(e.max_renewable_life));
     out += &format!("Last modified: {}\n", time(&rec.mod_time));
+    for (label, list) in [
+        ("Allowed to delegate to", &e.allowed_to_delegate_to),
+        ("Allowed to delegate from", &e.allowed_to_delegate_from),
+    ] {
+        if !list.is_empty() {
+            out += &format!("{label}: {}\n", list.join(", "));
+        }
+    }
     out += &format!("Number of keys: {}\n", e.keys.len());
     for k in &e.keys {
         let salt = match &k.salt {

@@ -7,6 +7,8 @@ mod aes_cts;
 mod aes_sha1;
 mod aes_sha2;
 mod dk;
+mod hmac_md5;
+pub(crate) use hmac_md5::hmac_md5_checksum;
 mod hmac_sha1;
 mod names;
 mod nfold;

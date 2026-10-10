@@ -88,6 +88,13 @@ pub struct PrincipalEntry {
     pub pw_expiration: Option<KerberosTime>,
     /// Long-term keys.
     pub keys: Vec<KeyEntry>,
+    /// Principals this service may delegate to with traditional S4U2Proxy,
+    /// as unparsed names (the `krbAllowedToDelegateTo` list that MIT's LDAP
+    /// module keeps in `KRB5_TL_CONSTRAINED_DELEGATION_ACL` tl-data).
+    pub allowed_to_delegate_to: Vec<String>,
+    /// Services allowed to delegate to this one with resource-based
+    /// constrained delegation, as unparsed names.
+    pub allowed_to_delegate_from: Vec<String>,
 }
 
 /// Which key version [`PrincipalEntry::find_key`] should match
@@ -258,6 +265,8 @@ impl MemoryStore {
         keys: Vec<KeyEntry>,
     ) -> PrincipalEntry {
         PrincipalEntry {
+            allowed_to_delegate_to: Vec::new(),
+            allowed_to_delegate_from: Vec::new(),
             name,
             realm: realm.to_string(),
             attributes,
@@ -355,6 +364,8 @@ mod tests {
 
     fn entry(keys: Vec<(u32, i32)>) -> PrincipalEntry {
         PrincipalEntry {
+            allowed_to_delegate_to: Vec::new(),
+            allowed_to_delegate_from: Vec::new(),
             name: PrincipalName::new_principal("u"),
             realm: "R".into(),
             attributes: PrincipalAttributes::empty(),

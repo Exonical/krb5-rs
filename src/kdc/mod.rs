@@ -25,6 +25,7 @@ pub mod kdb;
 mod policy;
 mod preauth;
 mod reqbody;
+mod s4u;
 #[cfg(feature = "tokio")]
 mod server;
 mod tgs_req;

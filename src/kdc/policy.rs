@@ -21,7 +21,7 @@ pub(crate) const KDC_INFINITY: i64 = u32::MAX as i64;
 
 /// Options that only make sense in TGS requests, plus S4U2Proxy
 /// (MIT kdc_util.h `AS_INVALID_OPTIONS`).
-const AS_INVALID_OPTIONS: KdcOptions = KdcOptions::FORWARDED
+pub(crate) const AS_INVALID_OPTIONS: KdcOptions = KdcOptions::FORWARDED
     .union(KdcOptions::PROXY)
     .union(KdcOptions::RENEW)
     .union(KdcOptions::VALIDATE)
@@ -35,7 +35,6 @@ pub(crate) const UNSUPPORTED_OPTIONS: KdcOptions = KdcOptions::ALLOW_POSTDATE
     .union(KdcOptions::VALIDATE)
     .union(KdcOptions::ENC_TKT_IN_SKEY)
     .union(KdcOptions::PROXY)
-    .union(KdcOptions::CNAME_IN_ADDL_TKT)
     .union(KdcOptions::REQUEST_ANONYMOUS);
 
 /// Realm-wide lifetime limits (MIT `realm_maxlife` / `realm_maxrlife`).
@@ -439,6 +438,8 @@ mod tests {
 
     fn entry() -> PrincipalEntry {
         PrincipalEntry {
+            allowed_to_delegate_to: Vec::new(),
+            allowed_to_delegate_from: Vec::new(),
             name: PrincipalName::new_principal("p"),
             realm: "R".into(),
             attributes: PrincipalAttributes::empty(),

@@ -185,6 +185,8 @@ pub struct TgsExchange {
     /// FAST per-request state (MIT always armors TGS requests with the
     /// implicit ccache==NULL armor, send_tgs.c:178).
     fast_state: FastState,
+    /// S4U2Self / S4U2Proxy mode.
+    s4u: s4u::S4uMode,
 }
 
 impl TgsExchange {
@@ -205,6 +207,7 @@ impl TgsExchange {
             credential: None,
             first_referral_attempt: true,
             fast_state: FastState::new(),
+            s4u: s4u::S4uMode::None,
         }
     }
 
@@ -379,6 +382,17 @@ impl TgsExchange {
         // Validate reply
         self.validate_tgs_reply(rep, &enc_part)?;
 
+        if self.is_s4u() {
+            // Only the single-realm flow is implemented; a referral TGT
+            // reply would need MIT's cross-realm S4U chains.
+            if self.is_referral_tgt(&enc_part) {
+                return Err(Krb5Error::ReplyValidation(
+                    "cross-realm S4U referral is not supported",
+                ));
+            }
+            self.verify_s4u2self_reply(rep.padata.as_deref(), &enc_part)?;
+        }
+
         // Check if this is a referral TGT or the actual service ticket
         let is_referral = self.is_referral_tgt(&enc_part);
 
@@ -387,9 +401,11 @@ impl TgsExchange {
         }
 
         // Service ticket — build credential and complete
-        self.credential = Some(crate::protocol::kdc_rep::credential_from_rep(
-            rep, &enc_part,
-        ));
+        let cred = crate::protocol::kdc_rep::credential_from_rep(rep, &enc_part);
+        if self.is_s4u() {
+            self.s4u_check_credential(&cred)?;
+        }
+        self.credential = Some(cred);
         self.state = TgsState::Complete;
         Ok(TgsStepResult::Complete)
     }
@@ -430,10 +446,16 @@ impl TgsExchange {
         enc_part: &EncKdcRepPart,
     ) -> Result<(), Krb5Error> {
         // Client principal must match the TGT holder
-        if rep.cname != self.cur_tgt.client {
+        let (expected_name, expected_realm) = self.expected_client();
+        let name_ok = if self.is_s4u() {
+            rep.cname.name_string == expected_name.name_string
+        } else {
+            rep.cname == expected_name
+        };
+        if !name_ok {
             return Err(Krb5Error::ReplyValidation("client principal mismatch"));
         }
-        if rep.crealm.as_bytes() != self.cur_tgt.crealm.as_bytes() {
+        if rep.crealm.as_bytes() != expected_realm.as_bytes() && !self.is_s4u() {
             return Err(Krb5Error::ReplyValidation("client realm mismatch"));
         }
 
@@ -504,6 +526,7 @@ impl TgsExchange {
 }
 
 mod request;
+mod s4u;
 
 #[cfg(test)]
 mod tests;

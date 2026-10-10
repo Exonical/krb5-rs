@@ -26,7 +26,7 @@ fn usage() -> ! {
          commands:\n  create [-s]\n  stash\n  \
          addprinc [-randkey] [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
          delprinc NAME\n  cpw [-randkey] [-keepold] NAME\n  \
-         modprinc [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
+         modprinc [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] [-allow_delegate_to P]... [-allow_delegate_from P]... [-clear_delegate_to] [-clear_delegate_from] NAME\n  \
          getprinc NAME\n  listprincs\n  ktadd -k PATH [-norandkey] NAME..."
     );
     std::process::exit(2);
@@ -68,6 +68,10 @@ fn principal_options(args: Vec<String>, randkey: &mut bool) -> (PrincipalOptions
             "-maxrenewlife" => opts.max_renewable_life = Some(ok(parse_lifetime(&next(&mut it)))),
             "-expire" => opts.expiration = Some(ok(parse_time(&next(&mut it)))),
             "-pwexpire" => opts.pw_expiration = Some(ok(parse_time(&next(&mut it)))),
+            "-allow_delegate_to" => opts.delegate_to.push(next(&mut it)),
+            "-allow_delegate_from" => opts.delegate_from.push(next(&mut it)),
+            "-clear_delegate_to" => opts.clear_delegate_to = true,
+            "-clear_delegate_from" => opts.clear_delegate_from = true,
             s if s.starts_with('+')
                 || (s.starts_with('-') && s.len() > 1 && !s.starts_with("-r")) =>
             {
