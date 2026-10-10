@@ -44,6 +44,16 @@ pub enum Krb5Error {
     #[error("exceeded maximum preauth retries ({0})")]
     PreauthLoopExceeded(u32),
 
+    /// The KDC did not include a FAST armored reply although the request
+    /// was FAST-armored (MIT `KRB5_ERR_FAST_REQUIRED`).
+    #[error("KDC reply is not FAST-armored")]
+    FastRequired,
+
+    /// Pre-authentication was required but no offered mechanism succeeded
+    /// (MIT `KRB5_PREAUTH_FAILED`, preauth2.c:715-724).
+    #[error("pre-authentication failed")]
+    PreauthFailed,
+
     /// No mutually supported encryption type.
     #[error("no common encryption type with KDC")]
     NoCommonEtype,
@@ -60,13 +70,43 @@ pub enum Krb5Error {
     #[error("ASN.1 encode error: {0}")]
     Asn1Encode(#[from] rasn::error::EncodeError),
 
+    /// AP exchange error (MIT KRB5KRB_AP_ERR_* / KRB5_* codes).
+    #[error("AP error: {0}")]
+    Ap(#[from] crate::protocol::ap::ApError),
+
+    /// GSS-API error (GSS_S_* major status).
+    #[error("GSS error: {0}")]
+    Gss(#[from] crate::gssapi::GssError),
+
     /// Cryptographic operation failed.
     #[error("crypto error: {0}")]
     Crypto(String),
 
+    /// Credential cache error (MIT KRB5_CC_*).
+    #[error("ccache error: {0}")]
+    Ccache(#[from] crate::ccache::CcError),
+
+    /// Keytab error (MIT KRB5_KT_*).
+    #[error("keytab error: {0}")]
+    Keytab(#[from] crate::keytab::KtError),
+
     /// Network/transport error.
     #[error("transport error: {0}")]
     Transport(#[from] std::io::Error),
+
+    /// KDC/service location error (MIT KRB5_REALM_*/KRB5_ERR_NO_SERVICE).
+    #[error("locate error: {0}")]
+    Locate(#[from] crate::locate::LocateError),
+
+    /// k5_sendto send/receive error (MIT KRB5_KDC_UNREACH /
+    /// KRB5_KDCSVC_UNAVAILABLE).
+    #[cfg(feature = "tokio")]
+    #[error("sendto error: {0}")]
+    Sendto(#[from] crate::transport::sendto::SendtoError),
+
+    /// Miscellaneous protocol failure.
+    #[error("protocol error: {0}")]
+    Protocol(String),
 }
 
 impl Krb5Error {

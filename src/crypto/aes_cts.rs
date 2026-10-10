@@ -135,7 +135,7 @@ pub(crate) fn aes_ecb_encrypt_block(key: &[u8], block: &[u8]) -> Result<Vec<u8>,
 /// AES-CBC encrypt with given IV. Input must be block-aligned.
 /// Implemented manually using AES-ECB + XOR (standard CBC construction).
 fn aes_cbc_encrypt(key: &[u8], iv: &[u8; AES_BLOCK], data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    if data.len() % AES_BLOCK != 0 {
+    if !data.len().is_multiple_of(AES_BLOCK) {
         return Err(CryptoError::InputTooShort);
     }
     let mut result = Vec::with_capacity(data.len());
@@ -156,7 +156,7 @@ fn aes_cbc_encrypt(key: &[u8], iv: &[u8; AES_BLOCK], data: &[u8]) -> Result<Vec<
 
 /// AES-CBC decrypt with given IV. Input must be block-aligned.
 fn aes_cbc_decrypt(key: &[u8], iv: &[u8; AES_BLOCK], data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    if data.len() % AES_BLOCK != 0 {
+    if !data.len().is_multiple_of(AES_BLOCK) {
         return Err(CryptoError::InputTooShort);
     }
     let mut result = Vec::with_capacity(data.len());

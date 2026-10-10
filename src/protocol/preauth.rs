@@ -19,7 +19,12 @@ use crate::Krb5Error;
 ///
 /// # Implementing a Plugin
 ///
-/// ```rust,ignore
+/// ```
+/// use krb5_rs::protocol::{PreauthContext, PreauthPlugin};
+/// use krb5_rs::types::PaData;
+/// use krb5_rs::Krb5Error;
+/// use rasn::types::OctetString;
+///
 /// struct MyPreauthPlugin;
 ///
 /// impl PreauthPlugin for MyPreauthPlugin {
@@ -29,9 +34,12 @@ use crate::Krb5Error;
 ///         method_data.iter().any(|pa| pa.padata_type == 42)
 ///     }
 ///
-///     fn generate(&self, ctx: &PreauthContext) -> Result<Vec<PaData>, Krb5Error> {
+///     fn generate(&self, _ctx: &PreauthContext) -> Result<Vec<PaData>, Krb5Error> {
 ///         // Build PA-DATA for type 42
-///         Ok(vec![/* ... */])
+///         Ok(vec![PaData {
+///             padata_type: 42,
+///             padata_value: OctetString::from(Vec::new()),
+///         }])
 ///     }
 /// }
 /// ```
@@ -80,13 +88,22 @@ pub(crate) struct PreauthHint {
 ///
 /// The e-data is DER-encoded METHOD-DATA (SEQUENCE OF PA-DATA). We look for
 /// PA-ETYPE-INFO2 (type 19) and select the first entry with a supported etype.
+#[cfg(test)]
 pub(crate) fn extract_preauth_hint(
     e_data: &[u8],
     supported_etypes: &[i32],
 ) -> Result<PreauthHint, Krb5Error> {
     // Decode METHOD-DATA (SEQUENCE OF PA-DATA)
     let method_data: Vec<PaData> = rasn::der::decode(e_data)?;
+    extract_preauth_hint_padata(&method_data, supported_etypes)
+}
 
+/// Extract pre-authentication hints from an already-decoded METHOD-DATA
+/// list (e.g. padata unwrapped from a FAST response).
+pub(crate) fn extract_preauth_hint_padata(
+    method_data: &[PaData],
+    supported_etypes: &[i32],
+) -> Result<PreauthHint, Krb5Error> {
     // First, try PA-ETYPE-INFO2 (padata-type 19)
     if let Some(etype_info2_pa) = method_data
         .iter()
@@ -181,6 +198,15 @@ pub(crate) fn build_pa_enc_timestamp(
         padata_type: PaDataType::EncTimestamp as i32,
         padata_value: enc_data_der.into(),
     })
+}
+
+/// Build an empty (informational) padata element, e.g. PA-AS-FRESHNESS
+/// or PA-REQ-ENC-PA-REP.
+pub(crate) fn build_empty_padata(padata_type: i32) -> PaData {
+    PaData {
+        padata_type,
+        padata_value: Vec::new().into(),
+    }
 }
 
 /// Build a PA-PAC-REQUEST padata element.
