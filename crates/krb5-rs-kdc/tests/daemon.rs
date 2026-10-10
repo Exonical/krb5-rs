@@ -342,3 +342,75 @@ fn sigterm_and_sigint_exit_promptly_when_idle() {
         daemon.wait_for_line("shutdown complete");
     }
 }
+
+#[tokio::test]
+async fn master_password_file_replaces_the_stash() {
+    let dir = TempDir::new("mpf");
+    let conf = dir.path("kdc.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "[realms]\n {REALM} = {{\n  database_name = {}\n  key_stash_file = {}\n  \
+             supported_enctypes = aes256-cts-hmac-sha1-96:normal\n }}\n",
+            slash(&dir.path("principal")),
+            slash(&dir.path("stash")),
+        ),
+    )
+    .expect("kdc.conf");
+    let master = dir.path("master");
+    let alice = dir.path("alice-pw");
+    std::fs::write(&master, "master-secret\n").expect("master");
+    std::fs::write(&alice, PASSWORD).expect("password");
+    let out = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdb"))
+        .args([
+            "--config",
+            &conf.to_string_lossy(),
+            "--realm",
+            REALM,
+            "init",
+        ])
+        .args(["--master-password-file", &master.to_string_lossy()])
+        .args(["--password", &format!("alice={}", alice.display())])
+        .output()
+        .expect("kdb init");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.path("stash").exists(), "no stash was requested");
+
+    // Without the stash or the flag the daemon cannot start.
+    let out = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+        .args([
+            "--config",
+            &conf.to_string_lossy(),
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+
+    let daemon = Daemon::start(
+        &conf,
+        &["--master-password-file", &master.to_string_lossy()],
+    );
+    let tcp = TcpTransport::new(daemon.tcp);
+    let cred = as_exchange(&tcp).await.expect("AS exchange");
+    assert_eq!(cred.client, PrincipalName::new_principal("alice"));
+
+    // The wrong master password is refused at startup.
+    std::fs::write(&master, "wrong\n").expect("master");
+    let out = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+        .args([
+            "--config",
+            &conf.to_string_lossy(),
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .args(["--master-password-file", &master.to_string_lossy()])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+}

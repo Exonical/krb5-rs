@@ -1,0 +1,14 @@
+apiVersion: v2
+name: krb5-rs-kdc
+description: Highly available Kerberos V5 KDC (krb5-rs) - one primary and stateless replicas that pull the database from it
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.26.0-0"
+home: https://github.com/Exonical/krb5-rs
+sources:
+  - https://github.com/Exonical/krb5-rs
+keywords:
+  - kerberos
+  - kdc
+  - krb5

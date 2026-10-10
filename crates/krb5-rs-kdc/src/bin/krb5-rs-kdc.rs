@@ -29,7 +29,7 @@ use krb5_rs::kdc::kdb::propagation::{
     initial_pull, run_replica_loop, serve_propagation, PropClientConfig, PropEvent, PropLogger,
     PropSecret, PropServerConfig,
 };
-use krb5_rs::kdc::kdb::{read_stash, FileStore};
+use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, FileStore};
 use krb5_rs::kdc::{
     default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
     MemoryStore, PrincipalAttributes, PrincipalStore, RealmConfig, RequestLogger, ServeOptions,
@@ -65,6 +65,11 @@ struct Cli {
     /// the kdc.conf listen addresses for both UDP and TCP.
     #[arg(long, value_name = "ADDR")]
     listen: Vec<String>,
+
+    /// Derive the master key from the password in this file (first line)
+    /// instead of reading the stash.
+    #[arg(long, value_name = "PATH")]
+    master_password_file: Option<PathBuf>,
 
     /// Serve the principals of this keytab instead of a database.
     #[arg(long, value_name = "PATH")]
@@ -196,7 +201,7 @@ fn replica_config(
         db_path: cfg.database_name.clone(),
         master_key: master.clone(),
         poll_interval: p.poll_interval,
-        io_timeout: Duration::from_secs(30),
+        io_timeout: Duration::from_secs(10),
         logger: Some(prop_logger()),
     })
 }
@@ -227,7 +232,18 @@ async fn config_mode(
         .or_else(|| default_realm(&kdc_conf, krb5.as_ref()))
         .ok_or_else(|| io_err("no realm given and no default realm found"))?;
     let cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm).map_err(io_err)?;
-    let master = read_stash(&cfg.key_stash_file, &realm).map_err(io_err)?;
+    let master = match &cli.master_password_file {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| io_err(format!("reading {}: {e}", path.display())))?;
+            let password = text.lines().next().unwrap_or("").trim_end_matches('\r');
+            if password.is_empty() {
+                return Err(io_err(format!("{} is empty", path.display())));
+            }
+            master_key_from_password(&realm, password, cfg.master_key_type).map_err(io_err)?
+        }
+        None => read_stash(&cfg.key_stash_file, &realm).map_err(io_err)?,
+    };
 
     let mut parts = PropParts::default();
     if cfg.propagation.is_replica() {

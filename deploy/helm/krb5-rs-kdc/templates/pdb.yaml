@@ -1,0 +1,14 @@
+{{- if and .Values.replicas.pdb.enabled (gt (int .Values.replicas.replicaCount) 0) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-replicas
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.replicas.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "krb5-rs-kdc.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: replica
+{{- end }}

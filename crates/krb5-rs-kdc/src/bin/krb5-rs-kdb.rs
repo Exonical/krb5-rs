@@ -23,7 +23,7 @@ use krb5_rs::profile::Profile;
 fn usage() -> ! {
     eprintln!(
         "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] [--force] <command>\n\
-         commands:\n  create [-s]\n  stash\n  \
+         commands:\n  init --master-password-file F [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash\n  \
          addprinc [-randkey] [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
          delprinc NAME\n  cpw [-randkey] [-keepold] NAME\n  \
          modprinc [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] [-allow_delegate_to P]... [-allow_delegate_from P]... [-clear_delegate_to] [-clear_delegate_from] NAME\n  \
@@ -48,6 +48,81 @@ fn read_line(prompt: &str) -> String {
         fail("unexpected end of input");
     }
     line.trim_end_matches(['\r', '\n']).to_string()
+}
+
+/// First line of a secret file; secrets never come from argv.
+fn read_secret_file(path: &str) -> String {
+    let text = ok(std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}")));
+    let line = text.lines().next().unwrap_or("").trim_end_matches('\r');
+    if line.is_empty() {
+        fail(format!("{path} is empty"));
+    }
+    line.to_string()
+}
+
+/// Idempotent bootstrap: create the database (and stash) if missing, then
+/// make sure every listed principal exists, leaving existing ones alone.
+fn init(args: Vec<String>, cfg: &RealmConfig, realm: &str) {
+    let mut master_file: Option<String> = None;
+    let mut stash = false;
+    let mut randkeys: Vec<String> = Vec::new();
+    let mut passwords: Vec<(String, String)> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--master-password-file" => master_file = Some(next(&mut it)),
+            "--stash" => stash = true,
+            "--randkey" => randkeys.push(next(&mut it)),
+            "--password" => {
+                let spec = next(&mut it);
+                let Some((name, file)) = spec.split_once('=') else {
+                    fail("--password expects NAME=FILE");
+                };
+                passwords.push((name.to_string(), file.to_string()));
+            }
+            _ => usage(),
+        }
+    }
+    let master_file = master_file.unwrap_or_else(|| fail("init requires --master-password-file"));
+    let key = ok(master_key_from_password(
+        realm,
+        &read_secret_file(&master_file),
+        cfg.master_key_type,
+    ));
+    let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
+    let store = if cfg.database_name.exists() {
+        ok(FileStore::open(&cfg.database_name, &key))
+    } else {
+        let store = ok(FileStore::create_with(
+            &cfg.database_name,
+            realm,
+            &key,
+            &etypes,
+        ));
+        println!("Database {} created.", cfg.database_name.display());
+        store
+    };
+    if stash && !cfg.key_stash_file.exists() {
+        ok(write_stash(&cfg.key_stash_file, realm, &key));
+        println!("Stash {} written.", cfg.key_stash_file.display());
+    }
+    let admin = Admin::new(&store, cfg.supported_keysalts.clone());
+    let opts = PrincipalOptions::default();
+    let wanted = randkeys.iter().map(|n| (n.as_str(), None)).chain(
+        passwords
+            .iter()
+            .map(|(n, f)| (n.as_str(), Some(f.as_str()))),
+    );
+    for (spec, password_file) in wanted {
+        let (name, r) = ok(parse_principal(spec, realm));
+        if ok(store.get_record(&name, &r)).is_some() {
+            println!("Principal \"{name}@{r}\" already exists.");
+            continue;
+        }
+        let password = password_file.map(read_secret_file);
+        ok(admin.add_principal(&name, &r, password.as_deref(), &opts));
+        println!("Principal \"{name}@{r}\" created.");
+    }
 }
 
 fn next(it: &mut std::vec::IntoIter<String>) -> String {
@@ -135,6 +210,10 @@ fn main() {
     }
 
     match cmd.as_str() {
+        "init" => {
+            init(args, &cfg, &realm);
+            return;
+        }
         "create" => {
             let stash = args.iter().any(|a| a == "-s");
             let password = read_line(&format!("Enter KDC database master key for {realm}: "));

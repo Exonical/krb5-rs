@@ -1,0 +1,27 @@
+# Non-default values exercised by CI (helm template + kubeconform).
+realm: EXAMPLE.COM
+image:
+  digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+secrets:
+  existingSecret: my-kdc-secret
+service:
+  type: ClusterIP
+networkPolicy:
+  enabled: true
+kdc:
+  domainRealm:
+    .example.com: EXAMPLE.COM
+  extraKrb5Conf: |
+    [logging]
+     default = STDERR
+primary:
+  persistence:
+    storageClass: fast
+    size: 5Gi
+  podAnnotations:
+    example.com/note: primary
+replicas:
+  replicaCount: 3
+  pdb:
+    minAvailable: 2
+priorityClassName: system-cluster-critical

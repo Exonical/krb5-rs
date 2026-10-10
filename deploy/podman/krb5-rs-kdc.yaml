@@ -1,0 +1,129 @@
+# Single-pod krb5-rs KDC for `podman kube play` (primary only, restart Always).
+# High availability (replicas) is Kubernetes-only: see deploy/helm.
+#
+# Before use replace EXAMPLE.COM and both CHANGE-ME passwords (README.md shows
+# how) and set the image if you do not use the published one.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: krb5-rs-kdc-secrets
+type: Opaque
+stringData:
+  master-password: CHANGE-ME-master
+  kprop-password: CHANGE-ME-kprop
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: krb5-rs-kdc-config
+data:
+  kdc.conf: |
+    [kdcdefaults]
+     kdc_ports = 8888
+     kdc_tcp_ports = 8888
+
+    [realms]
+     EXAMPLE.COM = {
+      database_name = /var/lib/krb5-rs/principal
+      key_stash_file = /var/lib/krb5-rs/stash
+      max_life = 24h
+      max_renewable_life = 7d
+      supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal
+     }
+  krb5.conf: |
+    [libdefaults]
+     default_realm = EXAMPLE.COM
+     dns_lookup_kdc = false
+     dns_lookup_realm = false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: krb5-rs-kdc-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: krb5-rs-kdc
+  labels:
+    app: krb5-rs-kdc
+spec:
+  restartPolicy: Always
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+  initContainers:
+    - name: init-database
+      image: ghcr.io/exonical/krb5-rs-kdc:latest
+      command: ["/usr/local/bin/krb5-rs-kdb"]
+      args:
+        - --config
+        - /etc/krb5-rs/kdc.conf
+        - --krb5-config
+        - /etc/krb5-rs/krb5.conf
+        - --realm
+        - EXAMPLE.COM
+        - init
+        - --master-password-file
+        - /secrets/master-password
+        - --stash
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/krb5-rs
+        - name: config
+          mountPath: /etc/krb5-rs
+          readOnly: true
+        - name: secrets
+          mountPath: /secrets
+          readOnly: true
+  containers:
+    - name: kdc
+      image: ghcr.io/exonical/krb5-rs-kdc:latest
+      args:
+        - --config
+        - /etc/krb5-rs/kdc.conf
+        - --krb5-config
+        - /etc/krb5-rs/krb5.conf
+        - --realm
+        - EXAMPLE.COM
+      ports:
+        - name: kdc-udp
+          containerPort: 8888
+          hostPort: 88
+          protocol: UDP
+        - name: kdc-tcp
+          containerPort: 8888
+          hostPort: 88
+          protocol: TCP
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/krb5-rs
+        - name: config
+          mountPath: /etc/krb5-rs
+          readOnly: true
+        - name: secrets
+          mountPath: /secrets
+          readOnly: true
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: krb5-rs-kdc-data
+    - name: config
+      configMap:
+        name: krb5-rs-kdc-config
+    - name: secrets
+      secret:
+        secretName: krb5-rs-kdc-secrets

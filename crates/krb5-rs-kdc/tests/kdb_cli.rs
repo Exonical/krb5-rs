@@ -144,3 +144,54 @@ fn errors_exit_non_zero() {
     assert_eq!(env.run(&["bogus"], "").status.code(), Some(2));
     assert_eq!(env.run(&[], "").status.code(), Some(2));
 }
+
+#[test]
+fn init_is_idempotent_and_reads_secrets_only_from_files() {
+    let env = Env::new("init");
+    let master = env.dir.join("master");
+    let pw = env.dir.join("kprop-pw");
+    std::fs::write(&master, "master-secret\n").expect("master file");
+    std::fs::write(&pw, "kprop-secret\r\n").expect("password file");
+    let args = [
+        "init",
+        "--master-password-file",
+        &master.to_string_lossy(),
+        "--stash",
+        "--randkey",
+        "kprop/primary",
+        "--password",
+        &format!("kprop/replica={}", pw.display()),
+    ];
+
+    let out = env.ok(&args, "");
+    assert!(out.contains("Database") && out.contains("created"), "{out}");
+    assert!(
+        out.contains(&format!("Principal \"kprop/primary@{REALM}\" created.")),
+        "{out}"
+    );
+    assert!(env.dir.join("stash").exists());
+    let listed = env.ok(&["listprincs"], "");
+    assert!(
+        listed.contains(&format!("kprop/replica@{REALM}")),
+        "{listed}"
+    );
+    let before = env.ok(&["getprinc", "kprop/primary"], "");
+
+    // A second run changes nothing and succeeds.
+    let out = env.ok(&args, "");
+    assert!(!out.contains("created"), "{out}");
+    assert_eq!(out.matches("already exists").count(), 2, "{out}");
+    assert_eq!(env.ok(&["getprinc", "kprop/primary"], ""), before);
+
+    // A different master password cannot open the existing database.
+    std::fs::write(&master, "other\n").expect("master file");
+    assert_eq!(env.run(&args, "").status.code(), Some(1));
+    // Missing or empty secret files and missing options are errors.
+    assert_eq!(
+        env.run(&["init", "--master-password-file", "/nonexistent/x"], "")
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(env.run(&["init"], "").status.code(), Some(1));
+}
