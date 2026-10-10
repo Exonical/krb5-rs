@@ -72,3 +72,14 @@ fn dispatch_missing_local_krbtgt_returns_generic_error() {
     // do_as_req.c:618-624 get_local_tgt failure -> KRB_ERR_GENERIC.
     assert_eq!(krb_error(&kdc.handle(&der)).error_code, 60);
 }
+
+#[test]
+fn dispatch_error_stime_has_no_fractional_seconds() {
+    let f = fixture();
+    let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_789).expect("time");
+    let reply = f.kdc.handle_at(&[1, 2, 3], now);
+    let err = krb_error(&reply);
+    assert_eq!(err.stime.timestamp(), 1_700_000_000);
+    assert_eq!(err.stime.timestamp_subsec_nanos(), 0);
+    assert_eq!(err.susec, 123_456);
+}

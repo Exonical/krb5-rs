@@ -63,3 +63,7 @@ optional = true
 [dependencies.rcgen]
 version = "0.14"
 optional = true
+
+[[example]]
+name = "kdc"
+required-features = ["kdc", "tokio"]

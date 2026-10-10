@@ -17,11 +17,16 @@ mod fast;
 mod policy;
 mod preauth;
 mod reqbody;
+#[cfg(feature = "tokio")]
+mod server;
 mod tgs_req;
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+
+#[cfg(feature = "tokio")]
+pub use server::{serve_tcp, serve_udp};
 
 pub use db::{
     KeyEntry, MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, StoreError,
@@ -54,11 +59,16 @@ pub struct KdcConfig {
     pub supported_enctypes: Vec<i32>,
     /// Allowed clock skew for authenticators and timestamps.
     pub clockskew: Duration,
+    /// Largest reply sent over UDP; larger replies are replaced by
+    /// `KRB_ERR_RESPONSE_TOO_BIG` (MIT `kdc_max_dgram_reply_size`).
+    pub max_dgram_reply_size: usize,
 }
 
 impl KdcConfig {
     /// Defaults for `realm`: 24h tickets, no renewable tickets,
-    /// AES (18, 17, 20, 19), 300s clock skew.
+    /// AES (18, 17, 20, 19), 300s clock skew, 65536-byte UDP replies
+    /// (MIT falls back to `MAX_DGRAM_SIZE` when `kdc_max_dgram_reply_size`
+    /// is unset, main.c:636-638; its docs say 4096).
     pub fn new(realm: impl Into<String>) -> Self {
         Self {
             realm: realm.into(),
@@ -66,6 +76,7 @@ impl KdcConfig {
             max_renewable_life: Duration::ZERO,
             supported_enctypes: vec![18, 17, 20, 19],
             clockskew: Duration::from_secs(300),
+            max_dgram_reply_size: 65536,
         }
     }
 }
@@ -94,6 +105,34 @@ impl<S: PrincipalStore> Kdc<S> {
             Ok(reply) => reply,
             Err(f) => build_krb_error(&f.err, &f.ctx, now),
         }
+    }
+
+    /// [`Kdc::handle`] for a UDP datagram: a reply longer than
+    /// `max_dgram_reply_size` is replaced by `KRB_ERR_RESPONSE_TOO_BIG`
+    /// (MIT `finish_dispatch`, dispatch.c:54-63).
+    pub fn handle_udp(&self, request: &[u8]) -> Vec<u8> {
+        self.handle_udp_at(request, Utc::now())
+    }
+
+    /// [`Kdc::handle_udp`] with an injectable clock.
+    pub fn handle_udp_at(&self, request: &[u8], now: DateTime<Utc>) -> Vec<u8> {
+        let reply = self.handle_at(request, now);
+        if reply.len() > self.config.max_dgram_reply_size {
+            return self.bare_error(KRB_ERR_RESPONSE_TOO_BIG, now);
+        }
+        reply
+    }
+
+    /// A KRB-ERROR with no client, text or e-data and the local TGS as
+    /// server (MIT `make_too_big_error`, dispatch.c:178-209, and
+    /// `make_toolong_error`, kdc_util.c:1882-1912).
+    pub(crate) fn bare_error(&self, code: i32, now: DateTime<Utc>) -> Vec<u8> {
+        let err = KdcError {
+            code,
+            e_text: None,
+            e_data: None,
+        };
+        build_krb_error(&err, &self.local_context(), now)
     }
 
     /// MIT `dispatch` (dispatch.c:89-175).
@@ -234,4 +273,46 @@ fn is_tgs_principal(name: &PrincipalName) -> bool {
 /// Name comparison ignoring the name type (MIT princ_comp.c).
 fn names_equal(a: &PrincipalName, b: &PrincipalName) -> bool {
     a.name_string == b.name_string
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::KrbErrorMsg;
+
+    fn kdc(max_dgram: usize) -> Kdc<MemoryStore> {
+        let mut config = KdcConfig::new("R");
+        config.max_dgram_reply_size = max_dgram;
+        Kdc::new(config, MemoryStore::new())
+    }
+
+    fn decode(der: &[u8]) -> KrbErrorMsg {
+        rasn::der::decode(der).expect("KRB-ERROR")
+    }
+
+    #[test]
+    fn handle_udp_reply_within_limit_is_unchanged() {
+        let reply = kdc(4096).handle_udp(&[1, 2, 3]);
+        assert_eq!(decode(&reply).error_code, KRB_AP_ERR_MSG_TYPE);
+    }
+
+    #[test]
+    fn handle_udp_oversize_reply_becomes_response_too_big() {
+        let k = kdc(10);
+        let full = k.handle(&[1, 2, 3]);
+        assert!(full.len() > 10);
+        let err = decode(&k.handle_udp(&[1, 2, 3]));
+        assert_eq!(err.error_code, KRB_ERR_RESPONSE_TOO_BIG);
+        assert!(err.cname.is_none() && err.crealm.is_none());
+        assert!(err.e_text.is_none() && err.e_data.is_none());
+        assert_eq!(err.realm.as_bytes(), b"R");
+        assert_eq!(err.sname.to_string(), "krbtgt/R");
+    }
+
+    #[test]
+    fn handle_udp_reply_exactly_at_limit_is_not_replaced() {
+        let probe = kdc(4096).handle(&[1, 2, 3]);
+        let reply = kdc(probe.len()).handle_udp(&[1, 2, 3]);
+        assert_eq!(decode(&reply).error_code, KRB_AP_ERR_MSG_TYPE);
+    }
 }

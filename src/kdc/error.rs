@@ -2,7 +2,7 @@
 //! `prepare_error_as`, do_tgs_req.c `prepare_error_tgs`, kdc_util.c
 //! `errcode_to_protocol`).
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use rasn::types::{GeneralString, OctetString};
 
 use crate::protocol::ap::ApError;
@@ -139,7 +139,8 @@ pub(crate) fn build_krb_error(err: &KdcError, ctx: &ErrorContext, now: DateTime<
             msg_type: 30,
             ctime: None,
             cusec: None,
-            stime: now.fixed_offset(),
+            // RFC 4120 §5.2.3: no fractional seconds (MIT rejects them).
+            stime: now.with_nanosecond(0).unwrap_or(now).fixed_offset(),
             susec: i32::try_from(now.timestamp_subsec_micros()).unwrap_or(0),
             error_code: err.code,
             crealm: crealm.map(fallback),
@@ -186,6 +187,26 @@ mod tests {
         assert_eq!(ap_error_code(ApError::BadKeyver), 44);
         assert_eq!(ap_error_code(ApError::NoKey), 45);
         assert_eq!(ap_error_code(ApError::NoPermEtype), 60);
+    }
+
+    #[test]
+    fn build_krb_error_stime_has_no_fractional_seconds() {
+        let ctx = ErrorContext {
+            realm: "R".into(),
+            sname: krbtgt_name("R").expect("name"),
+            crealm: None,
+            cname: None,
+            fast: None,
+        };
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 731_854_900).expect("time");
+        let der = build_krb_error(&KdcError::new(6, "X"), &ctx, now);
+        assert!(
+            !der.contains(&b'.'),
+            "GeneralizedTime must not carry a fraction"
+        );
+        let got: KrbErrorMsg = rasn::der::decode(&der).expect("decode");
+        assert_eq!(got.stime.timestamp_subsec_nanos(), 0);
+        assert_eq!(got.susec, 731_854);
     }
 
     #[test]
