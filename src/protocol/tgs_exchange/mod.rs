@@ -21,6 +21,12 @@ use super::error_codes::ErrorCode;
 use super::fast::{FastMsgType, FastState};
 use super::validate::{now_kerberos, time_diff, DEFAULT_MAX_CLOCK_SKEW, UTC_OFFSET};
 
+/// `krb5_is_tgs_principal` (MIT kdc_util.c:85-93): two components, the first
+/// "krbtgt"; the name type is not consulted.
+fn is_tgs_principal(name: &PrincipalName) -> bool {
+    name.name_string.len() == 2 && name.name_string[0].as_bytes() == b"krbtgt"
+}
+
 /// Maximum cross-realm referral hops (matches MIT's KRB5_REFERRAL_MAXHOPS).
 const MAX_REFERRAL_HOPS: u32 = 10;
 
@@ -228,10 +234,7 @@ impl TgsExchange {
     /// For a cross-realm TGT `krbtgt/OTHER@MINE`, this is OTHER.
     fn tgt_target_realm(&self) -> String {
         let sname = &self.cur_tgt.server;
-        if sname.name_type == 2
-            && sname.name_string.len() == 2
-            && sname.name_string[0].as_bytes() == b"krbtgt"
-        {
+        if is_tgs_principal(sname) {
             String::from_utf8_lossy(sname.name_string[1].as_bytes()).to_string()
         } else {
             // Fallback to srealm for non-krbtgt credentials
@@ -456,7 +459,7 @@ impl TgsExchange {
         // a canonicalized SPN. Referral TGTs are validated in handle_referral().
         if !self.is_referral_tgt(enc_part)
             && !self.options.canonicalize
-            && enc_part.sname != self.target_server
+            && enc_part.sname.name_string != self.target_server.name_string
         {
             return Err(Krb5Error::ReplyValidation(
                 "unexpected service principal in TGS-REP",
@@ -488,16 +491,11 @@ impl TgsExchange {
     /// from what we originally requested. If the response matches our
     /// target service principal, it's not a referral.
     fn is_referral_tgt(&self, enc_part: &EncKdcRepPart) -> bool {
-        // Must be NT_SRV_INST with 2 components
-        if enc_part.sname.name_type != 2 || enc_part.sname.name_string.len() != 2 {
-            return false;
-        }
-        // First component must be "krbtgt"
-        if enc_part.sname.name_string[0].as_bytes() != b"krbtgt" {
+        if !is_tgs_principal(&enc_part.sname) {
             return false;
         }
         // If we requested krbtgt/<REALM> and got exactly that, it's not a referral
-        if enc_part.sname == self.target_server {
+        if enc_part.sname.name_string == self.target_server.name_string {
             return false;
         }
         // It's a krbtgt for a different realm → referral

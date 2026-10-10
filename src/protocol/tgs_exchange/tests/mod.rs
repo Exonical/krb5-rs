@@ -409,3 +409,45 @@ fn test_ok_as_delegate_preserved_when_cross_realm_tgt_has_it() {
         "OK_AS_DELEGATE should be preserved when cross-realm TGT also has it"
     );
 }
+
+/// MIT identifies TGS principals by components only (kdc_util.c:85-93), so a
+/// referral whose stored name type is NT-PRINCIPAL is still a referral.
+#[test]
+fn test_referral_with_nt_principal_name_type_is_followed() {
+    let tgt = make_tgt("EXAMPLE.COM");
+    let target = PrincipalName::new_srv_hst("HTTP", "web.other.com");
+    let mut exchange = TgsExchange::new(tgt, target, TgsOptions::default());
+
+    let now = make_time(1_700_000_000);
+    let rep = make_referral_rep("OTHER.COM");
+    let mut enc_part = make_referral_enc_part(
+        "OTHER.COM",
+        now,
+        KerberosFlags::new(TicketFlags::FORWARDABLE),
+    );
+    enc_part.sname.name_type = 1;
+    assert!(exchange.is_referral_tgt(&enc_part));
+
+    let resume = ResumeState::Referrals {
+        realms_seen: vec!["EXAMPLE.COM".to_string()],
+        referral_count: 0,
+    };
+    match exchange.handle_referral(&rep, &enc_part, resume) {
+        Ok(TgsStepResult::SendToKdc { realm, .. }) => assert_eq!(realm, "OTHER.COM"),
+        other => panic!("expected a request to OTHER.COM, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_requested_tgs_name_is_not_a_referral_regardless_of_name_type() {
+    let tgt = make_tgt("EXAMPLE.COM");
+    let target = PrincipalName::new_srv_inst("krbtgt", "OTHER.COM");
+    let exchange = TgsExchange::new(tgt, target, TgsOptions::default());
+    let mut enc_part = make_referral_enc_part(
+        "OTHER.COM",
+        make_time(1_700_000_000),
+        KerberosFlags::new(TicketFlags::FORWARDABLE),
+    );
+    enc_part.sname.name_type = 1;
+    assert!(!exchange.is_referral_tgt(&enc_part));
+}
