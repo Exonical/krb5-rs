@@ -8,11 +8,15 @@ mod aes_sha1;
 mod aes_sha2;
 mod dk;
 mod hmac_sha1;
+mod names;
 mod nfold;
 pub(crate) mod util;
 
 pub use aes_sha1::{Aes128CtsHmacSha196, Aes256CtsHmacSha196};
 pub use aes_sha2::{Aes128CtsHmacSha256128, Aes256CtsHmacSha384192};
+pub use names::{
+    enctype_from_name, enctype_name, parse_enctype_list, parse_keysalt_list, KeysaltError, SaltType,
+};
 
 use std::collections::HashMap;
 use std::sync::LazyLock;

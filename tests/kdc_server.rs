@@ -60,9 +60,15 @@ async fn start(max_dgram: Option<usize>) -> Server {
     }
     let kdc = Arc::new(Kdc::new(config, store));
 
-    let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
-    let addr = tcp.local_addr().expect("addr");
-    let udp = UdpSocket::bind(addr).await.expect("bind udp");
+    // An ephemeral TCP port can be unusable for UDP (Windows excluded port
+    // ranges differ per protocol), so retry with a fresh port.
+    let (tcp, udp, addr) = loop {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
+        let addr = tcp.local_addr().expect("addr");
+        if let Ok(udp) = UdpSocket::bind(addr).await {
+            break (tcp, udp, addr);
+        }
+    };
     tokio::spawn(serve_udp(Arc::clone(&kdc), udp));
     tokio::spawn(serve_tcp(kdc, tcp));
     Server { addr }
