@@ -149,7 +149,7 @@ impl FileCcache {
             }
         }
         out.extend_from_slice(&marshal_princ(client, realm, v));
-        std::fs::write(&self.path, &out).map_err(CcError::Io)
+        crate::fsutil::write_private(&self.path, &out).map_err(CcError::Io)
     }
 }
 
@@ -205,7 +205,7 @@ impl Ccache for FileCcache {
                 return Err(CcError::Format);
             }
             data[off..off + len].copy_from_slice(&bytes);
-            return std::fs::write(&self.path, &data).map_err(CcError::Io);
+            return crate::fsutil::write_keep_mode(&self.path, &data).map_err(CcError::Io);
         }
         Err(CcError::NotFound)
     }

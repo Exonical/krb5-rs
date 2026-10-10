@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use bitflags::bitflags;
 
-use crate::crypto::find_etype;
 use crate::crypto::util::generate_random;
+use crate::crypto::{find_etype, SaltType};
 use crate::keytab::Keytab;
 use crate::protocol::preauth::default_salt;
 use crate::types::{EncryptionKey, KerberosTime, PrincipalName};
@@ -144,6 +144,60 @@ fn component_bytes(name: &PrincipalName) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// The salt string for `salt_type` (MIT `krb5_dbe_compute_salt`,
+/// kdb5.c:2345-2380): realm and components, components only, or the realm.
+pub fn salt_bytes(name: &PrincipalName, realm: &str, salt_type: SaltType) -> Vec<u8> {
+    match salt_type {
+        SaltType::Normal => default_salt(realm, &component_bytes(name)),
+        SaltType::NoRealm => component_bytes(name).concat(),
+        SaltType::OnlyRealm => realm.as_bytes().to_vec(),
+    }
+}
+
+/// Password-derived keys, one per key/salt pair. `Normal` salt is stored
+/// as `None`; the other salt types store the explicit salt.
+pub fn keys_from_password(
+    name: &PrincipalName,
+    realm: &str,
+    password: &str,
+    kvno: u32,
+    keysalts: &[(i32, SaltType)],
+) -> Result<Vec<KeyEntry>, Krb5Error> {
+    let mut keys = Vec::with_capacity(keysalts.len());
+    for &(etype, salt_type) in keysalts {
+        let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
+        let salt = salt_bytes(name, realm, salt_type);
+        let key = profile
+            .string_to_key(password.as_bytes(), &salt, None)
+            .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
+        keys.push(KeyEntry {
+            kvno,
+            key: EncryptionKey::new(etype, key.to_vec()),
+            salt: (salt_type != SaltType::Normal).then_some(salt),
+            s2kparams: None,
+        });
+    }
+    Ok(keys)
+}
+
+/// A random key per etype (MIT `krb5_c_make_random_key`).
+pub fn random_keys(kvno: u32, etypes: &[i32]) -> Result<Vec<KeyEntry>, Krb5Error> {
+    let mut keys = Vec::with_capacity(etypes.len());
+    for &etype in etypes {
+        let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
+        let key = profile
+            .random_to_key(&generate_random(profile.key_bytes()))
+            .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
+        keys.push(KeyEntry {
+            kvno,
+            key: EncryptionKey::new(etype, key.to_vec()),
+            salt: None,
+            s2kparams: None,
+        });
+    }
+    Ok(keys)
+}
+
 /// Principal store error.
 #[derive(Debug, thiserror::Error)]
 #[error("principal store error: {0}")]
@@ -160,9 +214,19 @@ pub trait PrincipalStore: Send + Sync {
     ) -> Result<Option<PrincipalEntry>, StoreError>;
 }
 
-type StoreKey = (Vec<Vec<u8>>, String);
+impl<T: PrincipalStore + ?Sized> PrincipalStore for std::sync::Arc<T> {
+    fn lookup(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<PrincipalEntry>, StoreError> {
+        (**self).lookup(name, realm)
+    }
+}
 
-fn store_key(name: &PrincipalName, realm: &str) -> StoreKey {
+pub(crate) type StoreKey = (Vec<Vec<u8>>, String);
+
+pub(crate) fn store_key(name: &PrincipalName, realm: &str) -> StoreKey {
     (component_bytes(name), realm.to_string())
 }
 
@@ -216,20 +280,9 @@ impl MemoryStore {
         etypes: &[i32],
         attributes: PrincipalAttributes,
     ) -> Result<(), Krb5Error> {
-        let salt = default_salt(realm, &component_bytes(&name));
-        let mut keys = Vec::with_capacity(etypes.len());
-        for &etype in etypes {
-            let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
-            let key = profile
-                .string_to_key(password.as_bytes(), &salt, None)
-                .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
-            keys.push(KeyEntry {
-                kvno,
-                key: EncryptionKey::new(etype, key.to_vec()),
-                salt: None,
-                s2kparams: None,
-            });
-        }
+        let keysalts: Vec<(i32, SaltType)> =
+            etypes.iter().map(|&e| (e, SaltType::Normal)).collect();
+        let keys = keys_from_password(&name, realm, password, kvno, &keysalts)?;
         self.insert(Self::new_entry(name, realm, attributes, keys));
         Ok(())
     }
@@ -243,19 +296,7 @@ impl MemoryStore {
         etypes: &[i32],
         attributes: PrincipalAttributes,
     ) -> Result<(), Krb5Error> {
-        let mut keys = Vec::with_capacity(etypes.len());
-        for &etype in etypes {
-            let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
-            let key = profile
-                .random_to_key(&generate_random(profile.key_bytes()))
-                .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
-            keys.push(KeyEntry {
-                kvno,
-                key: EncryptionKey::new(etype, key.to_vec()),
-                salt: None,
-                s2kparams: None,
-            });
-        }
+        let keys = random_keys(kvno, etypes)?;
         self.insert(Self::new_entry(name, realm, attributes, keys));
         Ok(())
     }

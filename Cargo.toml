@@ -67,3 +67,7 @@ optional = true
 [[example]]
 name = "kdc"
 required-features = ["kdc", "tokio"]
+
+[[example]]
+name = "kdb"
+required-features = ["kdc"]

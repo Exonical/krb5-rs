@@ -11,9 +11,11 @@
 //! handled in the `fast` module.
 
 mod as_req;
+mod config;
 mod db;
 mod error;
 mod fast;
+pub mod kdb;
 mod policy;
 mod preauth;
 mod reqbody;
@@ -28,8 +30,10 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "tokio")]
 pub use server::{serve_tcp, serve_udp};
 
+pub use config::{default_realm, parse_listen_addresses, ConfigError, RealmConfig};
 pub use db::{
-    KeyEntry, MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, StoreError,
+    keys_from_password, random_keys, salt_bytes, KeyEntry, MemoryStore, PrincipalAttributes,
+    PrincipalEntry, PrincipalStore, StoreError,
 };
 
 use db::KvnoSel;

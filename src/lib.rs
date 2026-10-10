@@ -26,6 +26,7 @@
 pub mod ccache;
 pub mod crypto;
 pub mod error;
+pub(crate) mod fsutil;
 pub mod gssapi;
 pub mod keytab;
 pub mod locate;

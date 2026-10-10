@@ -228,7 +228,7 @@ impl Keytab for FileKeytab {
         self.ensure_writable()?;
         // Create the file with a 0x0502 header if missing.
         if !self.path.exists() {
-            std::fs::write(&self.path, [0x05, 0x02])?;
+            crate::fsutil::write_keep_mode(&self.path, &[0x05, 0x02])?;
         }
         let body = Self::entry_body(entry);
         let needed = body.len() as i32;
@@ -249,7 +249,7 @@ impl Keytab for FileKeytab {
                     for b in &mut data[pos + 4 + body.len()..pos + 4 + hole] {
                         *b = 0;
                     }
-                    return std::fs::write(&self.path, &data).map_err(KtError::Io);
+                    return crate::fsutil::write_keep_mode(&self.path, &data).map_err(KtError::Io);
                 }
             } else if size == 0 {
                 break;
@@ -264,7 +264,7 @@ impl Keytab for FileKeytab {
         } else {
             data.extend_from_slice(&rec);
         }
-        std::fs::write(&self.path, &data).map_err(KtError::Io)
+        crate::fsutil::write_keep_mode(&self.path, &data).map_err(KtError::Io)
     }
 
     fn remove_entry(&mut self, entry: &KeytabEntry) -> Result<(), KtError> {
@@ -282,7 +282,7 @@ impl Keytab for FileKeytab {
                 for b in &mut data[off + 4..off + 4 + size] {
                     *b = 0;
                 }
-                return std::fs::write(&self.path, &data).map_err(KtError::Io);
+                return crate::fsutil::write_keep_mode(&self.path, &data).map_err(KtError::Io);
             }
         }
         Err(KtError::NotFound)
