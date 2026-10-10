@@ -121,11 +121,25 @@ pub(crate) fn etype_info2_padata(
 /// (REQUIRES_HW_AUTH) only hardware mechanisms are listed, so neither is.
 /// The trailing PA-FX-COOKIE is the trivial "MIT" cookie
 /// (kdc_fast_make_cookie, fast_util.c:673-676; no cookie state is kept).
+#[cfg(test)]
 pub(crate) fn hint_list(
     client: &PrincipalEntry,
     key: Option<&ClientKey>,
     hw_only: bool,
     armored: bool,
+) -> Result<Vec<u8>, KdcError> {
+    hint_list_with(client, key, hw_only, armored, &[])
+}
+
+/// [`hint_list`] with extra module hints (PKINIT's PA-PK-AS-REQ,
+/// PA-PKINIT-KX and freshness token) placed after the built-in mechanisms
+/// and before the cookie.
+pub(crate) fn hint_list_with(
+    client: &PrincipalEntry,
+    key: Option<&ClientKey>,
+    hw_only: bool,
+    armored: bool,
+    extras: &[PaData],
 ) -> Result<Vec<u8>, KdcError> {
     let empty = |t: PaDataType| PaData {
         padata_type: t as i32,
@@ -142,6 +156,7 @@ pub(crate) fn hint_list(
             }));
         }
     }
+    list.extend(extras.iter().cloned());
     list.push(PaData {
         padata_type: PaDataType::FxCookie as i32,
         padata_value: OctetString::from(b"MIT".to_vec()),

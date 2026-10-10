@@ -22,6 +22,7 @@ mod db;
 mod error;
 mod fast;
 pub mod kdb;
+mod pkinit;
 mod policy;
 mod preauth;
 mod reqbody;
@@ -91,6 +92,9 @@ pub struct KdcConfig {
     /// MIT `disable_pac` (kdc.conf realm relation, kdc/main.c:338): never
     /// issue a PAC.
     pub disable_pac: bool,
+    /// PKINIT settings; `None` leaves PKINIT off (MIT: no `pkinit_identity`).
+    #[cfg(feature = "pkinit")]
+    pub pkinit: Option<std::sync::Arc<crate::pkinit::server::ServerConfig>>,
 }
 
 impl KdcConfig {
@@ -111,6 +115,8 @@ impl KdcConfig {
             no_host_referral: Vec::new(),
             reject_bad_transit: true,
             disable_pac: false,
+            #[cfg(feature = "pkinit")]
+            pkinit: None,
         }
     }
 }
@@ -165,6 +171,7 @@ impl<S: PrincipalStore> Kdc<S> {
             code,
             e_text: None,
             e_data: None,
+            typed_e_data: false,
         };
         build_krb_error(&err, &self.local_context(), now)
     }

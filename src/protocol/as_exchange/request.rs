@@ -60,6 +60,11 @@ impl AsExchange {
             additional_tickets: None,
         };
 
+        #[cfg(feature = "pkinit")]
+        let preauth_padata = self
+            .fill_pkinit(preauth_padata.clone(), &req_body)?
+            .or(preauth_padata);
+
         // Build padata list: [PA-FX-COOKIE] [preauth] [info padata] [PA-PAC-REQUEST]
         let mut padata: Vec<PaData> = Vec::new();
 

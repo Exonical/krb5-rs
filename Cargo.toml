@@ -42,27 +42,42 @@ chrono = "0.4.38"
 
 # Error handling
 thiserror = "2.0"
+# PKINIT (feature `pkinit`). rsa is an exact-pinned release candidate: no stable
+# 0.10 exists yet, and rc.19 is newer than the 7-day dependency age rule.
+rsa = { version = "=0.10.0-rc.18", features = ["sha2"], optional = true }
+# rsa rc.18 builds only against pkcs1 0.8.0-rc.4; rc.5 changed RsaPrivateKey
+# generics, and `^0.8.0-rc.4` would otherwise resolve to it.
+pkcs1 = { version = "=0.8.0-rc.4", optional = true }
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"], optional = true }
+p384 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"], optional = true }
+p521 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"], optional = true }
+crypto-bigint = { version = "0.7", optional = true }
+rasn-pkix = { version = "0.28", optional = true }
 
 [dev-dependencies]
+rasn-cms = "0.28"
 tokio = { version = "1.50", features = ["full"] }
 
 [features]
 default = []
 client = ["tokio"]         # Kerberos client (TGT/TGS request)
 gssapi = []                # GSSAPI/SPNEGO mechanism
-pkinit = ["dep:x509-parser", "dep:rcgen"]  # PKINIT (X.509 + Kerberos)
+pkinit = [
+    "dep:rsa",
+    "dep:pkcs1",
+    "dep:p256",
+    "dep:p384",
+    "dep:p521",
+    "dep:crypto-bigint",
+    "dep:rasn-pkix",
+]  # PKINIT (X.509 + Kerberos)
+# TESTING ONLY: embeds fixed private keys and a certificate issuer
+# (`krb5_rs::pkinit::pki`); never enable in production builds.
+test-pki = ["pkinit"]
 fast = []                  # FAST pre-authentication tunneling
 kdc = []                   # Kerberos KDC (AS/TGS request processing)
 tokio = ["dep:tokio"]      # Tokio async transport adapter
 dns = ["dep:hickory-resolver", "dep:tokio"]  # Real DNS resolver for KDC location
-
-[dependencies.x509-parser]
-version = "0.18"
-optional = true
-
-[dependencies.rcgen]
-version = "0.14"
-optional = true
 
 [[example]]
 name = "kdc"
@@ -71,3 +86,7 @@ required-features = ["kdc", "tokio"]
 [[example]]
 name = "kdb"
 required-features = ["kdc"]
+
+[[example]]
+name = "gen_pkinit_pki"
+required-features = ["test-pki"]

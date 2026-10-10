@@ -31,6 +31,8 @@ pub mod gssapi;
 pub mod keytab;
 pub mod locate;
 pub mod pac;
+#[cfg(feature = "pkinit")]
+pub mod pkinit;
 pub mod profile;
 pub mod protocol;
 pub mod types;

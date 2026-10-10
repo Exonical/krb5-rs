@@ -485,7 +485,7 @@ fn s4u2self_issues_a_ticket_for_the_user_to_the_service_with_the_users_pac() {
 
 #[test]
 fn s4u2self_forwardable_follows_ok_to_auth_as_delegate_and_delegation_targets() {
-    // s4u2self_forwardable (kdc_util.c:1562-1580).
+    // s4u2self_forwardable (kdc_util.c:1626-1644).
     let cases = [
         (Cfg::default(), true),
         (

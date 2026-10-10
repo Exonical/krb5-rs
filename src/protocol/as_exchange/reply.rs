@@ -43,14 +43,23 @@ impl AsExchange {
         // Derive key from password, preferring params from AS-REP padata
         // (which is the FAST response padata when armored — MIT overwrites
         // resp->padata before the final k5_preauth pass).
-        let (salt, s2kparams) = self.compute_reply_key_params(rep);
-        let as_key = EncryptionKey::new(
-            etype,
-            profile
-                .string_to_key(self.password.as_bytes(), &salt, s2kparams.as_deref())
-                .map_err(|e| Krb5Error::Crypto(e.to_string()))?
-                .to_vec(),
-        );
+        #[cfg(feature = "pkinit")]
+        let pkinit_key = self.pkinit_reply_key(rep)?;
+        #[cfg(not(feature = "pkinit"))]
+        let pkinit_key: Option<EncryptionKey> = None;
+        let as_key = match pkinit_key {
+            Some(key) => key,
+            None => {
+                let (salt, s2kparams) = self.compute_reply_key_params(rep);
+                EncryptionKey::new(
+                    etype,
+                    profile
+                        .string_to_key(self.password.as_bytes(), &salt, s2kparams.as_deref())
+                        .map_err(|e| Krb5Error::Crypto(e.to_string()))?
+                        .to_vec(),
+                )
+            }
+        };
 
         // MIT fast.c:570-593 — a strengthen key folds into the reply key.
         let reply_key = FastState::reply_key(strengthen_key.as_ref(), &as_key)?;

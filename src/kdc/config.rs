@@ -206,6 +206,10 @@ impl RealmConfig {
         kdc.reject_bad_transit =
             kdc_conf.get_boolean(&["realms", realm, "reject_bad_transit"], true)?;
         kdc.disable_pac = kdc_conf.get_boolean(&["realms", realm, "disable_pac"], false)?;
+        #[cfg(feature = "pkinit")]
+        {
+            kdc.pkinit = pkinit_settings(kdc_conf, realm)?;
+        }
 
         Ok(Self {
             kdc,
@@ -223,6 +227,84 @@ impl RealmConfig {
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
         })
     }
+}
+
+/// PKINIT settings from `[realms]`/`[kdcdefaults]` (pkinit_srv.c
+/// `pkinit_init_kdc_profile` :958-1040; `pkinit_kdcdefault_*` look in the
+/// realm first, then `[kdcdefaults]`). PKINIT is off without
+/// `pkinit_identity`; `pkinit_anchors` is then required.
+#[cfg(feature = "pkinit")]
+fn pkinit_settings(
+    kdc_conf: &Profile,
+    realm: &str,
+) -> Result<Option<std::sync::Arc<crate::pkinit::server::ServerConfig>>, ConfigError> {
+    use crate::pkinit::cms::Identity;
+    use crate::pkinit::server::ServerConfig;
+    use crate::pkinit::x509::TrustStore;
+
+    let one = |key: &str| {
+        kdc_conf
+            .get_string(&["realms", realm, key])
+            .or_else(|| kdc_conf.get_string(&["kdcdefaults", key]))
+    };
+    let all = |key: &str| {
+        let mut v = kdc_conf.get_values(&["realms", realm, key]);
+        if v.is_empty() {
+            v = kdc_conf.get_values(&["kdcdefaults", key]);
+        }
+        v
+    };
+    let boolean = |key: &str| -> Result<bool, ConfigError> {
+        match one(key) {
+            None => Ok(false),
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => Ok(true),
+                "false" | "no" | "off" | "0" => Ok(false),
+                _ => Err(ConfigError::Invalid(format!("{key}: not a boolean"))),
+            },
+        }
+    };
+    let invalid = |m: String| ConfigError::Invalid(m);
+
+    let Some(identity_spec) = one("pkinit_identity") else {
+        return Ok(None);
+    };
+    let anchors = all("pkinit_anchors");
+    if anchors.is_empty() {
+        return Err(invalid(format!(
+            "No pkinit_anchors supplied for realm {realm}"
+        )));
+    }
+    if one("pkinit_kdc_ocsp").is_some() {
+        return Err(invalid(format!("OCSP is not supported: (realm: {realm})")));
+    }
+    let identity = Identity::from_spec(&identity_spec).map_err(invalid)?;
+    let mut store = TrustStore::default();
+    for a in anchors {
+        store.load(&a, true).map_err(invalid)?;
+    }
+    for p in all("pkinit_pool") {
+        store.load(&p, false).map_err(invalid)?;
+    }
+    for r in all("pkinit_revoke") {
+        store.load_crls(&r).map_err(invalid)?;
+    }
+    let mut server = ServerConfig::new(identity, store);
+    server.dh_min_bits =
+        crate::pkinit::kex::parse_dh_min_bits(one("pkinit_dh_min_bits").as_deref());
+    server.allow_upn = boolean("pkinit_allow_upn")?;
+    server.require_crl_checking = boolean("pkinit_require_crl_checking")?;
+    server.require_freshness = boolean("pkinit_require_freshness")?;
+    if let Some(eku) = one("pkinit_eku_checking") {
+        match eku.to_ascii_lowercase().as_str() {
+            "kpclientauth" => {}
+            "sclogin" => server.accept_secondary_eku = true,
+            "none" => server.require_eku = false,
+            _ => {}
+        }
+    }
+    server.indicators = all("pkinit_indicator");
+    Ok(Some(std::sync::Arc::new(server)))
 }
 
 /// A service list: all `[kdcdefaults]` values followed by all realm values

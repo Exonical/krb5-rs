@@ -48,8 +48,10 @@ impl<'a> Input<'a> {
         }
         let raw = self.bytes(count * 2)?;
         let units: Vec<u16> = raw
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let s = String::from_utf16(&units).map_err(|_| PacError::Invalid("bad UTF-16"))?;
         if count % 2 == 1 {

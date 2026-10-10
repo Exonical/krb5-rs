@@ -5,3 +5,4 @@
 pub mod fixtures;
 pub mod kdc;
 pub mod krb_error;
+pub mod pki;

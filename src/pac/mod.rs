@@ -306,8 +306,10 @@ impl Pac {
             return Err(PacError::Range);
         }
         let units: Vec<u16> = ci[PAC_CLIENT_INFO_LENGTH..PAC_CLIENT_INFO_LENGTH + name_len]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let name = String::from_utf16(&units)
             .map_err(|_| PacError::Generic("client name is not valid UTF-16".into()))?;

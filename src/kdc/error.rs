@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Timelike, Utc};
 use rasn::types::{GeneralString, OctetString};
+use rasn::{AsnType, Decode, Decoder, Encode, Encoder};
 
 use crate::protocol::ap::ApError;
 use crate::types::error_codes::*;
@@ -22,6 +23,9 @@ pub(crate) struct KdcError {
     pub e_text: Option<String>,
     /// KRB-ERROR e-data.
     pub e_data: Option<Vec<u8>>,
+    /// `e_data` is a METHOD-DATA list that goes on the wire as TYPED-DATA
+    /// unless the error is armored (MIT `typed_e_data`, do_as_req.c:811-816).
+    pub typed_e_data: bool,
 }
 
 impl KdcError {
@@ -31,6 +35,7 @@ impl KdcError {
             code,
             e_text: Some(text.to_string()),
             e_data: None,
+            typed_e_data: false,
         }
     }
 
@@ -43,6 +48,20 @@ impl KdcError {
     pub(crate) fn with_e_data(mut self, e_data: Vec<u8>) -> Self {
         self.e_data = Some(e_data);
         self
+    }
+
+    #[cfg(feature = "pkinit")]
+    /// Attach a typed e-data list (the elements plus the trailing
+    /// PA-FX-COOKIE `prepare_error_as` appends, do_as_req.c:783-797).
+    pub(crate) fn with_typed_e_data(mut self, items: Vec<PaData>) -> Result<Self, KdcError> {
+        let mut list = items;
+        list.push(PaData {
+            padata_type: 133,
+            padata_value: OctetString::from(b"MIT".to_vec()),
+        });
+        self.e_data = Some(rasn::der::encode(&list)?);
+        self.typed_e_data = true;
+        Ok(self)
     }
 }
 
@@ -172,7 +191,32 @@ pub(crate) fn build_krb_error(err: &KdcError, ctx: &ErrorContext, now: DateTime<
             }
         }
     }
+    if err.typed_e_data && ctx.fast.as_ref().is_none_or(|s| s.armor_key.is_none()) {
+        e_data = err.e_data.as_deref().and_then(typed_data_from_method_data);
+    }
     rasn::der::encode(&make(crealm.as_deref(), cname.as_ref(), e_data)).unwrap_or_default()
+}
+
+/// TYPED-DATA element: `{ data-type [0], data-value [1] }`.
+#[derive(AsnType, Encode, Decode)]
+struct TypedDataElement {
+    #[rasn(tag(explicit(context, 0)))]
+    data_type: i32,
+    #[rasn(tag(explicit(context, 1)))]
+    data_value: Option<OctetString>,
+}
+
+/// Re-encode METHOD-DATA as TYPED-DATA (`encode_krb5_typed_data`).
+fn typed_data_from_method_data(method_data: &[u8]) -> Option<Vec<u8>> {
+    let list: Vec<PaData> = rasn::der::decode(method_data).ok()?;
+    let typed: Vec<TypedDataElement> = list
+        .into_iter()
+        .map(|p| TypedDataElement {
+            data_type: p.padata_type,
+            data_value: Some(p.padata_value),
+        })
+        .collect();
+    rasn::der::encode(&typed).ok()
 }
 
 #[cfg(test)]
