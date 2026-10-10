@@ -1,0 +1,10 @@
+# Build context for deploy/docker/Dockerfile.
+.git
+.github
+target
+tests
+docker-compose.test.yml
+deploy
+AGENTS.md
+**/*.pem
+**/*.keytab

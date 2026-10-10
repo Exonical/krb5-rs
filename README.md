@@ -7,7 +7,7 @@ Pure Rust Kerberos V5 implementation. GSSAPI, SPNEGO, PKINIT.
 ## Features
 
 - **Kerberos V5 Client** — AS/TGS exchanges (TGT acquisition, service ticket requests), krb5.conf parsing, KDC discovery
-- **KDC** — AS/TGS request processing, FAST, UDP/TCP serving (`kdc` feature; see `examples/kdc.rs`)
+- **KDC** — AS/TGS request processing, FAST, UDP/TCP serving (`kdc` feature; the deployable daemon is `krb5-rs-kdc` in `crates/krb5-rs-kdc`)
 - **GSSAPI/SPNEGO** — HTTP Negotiate authentication
 - **PKINIT** — X.509 certificate-based authentication, client and KDC (`pkinit` feature; DH/ECDH replies, MIT 1.22 parity)
 - **FAST** — Flexible Authentication via Secure Tunneling
@@ -42,6 +42,21 @@ MIT Kerberos and Heimdal are massive C codebases (~450K and ~620K SLOC respectiv
 **Feature `test-pki`** (TESTING ONLY): embeds fixed RSA private keys and a certificate issuer used by the PKINIT tests and `examples/gen_pkinit_pki.rs`. Never enable it in production builds.
 
 **Not yet supported:** PAC/authorization data, S4U, PKINIT RSA key transport and anonymous PKINIT, DES/RC4/Camellia enctypes.
+
+## Running the KDC
+
+The `crates/krb5-rs-kdc` workspace member builds two binaries (not published to crates.io):
+
+- `krb5-rs-kdb` administers the persistent database (`create -s`, `addprinc`, `ktadd`, ...; passwords come from stdin).
+- `krb5-rs-kdc` serves it over UDP and TCP, driven by `kdc.conf` (`--config` / `KRB5_KDC_PROFILE`, `--krb5-config` / `KRB5_CONFIG`, optional `--listen` overrides), logs one MIT-style line per request to stdout (`RUST_LOG` controls verbosity) and shuts down gracefully on SIGTERM/SIGINT (`--shutdown-timeout`).
+
+```sh
+krb5-rs-kdb --config kdc.conf create -s
+echo secret | krb5-rs-kdb --config kdc.conf addprinc alice
+krb5-rs-kdc --config kdc.conf
+```
+
+`deploy/docker/Dockerfile` builds a static, distroless, nonroot image with both binaries (`podman build -f deploy/docker/Dockerfile .`). The container user cannot bind port 88: configure `kdc_ports = 8888` and map 88 to 8888 outside.
 
 ## License
 

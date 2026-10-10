@@ -1,6 +1,6 @@
 //! kadmin.local-like administration of the persistent principal database.
 //!
-//! `kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] <cmd> args`
+//! `krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] <cmd> args`
 //!
 //! Commands: `create [-s]`, `stash`, `addprinc`, `delprinc`, `cpw`,
 //! `modprinc`, `getprinc`, `listprincs`, `ktadd`. See `usage()`.
@@ -22,7 +22,7 @@ use krb5_rs::profile::Profile;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] <command>\n\
+        "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] <command>\n\
          commands:\n  create [-s]\n  stash\n  \
          addprinc [-randkey] [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
          delprinc NAME\n  cpw [-randkey] [-keepold] NAME\n  \
@@ -33,7 +33,7 @@ fn usage() -> ! {
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
-    eprintln!("kdb: {msg}");
+    eprintln!("krb5-rs-kdb: {msg}");
     std::process::exit(1);
 }
 

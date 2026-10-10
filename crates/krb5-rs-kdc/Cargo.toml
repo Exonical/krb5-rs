@@ -1,0 +1,25 @@
+[package]
+name = "krb5-rs-kdc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+authors = ["Dmitry Prudnikov <mail@polaz.com>"]
+description = "Deployable Kerberos KDC daemon and database administration tool built on krb5-rs"
+repository = "https://github.com/structured-world/krb5-rs"
+publish = false
+
+[[bin]]
+name = "krb5-rs-kdc"
+path = "src/bin/krb5-rs-kdc.rs"
+
+[[bin]]
+name = "krb5-rs-kdb"
+path = "src/bin/krb5-rs-kdb.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+krb5-rs = { path = "../..", features = ["kdc", "tokio", "pkinit"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }

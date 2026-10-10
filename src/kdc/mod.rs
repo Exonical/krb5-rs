@@ -29,6 +29,7 @@ mod reqbody;
 mod s4u;
 #[cfg(feature = "tokio")]
 mod server;
+mod summary;
 mod tgs_req;
 
 use std::time::Duration;
@@ -38,7 +39,11 @@ use crate::profile::Profile;
 use chrono::{DateTime, Utc};
 
 #[cfg(feature = "tokio")]
-pub use server::{serve_tcp, serve_udp};
+pub use server::{
+    serve_tcp, serve_tcp_with, serve_udp, serve_udp_with, RequestLogger, ServeOptions,
+};
+
+pub use summary::{Outcome, RequestKind, RequestSummary, Transport};
 
 pub use config::{default_realm, parse_listen_addresses, ConfigError, RealmConfig};
 pub use db::{
@@ -161,6 +166,21 @@ impl<S: PrincipalStore> Kdc<S> {
             return self.bare_error(KRB_ERR_RESPONSE_TOO_BIG, now);
         }
         reply
+    }
+
+    /// Process one request like [`Kdc::handle`] (or [`Kdc::handle_udp`] for
+    /// [`Transport::Udp`]) and summarise it for logging.
+    pub fn handle_summarized(
+        &self,
+        request: &[u8],
+        transport: Transport,
+    ) -> (Vec<u8>, RequestSummary) {
+        let reply = match transport {
+            Transport::Udp => self.handle_udp(request),
+            Transport::Tcp => self.handle(request),
+        };
+        let summary = RequestSummary::new(request, &reply, transport);
+        (reply, summary)
     }
 
     /// A KRB-ERROR with no client, text or e-data and the local TGS as

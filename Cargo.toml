@@ -32,7 +32,7 @@ zeroize = { version = "1", features = ["derive"] }
 bitflags = "2"
 
 # Network
-tokio = { version = "1.50", features = ["net", "io-util", "time", "sync", "rt"], optional = true }
+tokio = { version = "1.50", features = ["net", "io-util", "time", "sync", "rt", "macros"], optional = true }
 
 # DNS SRV/URI KDC discovery (optional real resolver)
 hickory-resolver = { version = "0.25.2", optional = true }
@@ -80,13 +80,8 @@ tokio = ["dep:tokio"]      # Tokio async transport adapter
 dns = ["dep:hickory-resolver", "dep:tokio"]  # Real DNS resolver for KDC location
 
 [[example]]
-name = "kdc"
-required-features = ["kdc", "tokio"]
-
-[[example]]
-name = "kdb"
-required-features = ["kdc"]
-
-[[example]]
 name = "gen_pkinit_pki"
 required-features = ["test-pki"]
+
+[workspace]
+members = [".", "crates/krb5-rs-kdc"]

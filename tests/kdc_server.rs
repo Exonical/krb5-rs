@@ -220,3 +220,85 @@ async fn udp_garbage_datagram_gets_error_reply() {
     let (n, _) = sock.recv_from(&mut buf).await.expect("recv");
     assert_eq!(code(&buf[..n]), 40);
 }
+
+#[tokio::test]
+async fn shutdown_stops_accepting_and_waits_for_open_connections() {
+    use krb5_rs::kdc::{serve_tcp_with, ServeOptions};
+    use std::sync::Mutex;
+
+    let kdc = Arc::new(Kdc::new(KdcConfig::new(REALM), MemoryStore::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let server = tokio::spawn(serve_tcp_with(
+        kdc,
+        listener,
+        ServeOptions {
+            logger: Some(Arc::new(move |s, peer| {
+                log.lock().expect("lock").push((s.clone(), peer));
+            })),
+            shutdown: Some(rx),
+        },
+    ));
+
+    // A connection that has sent nothing keeps the server from finishing.
+    let mut idle = TcpStream::connect(addr).await.expect("connect");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tx.send(true).expect("signal");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!server.is_finished(), "must wait for the idle connection");
+    assert!(
+        TcpStream::connect(addr).await.is_err()
+            || tokio::time::timeout(std::time::Duration::from_millis(300), async {
+                let mut c = TcpStream::connect(addr).await.expect("connect");
+                let mut b = [0u8; 1];
+                c.read(&mut b).await
+            })
+            .await
+            .is_ok_and(|r| r.map_or(true, |n| n == 0)),
+        "no new connections are served after shutdown"
+    );
+
+    // Finishing the request lets it drain, and the request was logged.
+    let request = vec![1u8, 2, 3];
+    idle.write_all(&(request.len() as u32).to_be_bytes())
+        .await
+        .expect("write");
+    idle.write_all(&request).await.expect("write");
+    let mut reply = Vec::new();
+    idle.read_to_end(&mut reply).await.expect("read");
+    assert!(reply.len() > 4);
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("drained")
+        .expect("join")
+        .expect("serve_tcp_with");
+    let seen = seen.lock().expect("lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0.kind, krb5_rs::kdc::RequestKind::Unknown);
+}
+
+#[tokio::test]
+async fn shutdown_stops_the_udp_server() {
+    use krb5_rs::kdc::{serve_udp_with, ServeOptions};
+
+    let kdc = Arc::new(Kdc::new(KdcConfig::new(REALM), MemoryStore::new()));
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(serve_udp_with(
+        kdc,
+        socket,
+        ServeOptions {
+            logger: None,
+            shutdown: Some(rx),
+        },
+    ));
+    tx.send(true).expect("signal");
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("stopped")
+        .expect("join")
+        .expect("serve_udp_with");
+}
