@@ -44,6 +44,10 @@ pub(super) struct KdbPrincipal {
     pub mod_time: Option<KerberosTime>,
     #[rasn(tag(explicit(context, 9)))]
     pub keys: Vec<KdbKey>,
+    #[rasn(tag(explicit(context, 10)))]
+    pub allowed_to_delegate_to: Option<Vec<GeneralString>>,
+    #[rasn(tag(explicit(context, 11)))]
+    pub allowed_to_delegate_from: Option<Vec<GeneralString>>,
 }
 
 /// One master-key-encrypted long-term key (MIT `krb5_key_data`).
@@ -61,4 +65,35 @@ pub(super) struct KdbKey {
     pub salt: Option<OctetString>,
     #[rasn(tag(explicit(context, 5)))]
     pub s2kparams: Option<OctetString>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record as written before the delegation lists existed.
+    #[derive(AsnType, Encode, Decode, Debug, Clone)]
+    struct LegacyPrincipal {
+        #[rasn(tag(explicit(context, 0)))]
+        name: PrincipalName,
+        #[rasn(tag(explicit(context, 1)))]
+        realm: GeneralString,
+        #[rasn(tag(explicit(context, 2)))]
+        attributes: u32,
+        #[rasn(tag(explicit(context, 9)))]
+        keys: Vec<KdbKey>,
+    }
+
+    #[test]
+    fn records_without_delegation_lists_still_decode() {
+        let legacy = LegacyPrincipal {
+            name: PrincipalName::new_principal("old"),
+            realm: GeneralString::from_bytes(b"R").expect("realm"),
+            attributes: 0,
+            keys: Vec::new(),
+        };
+        let der = rasn::der::encode(&legacy).expect("encode");
+        let rec: KdbPrincipal = rasn::der::decode(&der).expect("decode legacy record");
+        assert!(rec.allowed_to_delegate_to.is_none() && rec.allowed_to_delegate_from.is_none());
+    }
 }

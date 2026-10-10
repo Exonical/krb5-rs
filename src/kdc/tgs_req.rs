@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use rasn::types::OctetString;
 
+use super::authdata::S4uPac;
 use super::db::KvnoSel;
 use super::error::{
     ap_error_code, general_string, krbtgt_name, ErrorContext, KdcError, KRB_AP_ERR_ILL_CR_TKT,
@@ -16,6 +17,7 @@ use super::policy::{
 };
 use super::preauth::{enc_pa_rep_padata, find_padata};
 use super::reqbody::raw_req_body;
+use super::s4u::{impersonator_string, pac_options_reply};
 use super::{is_tgs_principal, names_equal, random_key, Kdc, PrincipalEntry, PrincipalStore};
 use crate::crypto::{find_cksumtype, find_etype, key_usage};
 use crate::locate::host_realm;
@@ -38,7 +40,7 @@ const AUTHDATA_IF_RELEVANT: i32 = 1;
 
 /// Options that make the header ticket's server the requested server
 /// (MIT kdc_util.h `NON_TGT_OPTION`).
-const NON_TGT_OPTION: KdcOptions = KdcOptions::FORWARDED
+pub(super) const NON_TGT_OPTION: KdcOptions = KdcOptions::FORWARDED
     .union(KdcOptions::PROXY)
     .union(KdcOptions::RENEW)
     .union(KdcOptions::VALIDATE);
@@ -356,23 +358,54 @@ impl<S: PrincipalStore> Kdc<S> {
         let header_pac =
             self.verify_header_pac(&header, &ap.ticket.sname, &header_key, &local_tgt)?;
 
-        let (server, is_referral) = self.search_sprinc(opts, sname, realm)?;
+        let (mut server, is_referral) = self.search_sprinc(opts, sname, realm)?;
 
         // The request is cross-realm if the header ticket server is not from
         // this realm (do_tgs_req.c:693-695).
         let client_realm = realm_string(&header.crealm);
         let is_crossrealm = tkt_realm != *realm;
 
+        // S4U2Self padata names the requested client; S4U2Proxy takes the
+        // evidence ticket (do_tgs_req.c:692-756).
+        let s4u2self =
+            self.process_s4u2self_req(req, &server, auth.subkey.as_ref(), &header.key)?;
+        if s4u2self.is_some() {
+            // Authorization data stays enabled for S4U2Self (:712-717).
+            server
+                .attributes
+                .remove(super::PrincipalAttributes::NO_AUTH_DATA_REQUIRED);
+        }
+        let proxy = opts.contains(KdcOptions::CNAME_IN_ADDL_TKT);
+        let stkt = if proxy {
+            body.additional_tickets
+                .as_ref()
+                .and_then(|t| t.first())
+                .map(|t| self.decrypt_2ndtkt(t, &local_tgt))
+                .transpose()?
+        } else {
+            None
+        };
+        let subject_tkt: &crate::types::EncTicketPart = stkt.as_ref().map_or(&header, |e| &e.part);
+        let (tkt_cname, tkt_crealm) = match (&s4u2self, &stkt) {
+            (Some(s), _) if !is_referral => (s.user.clone(), general_string(&s.user_realm)?),
+            (None, Some(e)) if !is_referral => (e.part.cname.clone(), e.part.crealm.clone()),
+            _ => (header.cname.clone(), header.crealm.clone()),
+        };
+        let tkt_realm_str = realm_string(&tkt_crealm);
+        let subject_realm = realm_string(&subject_tkt.crealm);
+
         // The client is looked up only when it belongs to this realm, and
-        // NO_AUTH_DATA_REQUIRED servers skip the lookup (do_tgs_req.c:771-779).
-        let client = if server
+        // NO_AUTH_DATA_REQUIRED servers skip the lookup (do_tgs_req.c:757-779).
+        let client = if let Some(s) = &s4u2self {
+            s.client.clone()
+        } else if server
             .attributes
             .contains(super::PrincipalAttributes::NO_AUTH_DATA_REQUIRED)
-            || client_realm != *realm
+            || subject_realm != *realm
         {
             None
         } else {
-            self.lookup(&header.cname, &client_realm, STATUS)
+            self.lookup(&subject_tkt.cname, &subject_realm, STATUS)
                 .ok()
                 .flatten()
         };
@@ -401,15 +434,38 @@ impl<S: PrincipalStore> Kdc<S> {
             }
         }
 
-        // check_tgs_lineage (tgs_policy.c:248-258): no local user tickets
-        // issued by a foreign realm.
-        if is_crossrealm && client_realm == *realm {
+        // check_tgs_s4u2self, or check_tgs_lineage (tgs_policy.c:248-258): no
+        // local user tickets issued by a foreign realm.
+        if let Some(s) = &s4u2self {
+            self.check_tgs_s4u2self(
+                s,
+                opts,
+                &server,
+                &header,
+                header_pac.as_ref(),
+                is_crossrealm,
+                is_referral,
+                kdc_time,
+            )?;
+        } else if is_crossrealm && client_realm == *realm {
             return Err(KdcError::new(KDC_ERR_POLICY, "INVALID LINEAGE"));
+        }
+
+        if proxy {
+            self.check_tgs_s4u2proxy(
+                opts,
+                sname,
+                &header,
+                header_pac.as_ref(),
+                stkt.as_ref(),
+                is_crossrealm,
+                is_referral,
+            )?;
         }
 
         // check_normal_tgs_pac (tgs_policy.c:600-625): the PAC client info
         // must match the header ticket's client (no realm).
-        if let Some(pac) = &header_pac {
+        if let (Some(pac), false) = (&header_pac, proxy || s4u2self.is_some()) {
             let authtime = header.authtime.timestamp();
             if pac
                 .verify(authtime, Some((&header.cname, &client_realm)), None, None)
@@ -427,6 +483,17 @@ impl<S: PrincipalStore> Kdc<S> {
             is_tgs_principal(&ap.ticket.sname),
             kdc_time,
         )?;
+        if let Some(e) = &stkt {
+            self.check_s4u2proxy_policy(
+                req,
+                (&header.cname, &client_realm),
+                &e.server,
+                (sname, &realm_string(&body.realm)),
+                &server,
+                is_crossrealm,
+                is_referral,
+            )?;
+        }
 
         // get_ticket_flags / compute_ticket_times (do_tgs_req.c:809-852).
         let mut flags = get_ticket_flags(opts, client.as_ref(), &server, Some(header_flags));
@@ -440,7 +507,7 @@ impl<S: PrincipalStore> Kdc<S> {
             .map(ts)
             .unwrap_or(ts(&header.authtime));
         let mut times = Times {
-            authtime: ts(&header.authtime),
+            authtime: ts(&subject_tkt.authtime),
             starttime: kdc_time,
             endtime: 0,
             renew_till: 0,
@@ -474,11 +541,14 @@ impl<S: PrincipalStore> Kdc<S> {
         if times.starttime == times.authtime {
             times.starttime = 0;
         }
+        if s4u2self.is_some() && !is_referral {
+            Self::s4u2self_forwardable(&server, &mut flags);
+        }
 
         // The transited list implied by the request (do_tgs_req.c:787-806):
         // unchanged unless this is a cross-realm request for a client of
         // another realm than the header ticket's issuer.
-        let transited = if !is_crossrealm || tkt_realm == client_realm {
+        let transited = if !is_crossrealm || tkt_realm == tkt_realm_str {
             header.transited.clone()
         } else {
             if header.transited.tr_type != 1 {
@@ -490,7 +560,7 @@ impl<S: PrincipalStore> Kdc<S> {
             let contents = add_to_transited(
                 header.transited.contents.as_ref(),
                 tkt_realm.as_bytes(),
-                client_realm.as_bytes(),
+                tkt_realm_str.as_bytes(),
                 body.realm.as_bytes(),
             )
             .map_err(|_| KdcError::new(KRB_AP_ERR_ILL_CR_TKT, "ADD_TO_TRANSITED_LIST"))?;
@@ -507,7 +577,7 @@ impl<S: PrincipalStore> Kdc<S> {
         if !opts.contains(KdcOptions::DISABLE_TRANSITED_CHECK)
             && check_transited_list(
                 transited.contents.as_ref(),
-                client_realm.as_bytes(),
+                subject_realm.as_bytes(),
                 body.realm.as_bytes(),
                 self.config.realm_profile.as_ref(),
             )
@@ -552,8 +622,8 @@ impl<S: PrincipalStore> Kdc<S> {
         let mut part = crate::types::EncTicketPart {
             flags: tkt_flags,
             key: session_key.clone(),
-            crealm: header.crealm.clone(),
-            cname: header.cname.clone(),
+            crealm: tkt_crealm.clone(),
+            cname: tkt_cname.clone(),
             transited,
             authtime: kerberos_time(times.authtime),
             starttime: optional_time(times.starttime),
@@ -569,9 +639,18 @@ impl<S: PrincipalStore> Kdc<S> {
             &local_tgt,
             body.enc_authorization_data
                 .as_ref()
-                .map(|e| (e, &header.key, auth.subkey.as_ref())),
-            &header,
-            header_pac.as_ref(),
+                .map(|e| (e, &subject_tkt.key, auth.subkey.as_ref())),
+            subject_tkt,
+            stkt.as_ref()
+                .map_or(header_pac.as_ref(), |e| e.pac.as_ref()),
+            match (&s4u2self, &stkt) {
+                (Some(_), _) => S4uPac::SelfReq,
+                (None, Some(e)) => S4uPac::Proxy {
+                    target: sname,
+                    impersonator: impersonator_string(&e.sname, &e.realm),
+                },
+                (None, None) => S4uPac::None,
+            },
         )?;
         let kvno =
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;
@@ -592,14 +671,20 @@ impl<S: PrincipalStore> Kdc<S> {
 
         // kdc_fast_response_handle_padata / kdc_fast_handle_reply_key
         // (do_tgs_req.c:1090-1097).
-        let mut outer_cname = header.cname.clone();
-        let mut outer_crealm = header.crealm.clone();
+        let mut outer_cname = tkt_cname.clone();
+        let mut outer_crealm = tkt_crealm.clone();
+        let s4u_rep: Vec<crate::types::PaData> = match &s4u2self {
+            Some(s) if s.x509 => {
+                vec![self.make_s4u2self_rep(s, auth.subkey.as_ref(), &header.key)?]
+            }
+            _ => Vec::new(),
+        };
         let (outer_padata, reply_key) = match ctx.fast.as_mut().filter(|f| f.armor_key.is_some()) {
             Some(fast) => {
                 let outer = fast.wrap_reply(
-                    Vec::new(),
+                    s4u_rep,
                     &ticket,
-                    (&realm_string(&header.crealm), &header.cname),
+                    (&tkt_realm_str, &tkt_cname),
                     initial_reply_key.keytype,
                     now,
                 )?;
@@ -610,13 +695,14 @@ impl<S: PrincipalStore> Kdc<S> {
                 }
                 (Some(outer), fast.reply_key(&initial_reply_key)?)
             }
-            None => (None, initial_reply_key),
+            None => ((!s4u_rep.is_empty()).then_some(s4u_rep), initial_reply_key),
         };
-        let enc_padata = if want_enc_pa_rep {
+        let mut enc_padata = if want_enc_pa_rep {
             enc_pa_rep_padata(&reply_key, raw)?
         } else {
             Vec::new()
         };
+        enc_padata.extend(pac_options_reply(req.padata.as_deref())?);
 
         let enc = EncTgsRepPart(EncKdcRepPart {
             key: session_key,

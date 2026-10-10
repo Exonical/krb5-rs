@@ -538,3 +538,56 @@ fn kdc_over_file_store_rejects_wrong_password() {
         "{err:?}"
     );
 }
+
+#[test]
+fn delegation_lists_persist_and_modprinc_edits_them() {
+    let (dir, store) = setup();
+    let admin = Admin::new(&store, keysalts());
+    let opts = PrincipalOptions {
+        delegate_to: vec!["HTTP/target.db.realm".into(), "ldap/x@OTHER".into()],
+        delegate_from: vec!["HTTP/front.db.realm@DB.REALM".into()],
+        ..PrincipalOptions::default()
+    };
+    admin
+        .add_principal(&name("svc"), REALM, Some("pw"), &opts)
+        .expect("addprinc");
+    let reopened = FileStore::open(&dir.path("principal"), &master()).expect("open");
+    let e = reopened
+        .lookup(&name("svc"), REALM)
+        .expect("lookup")
+        .expect("present");
+    assert_eq!(
+        e.allowed_to_delegate_to,
+        vec!["HTTP/target.db.realm@DB.REALM", "ldap/x@OTHER"]
+    );
+    assert_eq!(
+        e.allowed_to_delegate_from,
+        vec!["HTTP/front.db.realm@DB.REALM"]
+    );
+
+    let modify = PrincipalOptions {
+        clear_delegate_to: true,
+        delegate_to: vec!["host/new".into()],
+        clear_delegate_from: true,
+        ..PrincipalOptions::default()
+    };
+    admin
+        .modify_principal(&name("svc"), REALM, &modify)
+        .expect("modprinc");
+    let e = store
+        .lookup(&name("svc"), REALM)
+        .expect("lookup")
+        .expect("present");
+    assert_eq!(e.allowed_to_delegate_to, vec!["host/new@DB.REALM"]);
+    assert!(e.allowed_to_delegate_from.is_empty());
+    let shown = krb5_rs::kdc::kdb::admin::format_principal(
+        &store
+            .get_record(&name("svc"), REALM)
+            .expect("record")
+            .expect("present"),
+    );
+    assert!(
+        shown.contains("Allowed to delegate to: host/new@DB.REALM"),
+        "{shown}"
+    );
+}

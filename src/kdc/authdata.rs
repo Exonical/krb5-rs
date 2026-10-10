@@ -12,7 +12,8 @@ use super::error::KdcError;
 use super::{PrincipalAttributes, PrincipalEntry, PrincipalStore};
 use crate::crypto::find_etype;
 use crate::pac::{
-    kdc_sign_ticket, kdc_verify_ticket, Pac, PacError, PAC_CLIENT_INFO, PAC_DELEGATION_INFO,
+    kdc_sign_ticket, kdc_verify_ticket, DelegationInfo, Pac, PacError, PAC_CLIENT_INFO,
+    PAC_DELEGATION_INFO,
 };
 use crate::types::error_codes::*;
 use crate::types::{
@@ -72,6 +73,21 @@ pub(super) fn include_pac_p(padata: Option<&[PaData]>) -> bool {
         .find(|p| p.padata_type == PaDataType::PaPacRequest as i32)
         .and_then(|p| rasn::der::decode::<PaPacRequest>(p.padata_value.as_ref()).ok())
         .is_none_or(|r| r.include_pac)
+}
+
+/// The kind of S4U request a ticket is issued for (`KRB5_KDB_FLAGS_S4U`).
+pub(super) enum S4uPac<'a> {
+    /// An ordinary TGS request.
+    None,
+    /// S4U2Self: a new PAC for the impersonated user.
+    SelfReq,
+    /// S4U2Proxy: the evidence PAC with its delegation info extended.
+    Proxy {
+        /// The requested target service.
+        target: &'a PrincipalName,
+        /// The impersonating service, unparsed with realm.
+        impersonator: String,
+    },
 }
 
 fn pac_failure(e: PacError) -> KdcError {
@@ -171,8 +187,9 @@ impl<S: PrincipalStore> super::Kdc<S> {
         server_key: &EncryptionKey,
         local_tgt: &PrincipalEntry,
         request_authdata: Option<(&EncryptedData, &EncryptionKey, Option<&EncryptionKey>)>,
-        header: &EncTicketPart,
+        subject_tkt: &EncTicketPart,
         subject_pac: Option<&Pac>,
+        s4u: S4uPac<'_>,
     ) -> Result<(), KdcError> {
         let mut list: Vec<AuthorizationDataElement> = Vec::new();
         if let Some((enc, session, subkey)) = request_authdata {
@@ -182,7 +199,7 @@ impl<S: PrincipalStore> super::Kdc<S> {
             }
             list.extend(filtered(&decoded));
         }
-        if let Some(tgt_authdata) = header.authorization_data.as_deref() {
+        if let Some(tgt_authdata) = subject_tkt.authorization_data.as_deref() {
             if has_mandatory_for_kdc(tgt_authdata) {
                 return Err(KdcError::new(KDC_ERR_POLICY, "HANDLE_AUTHDATA"));
             }
@@ -202,22 +219,52 @@ impl<S: PrincipalStore> super::Kdc<S> {
             return Ok(());
         }
         let mut pac = Pac::new();
-        match subject.get_buffer(PAC_DELEGATION_INFO) {
-            Ok(d) => pac
-                .add_buffer(PAC_DELEGATION_INFO, d)
-                .map_err(pac_failure)?,
-            Err(PacError::NoEntry) => {}
-            Err(e) => return Err(pac_failure(e)),
+        if let S4uPac::Proxy {
+            target,
+            impersonator,
+        } = &s4u
+        {
+            // update_delegation_info (kdc_authdata.c:355-420).
+            let mut di = match subject.get_buffer(PAC_DELEGATION_INFO) {
+                Ok(d) => DelegationInfo::decode(d).map_err(pac_failure)?,
+                Err(PacError::NoEntry) => DelegationInfo {
+                    proxy_target: String::new(),
+                    transited_services: Vec::new(),
+                },
+                Err(e) => return Err(pac_failure(e)),
+            };
+            di.proxy_target = super::s4u::proxy_target_string(target);
+            di.transited_services.push(impersonator.clone());
+            pac.add_buffer(PAC_DELEGATION_INFO, &di.encode())
+                .map_err(pac_failure)?;
+        } else {
+            match subject.get_buffer(PAC_DELEGATION_INFO) {
+                Ok(d) => pac
+                    .add_buffer(PAC_DELEGATION_INFO, d)
+                    .map_err(pac_failure)?,
+                Err(PacError::NoEntry) => {}
+                Err(e) => return Err(pac_failure(e)),
+            }
         }
-        let client_info = subject.get_buffer(PAC_CLIENT_INFO).map_err(pac_failure)?;
-        pac.add_buffer(PAC_CLIENT_INFO, client_info)
-            .map_err(pac_failure)?;
+        // Client info: for either S4U kind the ticket client is added new
+        // (without realm); otherwise the subject's is copied
+        // (kdc_authdata.c:526-557).
+        let crealm = String::from_utf8_lossy(part.crealm.as_bytes()).to_string();
+        let cname = part.cname.clone();
+        let pac_client = if matches!(s4u, S4uPac::None) {
+            let client_info = subject.get_buffer(PAC_CLIENT_INFO).map_err(pac_failure)?;
+            pac.add_buffer(PAC_CLIENT_INFO, client_info)
+                .map_err(pac_failure)?;
+            None
+        } else {
+            Some((&cname, crealm.as_str()))
+        };
         let privsvr = self.privsvr_key(local_tgt)?;
         kdc_sign_ticket(
             part,
             &mut pac,
             &server.name,
-            None,
+            pac_client,
             server_key,
             &privsvr,
             false,

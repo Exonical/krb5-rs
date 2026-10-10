@@ -41,6 +41,7 @@ impl TgsExchange {
         if canonicalize {
             kdc_opts |= KdcOptions::CANONICALIZE;
         }
+        kdc_opts |= self.s4u_kdc_options();
 
         // Request 10h lifetime; KDC will cap to its policy maximum
         let till = now_kerberos()
@@ -59,7 +60,7 @@ impl TgsExchange {
             etype: self.options.etypes.clone(),
             addresses: None,
             enc_authorization_data: None,
-            additional_tickets: None,
+            additional_tickets: self.s4u_additional_tickets(),
         };
 
         // DER-encode req_body for checksum computation
@@ -79,9 +80,10 @@ impl TgsExchange {
         let mut padata = vec![pa_tgs_req];
 
         // Add PA-PAC-OPTIONS if requested
-        if self.options.pac_options {
+        if self.options.pac_options && !self.s4u_replaces_pac_options() {
             padata.push(build_pa_pac_options()?);
         }
+        padata.extend(self.s4u_request_padata(&subkey)?);
 
         // Build TGS-REQ
         let kdc_req = KdcReq {

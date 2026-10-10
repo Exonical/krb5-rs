@@ -16,6 +16,7 @@ mod flags;
 mod kdc;
 mod preauth;
 mod primitives;
+mod s4u;
 mod safe_priv_cred;
 mod ticket;
 
@@ -28,6 +29,7 @@ pub use flags::*;
 pub use kdc::*;
 pub use preauth::*;
 pub use primitives::*;
+pub use s4u::*;
 pub use safe_priv_cred::*;
 pub use ticket::*;
 

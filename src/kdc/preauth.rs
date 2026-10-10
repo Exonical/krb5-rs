@@ -292,6 +292,8 @@ mod tests {
             .string_to_key(b"pw", &salt, None)
             .expect("s2k");
         PrincipalEntry {
+            allowed_to_delegate_to: Vec::new(),
+            allowed_to_delegate_from: Vec::new(),
             name,
             realm: "R".into(),
             attributes: PrincipalAttributes::empty(),
