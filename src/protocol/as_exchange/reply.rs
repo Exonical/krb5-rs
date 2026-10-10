@@ -17,7 +17,8 @@ impl AsExchange {
 
         // MIT fast.c:517-568 `krb5int_fast_process_response` — when the
         // request was FAST-armored, the reply must carry PA-FX-FAST; the
-        // response's finished client and padata replace the reply's.
+        // response's finished client (name and realm, fast.c:555-558) and
+        // padata replace the reply's.
         let fast_out = self
             .fast_state
             .process_response(rep.padata.as_deref(), &rep.ticket)?;
@@ -25,6 +26,7 @@ impl AsExchange {
         let mut strengthen_key = None;
         if let Some(out) = fast_out {
             rep.cname = out.client;
+            rep.crealm = out.crealm;
             rep.padata = if out.padata.is_empty() {
                 None
             } else {

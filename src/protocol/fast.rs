@@ -7,7 +7,7 @@ use crate::crypto::{find_etype, fx_cf2, key_usage, EtypeProfile};
 use crate::types::{
     AsReq, Checksum, EncryptedData, EncryptionKey, KdcReq, KerberosTime, KrbErrorMsg, KrbFastArmor,
     KrbFastArmoredReq, KrbFastReq, KrbFastResponse, PaData, PaDataType, PaEncTsEnc, PaFxFastReply,
-    PaFxFastRequest, PrincipalName, TgsReq, Ticket,
+    PaFxFastRequest, PrincipalName, Realm, TgsReq, Ticket,
 };
 use crate::Krb5Error;
 
@@ -83,6 +83,9 @@ pub struct FastError {
 pub struct FastResponseOut {
     /// Client principal asserted by KrbFastFinished (replaces rep.cname).
     pub client: PrincipalName,
+    /// Client realm asserted by KrbFastFinished (replaces rep.crealm;
+    /// MIT replaces the whole principal, fast.c:555-558).
+    pub crealm: Realm,
     /// Strengthen key for reply-key derivation, if the KDC sent one.
     pub strengthen_key: Option<EncryptionKey>,
     /// Padata carried inside the FAST response (replaces rep.padata).
@@ -379,6 +382,7 @@ impl FastState {
 
         Ok(Some(FastResponseOut {
             client: finished.cname.clone(),
+            crealm: finished.crealm.clone(),
             strengthen_key: resp.strengthen_key,
             padata: resp.padata,
         }))

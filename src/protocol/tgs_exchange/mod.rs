@@ -356,6 +356,7 @@ impl TgsExchange {
             Ok(Some(out)) => {
                 let mut rep = rep.clone();
                 rep.cname = out.client;
+                rep.crealm = out.crealm;
                 rep.padata = if out.padata.is_empty() {
                     None
                 } else {
