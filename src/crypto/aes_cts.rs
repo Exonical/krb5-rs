@@ -141,7 +141,7 @@ fn aes_cbc_encrypt(key: &[u8], iv: &[u8; AES_BLOCK], data: &[u8]) -> Result<Vec<
     let mut result = Vec::with_capacity(data.len());
     let mut prev = *iv;
 
-    for chunk in data.chunks_exact(AES_BLOCK) {
+    for chunk in data.as_chunks::<AES_BLOCK>().0 {
         // XOR plaintext block with previous ciphertext (or IV)
         let mut block = [0u8; AES_BLOCK];
         for i in 0..AES_BLOCK {
@@ -162,7 +162,7 @@ fn aes_cbc_decrypt(key: &[u8], iv: &[u8; AES_BLOCK], data: &[u8]) -> Result<Vec<
     let mut result = Vec::with_capacity(data.len());
     let mut prev = *iv;
 
-    for chunk in data.chunks_exact(AES_BLOCK) {
+    for chunk in data.as_chunks::<AES_BLOCK>().0 {
         let decrypted = aes_ecb_decrypt_block(key, chunk)?;
         let mut plain_block = [0u8; AES_BLOCK];
         for i in 0..AES_BLOCK {

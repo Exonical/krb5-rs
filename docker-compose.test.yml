@@ -15,6 +15,7 @@ services:
       interval: 2s
       timeout: 5s
       retries: 15
+      start_period: 300s
 
   kdc-other:
     image: ubuntu:24.04
@@ -30,3 +31,4 @@ services:
       interval: 2s
       timeout: 5s
       retries: 15
+      start_period: 300s

@@ -140,8 +140,16 @@ pub fn get_service_ticket(
 // ---------------------------------------------------------------------------
 // podman wrappers (ccache_keytab_live)
 
+/// Container CLI: `CONTAINER_CLI` (e.g. `docker` in CI), default `podman`.
+pub fn container_cli() -> String {
+    std::env::var("CONTAINER_CLI").unwrap_or_else(|_| "podman".into())
+}
+
 pub fn pod(args: &[&str]) -> std::process::Output {
-    Command::new("podman").args(args).output().expect("podman")
+    Command::new(container_cli())
+        .args(args)
+        .output()
+        .expect("container CLI")
 }
 
 pub fn exec_kdc(cmd: &str) -> String {
@@ -165,7 +173,7 @@ pub fn cp_out(cpath: &str, name: &str) -> std::path::PathBuf {
         &format!("{KDC_CONTAINER}:{cpath}"),
         &local.to_string_lossy(),
     ]);
-    assert!(out.status.success(), "podman cp out failed");
+    assert!(out.status.success(), "container cp out failed");
     local
 }
 
@@ -175,5 +183,5 @@ pub fn cp_in(local: &std::path::Path, cpath: &str) {
         &local.to_string_lossy(),
         &format!("{KDC_CONTAINER}:{cpath}"),
     ]);
-    assert!(out.status.success(), "podman cp in failed");
+    assert!(out.status.success(), "container cp in failed");
 }
