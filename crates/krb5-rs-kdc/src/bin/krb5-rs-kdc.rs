@@ -24,6 +24,11 @@ use std::time::Duration;
 
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
+use krb5_rs::kdc::kdb::admin::parse_principal;
+use krb5_rs::kdc::kdb::propagation::{
+    initial_pull, run_replica_loop, serve_propagation, PropClientConfig, PropEvent, PropLogger,
+    PropSecret, PropServerConfig,
+};
 use krb5_rs::kdc::kdb::{read_stash, FileStore};
 use krb5_rs::kdc::{
     default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
@@ -31,8 +36,9 @@ use krb5_rs::kdc::{
 };
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
-use krb5_rs::types::PrincipalName;
+use krb5_rs::types::{EncryptionKey, PrincipalName};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -135,7 +141,74 @@ fn keytab_mode(cli: &Cli, keytab: &Path) -> std::io::Result<(DynKdc, Listen)> {
     ))
 }
 
-fn config_mode(cli: &Cli, krb5_conf_explicit: bool) -> std::io::Result<(DynKdc, Listen)> {
+/// Propagation roles of this process (kdc.conf `kprop_*`).
+#[derive(Default)]
+struct PropParts {
+    server: Option<(Arc<FileStore>, PropServerConfig, Vec<SocketAddr>)>,
+    replica: Option<PropClientConfig>,
+}
+
+fn prop_logger() -> PropLogger {
+    Arc::new(|event| match event {
+        PropEvent::Refused { .. } | PropEvent::PullFailed { .. } => {
+            warn!(target: "kprop", "{event}")
+        }
+        _ => info!(target: "kprop", "{event}"),
+    })
+}
+
+fn principal(spec: &str, realm: &str) -> std::io::Result<PrincipalName> {
+    let (name, r) = parse_principal(spec, realm).map_err(io_err)?;
+    if r != realm {
+        return Err(io_err(format!("{spec} is not in realm {realm}")));
+    }
+    Ok(name)
+}
+
+fn replica_config(
+    cfg: &RealmConfig,
+    realm: &str,
+    master: &EncryptionKey,
+) -> std::io::Result<PropClientConfig> {
+    let p = &cfg.propagation;
+    let secret = match (&p.keytab, &p.password_file) {
+        (Some(k), None) => PropSecret::Keytab(k.clone()),
+        (None, Some(f)) => PropSecret::PasswordFile(f.clone()),
+        _ => {
+            return Err(io_err(
+                "a replica needs exactly one of kprop_keytab and kprop_password_file",
+            ))
+        }
+    };
+    Ok(PropClientConfig {
+        realm: realm.to_string(),
+        primary: p
+            .primary
+            .clone()
+            .ok_or_else(|| io_err("kprop_primary is not set"))?,
+        kdc: p
+            .primary_kdc
+            .clone()
+            .ok_or_else(|| io_err("kprop_primary_kdc is not set"))?,
+        client: principal(&p.client, realm)?,
+        service: principal(&p.service, realm)?,
+        secret,
+        db_path: cfg.database_name.clone(),
+        master_key: master.clone(),
+        poll_interval: p.poll_interval,
+        io_timeout: Duration::from_secs(30),
+        logger: Some(prop_logger()),
+    })
+}
+
+/// Load kdc.conf and open the database. A replica without a local database
+/// pulls one first (retrying until the primary answers) and only then lets
+/// the caller bind its listeners; `None` means shutdown arrived meanwhile.
+async fn config_mode(
+    cli: &Cli,
+    krb5_conf_explicit: bool,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> std::io::Result<Option<(DynKdc, Listen, PropParts)>> {
     let conf = cli
         .config
         .clone()
@@ -155,15 +228,57 @@ fn config_mode(cli: &Cli, krb5_conf_explicit: bool) -> std::io::Result<(DynKdc, 
         .ok_or_else(|| io_err("no realm given and no default realm found"))?;
     let cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm).map_err(io_err)?;
     let master = read_stash(&cfg.key_stash_file, &realm).map_err(io_err)?;
-    let store = FileStore::open(&cfg.database_name, &master).map_err(io_err)?;
-    let store: Arc<dyn PrincipalStore> = Arc::new(store);
+
+    let mut parts = PropParts::default();
+    if cfg.propagation.is_replica() {
+        let client = replica_config(&cfg, &realm, &master)?;
+        if !cfg.database_name.exists() {
+            info!(
+                "no local database {}; pulling from {} before serving",
+                cfg.database_name.display(),
+                client.primary
+            );
+            let mut rx = shutdown_rx.clone();
+            let pulled = tokio::select! {
+                r = initial_pull(&client, &mut rx) => r,
+                signal = termination_signal() => {
+                    info!("received {}, exiting", signal?);
+                    None
+                }
+            };
+            if pulled.is_none() {
+                return Ok(None);
+            }
+        }
+        parts.replica = Some(client);
+    }
+
+    let store = Arc::new(FileStore::open(&cfg.database_name, &master).map_err(io_err)?);
+    if !cfg.propagation.listen.is_empty() {
+        let service = principal(&cfg.propagation.service, &realm)?;
+        if store.lookup(&service, &realm).map_err(io_err)?.is_none() {
+            return Err(io_err(format!(
+                "kprop service principal {} is not in the database",
+                cfg.propagation.service
+            )));
+        }
+        let mut server = PropServerConfig::new(service, cfg.propagation.acl.clone());
+        server.clockskew = cfg.kdc.clockskew;
+        server.logger = Some(prop_logger());
+        parts.server = Some((Arc::clone(&store), server, cfg.propagation.listen.clone()));
+    }
+    let kdc_store: Arc<dyn PrincipalStore> = store;
     let (udp, tcp) = if cli.listen.is_empty() {
         (cfg.udp_listen, cfg.tcp_listen)
     } else {
         let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
         (addrs.clone(), addrs)
     };
-    Ok((Kdc::new(cfg.kdc, store), Listen { udp, tcp }))
+    Ok(Some((
+        Kdc::new(cfg.kdc, kdc_store),
+        Listen { udp, tcp },
+        parts,
+    )))
 }
 
 /// Bind failures on an IPv6 address are tolerated: a dual-stack wildcard
@@ -194,12 +309,14 @@ async fn termination_signal() -> std::io::Result<&'static str> {
 }
 
 async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::io::Result<()> {
-    let (kdc, addrs) = match &cli.keytab {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (kdc, addrs, prop) = match &cli.keytab {
         Some(kt) => {
             if config_explicit {
                 return Err(io_err("--keytab and --config are mutually exclusive"));
             }
-            keytab_mode(&cli, kt)?
+            let (kdc, addrs) = keytab_mode(&cli, kt)?;
+            (kdc, addrs, PropParts::default())
         }
         None => {
             if cli.max_life.is_some() || cli.max_renewable_life.is_some() {
@@ -207,7 +324,10 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
                     "--max-life/--max-renewable-life come from kdc.conf in config mode",
                 ));
             }
-            config_mode(&cli, krb5_conf_explicit)?
+            match config_mode(&cli, krb5_conf_explicit, &shutdown_rx).await? {
+                Some(parts) => parts,
+                None => return Ok(()),
+            }
         }
     };
     let kdc = Arc::new(kdc);
@@ -215,10 +335,9 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
     let logger: RequestLogger = Arc::new(|summary, peer| {
         info!(target: "request", "{}", summary.log_line(peer));
     });
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let options = ServeOptions {
         logger: Some(logger),
-        shutdown: Some(shutdown_rx),
+        shutdown: Some(shutdown_rx.clone()),
     };
 
     let mut tasks = JoinSet::new();
@@ -241,6 +360,31 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
             Err(e) if tolerable(addr, &e) => info!("skipping tcp {addr}: {e}"),
             Err(e) => return Err(io_err(format!("bind tcp {addr}: {e}"))),
         }
+    }
+    if let Some((store, config, addrs)) = prop.server {
+        for addr in addrs {
+            let listener = TcpListener::bind(addr)
+                .await
+                .map_err(|e| io_err(format!("bind kprop {addr}: {e}")))?;
+            info!("listening on {} (kprop)", listener.local_addr()?);
+            tasks.spawn(serve_propagation(
+                Arc::clone(&store),
+                config.clone(),
+                listener,
+                Some(shutdown_rx.clone()),
+            ));
+        }
+    }
+    if let Some(client) = prop.replica {
+        info!(
+            "replica of {}: polling every {:?}",
+            client.primary, client.poll_interval
+        );
+        let rx = shutdown_rx.clone();
+        tasks.spawn(async move {
+            run_replica_loop(client, rx).await;
+            Ok(())
+        });
     }
     if tasks.is_empty() {
         return Err(io_err("no listen address could be bound"));

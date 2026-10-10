@@ -37,6 +37,140 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// Default port of the propagation listener (MIT kpropd's `krb5_prop`).
+const DEFAULT_KPROP_PORT: u16 = 754;
+/// Default `kprop_poll_interval`, seconds.
+const DEFAULT_KPROP_POLL_INTERVAL: i32 = 60;
+
+/// Database propagation settings: krb5-rs extensions to kdc.conf `[realms]`
+/// with no MIT counterpart (MIT uses kprop/kpropd push).
+///
+/// A primary sets `kprop_listen`; a replica sets `kprop_primary` plus one of
+/// `kprop_keytab` and `kprop_password_file`. Both together is an error.
+#[derive(Debug, Clone, Default)]
+pub struct PropagationSettings {
+    /// `kprop_listen`: where the primary serves replicas (empty = off).
+    pub listen: Vec<SocketAddr>,
+    /// `kprop_primary` (`host:port`): set on replicas.
+    pub primary: Option<String>,
+    /// `kprop_primary_kdc` (`host:port`): the KDC replicas get their ticket
+    /// from (default: the `kprop_primary` host on port 88).
+    pub primary_kdc: Option<String>,
+    /// `kprop_service`: the kprop service principal as `name@REALM`
+    /// (default `kprop/primary@REALM`).
+    pub service: String,
+    /// `kprop_client`: the replica principal as `name@REALM` (default
+    /// `kprop/replica@REALM`).
+    pub client: String,
+    /// `kprop_acl`: principals (`name@REALM`) the primary lets pull
+    /// (default: `kprop_client`).
+    pub acl: Vec<String>,
+    /// `kprop_keytab`: the replica's key.
+    pub keytab: Option<PathBuf>,
+    /// `kprop_password_file`: file whose first line is the replica's password.
+    pub password_file: Option<PathBuf>,
+    /// `kprop_poll_interval` (deltat, default 60 s).
+    pub poll_interval: Duration,
+}
+
+impl PropagationSettings {
+    /// Whether this KDC is a replica (`kprop_primary` set).
+    pub fn is_replica(&self) -> bool {
+        self.primary.is_some()
+    }
+}
+
+fn with_realm(name: &str, realm: &str) -> String {
+    if name.contains('@') {
+        name.to_string()
+    } else {
+        format!("{name}@{realm}")
+    }
+}
+
+/// `host:port` with the port replaced by `default_port`.
+fn host_with_port(addr: &str, default_port: u16) -> String {
+    match addr.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            // [v6]:port keeps its brackets; a bare v6 address has several colons.
+            if host.contains(':') && !host.ends_with(']') {
+                format!("[{addr}]:{default_port}")
+            } else {
+                format!("{host}:{default_port}")
+            }
+        }
+        _ => format!("{addr}:{default_port}"),
+    }
+}
+
+fn propagation_settings(
+    kdc_conf: &Profile,
+    realm: &str,
+) -> Result<PropagationSettings, ConfigError> {
+    let r = |key: &str| kdc_conf.get_string(&["realms", realm, key]);
+    let invalid = |m: &str| ConfigError::Invalid(m.to_string());
+
+    let listen = match r("kprop_listen") {
+        Some(spec) => parse_listen_addresses(&spec, DEFAULT_KPROP_PORT)?,
+        None => Vec::new(),
+    };
+    let primary = r("kprop_primary");
+    if !listen.is_empty() && primary.is_some() {
+        return Err(invalid(
+            "kprop_listen (primary) and kprop_primary (replica) are mutually exclusive",
+        ));
+    }
+    let keytab = r("kprop_keytab").map(PathBuf::from);
+    let password_file = r("kprop_password_file").map(PathBuf::from);
+    if primary.is_some() && keytab.is_some() == password_file.is_some() {
+        return Err(invalid(
+            "a replica needs exactly one of kprop_keytab and kprop_password_file",
+        ));
+    }
+    let client = with_realm(
+        &r("kprop_client").unwrap_or_else(|| "kprop/replica".into()),
+        realm,
+    );
+    let acl = {
+        let listed = kdc_conf.get_values(&["realms", realm, "kprop_acl"]);
+        let names: Vec<String> = listed
+            .iter()
+            .flat_map(|v| v.split(|c: char| c.is_whitespace() || c == ','))
+            .filter(|s| !s.is_empty())
+            .map(|s| with_realm(s, realm))
+            .collect();
+        if names.is_empty() {
+            vec![client.clone()]
+        } else {
+            names
+        }
+    };
+    let primary_kdc = r("kprop_primary_kdc")
+        .or_else(|| primary.as_deref().map(|p| host_with_port(p, DEFAULT_PORT)));
+    let poll = deltat(
+        kdc_conf,
+        &["realms", realm, "kprop_poll_interval"],
+        DEFAULT_KPROP_POLL_INTERVAL,
+    )?;
+    if poll <= 0 {
+        return Err(invalid("kprop_poll_interval must be positive"));
+    }
+    Ok(PropagationSettings {
+        listen,
+        primary,
+        primary_kdc,
+        service: with_realm(
+            &r("kprop_service").unwrap_or_else(|| "kprop/primary".into()),
+            realm,
+        ),
+        client,
+        acl,
+        keytab,
+        password_file,
+        poll_interval: Duration::from_secs(u64::try_from(poll).unwrap_or(60)),
+    })
+}
+
 /// Everything the KDC needs to know about one realm.
 ///
 /// `database_name` points at this crate's own database file format
@@ -58,6 +192,8 @@ pub struct RealmConfig {
     /// TCP listen addresses (`kdc_tcp_listen` / `kdc_tcp_ports`, defaulting
     /// to the UDP list as in kdc/main.c:969-971).
     pub tcp_listen: Vec<SocketAddr>,
+    /// Database propagation (`kprop_*`).
+    pub propagation: PropagationSettings,
 }
 
 /// The realm to serve when none is given: the only `[realms]` subsection of
@@ -225,6 +361,7 @@ impl RealmConfig {
             supported_keysalts,
             udp_listen: parse_listen_addresses(&udp_str, DEFAULT_PORT)?,
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
+            propagation: propagation_settings(kdc_conf, realm)?,
         })
     }
 }
@@ -474,5 +611,74 @@ default_principal_flags = +preauth\n    }\n";
         assert_eq!(default_realm(&two, None), None);
         let krb5 = profile("[libdefaults]\n default_realm = B\n");
         assert_eq!(default_realm(&two, Some(&krb5)), Some("B".into()));
+    }
+}
+
+#[cfg(test)]
+mod propagation_tests {
+    use super::*;
+
+    fn settings(realm_body: &str) -> Result<PropagationSettings, ConfigError> {
+        let p = Profile::parse(&format!("[realms]\n R = {{\n{realm_body}\n }}\n")).expect("conf");
+        propagation_settings(&p, "R")
+    }
+
+    #[test]
+    fn defaults_are_off_with_kprop_principals() {
+        let s = settings("").expect("settings");
+        assert!(s.listen.is_empty() && !s.is_replica());
+        assert_eq!(s.service, "kprop/primary@R");
+        assert_eq!(s.client, "kprop/replica@R");
+        assert_eq!(s.acl, vec!["kprop/replica@R".to_string()]);
+        assert_eq!(s.poll_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn primary_settings() {
+        let s = settings(
+            "  kprop_listen = 127.0.0.1:7540\n  kprop_acl = kprop/a kprop/b@R\n  \
+             kprop_service = kprop/kdc0",
+        )
+        .expect("settings");
+        assert_eq!(s.listen, vec!["127.0.0.1:7540".parse().expect("addr")]);
+        assert_eq!(
+            s.acl,
+            vec!["kprop/a@R".to_string(), "kprop/b@R".to_string()]
+        );
+        assert_eq!(s.service, "kprop/kdc0@R");
+    }
+
+    #[test]
+    fn replica_settings_default_the_kdc_to_the_primary_host_on_port_88() {
+        let s = settings(
+            "  kprop_primary = kdc-0.example.com:754\n  kprop_keytab = /k/replica.keytab\n  \
+             kprop_poll_interval = 30s",
+        )
+        .expect("settings");
+        assert!(s.is_replica());
+        assert_eq!(s.primary_kdc.as_deref(), Some("kdc-0.example.com:88"));
+        assert_eq!(s.keytab, Some(PathBuf::from("/k/replica.keytab")));
+        assert_eq!(s.poll_interval, Duration::from_secs(30));
+        let s = settings(
+            "  kprop_primary = [2001:db8::1]:754\n  kprop_password_file = /k/pw\n  \
+             kprop_primary_kdc = other:8888",
+        )
+        .expect("settings");
+        assert_eq!(s.primary_kdc.as_deref(), Some("other:8888"));
+        assert_eq!(host_with_port("[2001:db8::1]:754", 88), "[2001:db8::1]:88");
+        assert_eq!(host_with_port("host", 88), "host:88");
+    }
+
+    #[test]
+    fn invalid_combinations_are_errors() {
+        assert!(
+            settings("  kprop_listen = 754\n  kprop_primary = h:754\n  kprop_keytab = /k").is_err()
+        );
+        assert!(settings("  kprop_primary = h:754").is_err());
+        assert!(settings(
+            "  kprop_primary = h:754\n  kprop_keytab = /k\n  kprop_password_file = /p"
+        )
+        .is_err());
+        assert!(settings("  kprop_poll_interval = 0").is_err());
     }
 }

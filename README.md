@@ -58,6 +58,25 @@ krb5-rs-kdc --config kdc.conf
 
 `deploy/docker/Dockerfile` builds a static, distroless, nonroot image with both binaries (`podman build -f deploy/docker/Dockerfile .`). The container user cannot bind port 88: configure `kdc_ports = 8888` and map 88 to 8888 outside.
 
+### Replicas (database propagation)
+
+For HA, one primary keeps the writable database and any number of stateless replicas pull it. This is MIT kprop/kpropd's idea reversed into a pull model (protocol `KRB5RS-PROP-1`, documented in `src/kdc/kdb/propagation.rs`): a replica authenticates to the primary's `kprop/primary` service with a Kerberos ticket (AP-REQ with mutual authentication), asks for the database naming the serial it already has, and receives the raw database file in KRB-PRIV blocks protected by the negotiated subkeys, unless it is current. The replica verifies size, SHA-256, format, realm and its master key, and only then renames the file over its database.
+
+The settings below go in the kdc.conf realm section. They are krb5-rs extensions with no MIT counterpart.
+
+| Option | Role | Meaning |
+| --- | --- | --- |
+| `kprop_listen` | primary | Listen address(es) of the propagation server (default port 754); unset = off |
+| `kprop_service` | both | Service principal (default `kprop/primary`); needs a key in the primary's database |
+| `kprop_acl` | primary | Principals allowed to pull (default: `kprop_client`) |
+| `kprop_primary` | replica | `host:port` of the primary's propagation server; setting it makes this KDC a replica |
+| `kprop_primary_kdc` | replica | `host:port` of the primary's KDC, used for the ticket (default: the `kprop_primary` host, port 88) |
+| `kprop_client` | replica | The replica's principal (default `kprop/replica`) |
+| `kprop_keytab` / `kprop_password_file` | replica | Exactly one: where the replica's key comes from |
+| `kprop_poll_interval` | replica | Time between pulls (deltat, default 60s, ±10% jitter; failures back off from 1s up to this value) |
+
+`kprop_listen` and `kprop_primary` together are a configuration error. A replica needs the same master key stash as the primary. With no local database it pulls before binding its KDC listeners, retrying with backoff; with one it serves immediately and syncs in the background. `krb5-rs-kdb` refuses to modify a replica's database unless given `--force`.
+
 ## License
 
 Apache-2.0

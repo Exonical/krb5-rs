@@ -64,6 +64,7 @@ type Stamp = (SystemTime, u64);
 #[derive(Default)]
 struct Cache {
     stamp: Option<Stamp>,
+    serial: u64,
     records: HashMap<StoreKey, KdbPrincipal>,
 }
 
@@ -98,6 +99,11 @@ fn stamp_of(path: &Path) -> Result<Stamp, StoreError> {
 fn read_file(path: &Path) -> Result<(Stamp, KdbFile), StoreError> {
     let stamp = stamp_of(path)?;
     let bytes = std::fs::read(path).map_err(|e| err(format!("{}: {e}", path.display())))?;
+    Ok((stamp, parse_image(&bytes)?))
+}
+
+/// Decode and sanity-check the bytes of a database file.
+fn parse_image(bytes: &[u8]) -> Result<KdbFile, StoreError> {
     let body = bytes
         .strip_prefix(MAGIC.as_slice())
         .ok_or_else(|| err("not a krb5-rs database (bad magic)"))?;
@@ -109,7 +115,7 @@ fn read_file(path: &Path) -> Result<(Stamp, KdbFile), StoreError> {
             file.version
         )));
     }
-    Ok((stamp, file))
+    Ok(file)
 }
 
 fn write_atomic(path: &Path, file: &KdbFile) -> Result<(), StoreError> {
@@ -201,6 +207,7 @@ impl FileStore {
             version: VERSION,
             realm: general(realm)?,
             principals,
+            serial: Some(1),
         };
         write_atomic(path, &file)?;
         store.refresh(true)?;
@@ -232,6 +239,45 @@ impl FileStore {
     /// The realm this database serves.
     pub fn realm(&self) -> &str {
         &self.realm
+    }
+
+    /// The database file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The modification serial: 1 at creation, incremented by every write,
+    /// 0 for a file written before serials existed.
+    pub fn serial(&self) -> u64 {
+        let _ = self.refresh(false);
+        self.read_cache().serial
+    }
+
+    /// The raw database file and its serial, from one read (writes replace
+    /// the file atomically, so the pair is consistent).
+    pub fn snapshot(&self) -> Result<(u64, Vec<u8>), StoreError> {
+        let bytes =
+            std::fs::read(&self.path).map_err(|e| err(format!("{}: {e}", self.path.display())))?;
+        let file = parse_image(&bytes)?;
+        Ok((file.serial.unwrap_or(0), bytes))
+    }
+
+    /// Check that `path` is a database for `realm` that opens under
+    /// `master` (magic, version, realm, and the K/M key check), returning
+    /// its serial.
+    pub fn verify_image(
+        path: &Path,
+        realm: &str,
+        master: &EncryptionKey,
+    ) -> Result<u64, StoreError> {
+        let store = Self::open(path, master)?;
+        if store.realm != realm {
+            return Err(err(format!(
+                "database is for realm {}, expected {realm}",
+                store.realm
+            )));
+        }
+        Ok(store.serial())
     }
 
     fn to_record(
@@ -318,6 +364,7 @@ impl FileStore {
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
         *cache = Cache {
             stamp: Some(stamp),
+            serial: file.serial.unwrap_or(0),
             records,
         };
         Ok(())
@@ -358,6 +405,7 @@ impl FileStore {
         let _guard = self.lock()?;
         let (_, mut file) = read_file(&self.path)?;
         let out = f(&mut file.principals)?;
+        file.serial = Some(file.serial.unwrap_or(0) + 1);
         write_atomic(&self.path, &file)?;
         self.refresh(true)?;
         Ok(out)
@@ -426,5 +474,77 @@ impl PrincipalStore for FileStore {
         realm: &str,
     ) -> Result<Option<PrincipalEntry>, StoreError> {
         Ok(self.get_record(name, realm)?.map(|r| r.entry))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kdc::kdb::master_key_from_password;
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("krb5rs_file_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("principal")
+    }
+
+    fn user(name: &str) -> PrincipalEntry {
+        PrincipalEntry {
+            name: PrincipalName::new_principal(name),
+            realm: "R".into(),
+            attributes: PrincipalAttributes::empty(),
+            max_life: None,
+            max_renewable_life: None,
+            expiration: None,
+            pw_expiration: None,
+            keys: random_keys(1, &[18]).expect("keys"),
+            allowed_to_delegate_to: Vec::new(),
+            allowed_to_delegate_from: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn serial_starts_at_one_and_increments_on_every_write() {
+        let path = temp("serial");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = FileStore::create(&path, "R", &master).expect("create");
+        assert_eq!(store.serial(), 1);
+        store.put(user("a")).expect("put");
+        assert_eq!(store.serial(), 2);
+        store
+            .delete(&PrincipalName::new_principal("a"), "R")
+            .expect("delete");
+        assert_eq!(store.serial(), 3);
+        let (serial, bytes) = store.snapshot().expect("snapshot");
+        assert_eq!(serial, 3);
+        assert_eq!(bytes, std::fs::read(&path).expect("read"));
+        assert_eq!(FileStore::open(&path, &master).expect("open").serial(), 3);
+        assert_eq!(
+            FileStore::verify_image(&path, "R", &master).expect("verify"),
+            3
+        );
+        assert!(FileStore::verify_image(&path, "OTHER", &master).is_err());
+        let wrong = master_key_from_password("R", "wrong", 18).expect("key");
+        assert!(FileStore::verify_image(&path, "R", &wrong).is_err());
+    }
+
+    #[test]
+    fn a_file_without_a_serial_loads_as_zero_and_gets_one_on_the_next_write() {
+        let path = temp("legacy");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        drop(FileStore::create(&path, "R", &master).expect("create"));
+        let (_, mut file) = read_file(&path).expect("read");
+        file.serial = None;
+        write_atomic(&path, &file).expect("rewrite without serial");
+
+        let store = FileStore::open(&path, &master).expect("old file opens");
+        assert_eq!(store.serial(), 0);
+        store.put(user("a")).expect("put");
+        assert_eq!(store.serial(), 1);
+        assert!(store
+            .get_record(&PrincipalName::new_principal("a"), "R")
+            .expect("record")
+            .is_some());
     }
 }

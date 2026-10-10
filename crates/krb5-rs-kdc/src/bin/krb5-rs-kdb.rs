@@ -22,7 +22,7 @@ use krb5_rs::profile::Profile;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] <command>\n\
+        "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] [--force] <command>\n\
          commands:\n  create [-s]\n  stash\n  \
          addprinc [-randkey] [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
          delprinc NAME\n  cpw [-randkey] [-keepold] NAME\n  \
@@ -88,9 +88,14 @@ fn main() {
     let mut config: Option<PathBuf> = std::env::var_os("KRB5_KDC_PROFILE").map(PathBuf::from);
     let mut krb5_config: Option<PathBuf> = std::env::var_os("KRB5_CONFIG").map(PathBuf::from);
     let mut realm: Option<String> = None;
+    let mut force = false;
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     while let Some(first) = args.first().map(String::as_str) {
         match first {
+            "--force" => {
+                force = true;
+                args.remove(0);
+            }
             "--config" | "--krb5-config" | "--realm" => {
                 if args.len() < 2 {
                     usage();
@@ -120,6 +125,14 @@ fn main() {
         .or_else(|| default_realm(&kdc_conf, krb5.as_ref()))
         .unwrap_or_else(|| fail("no realm given and no default realm found"));
     let cfg = ok(RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm));
+
+    let read_only_command = matches!(cmd.as_str(), "getprinc" | "listprincs" | "stash");
+    if cfg.propagation.is_replica() && !read_only_command && !force {
+        fail(format!(
+            "this is a replica of {} (kprop_primary is set), so its database is read-only; \nrun `{cmd}` on the primary, or pass --force to override",
+            cfg.propagation.primary.as_deref().unwrap_or("?")
+        ));
+    }
 
     match cmd.as_str() {
         "create" => {

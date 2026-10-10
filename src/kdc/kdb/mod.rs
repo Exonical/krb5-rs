@@ -10,6 +10,8 @@ pub mod admin;
 mod file;
 mod format;
 mod master;
+#[cfg(feature = "tokio")]
+pub mod propagation;
 
 pub use file::{FileStore, PrincipalRecord};
 pub use master::{master_key_from_password, read_stash, write_stash};

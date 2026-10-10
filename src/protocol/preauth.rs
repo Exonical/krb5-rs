@@ -173,6 +173,22 @@ pub(crate) fn build_pa_enc_timestamp(
     let key = profile
         .string_to_key(password, salt, s2kparams)
         .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
+    build_pa_enc_timestamp_with_key(
+        &crate::types::EncryptionKey::new(etype, key.to_vec()),
+        now,
+        now_usec,
+    )
+}
+
+/// PA-ENC-TIMESTAMP encrypted directly under a long-term key.
+pub(crate) fn build_pa_enc_timestamp_with_key(
+    key: &crate::types::EncryptionKey,
+    now: KerberosTime,
+    now_usec: Option<i32>,
+) -> Result<PaData, Krb5Error> {
+    let etype = key.keytype;
+    let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
+    let key = key.key_bytes();
 
     // Build PA-ENC-TS-ENC
     let ts_enc = PaEncTsEnc {
@@ -183,7 +199,7 @@ pub(crate) fn build_pa_enc_timestamp(
 
     // Encrypt with key usage 1 (PA_ENC_TIMESTAMP)
     let cipher = profile
-        .encrypt(&key, key_usage::PA_ENC_TIMESTAMP, &ts_enc_der)
+        .encrypt(key, key_usage::PA_ENC_TIMESTAMP, &ts_enc_der)
         .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
 
     // Wrap in EncryptedData

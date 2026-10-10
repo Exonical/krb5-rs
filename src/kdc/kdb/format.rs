@@ -19,6 +19,10 @@ pub(super) struct KdbFile {
     pub realm: GeneralString,
     #[rasn(tag(explicit(context, 2)))]
     pub principals: Vec<KdbPrincipal>,
+    /// Incremented by every write; absent (read as 0) in files written
+    /// before propagation existed.
+    #[rasn(tag(explicit(context, 3)))]
+    pub serial: Option<u64>,
 }
 
 /// One principal record; lifetimes are in seconds.
@@ -82,6 +86,29 @@ mod tests {
         attributes: u32,
         #[rasn(tag(explicit(context, 9)))]
         keys: Vec<KdbKey>,
+    }
+
+    /// A file as written before the serial existed.
+    #[derive(AsnType, Encode, Decode, Debug, Clone)]
+    struct LegacyFile {
+        #[rasn(tag(explicit(context, 0)))]
+        version: u32,
+        #[rasn(tag(explicit(context, 1)))]
+        realm: GeneralString,
+        #[rasn(tag(explicit(context, 2)))]
+        principals: Vec<KdbPrincipal>,
+    }
+
+    #[test]
+    fn files_without_a_serial_still_decode() {
+        let legacy = LegacyFile {
+            version: VERSION,
+            realm: GeneralString::from_bytes(b"R").expect("realm"),
+            principals: Vec::new(),
+        };
+        let der = rasn::der::encode(&legacy).expect("encode");
+        let file: KdbFile = rasn::der::decode(&der).expect("decode legacy file");
+        assert_eq!(file.serial, None);
     }
 
     #[test]
