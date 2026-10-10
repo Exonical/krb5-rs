@@ -30,6 +30,7 @@ pub(crate) mod fsutil;
 pub mod gssapi;
 pub mod keytab;
 pub mod locate;
+pub mod pac;
 pub mod profile;
 pub mod protocol;
 pub mod types;

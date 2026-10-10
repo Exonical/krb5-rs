@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use krb5_rs::kdc::{Kdc, KdcConfig, MemoryStore, PrincipalAttributes, PrincipalStore};
+use krb5_rs::pac::{ticket_pac, verify_ticket_pac};
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::ap::decrypt_ticket;
 use krb5_rs::protocol::{
@@ -38,6 +39,7 @@ struct Builder {
     stores: BTreeMap<String, MemoryStore>,
     configs: BTreeMap<String, KdcConfig>,
     service_keys: BTreeMap<String, EncryptionKey>,
+    tgt_keys: BTreeMap<String, EncryptionKey>,
 }
 
 impl Builder {
@@ -52,6 +54,14 @@ impl Builder {
                 PrincipalAttributes::empty(),
             )
             .expect("local krbtgt");
+        let key = store
+            .lookup(&tgs_name(name), name)
+            .expect("lookup")
+            .expect("entry")
+            .keys[0]
+            .key
+            .clone();
+        self.tgt_keys.insert(name.to_string(), key);
         self.stores.insert(name.to_string(), store);
         let mut config = KdcConfig::new(name);
         config.realm_profile = krb5_conf.map(|t| Profile::parse(t).expect("krb5.conf"));
@@ -148,6 +158,7 @@ impl Builder {
         World {
             kdcs,
             service_keys: self.service_keys,
+            tgt_keys: self.tgt_keys,
         }
     }
 }
@@ -158,6 +169,7 @@ type Seen = Vec<(String, Vec<u8>)>;
 struct World {
     kdcs: BTreeMap<String, Kdc<MemoryStore>>,
     service_keys: BTreeMap<String, EncryptionKey>,
+    tgt_keys: BTreeMap<String, EncryptionKey>,
 }
 
 impl World {
@@ -569,4 +581,43 @@ fn referral_with_nt_principal_trust_entry_is_followed_by_the_client() {
     assert_eq!(first.0.ticket.sname.name_type, 1);
     assert_eq!(cred.server, host_service("web.beta.org"));
     decrypt_ticket(&w.service_keys[BETA], &cred.ticket).expect("service key");
+}
+
+#[test]
+fn cross_realm_pac_is_signed_with_trust_key_then_resigned_for_the_service() {
+    let w = two_realm_builder().build();
+    let tgt = w.login(ALPHA, "alice");
+    let (res, seen) = w.tgs(&tgt, host_service("web.beta.org"), TgsOptions::default());
+    let cred = res.expect("service ticket via referral");
+    let alice = PrincipalName::new_principal("alice");
+
+    // The referral TGT's PAC: server signature under the trust key, KDC
+    // signature under ALPHA's krbtgt key (handle_pac: server = the trust
+    // principal, privsvr = the local TGT key).
+    let first: TgsRep = rasn::der::decode(&seen[0].1).expect("TGS-REP");
+    let trust = trust_key(ALPHA, BETA, TRUST_PW);
+    let part = decrypt_ticket(&trust, &first.0.ticket).expect("trust key");
+    let pac = ticket_pac(&part).expect("parse").expect("PAC");
+    pac.verify(
+        part.authtime.timestamp(),
+        Some((&alice, ALPHA)),
+        Some(&trust),
+        Some(&w.tgt_keys[ALPHA]),
+    )
+    .expect("referral PAC verifies");
+    assert_eq!(pac.client_info().expect("client info").name, "alice");
+
+    // BETA verified it with the trust key and issued a new PAC for the
+    // service, still naming alice (no realm in the client info).
+    let svc = decrypt_ticket(&w.service_keys[BETA], &cred.ticket).expect("service key");
+    verify_ticket_pac(
+        &svc,
+        &host_service("web.beta.org"),
+        &w.service_keys[BETA],
+        Some(&w.tgt_keys[BETA]),
+    )
+    .expect("service ticket PAC")
+    .expect("PAC present");
+    let spac = ticket_pac(&svc).expect("parse").expect("PAC");
+    assert_eq!(spac.client_info().expect("client info").name, "alice");
 }

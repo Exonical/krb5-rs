@@ -500,3 +500,43 @@ fn tgs_req_disable_transited_check_is_rejected_by_policy() {
     );
     assert_eq!(tgs_error_code(&f, &req), 12);
 }
+
+fn pac_in(part: &EncTicketPart) -> krb5_rs::pac::Pac {
+    krb5_rs::pac::ticket_pac(part)
+        .expect("parse PAC")
+        .expect("PAC present")
+}
+
+#[test]
+fn tgs_req_renew_of_tgt_keeps_a_valid_pac() {
+    let f = fixture();
+    let tgt = get_tgt(&f);
+    let (req, subkey) = build_tgs_req(
+        &tgt,
+        TgsReqSpec::new(krbtgt(), KdcOptions::RENEW | KdcOptions::RENEWABLE),
+    );
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    assert!(enc.flags.contains(TicketFlags::RENEWABLE));
+    let part = decrypt_ticket(&f.tgs_key, &rep.ticket).expect("decrypt renewed TGT");
+    let pac = pac_in(&part);
+    pac.verify(
+        part.authtime.timestamp(),
+        Some((&user(), REALM)),
+        Some(&f.tgs_key),
+        Some(&f.tgs_key),
+    )
+    .expect("renewed TGT PAC verifies");
+}
+
+#[test]
+fn tgs_req_renew_of_service_ticket_resigns_pac_with_ticket_checksums() {
+    let f = fixture();
+    let tgt = get_tgt(&f);
+    let svc = plain_tgs(&f, &tgt).result.expect("service ticket");
+    let (req, subkey) = build_tgs_req(&svc, TgsReqSpec::new(service(), KdcOptions::RENEW));
+    let (rep, _) = open_tgs_rep(&f.kdc.handle(&req), &subkey);
+    let part = decrypt_ticket(&f.service_key, &rep.ticket).expect("decrypt renewed ticket");
+    krb5_rs::pac::verify_ticket_pac(&part, &service(), &f.service_key, Some(&f.tgs_key))
+        .expect("ticket, server, KDC and full checksums")
+        .expect("PAC present");
+}
