@@ -97,4 +97,5 @@ pub mod error_codes {
     pub const KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED: i32 = 65;
     pub const KDC_ERR_WRONG_REALM: i32 = 68;
     pub const KRB_AP_ERR_USER_TO_USER_REQUIRED: i32 = 69;
+    pub const KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTION: i32 = 93;
 }

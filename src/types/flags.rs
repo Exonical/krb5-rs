@@ -155,6 +155,7 @@ bitflags! {
         // bit 7 unused
         const RENEWABLE         = 1 << 23; // bit 8
         // bits 9-14 unused
+        const CNAME_IN_ADDL_TKT = 1 << 17; // bit 14
         const CANONICALIZE      = 1 << 16; // bit 15
         const REQUEST_ANONYMOUS = 1 << 15; // bit 16
         // bits 17-25 unused

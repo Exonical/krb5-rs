@@ -52,6 +52,7 @@ client = ["tokio"]         # Kerberos client (TGT/TGS request)
 gssapi = []                # GSSAPI/SPNEGO mechanism
 pkinit = ["dep:x509-parser", "dep:rcgen"]  # PKINIT (X.509 + Kerberos)
 fast = []                  # FAST pre-authentication tunneling
+kdc = []                   # Kerberos KDC (AS/TGS request processing)
 tokio = ["dep:tokio"]      # Tokio async transport adapter
 dns = ["dep:hickory-resolver", "dep:tokio"]  # Real DNS resolver for KDC location
 
@@ -62,3 +63,7 @@ optional = true
 [dependencies.rcgen]
 version = "0.14"
 optional = true
+
+[[example]]
+name = "kdc"
+required-features = ["kdc", "tokio"]

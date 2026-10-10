@@ -39,4 +39,7 @@ pub mod transport;
 #[cfg(feature = "client")]
 pub mod client;
 
+#[cfg(feature = "kdc")]
+pub mod kdc;
+
 pub use error::Krb5Error;

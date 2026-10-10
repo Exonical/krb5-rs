@@ -242,6 +242,9 @@ pub struct AuthContext {
     rcache: HashSet<Vec<u8>>,
     conn_sane_seq: bool,
     conn_heimdal_seq: bool,
+    /// KDC mode (MIT `krb5_rd_req_decoded_anyflag`): TGS authenticator key
+    /// usage and no INVALID-flag check (rd_req_dec.c:521-529, 813-814).
+    tgs_req: bool,
 }
 
 impl Default for AuthContext {
@@ -274,7 +277,15 @@ impl AuthContext {
             rcache: HashSet::new(),
             conn_sane_seq: false,
             conn_heimdal_seq: false,
+            tgs_req: false,
         }
+    }
+
+    /// Select KDC rd_req semantics (key usage 7 authenticator, no INVALID
+    /// check) for TGS-REQ header tickets.
+    #[cfg(feature = "kdc")]
+    pub(crate) fn set_tgs_req(&mut self, tgs_req: bool) {
+        self.tgs_req = tgs_req;
     }
 
     /// Set the auth-context flags.
