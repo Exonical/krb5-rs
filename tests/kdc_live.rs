@@ -134,7 +134,7 @@ fn live() -> &'static Live {
 
 /// Run `cmd` in the MIT container; optional stdin. Returns (status, output).
 fn run(cmd: &str, stdin: Option<&str>) -> (i32, String) {
-    let mut child = Command::new("podman")
+    let mut child = Command::new(common::kdc::container_cli())
         .args(["exec", "-i", KDC_CONTAINER, "bash", "-c", cmd])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
