@@ -9,7 +9,7 @@
 pub mod admin;
 mod file;
 mod format;
-mod master;
+pub mod master;
 #[cfg(feature = "tokio")]
 pub mod propagation;
 

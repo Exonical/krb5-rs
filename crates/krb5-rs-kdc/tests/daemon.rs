@@ -495,3 +495,51 @@ async fn lockout_policy_from_the_database_applies_in_the_daemon() {
     // alice (no policy) is unaffected by any of this.
     assert_eq!(attempt(daemon.tcp, "alice", PASSWORD).await, Ok(()));
 }
+
+#[cfg(feature = "turso")]
+#[tokio::test]
+async fn the_daemon_serves_from_a_turso_replica_selected_by_db_library() {
+    use krb5_rs::kdc::replication::{
+        Change, ChangeBatch, ReplicaSink, ReplicationTs, StoredPrincipal,
+    };
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    let dir = TempDir::new("turso");
+    let conf = make_realm(&dir);
+    let kdc_conf = Profile::load(&conf).expect("kdc.conf");
+    let cfg = RealmConfig::from_profiles(&kdc_conf, None, REALM).expect("realm config");
+    let key = master_key_from_password(REALM, "master", cfg.master_key_type).expect("master key");
+    let store = FileStore::open(&cfg.database_name, &key).expect("open file store");
+    let replica_dir = dir.path("replica");
+    {
+        let replica = TursoReplica::open(&replica_dir, TursoOptions::default(), key.clone())
+            .await
+            .expect("open replica");
+        let ts = ReplicationTs::new(1_000, 0);
+        let changes = store
+            .list()
+            .expect("list")
+            .iter()
+            .map(|e| Change::UpsertPrincipal {
+                principal: StoredPrincipal::from_entry(e, None, None, &key).expect("stored"),
+                version: ts,
+            })
+            .collect();
+        replica
+            .apply(ChangeBatch { upto: ts, changes })
+            .await
+            .expect("apply");
+    }
+    // Point the realm at the replica and take the file database away.
+    let mut text = std::fs::read_to_string(&conf).expect("read kdc.conf");
+    text.push_str(&format!(
+        "[dbmodules]\n {REALM} = {{\n  db_library = krb5-rs-turso\n  replica_path = {}\n }}\n",
+        slash(&replica_dir)
+    ));
+    std::fs::write(&conf, text).expect("write kdc.conf");
+    std::fs::remove_file(&cfg.database_name).expect("remove the file database");
+
+    let daemon = Daemon::start(&conf, &[]);
+    assert_eq!(attempt(daemon.tcp, "alice", PASSWORD).await, Ok(()));
+    assert_eq!(attempt(daemon.tcp, "nobody", PASSWORD).await, Err(6));
+}

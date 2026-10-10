@@ -17,7 +17,13 @@ path = "src/bin/krb5-rs-kdc.rs"
 name = "krb5-rs-kdb"
 path = "src/bin/krb5-rs-kdb.rs"
 
+[features]
+# The Turso replica database module (db_library = krb5-rs-turso). Off by
+# default: it pulls Turso, whose dependencies include C code (simsimd).
+turso = ["dep:krb5-rs-kdb-turso"]
+
 [dependencies]
+krb5-rs-kdb-turso = { path = "../krb5-rs-kdb-turso", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 krb5-rs = { path = "../..", features = ["kdc", "tokio", "pkinit"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }

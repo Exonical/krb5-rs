@@ -50,8 +50,10 @@ Module selection mirrors MIT's `[dbmodules]` / `database_module`:
         cockroach_cert = /etc/krb5-rs/crdb/client.kdc.crt
         cockroach_key = /etc/krb5-rs/crdb/client.kdc.key
         # local replica
+        # local replica (PR 5 reads the replica from its own dbmodules section:
+        # db_library = krb5-rs-turso, replica_path = a directory)
         replica_library = krb5-rs-turso
-        replica_path = /var/lib/krb5-rs/replica.db
+        replica_path = /var/lib/krb5-rs/replica
     }
 ```
 
@@ -134,14 +136,14 @@ Same entities, plus the replica's own tables:
 
 | Table | Notes |
 |---|---|
-| `principals`, `principal_keys`, `policies`, `lockouts` | Mirror of the authoritative rows plus `version`. Rowid tables with unique indexes, because MVCC does not support indexes on `WITHOUT ROWID` tables |
+| `principals`, `principal_keys`, `policies`, `lockouts` | Mirror of the authoritative rows plus `version_wall`/`version_logical` (the HLC split into two integers, compared in Rust) and `deleted` (a delete keeps a versioned tombstone row, so an older re-create cannot resurrect it). Rowid tables with unique indexes, because MVCC does not support indexes on `WITHOUT ROWID` tables |
 | `replication_state` | singleton: `checkpoint_ts`, `snapshot_ts`, `last_success_unix`, `status` |
-| `auth_state` | `(realm, name)`: `fail_count`, `last_failed`, `last_success`, `locked_until`. Local only, never replicated |
+| `auth_state` | `(realm, name)`: `fail_count`, `last_failed`, `last_success`. Local only, never replicated. The lock end is derived from the policy's duration (MIT `locked_check_p`); a replicated `lockouts` row folds into the state as `fail_count = u32::MAX`, `last_failed = locked_at` while active |
 | `schema_migrations` | |
 
 The database is opened in MVCC journal mode (`PRAGMA journal_mode = 'mvcc'`).
 Open fails if the mode is not MVCC; there is no WAL fallback. Turso is pinned
-to an exact version (`=0.8.1`) and upgrades are deliberate. Known limits,
+to an exact version (`=0.8.1`, with every `turso_*` crate pinned the same) and upgrades are deliberate. The replica's `path` is a directory holding `replica-<snapshot_ts>.db` files and a `CURRENT` pointer (a rebuild writes a new file and switches the pointer). Known limits,
 which are documented and benchmarked:
 - row versions live in memory;
 - `wal_checkpoint(TRUNCATE)` blocks readers (passive checkpointing is still experimental);

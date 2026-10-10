@@ -100,6 +100,8 @@ struct Listen {
 enum DaemonStore {
     Memory(Arc<MemoryStore>),
     File(Arc<FileStore>),
+    #[cfg(feature = "turso")]
+    Turso(krb5_rs_kdb_turso::TursoReplica),
 }
 
 impl PrincipalStore for DaemonStore {
@@ -111,6 +113,8 @@ impl PrincipalStore for DaemonStore {
         match self {
             DaemonStore::Memory(s) => s.lookup(name, realm).await,
             DaemonStore::File(s) => s.lookup(name, realm).await,
+            #[cfg(feature = "turso")]
+            DaemonStore::Turso(s) => s.lookup(name, realm).await,
         }
     }
 }
@@ -227,6 +231,73 @@ fn replica_config(
     })
 }
 
+/// Serve from a Turso replica (`db_library = krb5-rs-turso`), read-only.
+/// Replication into it is not wired here yet.
+#[cfg(feature = "turso")]
+async fn turso_mode(
+    cli: &Cli,
+    cfg: RealmConfig,
+    master: krb5_rs::types::EncryptionKey,
+) -> std::io::Result<(DynKdc, Listen, PropParts)> {
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    if cfg.propagation.is_replica() || !cfg.propagation.listen.is_empty() {
+        return Err(io_err(
+            "kprop_* settings cannot be combined with db_library = krb5-rs-turso",
+        ));
+    }
+    let path = cfg
+        .db_module
+        .get("replica_path")
+        .ok_or_else(|| io_err("db_library krb5-rs-turso needs replica_path"))?;
+    let number = |key: &str| -> std::io::Result<Option<i64>> {
+        cfg.db_module
+            .get(key)
+            .map(|v| {
+                v.parse()
+                    .map_err(|_| io_err(format!("{key}: not a number")))
+            })
+            .transpose()
+    };
+    let mut options = TursoOptions::default();
+    if let Some(n) = number("turso_pool_size")? {
+        options.pool_size = usize::try_from(n).map_err(|_| io_err("turso_pool_size"))?;
+    }
+    options.mvcc_checkpoint_threshold = number("turso_checkpoint_threshold")?;
+    if let Some(n) = number("turso_max_retries")? {
+        options.max_retries = u32::try_from(n).map_err(|_| io_err("turso_max_retries"))?;
+    }
+    if let Some(v) = cfg.db_module.get("turso_passive_checkpoint") {
+        options.passive_checkpoint =
+            matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1");
+    }
+    let replica = TursoReplica::open(path, options, master)
+        .await
+        .map_err(io_err)?;
+    let (udp, tcp) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen)
+    } else {
+        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
+        (addrs.clone(), addrs)
+    };
+    let kdc = Kdc::builder(cfg.kdc, DaemonStore::Turso(replica.clone()))
+        .policies(replica.clone())
+        .auth_state(replica)
+        .build();
+    Ok((kdc, Listen { udp, tcp }, PropParts::default()))
+}
+
+#[cfg(not(feature = "turso"))]
+async fn turso_mode(
+    _cli: &Cli,
+    _cfg: RealmConfig,
+    _master: krb5_rs::types::EncryptionKey,
+) -> std::io::Result<(DynKdc, Listen, PropParts)> {
+    Err(io_err(
+        "db_library krb5-rs-turso needs a krb5-rs-kdc built with the `turso` feature",
+    ))
+}
+
 /// Load kdc.conf and open the database. A replica without a local database
 /// pulls one first (retrying until the primary answers) and only then lets
 /// the caller bind its listeners; `None` means shutdown arrived meanwhile.
@@ -265,6 +336,12 @@ async fn config_mode(
         }
         None => read_stash(&cfg.key_stash_file, &realm).map_err(io_err)?,
     };
+
+    match cfg.db_module.library.as_deref() {
+        None => {}
+        Some("krb5-rs-turso") => return turso_mode(cli, cfg, master).await.map(Some),
+        Some(other) => return Err(io_err(format!("unknown db_library {other:?}"))),
+    }
 
     let mut parts = PropParts::default();
     if cfg.propagation.is_replica() {

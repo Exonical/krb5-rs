@@ -1,0 +1,32 @@
+[package]
+name = "krb5-rs-kdb-turso"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+authors = ["Dmitry Prudnikov <mail@polaz.com>"]
+description = "Turso (MVCC) local replica database module for the krb5-rs KDC"
+repository = "https://github.com/structured-world/krb5-rs"
+publish = false
+
+[dependencies]
+krb5-rs = { path = "../..", features = ["kdc", "tokio"] }
+rasn = "0.28"
+tokio = { version = "1.53.2", features = ["sync", "time", "rt", "macros"] }
+turso = { version = "=0.8.1", default-features = false, features = ["pure-rust-crypto"] }
+turso_core = "=0.8.1"
+turso_ext = "=0.8.1"
+turso_macros = "=0.8.1"
+turso_parser = "=0.8.1"
+turso_sdk_kit = "=0.8.1"
+turso_sdk_kit_macros = "=0.8.1"
+turso_sync_engine = "=0.8.1"
+turso_sync_sdk_kit = "=0.8.1"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread"] }
+
+[[bench]]
+name = "replica"
+harness = false

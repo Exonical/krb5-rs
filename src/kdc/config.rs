@@ -171,6 +171,35 @@ fn propagation_settings(
     })
 }
 
+/// The realm's database module (`[dbmodules]`, selected by the realm's
+/// `database_module`, default the realm name; MIT kdb5.c `get_conf_section`).
+/// Without `db_library` the built-in file database is used.
+#[derive(Debug, Clone, Default)]
+pub struct DbModuleConfig {
+    /// `db_library`: the plug-in serving the data (for example
+    /// `krb5-rs-turso`).
+    pub library: Option<String>,
+    /// Every other key of the section, for the plug-in to interpret
+    /// (`replica_path`, `turso_pool_size`, ...).
+    pub options: std::collections::BTreeMap<String, String>,
+}
+
+impl DbModuleConfig {
+    /// The value of option `key`.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.options.get(key).map(String::as_str)
+    }
+}
+
+/// Keys of a `[dbmodules]` section that plug-ins may read.
+const DBMODULE_OPTION_KEYS: &[&str] = &[
+    "replica_path",
+    "turso_pool_size",
+    "turso_checkpoint_threshold",
+    "turso_passive_checkpoint",
+    "turso_max_retries",
+];
+
 /// Everything the KDC needs to know about one realm.
 ///
 /// `database_name` points at this crate's own database file format
@@ -194,6 +223,8 @@ pub struct RealmConfig {
     pub tcp_listen: Vec<SocketAddr>,
     /// Database propagation (`kprop_*`).
     pub propagation: PropagationSettings,
+    /// The database module (`[dbmodules]`).
+    pub db_module: DbModuleConfig,
 }
 
 /// The realm to serve when none is given: the only `[realms]` subsection of
@@ -360,6 +391,19 @@ impl RealmConfig {
                 (None, Some(_)) => krb5_conf.map_or(Ok(false), |p| p.get_boolean(&path, false))?,
             };
         }
+        let module_value = |key: &str| {
+            let path = ["dbmodules", module.as_str(), key];
+            kdc_conf
+                .get_string(&path)
+                .or_else(|| krb5_conf.and_then(|p| p.get_string(&path)))
+        };
+        let db_module = DbModuleConfig {
+            library: module_value("db_library"),
+            options: DBMODULE_OPTION_KEYS
+                .iter()
+                .filter_map(|k| module_value(k).map(|v| ((*k).to_string(), v)))
+                .collect(),
+        };
         #[cfg(feature = "pkinit")]
         {
             kdc.pkinit = pkinit_settings(kdc_conf, realm)?;
@@ -380,6 +424,7 @@ impl RealmConfig {
             udp_listen: parse_listen_addresses(&udp_str, DEFAULT_PORT)?,
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
             propagation: propagation_settings(kdc_conf, realm)?,
+            db_module,
         })
     }
 }
@@ -735,5 +780,35 @@ mod dbmodule_tests {
             Some("[dbmodules]\n R = {\n  disable_lockout = true\n }\n"),
         );
         assert!(c.kdc.disable_lockout);
+    }
+}
+
+#[cfg(test)]
+mod db_module_tests {
+    use super::*;
+
+    #[test]
+    fn db_library_and_plugin_options_come_from_dbmodules() {
+        let kdc = Profile::parse(
+            "[realms]\n R = {\n  database_module = replica\n }\n[dbmodules]\n replica = {\n  \
+             db_library = krb5-rs-turso\n  replica_path = /var/lib/krb5-rs/replica\n  \
+             turso_pool_size = 16\n  unrelated = x\n }\n",
+        )
+        .expect("kdc.conf");
+        let c = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
+        assert_eq!(c.db_module.library.as_deref(), Some("krb5-rs-turso"));
+        assert_eq!(
+            c.db_module.get("replica_path"),
+            Some("/var/lib/krb5-rs/replica")
+        );
+        assert_eq!(c.db_module.get("turso_pool_size"), Some("16"));
+        assert_eq!(c.db_module.get("unrelated"), None);
+        let none = RealmConfig::from_profiles(
+            &Profile::parse("[realms]\n R = {\n }\n").expect("kdc.conf"),
+            None,
+            "R",
+        )
+        .expect("config");
+        assert!(none.db_module.library.is_none());
     }
 }

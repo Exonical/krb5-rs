@@ -27,6 +27,7 @@ pub mod lockout;
 mod pkinit;
 mod policy;
 mod preauth;
+pub mod replication;
 mod reqbody;
 mod s4u;
 #[cfg(feature = "tokio")]
@@ -49,7 +50,8 @@ pub use server::{
 pub use summary::{Outcome, RequestKind, RequestSummary, Transport};
 
 pub use config::{
-    default_realm, parse_listen_addresses, ConfigError, PropagationSettings, RealmConfig,
+    default_realm, parse_listen_addresses, ConfigError, DbModuleConfig, PropagationSettings,
+    RealmConfig,
 };
 pub use db::{
     keys_from_password, random_keys, salt_bytes, KeyEntry, MemoryStore, PrincipalAttributes,

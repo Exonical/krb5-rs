@@ -4,3 +4,7 @@
 [[package]]
 name = "krb5-rs-kdc"
 release = false
+
+[[package]]
+name = "krb5-rs-kdb-turso"
+release = false

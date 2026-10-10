@@ -44,13 +44,11 @@ pub fn master_key_from_password(
     Ok(EncryptionKey::new(etype, key.to_vec()))
 }
 
-/// Encrypt a key for storage (MIT `krb5_dbe_def_encrypt_key_data`,
+/// Encrypt a key for storage under the master key (MIT
+/// `krb5_dbe_def_encrypt_key_data`,
 /// encrypt_key.c:36-95): 2-byte little-endian key length, then the key
 /// encrypted under the master key with usage 0.
-pub(super) fn encrypt_key(
-    master: &EncryptionKey,
-    key: &EncryptionKey,
-) -> Result<Vec<u8>, StoreError> {
+pub fn encrypt_key(master: &EncryptionKey, key: &EncryptionKey) -> Result<Vec<u8>, StoreError> {
     let profile = find_etype(master.keytype).map_err(|_| err("unsupported master key enctype"))?;
     let len = u16::try_from(key.key_bytes().len()).map_err(|_| err("key too long"))?;
     let cipher = profile
@@ -63,7 +61,7 @@ pub(super) fn encrypt_key(
 
 /// Inverse of [`encrypt_key`] (MIT decrypt_key.c); integrity failure means
 /// a wrong master key or a damaged database.
-pub(super) fn decrypt_key(
+pub fn decrypt_key(
     master: &EncryptionKey,
     enctype: i32,
     blob: &[u8],
