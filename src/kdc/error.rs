@@ -11,7 +11,7 @@ use crate::types::{KrbErrorMsg, PaData, PrincipalName};
 use crate::Krb5Error;
 
 /// KRB_AP_ERR_ILL_CR_TKT (not in [`crate::types::error_codes`]).
-const KRB_AP_ERR_ILL_CR_TKT: i32 = 43;
+pub(crate) const KRB_AP_ERR_ILL_CR_TKT: i32 = 43;
 
 /// A KDC processing failure: protocol error code plus optional text/e-data.
 #[derive(Debug, Clone)]

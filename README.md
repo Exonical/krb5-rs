@@ -37,7 +37,7 @@ MIT Kerberos and Heimdal are massive C codebases (~450K and ~620K SLOC respectiv
 | [RFC 6806](https://www.rfc-editor.org/rfc/rfc6806) | Enc-pa-rep / FAST negotiation | Client + KDC |
 | [RFC 4556](https://www.rfc-editor.org/rfc/rfc4556) | PKINIT | Planned |
 
-**Not yet supported:** cross-realm, PAC/authorization data, S4U, PKINIT, DES/RC4/Camellia enctypes.
+**Not yet supported:** PAC/authorization data, S4U, PKINIT, DES/RC4/Camellia enctypes.
 
 ## License
 

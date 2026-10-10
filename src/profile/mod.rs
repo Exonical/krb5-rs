@@ -45,6 +45,7 @@ impl std::fmt::Display for ProfileError {
 impl std::error::Error for ProfileError {}
 
 /// A parsed profile (krb5.conf) tree.
+#[derive(Debug, Clone)]
 pub struct Profile {
     root: Node,
 }

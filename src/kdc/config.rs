@@ -200,6 +200,11 @@ impl RealmConfig {
         kdc.supported_enctypes = supported_enctypes;
         kdc.clockskew = Duration::from_secs(u64::try_from(clockskew).unwrap_or(0));
         kdc.max_dgram_reply_size = usize::try_from(max_dgram).unwrap_or(MAX_DGRAM_SIZE);
+        kdc.realm_profile = krb5_conf.cloned();
+        kdc.host_based_services = service_list(kdc_conf, realm, "host_based_services");
+        kdc.no_host_referral = service_list(kdc_conf, realm, "no_host_referral");
+        kdc.reject_bad_transit =
+            kdc_conf.get_boolean(&["realms", realm, "reject_bad_transit"], true)?;
 
         Ok(Self {
             kdc,
@@ -217,6 +222,20 @@ impl RealmConfig {
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
         })
     }
+}
+
+/// A service list: all `[kdcdefaults]` values followed by all realm values
+/// (`combine`, kdc/main.c:171-189, over `krb5_aprof_get_string_all`), split
+/// on whitespace and commas (`in_list`, do_tgs_req.c:420-435).
+fn service_list(kdc_conf: &Profile, realm: &str, key: &str) -> Vec<String> {
+    let mut values = kdc_conf.get_values(&["kdcdefaults", key]);
+    values.extend(kdc_conf.get_values(&["realms", realm, key]));
+    values
+        .iter()
+        .flat_map(|v| v.split(|c: char| c.is_whitespace() || c == ','))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn deltat(p: &Profile, names: &[&str], default: i32) -> Result<i32, ConfigError> {
@@ -343,6 +362,24 @@ default_principal_flags = +preauth\n    }\n";
     fn parse_listen_addresses_rejects_bad_ports() {
         assert!(parse_listen_addresses("127.0.0.1:99999", 88).is_err());
         assert!(parse_listen_addresses(":88", 88).is_err());
+    }
+
+    #[test]
+    fn from_profiles_reads_referral_and_transit_settings() {
+        let kdc = profile(
+            "[kdcdefaults]\n host_based_services = http\n[realms]\n R = {\n \
+             host_based_services = ftp, imap\n no_host_referral = *\n \
+             reject_bad_transit = false\n }\n",
+        );
+        let krb5 = profile("[domain_realm]\n .a.com = A.COM\n");
+        let cfg = RealmConfig::from_profiles(&kdc, Some(&krb5), "R").expect("config");
+        assert_eq!(cfg.kdc.host_based_services, vec!["http", "ftp", "imap"]);
+        assert_eq!(cfg.kdc.no_host_referral, vec!["*"]);
+        assert!(!cfg.kdc.reject_bad_transit);
+        assert!(cfg.kdc.realm_profile.is_some());
+        let plain = RealmConfig::from_profiles(&profile("[realms]\n R = {\n }\n"), None, "R")
+            .expect("config");
+        assert!(plain.kdc.reject_bad_transit && plain.kdc.realm_profile.is_none());
     }
 
     #[test]
