@@ -1,6 +1,6 @@
 #![cfg(feature = "client")]
 //! Live interop tests: krb5-rs SPNEGO (RFC 4178) against MIT's
-//! libgssapi via the python3-gssapi oracle (tests/kdc/gss_oracle.py).
+//! libgssapi via the python-gssapi oracle (built against MIT 1.22.2) (tests/kdc/gss_oracle.py).
 //!
 //! Requires the KDC + oracle containers:
 //!   docker compose -f docker-compose.test.yml up -d

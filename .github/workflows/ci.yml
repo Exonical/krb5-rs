@@ -52,7 +52,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Start MIT KDC containers
-        run: docker compose -p krb5-rs -f docker-compose.test.yml up -d --wait
+        run: docker compose -p krb5-rs -f docker-compose.test.yml up -d --wait --build
       - name: Find the compose network gateway
         run: |
           # Containers reach the runner host (where the in-process KDC under

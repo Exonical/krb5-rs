@@ -4,16 +4,13 @@ if [[ "${DEBUG_KDC_SETUP:-0}" == "1" ]]; then
     set -x
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-
 # Second realm KDC for cross-realm referral testing.
 # Creates OTHER.REALM with trust to TEST.REALM.
 
 MASTER_KEY="${KDC_MASTER_KEY:-masterkey2}"
 TRUST_PASSWORD="${KDC_TRUST_PASSWORD:-crosstrust}"
 
-apt-get update -qq
-apt-get install -y -qq krb5-kdc krb5-admin-server
+mkdir -p /etc/krb5kdc /var/lib/krb5kdc
 
 # Write config — knows about both realms
 cat > /etc/krb5.conf <<'CONF'

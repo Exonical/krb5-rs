@@ -1,6 +1,6 @@
 #![cfg(feature = "client")]
 //! Live interop tests: krb5-rs GSS-API (RFC 4121) against MIT's
-//! libgssapi_krb5 via the python3-gssapi oracle (tests/kdc/gss_oracle.py).
+//! libgssapi_krb5 via the python-gssapi oracle (built against MIT 1.22.2) (tests/kdc/gss_oracle.py).
 //!
 //! Requires the KDC + oracle containers:
 //!   docker compose -f docker-compose.test.yml up -d
@@ -425,13 +425,13 @@ async fn mit_init_rust_accept_deleg() {
 
 /// (f) MIT initiator asserts CHANNEL_BOUND with no bindings of its own.
 ///
-/// Verified against the wire: python-gssapi does not forward the
-/// non-standard GSS_C_CHANNEL_BOUND_FLAG (0x800) into gss_init_sec_context,
-/// so MIT's AP-REQ carries a zero cb hash *and no AP_OPTIONS CBT authdata*
-/// (decoded the live token: authorization_data is absent).  MIT acceptor
-/// semantics (accept_sec_context.c:541-546 + check_cbt :424-449): absent
-/// initiator bindings are not a mismatch and no CBT marker means check_cbt
-/// passes → plain accept, no CHANNEL_BOUND flag.  Assert exactly that.
+/// With krb5 1.22.2's libgssapi (init_sec_context.c:403-404, 486) the
+/// request flag arms the KERB_AP_OPTIONS_CBT authdata in the AP-REQ, while
+/// the authenticator's channel-binding hash stays zero. An acceptor that
+/// does have bindings then fails (accept_sec_context.c:604-618: client CBT
+/// asserted, acceptor bindings given, no match -> GSS_S_BAD_BINDINGS).
+/// (The Ubuntu 1.20.1 libraries did not arm it, which an earlier version of
+/// this test recorded.)
 #[tokio::test]
 #[ignore = "requires KDC + oracle: docker compose -f docker-compose.test.yml up -d"]
 async fn mit_init_rust_accept_channel_bound() {
@@ -447,6 +447,23 @@ async fn mit_init_rust_accept_channel_bound() {
         application_data: b"abc".to_vec(),
     };
     let mut acc = Krb5Acceptor::new(Box::new(HttpKeys), Some(service()), Some(cb));
+    let err = acc.step(&token).expect_err("CBT asserted, bindings differ");
+    assert!(
+        matches!(err, Krb5Error::Gss(GssError::BadBindings)),
+        "{err:?}"
+    );
+}
+
+/// (f') The same MIT initiator against an acceptor without bindings: the
+/// CBT assertion is ignored (accept_sec_context.c:615 needs acceptor
+/// bindings) and no CHANNEL_BOUND flag is set.
+#[tokio::test]
+#[ignore = "requires KDC + oracle: docker compose -f docker-compose.test.yml up -d"]
+async fn mit_init_channel_bound_rust_accept_without_bindings() {
+    let mut orc = Oracle::connect().await;
+    let (status, token, _json) = orc.init_start(4).await;
+    assert_eq!(status, b'N');
+    let mut acc = Krb5Acceptor::new(Box::new(HttpKeys), Some(service()), None);
     let rep = accept_complete(acc.step(&token).expect("accept")).expect("ap-rep");
     let (status, _out, json) = orc.init_step(&rep).await;
     assert_eq!(status, b'C', "{json}");

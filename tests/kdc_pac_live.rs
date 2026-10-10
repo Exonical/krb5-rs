@@ -167,14 +167,14 @@ fn our_library_parses_and_verifies_pac_in_mit_issued_service_ticket() {
         .expect("parse MIT PAC")
         .expect("MIT 1.22 issues a PAC by default");
     let types = pac.types();
-    // The containers run krb5 1.20.1, which predates the full checksum
-    // (buffer 19, added in 1.21).
-    assert!(!types.contains(&PAC_FULL_CHECKSUM), "{types:?}");
+    // krb5 1.22 service-ticket PACs carry client info, ticket, server,
+    // privsvr and full checksums (pac_sign.c sign_pac / add_ticket_signature).
     for ty in [
         PAC_CLIENT_INFO,
         PAC_SERVER_CHECKSUM,
         PAC_PRIVSVR_CHECKSUM,
         PAC_TICKET_CHECKSUM,
+        PAC_FULL_CHECKSUM,
     ] {
         assert!(types.contains(&ty), "missing buffer {ty} in {types:?}");
     }

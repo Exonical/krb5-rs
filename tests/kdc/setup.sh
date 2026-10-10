@@ -4,18 +4,14 @@ if [[ "${DEBUG_KDC_SETUP:-0}" == "1" ]]; then
     set -x
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-
 # Allow overriding credentials via env vars so secrets don't appear in ps output.
 # The default values below are for local testing only and MUST NOT be reused outside tests.
 MASTER_KEY="${KDC_MASTER_KEY:-masterkey}"
 TESTUSER1_PASSWORD="${KDC_TESTUSER1_PASSWORD:-testpassword}"
 TESTUSER2_PASSWORD="${KDC_TESTUSER2_PASSWORD:-password2}"
 
-# Install MIT KDC (krb5.conf must not be bind-mounted during install
-# because krb5-config postinst tries to rename it)
-apt-get update -qq
-apt-get install -y -qq krb5-kdc krb5-admin-server krb5-user python3-gssapi
+# MIT krb5 is built into the image (tests/kdc/Dockerfile).
+mkdir -p /etc/krb5kdc /var/lib/krb5kdc
 
 # Write config files (overwrite the defaults created by package install)
 cat > /etc/krb5.conf <<'CONF'
