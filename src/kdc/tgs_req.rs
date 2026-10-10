@@ -288,7 +288,11 @@ impl<S: PrincipalStore> Kdc<S> {
         auth_ctx.set_time_offset(now - Utc::now());
         auth_ctx.set_permitted_etypes(Some(self.config.supported_enctypes.clone()));
         let rd = auth_ctx
-            .rd_req(ap_bytes, Some(&ap.ticket.sname), &FixedKey(header_key))
+            .rd_req(
+                ap_bytes,
+                Some(&ap.ticket.sname),
+                &FixedKey(header_key.clone()),
+            )
             .map_err(|e| match e {
                 Krb5Error::Ap(a) => KdcError::new(ap_error_code(a), STATUS),
                 _ => KdcError::generic(STATUS),
@@ -346,7 +350,11 @@ impl<S: PrincipalStore> Kdc<S> {
             .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "NULL_SERVER"))?;
         let realm = &self.config.realm;
 
-        self.require_local_tgt()?;
+        let local_tgt = self.require_local_tgt()?;
+
+        // get_verified_pac (do_tgs_req.c:636-644): HEADER_PAC.
+        let header_pac =
+            self.verify_header_pac(&header, &ap.ticket.sname, &header_key, &local_tgt)?;
 
         let (server, is_referral) = self.search_sprinc(opts, sname, realm)?;
 
@@ -397,6 +405,18 @@ impl<S: PrincipalStore> Kdc<S> {
         // issued by a foreign realm.
         if is_crossrealm && client_realm == *realm {
             return Err(KdcError::new(KDC_ERR_POLICY, "INVALID LINEAGE"));
+        }
+
+        // check_normal_tgs_pac (tgs_policy.c:600-625): the PAC client info
+        // must match the header ticket's client (no realm).
+        if let Some(pac) = &header_pac {
+            let authtime = header.authtime.timestamp();
+            if pac
+                .verify(authtime, Some((&header.cname, &client_realm)), None, None)
+                .is_err()
+            {
+                return Err(KdcError::new(KDC_ERR_BADOPTION, "HEADER_PAC"));
+            }
         }
 
         // check_tgs_policy (tgs_policy.c:732-771).
@@ -529,7 +549,7 @@ impl<S: PrincipalStore> Kdc<S> {
         };
 
         let tkt_flags = KerberosFlags::new(flags);
-        let part = crate::types::EncTicketPart {
+        let mut part = crate::types::EncTicketPart {
             flags: tkt_flags,
             key: session_key.clone(),
             crealm: header.crealm.clone(),
@@ -542,6 +562,17 @@ impl<S: PrincipalStore> Kdc<S> {
             caddr: ticket_caddr,
             authorization_data: None,
         };
+        self.issue_tgs_authdata(
+            &mut part,
+            &server,
+            &server_key.key,
+            &local_tgt,
+            body.enc_authorization_data
+                .as_ref()
+                .map(|e| (e, &header.key, auth.subkey.as_ref())),
+            &header,
+            header_pac.as_ref(),
+        )?;
         let kvno =
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;
         let ticket_sname = if opts.contains(KdcOptions::RENEW) {

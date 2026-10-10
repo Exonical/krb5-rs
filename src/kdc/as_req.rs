@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use rasn::types::OctetString;
 
+use super::authdata::include_pac_p;
 use super::db::{KvnoSel, PrincipalAttributes, PrincipalEntry};
 use super::error::{general_string, ErrorContext, KdcError};
 use super::fast::{anonymous_client, FastInputs};
@@ -100,7 +101,7 @@ impl<S: PrincipalStore> Kdc<S> {
         let server = self
             .lookup(sname, realm, "LOOKING_UP_SERVER")?
             .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "SERVER_NOT_FOUND"))?;
-        self.require_local_tgt()?;
+        let local_tgt = self.require_local_tgt()?;
 
         validate_as_request(opts, &client, &server, kdc_time)?;
 
@@ -252,7 +253,7 @@ impl<S: PrincipalStore> Kdc<S> {
             flags |= TicketFlags::ENC_PA_REP;
         }
         let tkt_flags = KerberosFlags::new(flags);
-        let part = EncTicketPart {
+        let mut part = EncTicketPart {
             flags: tkt_flags,
             key: session_key.clone(),
             crealm: body.realm.clone(),
@@ -268,6 +269,13 @@ impl<S: PrincipalStore> Kdc<S> {
             caddr: body.addresses.clone(),
             authorization_data: None,
         };
+        self.issue_as_pac(
+            &mut part,
+            &server,
+            &server_key.key,
+            &local_tgt,
+            include_pac_p(request.padata.as_deref()),
+        )?;
         let kvno =
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;
         let ticket =

@@ -7,13 +7,16 @@
 //!
 //! One KDC serves one realm. Cross-realm trust (incoming and outgoing
 //! `krbtgt/` keys), host-based referrals, alternate cross-realm TGTs and
-//! transited-path policy follow MIT (see [`KdcConfig::realm_profile`]); no
-//! PKINIT, PAC/authdata, S4U, user-to-user, postdating, validation, proxy
-//! tickets, lockout or lookaside cache.
+//! transited-path policy follow MIT (see [`KdcConfig::realm_profile`]). Tickets
+//! carry an MS-PAC with client info and signatures, issued, verified and
+//! re-signed as MIT's `handle_pac` does (see [`crate::pac`]); there is no
+//! logon-information source. No PKINIT, S4U, user-to-user, postdating,
+//! validation, proxy tickets, lockout or lookaside cache.
 //! FAST (RFC 6113) armor, encrypted challenge and armored replies/errors are
 //! handled in the `fast` module.
 
 mod as_req;
+mod authdata;
 mod config;
 mod db;
 mod error;
@@ -84,6 +87,9 @@ pub struct KdcConfig {
     /// MIT `reject_bad_transit` (default true): refuse tickets whose
     /// transited path was not checked successfully.
     pub reject_bad_transit: bool,
+    /// MIT `disable_pac` (kdc.conf realm relation, kdc/main.c:338): never
+    /// issue a PAC.
+    pub disable_pac: bool,
 }
 
 impl KdcConfig {
@@ -103,6 +109,7 @@ impl KdcConfig {
             host_based_services: Vec::new(),
             no_host_referral: Vec::new(),
             reject_bad_transit: true,
+            disable_pac: false,
         }
     }
 }
