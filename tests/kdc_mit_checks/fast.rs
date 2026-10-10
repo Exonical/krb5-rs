@@ -22,6 +22,7 @@ fn types(padata: &[PaData]) -> Vec<i32> {
 /// Armor material for a hand-built FAST request.
 struct Armor {
     key: EncryptionKey,
+    subkey: Option<EncryptionKey>,
     armor: KrbFastArmor,
 }
 
@@ -39,6 +40,7 @@ fn ap_armor(tgt: &Credential, use_subkey: bool) -> Armor {
     };
     Armor {
         key,
+        subkey: ctx.send_subkey().cloned(),
         armor: KrbFastArmor {
             armor_type: 1,
             armor_value: OctetString::from(der),
@@ -546,4 +548,94 @@ fn tgs_req_fast_ap_request_armor_with_subkey_returns_preauth_failed() {
     decoded.0.padata.as_mut().expect("padata").push(fx);
     let der = rasn::der::encode(&decoded).expect("encode");
     assert_eq!(krb_error(&f.kdc.handle(&der)).error_code, 24);
+}
+
+/// Replace the outer client of a KDC-REP with the anonymous principal, as a
+/// KDC honouring FAST hide-client-names would (the outer cname/crealm are
+/// not integrity-protected; the real client is in the encrypted finished).
+fn anonymize_outer_client(rep: &mut KdcRep) {
+    rep.cname = PrincipalName {
+        name_type: 11,
+        name_string: vec![gs("WELLKNOWN"), gs("ANONYMOUS")],
+    };
+    rep.crealm = gs("WELLKNOWN:ANONYMOUS");
+}
+
+#[test]
+fn fast_hide_client_reply_finished_restores_real_client_realm() {
+    use krb5_rs::protocol::fast::FastState;
+    let f = fixture();
+    let tgt = get_tgt(&f);
+    let armor = ap_armor(&tgt, true);
+    let mut spec = FastAs::new(USER);
+    spec.fast_options = vec![0x40, 0, 0, 0];
+    spec.inner_padata = vec![enc_timestamp_padata(USER, PASSWORD, at(0))];
+    let reply = f.kdc.handle(&build_fast_as(&armor, spec));
+    let rep: AsRep = rasn::der::decode(&reply).expect("AS-REP");
+    assert_eq!(rep.0.crealm.as_bytes(), b"WELLKNOWN:ANONYMOUS");
+
+    let mut state = FastState::new();
+    state
+        .tgs_armor(armor.subkey.as_ref().expect("subkey"), &tgt.session_key)
+        .expect("armor key");
+    assert_eq!(
+        state.armor_key().expect("armor key").key_bytes(),
+        armor.key.key_bytes()
+    );
+    // prep_req records the request nonce the response must echo.
+    let probe = KdcReq {
+        pvno: 5,
+        msg_type: 10,
+        padata: None,
+        req_body: as_body(USER),
+    };
+    state
+        .prep_req(&probe, &[], krb5_rs::protocol::fast::FastMsgType::As)
+        .expect("prep_req");
+    let out = state
+        .process_response(rep.0.padata.as_deref(), &rep.0.ticket)
+        .expect("process_response")
+        .expect("armored");
+    assert_eq!(out.crealm.as_bytes(), REALM.as_bytes());
+    assert_eq!(out.client, user());
+}
+
+#[test]
+fn as_exchange_fast_anonymous_outer_client_completes_with_real_client() {
+    let f = fixture();
+    let tgt = get_tgt(&f);
+    let mut exchange = AsExchange::new(armored_config(&tgt), PASSWORD);
+    let mut reply = Vec::new();
+    while let StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } =
+        exchange.step(&reply).expect("step")
+    {
+        reply = f.kdc.handle(&data);
+        if let Ok(mut rep) = rasn::der::decode::<AsRep>(&reply) {
+            anonymize_outer_client(&mut rep.0);
+            reply = rasn::der::encode(&rep).expect("encode");
+        }
+    }
+    let cred = exchange.credential().expect("credential");
+    assert_eq!(cred.client, user());
+    assert_eq!(cred.crealm, REALM);
+}
+
+#[test]
+fn tgs_exchange_fast_anonymous_outer_client_completes_with_real_client() {
+    let f = fixture();
+    let tgt = get_tgt(&f);
+    let mut exchange = TgsExchange::new(tgt, service(), TgsOptions::default());
+    let mut reply = Vec::new();
+    while let TgsStepResult::SendToKdc { data, .. } | TgsStepResult::RetryTcp { data, .. } =
+        exchange.step(&reply).expect("step")
+    {
+        reply = f.kdc.handle(&data);
+        if let Ok(mut rep) = rasn::der::decode::<TgsRep>(&reply) {
+            anonymize_outer_client(&mut rep.0);
+            reply = rasn::der::encode(&rep).expect("encode");
+        }
+    }
+    let cred = exchange.credential().expect("credential");
+    assert_eq!(cred.client, user());
+    assert_eq!(cred.crealm, REALM);
 }
