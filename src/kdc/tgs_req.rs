@@ -5,7 +5,9 @@ use chrono::{DateTime, Utc};
 use rasn::types::OctetString;
 
 use super::db::KvnoSel;
-use super::error::{ap_error_code, general_string, ErrorContext, KdcError};
+use super::error::{
+    ap_error_code, general_string, krbtgt_name, ErrorContext, KdcError, KRB_AP_ERR_ILL_CR_TKT,
+};
 use super::fast::{anonymous_client, FastInputs};
 use super::policy::{
     check_tgs_opts, check_tgs_svc_policy, check_tgs_times, get_ticket_endtime, get_ticket_flags,
@@ -14,14 +16,18 @@ use super::policy::{
 };
 use super::preauth::{enc_pa_rep_padata, find_padata};
 use super::reqbody::raw_req_body;
-use super::{is_tgs_principal, names_equal, random_key, Kdc, PrincipalStore};
+use super::{is_tgs_principal, names_equal, random_key, Kdc, PrincipalEntry, PrincipalStore};
 use crate::crypto::{find_cksumtype, find_etype, key_usage};
+use crate::locate::host_realm;
 use crate::protocol::ap::{encrypt_ticket_part, ApError, AuthContext, AuthContextFlags, KeySource};
+use crate::protocol::transit::{
+    add_to_transited, check_transited_list, walk_realm_tree, REALM_BRANCH_CHAR,
+};
 use crate::types::error_codes::*;
 use crate::types::{
     ApOptions, ApReq, AuthorizationDataElement, Checksum, EncKdcRepPart, EncTgsRepPart,
     EncryptedData, EncryptionKey, KdcOptions, KdcRep, KdcReq, KerberosFlags, KerberosTime,
-    LastReqEntry, PaDataType, PrincipalName, TgsRep, TicketFlags,
+    LastReqEntry, PaDataType, PrincipalName, TgsRep, TicketFlags, TransitedEncoding,
 };
 use crate::Krb5Error;
 
@@ -99,7 +105,124 @@ fn realm_string(g: &rasn::types::GeneralString) -> String {
     String::from_utf8_lossy(g.as_bytes()).to_string()
 }
 
+/// MIT `is_cross_tgs_principal` (kdc_util.c:98-103): a TGS principal whose
+/// instance is not its own realm.
+fn is_cross_tgs(name: &PrincipalName, realm: &str) -> bool {
+    is_tgs_principal(name) && name.name_string[1].as_bytes() != realm.as_bytes()
+}
+
+/// Whether `list` names `item` or `*` (MIT `in_list`, do_tgs_req.c:420-435).
+fn in_list(list: &[String], item: &str) -> bool {
+    list.iter().any(|l| l == item || l == "*")
+}
+
 impl<S: PrincipalStore> Kdc<S> {
+    /// `is_referral_req` (do_tgs_req.c:437-478).
+    fn is_referral_req(&self, opts: KdcOptions, sname: &PrincipalName) -> bool {
+        if !opts.contains(KdcOptions::CANONICALIZE)
+            || opts.contains(KdcOptions::ENC_TKT_IN_SKEY)
+            || sname.name_string.len() != 2
+        {
+            return false;
+        }
+        let stype = String::from_utf8_lossy(sname.name_string[0].as_bytes()).to_string();
+        match sname.name_type {
+            0 if !in_list(&self.config.host_based_services, &stype) => return false,
+            0 | 2 | 3 => {}
+            _ => return false,
+        }
+        !in_list(&self.config.no_host_referral, &stype)
+    }
+
+    /// `find_referral_tgs` (do_tgs_req.c:480-519): `krbtgt/<host realm>@realm`
+    /// for an FQDN host in another realm; `[domain_realm]` comes from the
+    /// KDC's krb5.conf.
+    fn find_referral_tgs(
+        &self,
+        opts: KdcOptions,
+        sname: &PrincipalName,
+        realm: &str,
+    ) -> Option<PrincipalName> {
+        if !self.is_referral_req(opts, sname) {
+            return None;
+        }
+        let hostname = String::from_utf8_lossy(sname.name_string[1].as_bytes()).to_string();
+        if !hostname.contains('.') {
+            return None;
+        }
+        let profile = self.config.realm_profile.as_ref()?;
+        let host_realm = host_realm(profile, &hostname).into_iter().next()?;
+        if host_realm.is_empty() || host_realm == realm {
+            return None;
+        }
+        let name = PrincipalName {
+            name_type: 2,
+            name_string: vec![
+                general_string("krbtgt").ok()?,
+                general_string(&host_realm).ok()?,
+            ],
+        };
+        Some(name)
+    }
+
+    /// `find_alternate_tgs` (do_tgs_req.c:371-418): the cross-realm TGT
+    /// nearest the target on the realm path, trying the target first and
+    /// skipping the local-realm entry.
+    fn find_alternate_tgs(&self, princ: &PrincipalName, realm: &str) -> Option<PrincipalEntry> {
+        let target = princ.name_string[1].as_bytes();
+        let hops = walk_realm_tree(
+            realm.as_bytes(),
+            target,
+            self.config.realm_profile.as_ref(),
+            REALM_BRANCH_CHAR,
+        )
+        .ok()?;
+        hops.iter().skip(1).rev().find_map(|hop| {
+            let name = krbtgt_name(&String::from_utf8_lossy(&hop.instance)).ok()?;
+            self.lookup(&name, realm, "LOOKING_UP_SERVER")
+                .ok()
+                .flatten()
+        })
+    }
+
+    /// `search_sprinc` (do_tgs_req.c:541-581): the requested server, else a
+    /// referral TGT, else an alternate cross-realm TGT. Returns whether a
+    /// referral/alternate TGT is being issued (:668-671).
+    fn search_sprinc(
+        &self,
+        opts: KdcOptions,
+        sname: &PrincipalName,
+        realm: &str,
+    ) -> Result<(PrincipalEntry, bool), KdcError> {
+        let unknown = || KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "LOOKING_UP_SERVER");
+        if let Some(found) = self
+            .lookup(sname, realm, "LOOKING_UP_SERVER")
+            .ok()
+            .flatten()
+        {
+            return Ok((found, false));
+        }
+        if opts.intersects(NON_TGT_OPTION | KdcOptions::ENC_TKT_IN_SKEY) {
+            return Err(unknown());
+        }
+        let mut princ = sname.clone();
+        if !is_cross_tgs(sname, realm) {
+            let reftgs = self
+                .find_referral_tgs(opts, sname, realm)
+                .ok_or_else(unknown)?;
+            if let Some(found) = self
+                .lookup(&reftgs, realm, "LOOKING_UP_SERVER")
+                .ok()
+                .flatten()
+            {
+                return Ok((found, true));
+            }
+            princ = reftgs;
+        }
+        let found = self.find_alternate_tgs(&princ, realm).ok_or_else(unknown)?;
+        Ok((found, true))
+    }
+
     /// MIT `process_tgs_req` (do_tgs_req.c:1163-1229).
     pub(super) fn process_tgs_req(
         &self,
@@ -225,22 +348,23 @@ impl<S: PrincipalStore> Kdc<S> {
 
         self.require_local_tgt()?;
 
-        // search_sprinc (do_tgs_req.c:541-581): no referrals.
-        let server = self
-            .lookup(sname, realm, "LOOKING_UP_SERVER")
-            .ok()
-            .flatten()
-            .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "LOOKING_UP_SERVER"))?;
+        let (server, is_referral) = self.search_sprinc(opts, sname, realm)?;
 
-        // NO_AUTH_DATA_REQUIRED servers skip the client lookup
-        // (do_tgs_req.c:771-779).
+        // The request is cross-realm if the header ticket server is not from
+        // this realm (do_tgs_req.c:693-695).
+        let client_realm = realm_string(&header.crealm);
+        let is_crossrealm = tkt_realm != *realm;
+
+        // The client is looked up only when it belongs to this realm, and
+        // NO_AUTH_DATA_REQUIRED servers skip the lookup (do_tgs_req.c:771-779).
         let client = if server
             .attributes
             .contains(super::PrincipalAttributes::NO_AUTH_DATA_REQUIRED)
+            || client_realm != *realm
         {
             None
         } else {
-            self.lookup(&header.cname, &realm_string(&header.crealm), STATUS)
+            self.lookup(&header.cname, &client_realm, STATUS)
                 .ok()
                 .flatten()
         };
@@ -267,6 +391,12 @@ impl<S: PrincipalStore> Kdc<S> {
             if ap.ticket.sname.name_string[1].as_bytes() != body.realm.as_bytes() {
                 return Err(KdcError::new(KRB_AP_ERR_NOT_US, "BAD TGS SERVER INSTANCE"));
             }
+        }
+
+        // check_tgs_lineage (tgs_policy.c:248-258): no local user tickets
+        // issued by a foreign realm.
+        if is_crossrealm && client_realm == *realm {
+            return Err(KdcError::new(KDC_ERR_POLICY, "INVALID LINEAGE"));
         }
 
         // check_tgs_policy (tgs_policy.c:732-771).
@@ -325,16 +455,50 @@ impl<S: PrincipalStore> Kdc<S> {
             times.starttime = 0;
         }
 
-        // Transited-path check (do_tgs_req.c:924-948): with no capaths
-        // support only an empty transited list can be verified, and a
-        // request that disables the check cannot set the policy flag, which
-        // reject_bad_transit (MIT default) refuses.
-        if opts.contains(KdcOptions::DISABLE_TRANSITED_CHECK)
-            || !header.transited.contents.is_empty()
+        // The transited list implied by the request (do_tgs_req.c:787-806):
+        // unchanged unless this is a cross-realm request for a client of
+        // another realm than the header ticket's issuer.
+        let transited = if !is_crossrealm || tkt_realm == client_realm {
+            header.transited.clone()
+        } else {
+            if header.transited.tr_type != 1 {
+                return Err(KdcError::new(
+                    KDC_ERR_TRTYPE_NOSUPP,
+                    "VALIDATE_TRANSIT_TYPE",
+                ));
+            }
+            let contents = add_to_transited(
+                header.transited.contents.as_ref(),
+                tkt_realm.as_bytes(),
+                client_realm.as_bytes(),
+                body.realm.as_bytes(),
+            )
+            .map_err(|_| KdcError::new(KRB_AP_ERR_ILL_CR_TKT, "ADD_TO_TRANSITED_LIST"))?;
+            TransitedEncoding {
+                tr_type: 1,
+                contents: OctetString::from(contents),
+            }
+        };
+
+        // Transited-path check (do_tgs_req.c:924-948): skipped when the
+        // request disables it; otherwise a failure only withholds
+        // TRANSITED_POLICY_CHECKED. reject_bad_transit then refuses an
+        // unchecked path (:951-958, KRB5KDC_ERR_POLICY).
+        if !opts.contains(KdcOptions::DISABLE_TRANSITED_CHECK)
+            && check_transited_list(
+                transited.contents.as_ref(),
+                client_realm.as_bytes(),
+                body.realm.as_bytes(),
+                self.config.realm_profile.as_ref(),
+            )
+            .is_ok()
+        {
+            flags |= TicketFlags::TRANSITED_POLICY_CHECKED;
+        }
+        if self.config.reject_bad_transit && !flags.contains(TicketFlags::TRANSITED_POLICY_CHECKED)
         {
             return Err(KdcError::new(KDC_ERR_POLICY, "BAD_TRANSIT"));
         }
-        flags |= TicketFlags::TRANSITED_POLICY_CHECKED;
 
         // tgs_issue_ticket (do_tgs_req.c:955-1139).
         let session_etype = select_session_keytype(&server, &body.etype, &permitted)
@@ -370,7 +534,7 @@ impl<S: PrincipalStore> Kdc<S> {
             key: session_key.clone(),
             crealm: header.crealm.clone(),
             cname: header.cname.clone(),
-            transited: header.transited.clone(),
+            transited,
             authtime: kerberos_time(times.authtime),
             starttime: optional_time(times.starttime),
             endtime: kerberos_time(times.endtime),
@@ -382,6 +546,8 @@ impl<S: PrincipalStore> Kdc<S> {
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;
         let ticket_sname = if opts.contains(KdcOptions::RENEW) {
             ap.ticket.sname.clone()
+        } else if is_referral {
+            server.name.clone()
         } else {
             sname.clone()
         };

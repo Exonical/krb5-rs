@@ -5,8 +5,11 @@
 //! tgs_policy.c, kdc_preauth.c, kdc_preauth_encts.c). No networking: feed a
 //! DER request to [`Kdc::handle`] and send the returned DER reply.
 //!
-//! Single realm only; no PKINIT, PAC/authdata, cross-realm, S4U, user-to-user,
-//! postdating, validation, proxy tickets, lockout or lookaside cache.
+//! One KDC serves one realm. Cross-realm trust (incoming and outgoing
+//! `krbtgt/` keys), host-based referrals, alternate cross-realm TGTs and
+//! transited-path policy follow MIT (see [`KdcConfig::realm_profile`]); no
+//! PKINIT, PAC/authdata, S4U, user-to-user, postdating, validation, proxy
+//! tickets, lockout or lookaside cache.
 //! FAST (RFC 6113) armor, encrypted challenge and armored replies/errors are
 //! handled in the `fast` module.
 
@@ -24,6 +27,8 @@ mod server;
 mod tgs_req;
 
 use std::time::Duration;
+
+use crate::profile::Profile;
 
 use chrono::{DateTime, Utc};
 
@@ -66,6 +71,19 @@ pub struct KdcConfig {
     /// Largest reply sent over UDP; larger replies are replaced by
     /// `KRB_ERR_RESPONSE_TOO_BIG` (MIT `kdc_max_dgram_reply_size`).
     pub max_dgram_reply_size: usize,
+    /// The KDC's krb5.conf, for `[domain_realm]` (referrals) and `[capaths]`
+    /// (transit checking and alternate TGTs). Without it only hierarchical
+    /// realm relationships are known and no host-to-realm mapping exists.
+    pub realm_profile: Option<Profile>,
+    /// MIT `host_based_services`: service names for which NT-UNKNOWN
+    /// principals may be referred (`*` for all).
+    pub host_based_services: Vec<String>,
+    /// MIT `no_host_referral`: service names that never get referrals
+    /// (`*` for all).
+    pub no_host_referral: Vec<String>,
+    /// MIT `reject_bad_transit` (default true): refuse tickets whose
+    /// transited path was not checked successfully.
+    pub reject_bad_transit: bool,
 }
 
 impl KdcConfig {
@@ -81,6 +99,10 @@ impl KdcConfig {
             supported_enctypes: vec![18, 17, 20, 19],
             clockskew: Duration::from_secs(300),
             max_dgram_reply_size: 65536,
+            realm_profile: None,
+            host_based_services: Vec::new(),
+            no_host_referral: Vec::new(),
+            reject_bad_transit: true,
         }
     }
 }

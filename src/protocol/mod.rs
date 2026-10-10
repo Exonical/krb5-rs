@@ -15,6 +15,8 @@ pub mod fast;
 mod kdc_rep;
 pub(crate) mod preauth;
 mod tgs_exchange;
+#[cfg(feature = "kdc")]
+pub(crate) mod transit;
 mod validate;
 
 pub use as_exchange::{AsExchange, AsExchangeConfig, StepResult};

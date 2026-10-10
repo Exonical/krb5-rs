@@ -7,7 +7,7 @@ use std::path::Path;
 use super::ProfileError;
 
 /// A profile tree node.  `value.is_none()` marks a section/subsection.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Node {
     pub name: String,
     pub value: Option<String>,
