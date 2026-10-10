@@ -1,6 +1,11 @@
+x-mit-build: &mit-build
+  context: tests/kdc
+  dockerfile: Dockerfile
+
 services:
   kdc:
-    image: ubuntu:24.04
+    build: *mit-build
+    image: krb5-rs-mit-test:1.22.2
     hostname: kdc.test.realm
     ports:
       - "10188:88/udp"
@@ -15,10 +20,11 @@ services:
       interval: 2s
       timeout: 5s
       retries: 15
-      start_period: 300s
+      start_period: 60s
 
   kdc-other:
-    image: ubuntu:24.04
+    build: *mit-build
+    image: krb5-rs-mit-test:1.22.2
     hostname: kdc.other.realm
     ports:
       - "10288:88/udp"
@@ -31,4 +37,4 @@ services:
       interval: 2s
       timeout: 5s
       retries: 15
-      start_period: 300s
+      start_period: 60s
