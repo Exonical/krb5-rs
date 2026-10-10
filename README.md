@@ -9,7 +9,7 @@ Pure Rust Kerberos V5 implementation. GSSAPI, SPNEGO, PKINIT.
 - **Kerberos V5 Client** — AS/TGS exchanges (TGT acquisition, service ticket requests), krb5.conf parsing, KDC discovery
 - **KDC** — AS/TGS request processing, FAST, UDP/TCP serving (`kdc` feature; see `examples/kdc.rs`)
 - **GSSAPI/SPNEGO** — HTTP Negotiate authentication
-- **PKINIT** — X.509 certificate-based authentication (planned)
+- **PKINIT** — X.509 certificate-based authentication, client and KDC (`pkinit` feature; DH/ECDH replies, MIT 1.22 parity)
 - **FAST** — Flexible Authentication via Secure Tunneling
 - **Credential Cache** — Read/write ccache and keytab formats
 
@@ -35,9 +35,13 @@ MIT Kerberos and Heimdal are massive C codebases (~450K and ~620K SLOC respectiv
 | [RFC 8009](https://www.rfc-editor.org/rfc/rfc8009) | AES-SHA2 encryption | Implemented |
 | [RFC 6113](https://www.rfc-editor.org/rfc/rfc6113) | FAST | Client + KDC |
 | [RFC 6806](https://www.rfc-editor.org/rfc/rfc6806) | Enc-pa-rep / FAST negotiation | Client + KDC |
-| [RFC 4556](https://www.rfc-editor.org/rfc/rfc4556) | PKINIT | Planned |
+| [RFC 4556](https://www.rfc-editor.org/rfc/rfc4556) | PKINIT (Diffie-Hellman and ECDH) | Client + KDC |
+| [RFC 8636](https://www.rfc-editor.org/rfc/rfc8636) | PKINIT algorithm agility (KDFs, ECDH groups) | Client + KDC |
+| [RFC 8070](https://www.rfc-editor.org/rfc/rfc8070) | PKINIT freshness | Client + KDC |
 
-**Not yet supported:** PAC/authorization data, S4U, PKINIT, DES/RC4/Camellia enctypes.
+**Feature `test-pki`** (TESTING ONLY): embeds fixed RSA private keys and a certificate issuer used by the PKINIT tests and `examples/gen_pkinit_pki.rs`. Never enable it in production builds.
+
+**Not yet supported:** PAC/authorization data, S4U, PKINIT RSA key transport and anonymous PKINIT, DES/RC4/Camellia enctypes.
 
 ## License
 

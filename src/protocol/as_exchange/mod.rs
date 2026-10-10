@@ -34,6 +34,8 @@ const KDC_ERR_PREAUTH_REQUIRED: i32 = ErrorCode::PreauthRequired as i32;
 const KRB_ERR_RESPONSE_TOO_BIG: i32 = ErrorCode::ResponseTooBig as i32;
 const KDC_ERR_WRONG_REALM: i32 = ErrorCode::WrongRealm as i32;
 const KDC_ERR_PREAUTH_FAILED: i32 = ErrorCode::PreauthFailed as i32;
+#[cfg(feature = "pkinit")]
+const KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED: i32 = 65;
 /// RFC 6113 codes not represented in `ErrorCode`.
 const KDC_ERR_PREAUTH_EXPIRED: i32 = 90;
 const KDC_ERR_MORE_PREAUTH_DATA_REQUIRED: i32 = 91;
@@ -67,6 +69,10 @@ pub struct AsExchangeConfig {
     pub max_clock_skew: Duration,
     /// FAST mode (RFC 6113). Default: disabled.
     pub fast: FastMode,
+    /// PKINIT settings (RFC 4556). When set, PA-PK-AS-REQ is used if the KDC
+    /// offers it; the password may then be empty. Default: none.
+    #[cfg(feature = "pkinit")]
+    pub pkinit: Option<std::sync::Arc<crate::pkinit::client::ClientConfig>>,
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -87,6 +93,8 @@ impl Default for AsExchangeConfig {
             request_pac: true,
             max_clock_skew: DEFAULT_MAX_CLOCK_SKEW,
             fast: FastMode::Disabled,
+            #[cfg(feature = "pkinit")]
+            pkinit: None,
         }
     }
 }
@@ -237,6 +245,15 @@ pub struct AsExchange {
     loop_count: u32,
     /// Output credential.
     credential: Option<Credential>,
+    /// Key exchange group offered in the next PA-PK-AS-REQ.
+    #[cfg(feature = "pkinit")]
+    pkinit_group: crate::pkinit::Group,
+    /// Key pair of the outstanding PA-PK-AS-REQ.
+    #[cfg(feature = "pkinit")]
+    pkinit_keypair: Option<crate::pkinit::kex::KeyPair>,
+    /// Freshness token from the KDC (RFC 8070).
+    #[cfg(feature = "pkinit")]
+    freshness_token: Option<Vec<u8>>,
 }
 
 /// KDC time offset learned from a preauth error (MIT `pa_offset_state`).
@@ -253,6 +270,8 @@ struct PaOffset {
 impl AsExchange {
     /// Create a new AS exchange.
     pub fn new(config: AsExchangeConfig, password: impl Into<String>) -> Self {
+        #[cfg(feature = "pkinit")]
+        let pkinit_group = Self::initial_pkinit_group(&config);
         Self {
             state: AsState::Initial,
             config,
@@ -276,6 +295,12 @@ impl AsExchange {
             kdc_verified: false,
             loop_count: 0,
             credential: None,
+            #[cfg(feature = "pkinit")]
+            pkinit_group,
+            #[cfg(feature = "pkinit")]
+            pkinit_keypair: None,
+            #[cfg(feature = "pkinit")]
+            freshness_token: None,
         }
     }
 
@@ -377,6 +402,11 @@ impl AsExchange {
         {
             self.restarted = true;
             return self.restart(true);
+        }
+
+        #[cfg(feature = "pkinit")]
+        if let Some(result) = self.pkinit_error(&krb_error, err_padata.as_deref()) {
+            return result;
         }
 
         match krb_error.error_code {
@@ -481,6 +511,13 @@ impl AsExchange {
             .find(|pa| pa.padata_type == PaDataType::FxCookie as i32)
             .map(|pa| pa.padata_value.as_ref().to_vec());
 
+        #[cfg(feature = "pkinit")]
+        self.note_freshness(&method);
+        #[cfg(feature = "pkinit")]
+        let pkinit_offered = self.pkinit_offered(&method);
+        #[cfg(not(feature = "pkinit"))]
+        let pkinit_offered = false;
+
         // Persist salt and s2kparams for AS-REP decryption later.
         match extract_preauth_hint_padata(&method, &self.config.etypes) {
             Ok(hint) => {
@@ -489,7 +526,7 @@ impl AsExchange {
                 self.last_preauth_etype = Some(hint.etype);
             }
             Err(e) => {
-                if self.last_preauth_etype.is_none() {
+                if self.last_preauth_etype.is_none() && !pkinit_offered {
                     return Err(e);
                 }
             }
@@ -515,6 +552,14 @@ impl AsExchange {
             salt: self.last_preauth_salt.clone(),
             s2kparams: self.last_s2kparams.clone(),
         };
+        #[cfg(feature = "pkinit")]
+        if self.pkinit_offered(method) {
+            self.selected_preauth_type = Some(crate::pkinit::server::PA_PK_AS_REQ);
+            return Ok(PaData {
+                padata_type: crate::pkinit::server::PA_PK_AS_REQ,
+                padata_value: Vec::new().into(),
+            });
+        }
         for pa in method {
             match pa.padata_type {
                 t if t == PaDataType::EncryptedChallenge as i32 => {
@@ -577,6 +622,8 @@ fn duration_secs_i64(dur: Duration) -> i64 {
 
 pub(crate) use crate::protocol::validate::now_kerberos;
 
+#[cfg(feature = "pkinit")]
+mod pkinit;
 mod reply;
 mod request;
 

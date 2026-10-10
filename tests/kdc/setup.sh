@@ -47,8 +47,17 @@ cat > /etc/krb5kdc/kdc.conf <<'CONF'
         max_renewable_life = 7d
         supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal
         default_principal_flags = +preauth
+        pkinit_identity = FILE:/pki/kdc-test-realm.pem,/pki/kdc-key.pem
+        pkinit_anchors = FILE:/pki/ca.pem
     }
 CONF
+
+# A second KDC process on the same database that requires PKINIT freshness
+# tokens (RFC 8070), on port 8888 (published as 10190).
+sed -e 's/kdc_ports = 88$/kdc_ports = 8888/' \
+    -e 's/kdc_tcp_ports = 88$/kdc_tcp_ports = 8888/' /etc/krb5kdc/kdc.conf | \
+    awk '{ print } /pkinit_anchors/ { print "        pkinit_require_freshness = true" }' \
+    > /etc/krb5kdc/kdc-fresh.conf
 
 # Create KDC database
 mkdir -p /var/lib/krb5kdc
@@ -97,6 +106,9 @@ LOGGING
 if [[ -f /gss_oracle.py ]]; then
     ORACLE_PASSWORD="$TESTUSER1_PASSWORD" python3 /gss_oracle.py &
 fi
+
+# Freshness-requiring KDC (same database, other port and kdc.conf).
+KRB5_KDC_PROFILE=/etc/krb5kdc/kdc-fresh.conf krb5kdc -n &
 
 # Start KDC in foreground
 exec krb5kdc -n

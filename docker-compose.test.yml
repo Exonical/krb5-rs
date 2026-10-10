@@ -11,9 +11,12 @@ services:
       - "10188:88/udp"
       - "10188:88/tcp"
       - "10189:10189/tcp"   # MIT GSS-API oracle (tests/kdc/gss_oracle.py)
+      - "10190:8888/udp"    # KDC requiring PKINIT freshness (setup.sh)
+      - "10190:8888/tcp"
     volumes:
       - ./tests/kdc/setup.sh:/setup.sh:ro
       - ./tests/kdc/gss_oracle.py:/gss_oracle.py:ro
+      - ./tests/kdc/pki:/pki:ro
     command: ["/bin/bash", "/setup.sh"]
     healthcheck:
       test: ["CMD", "bash", "-c", "echo >/dev/tcp/127.0.0.1/88"]

@@ -66,6 +66,8 @@ pub mod key_usage {
     pub const FAST_REP: i32 = 52;
     /// FAST finished ticket checksum (RFC 6113 §5.4.3).
     pub const FAST_FINISHED: i32 = 53;
+    /// KRB5_KEYUSAGE_PA_AS_FRESHNESS (RFC 8070).
+    pub const PA_AS_FRESHNESS: i32 = 514;
     /// Client-direction encrypted challenge (RFC 6113 §5.4.5).
     pub const ENC_CHALLENGE_CLIENT: i32 = 54;
     /// KDC-direction encrypted challenge (RFC 6113 §5.4.5).
