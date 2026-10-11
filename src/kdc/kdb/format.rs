@@ -19,6 +19,47 @@ pub(super) struct KdbFile {
     pub realm: GeneralString,
     #[rasn(tag(explicit(context, 2)))]
     pub principals: Vec<KdbPrincipal>,
+    /// Incremented by every write; absent (read as 0) in files written
+    /// before propagation existed.
+    #[rasn(tag(explicit(context, 3)))]
+    pub serial: Option<u64>,
+    /// Password/lockout policies; absent in files written before policies
+    /// existed.
+    #[rasn(tag(explicit(context, 4)))]
+    pub policies: Option<Vec<KdbPolicy>>,
+}
+
+/// One policy (MIT `osa_policy_ent_rec`).
+#[derive(AsnType, Encode, Decode, Debug, Clone)]
+pub(super) struct KdbPolicy {
+    #[rasn(tag(explicit(context, 0)))]
+    pub name: GeneralString,
+    #[rasn(tag(explicit(context, 1)))]
+    pub pw_min_life: u32,
+    #[rasn(tag(explicit(context, 2)))]
+    pub pw_max_life: u32,
+    #[rasn(tag(explicit(context, 3)))]
+    pub pw_min_length: u32,
+    #[rasn(tag(explicit(context, 4)))]
+    pub pw_min_classes: u32,
+    #[rasn(tag(explicit(context, 5)))]
+    pub pw_history_num: u32,
+    #[rasn(tag(explicit(context, 6)))]
+    pub pw_max_fail: u32,
+    #[rasn(tag(explicit(context, 7)))]
+    pub pw_failcnt_interval: u32,
+    #[rasn(tag(explicit(context, 8)))]
+    pub pw_lockout_duration: u32,
+    #[rasn(tag(explicit(context, 9)))]
+    pub attributes: u32,
+    #[rasn(tag(explicit(context, 10)))]
+    pub max_life: u32,
+    #[rasn(tag(explicit(context, 11)))]
+    pub max_renewable_life: u32,
+    #[rasn(tag(explicit(context, 12)))]
+    pub allowed_keysalts: Option<GeneralString>,
+    #[rasn(tag(explicit(context, 13)))]
+    pub security_epoch: Option<u64>,
 }
 
 /// One principal record; lifetimes are in seconds.
@@ -48,6 +89,12 @@ pub(super) struct KdbPrincipal {
     pub allowed_to_delegate_to: Option<Vec<GeneralString>>,
     #[rasn(tag(explicit(context, 11)))]
     pub allowed_to_delegate_from: Option<Vec<GeneralString>>,
+    #[rasn(tag(explicit(context, 12)))]
+    pub policy: Option<GeneralString>,
+    #[rasn(tag(explicit(context, 13)))]
+    pub security_epoch: Option<u64>,
+    #[rasn(tag(explicit(context, 14)))]
+    pub last_admin_unlock: Option<KerberosTime>,
 }
 
 /// One master-key-encrypted long-term key (MIT `krb5_key_data`).
@@ -84,6 +131,30 @@ mod tests {
         keys: Vec<KdbKey>,
     }
 
+    /// A file as written before the serial existed.
+    #[derive(AsnType, Encode, Decode, Debug, Clone)]
+    struct LegacyFile {
+        #[rasn(tag(explicit(context, 0)))]
+        version: u32,
+        #[rasn(tag(explicit(context, 1)))]
+        realm: GeneralString,
+        #[rasn(tag(explicit(context, 2)))]
+        principals: Vec<KdbPrincipal>,
+    }
+
+    #[test]
+    fn files_without_a_serial_still_decode() {
+        let legacy = LegacyFile {
+            version: VERSION,
+            realm: GeneralString::from_bytes(b"R").expect("realm"),
+            principals: Vec::new(),
+        };
+        let der = rasn::der::encode(&legacy).expect("encode");
+        let file: KdbFile = rasn::der::decode(&der).expect("decode legacy file");
+        assert_eq!(file.serial, None);
+        assert!(file.policies.is_none());
+    }
+
     #[test]
     fn records_without_delegation_lists_still_decode() {
         let legacy = LegacyPrincipal {
@@ -95,5 +166,8 @@ mod tests {
         let der = rasn::der::encode(&legacy).expect("encode");
         let rec: KdbPrincipal = rasn::der::decode(&der).expect("decode legacy record");
         assert!(rec.allowed_to_delegate_to.is_none() && rec.allowed_to_delegate_from.is_none());
+        assert!(
+            rec.policy.is_none() && rec.security_epoch.is_none() && rec.last_admin_unlock.is_none()
+        );
     }
 }

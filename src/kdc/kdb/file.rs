@@ -14,17 +14,61 @@ use std::time::{Duration, SystemTime};
 use chrono::Utc;
 use rasn::types::{GeneralString, OctetString};
 
-use super::format::{KdbFile, KdbKey, KdbPrincipal, MAGIC, VERSION};
+use super::format::{KdbFile, KdbKey, KdbPolicy, KdbPrincipal, MAGIC, VERSION};
 use super::master::{decrypt_key, encrypt_key, master_principal};
 use crate::kdc::db::{
-    random_keys, store_key, KeyEntry, PrincipalAttributes, PrincipalEntry, PrincipalStore,
-    StoreError, StoreKey,
+    random_keys, store_key, KeyEntry, PrincipalAttributes, PrincipalEntry, StoreKey,
 };
 use crate::kdc::policy::kerberos_time;
+use crate::kdc::store::{
+    AdminStore, HealthCheck, Policy, PolicyStore, PrincipalRecord, PrincipalStore, StoreError,
+    StoreErrorKind,
+};
 use crate::types::{EncryptionKey, KerberosTime, PrincipalName};
 
 fn err(msg: impl Into<String>) -> StoreError {
-    StoreError(msg.into())
+    StoreError::backend(msg)
+}
+
+fn policy_from_record(p: &KdbPolicy) -> Policy {
+    Policy {
+        name: String::from_utf8_lossy(p.name.as_bytes()).to_string(),
+        pw_min_life: p.pw_min_life,
+        pw_max_life: p.pw_max_life,
+        pw_min_length: p.pw_min_length,
+        pw_min_classes: p.pw_min_classes,
+        pw_history_num: p.pw_history_num,
+        pw_max_fail: p.pw_max_fail,
+        pw_failcnt_interval: p.pw_failcnt_interval,
+        pw_lockout_duration: p.pw_lockout_duration,
+        attributes: p.attributes,
+        max_life: p.max_life,
+        max_renewable_life: p.max_renewable_life,
+        allowed_keysalts: p
+            .allowed_keysalts
+            .as_ref()
+            .map(|g| String::from_utf8_lossy(g.as_bytes()).to_string()),
+        security_epoch: p.security_epoch.unwrap_or(0),
+    }
+}
+
+fn policy_to_record(p: &Policy) -> Result<KdbPolicy, StoreError> {
+    Ok(KdbPolicy {
+        name: general(&p.name)?,
+        pw_min_life: p.pw_min_life,
+        pw_max_life: p.pw_max_life,
+        pw_min_length: p.pw_min_length,
+        pw_min_classes: p.pw_min_classes,
+        pw_history_num: p.pw_history_num,
+        pw_max_fail: p.pw_max_fail,
+        pw_failcnt_interval: p.pw_failcnt_interval,
+        pw_lockout_duration: p.pw_lockout_duration,
+        attributes: p.attributes,
+        max_life: p.max_life,
+        max_renewable_life: p.max_renewable_life,
+        allowed_keysalts: p.allowed_keysalts.as_deref().map(general).transpose()?,
+        security_epoch: Some(p.security_epoch),
+    })
 }
 
 fn general(s: &str) -> Result<GeneralString, StoreError> {
@@ -48,23 +92,14 @@ fn string_list(l: &Option<Vec<GeneralString>>) -> Vec<String> {
         .collect()
 }
 
-/// A database record: the principal plus bookkeeping the KDC does not use.
-#[derive(Debug, Clone)]
-pub struct PrincipalRecord {
-    /// The principal as the KDC sees it (keys decrypted).
-    pub entry: PrincipalEntry,
-    /// Last password change.
-    pub last_pwd_change: Option<KerberosTime>,
-    /// Last modification.
-    pub mod_time: Option<KerberosTime>,
-}
-
 type Stamp = (SystemTime, u64);
 
 #[derive(Default)]
 struct Cache {
     stamp: Option<Stamp>,
+    serial: u64,
     records: HashMap<StoreKey, KdbPrincipal>,
+    policies: HashMap<String, Policy>,
 }
 
 /// Persistent [`PrincipalStore`] in this crate's own file format (not MIT's
@@ -98,18 +133,23 @@ fn stamp_of(path: &Path) -> Result<Stamp, StoreError> {
 fn read_file(path: &Path) -> Result<(Stamp, KdbFile), StoreError> {
     let stamp = stamp_of(path)?;
     let bytes = std::fs::read(path).map_err(|e| err(format!("{}: {e}", path.display())))?;
+    Ok((stamp, parse_image(&bytes)?))
+}
+
+/// Decode and sanity-check the bytes of a database file.
+fn parse_image(bytes: &[u8]) -> Result<KdbFile, StoreError> {
     let body = bytes
         .strip_prefix(MAGIC.as_slice())
-        .ok_or_else(|| err("not a krb5-rs database (bad magic)"))?;
-    let file: KdbFile =
-        rasn::der::decode(body).map_err(|e| err(format!("corrupt database: {e}")))?;
+        .ok_or_else(|| StoreError::corrupt("not a krb5-rs database (bad magic)"))?;
+    let file: KdbFile = rasn::der::decode(body)
+        .map_err(|e| StoreError::corrupt(format!("corrupt database: {e}")))?;
     if file.version != VERSION {
-        return Err(err(format!(
+        return Err(StoreError::corrupt(format!(
             "unsupported database version {}",
             file.version
         )));
     }
-    Ok((stamp, file))
+    Ok(file)
 }
 
 fn write_atomic(path: &Path, file: &KdbFile) -> Result<(), StoreError> {
@@ -166,6 +206,9 @@ impl FileStore {
         let km = PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
             name: master_principal()?,
             realm: realm.to_string(),
             attributes: PrincipalAttributes::DISALLOW_ALL_TIX
@@ -184,6 +227,9 @@ impl FileStore {
         let tgs = PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
             name: tgs_name,
             realm: realm.to_string(),
             attributes: PrincipalAttributes::empty(),
@@ -201,6 +247,8 @@ impl FileStore {
             version: VERSION,
             realm: general(realm)?,
             principals,
+            serial: Some(1),
+            policies: None,
         };
         write_atomic(path, &file)?;
         store.refresh(true)?;
@@ -212,6 +260,20 @@ impl FileStore {
     pub fn open(path: &Path, master: &EncryptionKey) -> Result<Self, StoreError> {
         let (_, file) = read_file(path)?;
         let realm = String::from_utf8_lossy(file.realm.as_bytes()).to_string();
+        let master_name = master_principal()?;
+        let km = file
+            .principals
+            .iter()
+            .find(|p| p.name == master_name && p.realm.as_bytes() == realm.as_bytes())
+            .ok_or_else(|| err("database has no K/M principal"))?;
+        let stored = km.keys.first().ok_or_else(|| err("K/M has no key"))?;
+        let stored_master = decrypt_key(master, stored.enctype, stored.enc_key.as_ref())
+            .map_err(|_| err("incorrect master key"))?;
+        if stored_master.key_bytes() != master.key_bytes()
+            || stored_master.keytype != master.keytype
+        {
+            return Err(err("incorrect master key"));
+        }
         let store = Self {
             path: path.to_path_buf(),
             realm,
@@ -219,19 +281,51 @@ impl FileStore {
             cache: RwLock::new(Cache::default()),
         };
         store.refresh(true)?;
-        let km = store
-            .get_record(&master_principal()?, &store.realm)?
-            .ok_or_else(|| err("database has no K/M principal"))?;
-        let stored = km.entry.keys.first().ok_or_else(|| err("K/M has no key"))?;
-        if stored.key.key_bytes() != master.key_bytes() || stored.key.keytype != master.keytype {
-            return Err(err("incorrect master key"));
-        }
         Ok(store)
     }
 
     /// The realm this database serves.
     pub fn realm(&self) -> &str {
         &self.realm
+    }
+
+    /// The database file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The modification serial: 1 at creation, incremented by every write,
+    /// 0 for a file written before serials existed.
+    pub fn serial(&self) -> u64 {
+        let _ = self.refresh(false);
+        self.read_cache().serial
+    }
+
+    /// The raw database file and its serial, from one read (writes replace
+    /// the file atomically, so the pair is consistent).
+    pub fn snapshot(&self) -> Result<(u64, Vec<u8>), StoreError> {
+        let bytes =
+            std::fs::read(&self.path).map_err(|e| err(format!("{}: {e}", self.path.display())))?;
+        let file = parse_image(&bytes)?;
+        Ok((file.serial.unwrap_or(0), bytes))
+    }
+
+    /// Check that `path` is a database for `realm` that opens under
+    /// `master` (magic, version, realm, and the K/M key check), returning
+    /// its serial.
+    pub fn verify_image(
+        path: &Path,
+        realm: &str,
+        master: &EncryptionKey,
+    ) -> Result<u64, StoreError> {
+        let store = Self::open(path, master)?;
+        if store.realm != realm {
+            return Err(err(format!(
+                "database is for realm {}, expected {realm}",
+                store.realm
+            )));
+        }
+        Ok(store.serial())
     }
 
     fn to_record(
@@ -265,6 +359,9 @@ impl FileStore {
             keys,
             allowed_to_delegate_to: general_list(&e.allowed_to_delegate_to)?,
             allowed_to_delegate_from: general_list(&e.allowed_to_delegate_from)?,
+            policy: e.policy.as_deref().map(general).transpose()?,
+            security_epoch: (e.security_epoch != 0).then_some(e.security_epoch),
+            last_admin_unlock: e.last_admin_unlock,
         })
     }
 
@@ -290,6 +387,12 @@ impl FileStore {
                 keys,
                 allowed_to_delegate_to: string_list(&r.allowed_to_delegate_to),
                 allowed_to_delegate_from: string_list(&r.allowed_to_delegate_from),
+                policy: r
+                    .policy
+                    .as_ref()
+                    .map(|g| String::from_utf8_lossy(g.as_bytes()).to_string()),
+                security_epoch: r.security_epoch.unwrap_or(0),
+                last_admin_unlock: r.last_admin_unlock,
             },
             last_pwd_change: to_time(&r.last_pwd_change),
             mod_time: to_time(&r.mod_time),
@@ -315,10 +418,21 @@ impl FileStore {
                 (store_key(&p.name, &realm), p)
             })
             .collect();
+        let policies = file
+            .policies
+            .iter()
+            .flatten()
+            .map(|p| {
+                let policy = policy_from_record(p);
+                (policy.name.clone(), policy)
+            })
+            .collect();
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
         *cache = Cache {
             stamp: Some(stamp),
+            serial: file.serial.unwrap_or(0),
             records,
+            policies,
         };
         Ok(())
     }
@@ -355,9 +469,18 @@ impl FileStore {
         &self,
         f: impl FnOnce(&mut Vec<KdbPrincipal>) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
+        self.modify_file(|file| f(&mut file.principals))
+    }
+
+    /// Run `f` over the whole on-disk file under the write lock.
+    fn modify_file<R>(
+        &self,
+        f: impl FnOnce(&mut KdbFile) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
         let _guard = self.lock()?;
         let (_, mut file) = read_file(&self.path)?;
-        let out = f(&mut file.principals)?;
+        let out = f(&mut file)?;
+        file.serial = Some(file.serial.unwrap_or(0) + 1);
         write_atomic(&self.path, &file)?;
         self.refresh(true)?;
         Ok(out)
@@ -409,6 +532,146 @@ impl FileStore {
         })
     }
 
+    /// The policy called `name`.
+    pub fn get_policy(&self, name: &str) -> Result<Option<Policy>, StoreError> {
+        self.refresh(false)?;
+        Ok(self.read_cache().policies.get(name).cloned())
+    }
+
+    /// Insert or replace a policy.
+    pub fn put_policy(&self, policy: Policy) -> Result<(), StoreError> {
+        let record = policy_to_record(&policy)?;
+        self.modify_file(|file| {
+            let list = file.policies.get_or_insert_with(Vec::new);
+            list.retain(|p| p.name.as_bytes() != record.name.as_bytes());
+            list.push(record);
+            Ok(())
+        })
+    }
+
+    /// Remove a policy; returns whether it existed.
+    pub fn delete_policy(&self, name: &str) -> Result<bool, StoreError> {
+        self.modify_file(|file| {
+            let Some(list) = file.policies.as_mut() else {
+                return Ok(false);
+            };
+            let before = list.len();
+            list.retain(|p| p.name.as_bytes() != name.as_bytes());
+            Ok(list.len() != before)
+        })
+    }
+
+    /// Every policy, sorted by name.
+    pub fn list_policies(&self) -> Result<Vec<Policy>, StoreError> {
+        self.refresh(false)?;
+        let mut all: Vec<Policy> = self.read_cache().policies.values().cloned().collect();
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(all)
+    }
+
+    /// Every principal's record.
+    pub(crate) fn list_records(&self) -> Result<Vec<PrincipalRecord>, StoreError> {
+        self.refresh(false)?;
+        let raws: Vec<KdbPrincipal> = self.read_cache().records.values().cloned().collect();
+        raws.iter().map(|r| self.decrypt_record(r)).collect()
+    }
+
+    /// Insert a new principal under the write lock; `Conflict` if it exists.
+    pub(crate) fn create_record(
+        &self,
+        entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
+    ) -> Result<(), StoreError> {
+        let record = self.to_record(
+            &entry,
+            last_pwd_change,
+            Some(kerberos_time(Utc::now().timestamp())),
+        )?;
+        let key = store_key(&entry.name, &entry.realm);
+        self.modify(|list| {
+            let exists = list.iter().any(|p| {
+                let realm = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
+                store_key(&p.name, &realm) == key
+            });
+            if exists {
+                return Err(StoreError::conflict(format!(
+                    "Principal or policy already exists: {}@{}",
+                    entry.name, entry.realm
+                )));
+            }
+            list.push(record);
+            Ok(())
+        })
+    }
+
+    /// Read-modify-write a principal under the write lock.
+    pub(crate) fn update_record(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        mut f: impl FnMut(&mut PrincipalRecord) -> Result<(), StoreError>,
+    ) -> Result<PrincipalRecord, StoreError> {
+        let key = store_key(name, realm);
+        self.modify(|list| {
+            let pos = list
+                .iter()
+                .position(|p| {
+                    let r = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
+                    store_key(&p.name, &r) == key
+                })
+                .ok_or_else(|| {
+                    StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
+                })?;
+            let mut rec = self.decrypt_record(&list[pos])?;
+            f(&mut rec)?;
+            rec.mod_time = Some(kerberos_time(Utc::now().timestamp()));
+            list[pos] = self.to_record(&rec.entry, rec.last_pwd_change, rec.mod_time)?;
+            Ok(rec)
+        })
+    }
+
+    /// Insert a new policy under the write lock; `Conflict` if it exists.
+    pub(crate) fn create_policy_record(&self, policy: Policy) -> Result<(), StoreError> {
+        let record = policy_to_record(&policy)?;
+        self.modify_file(|file| {
+            let list = file.policies.get_or_insert_with(Vec::new);
+            if list
+                .iter()
+                .any(|p| p.name.as_bytes() == record.name.as_bytes())
+            {
+                return Err(StoreError::conflict(format!(
+                    "Principal or policy already exists: policy {}",
+                    policy.name
+                )));
+            }
+            list.push(record);
+            Ok(())
+        })
+    }
+
+    /// Read-modify-write a policy under the write lock.
+    pub(crate) fn update_policy_record(
+        &self,
+        name: &str,
+        mut f: impl FnMut(&mut Policy) -> Result<(), StoreError>,
+    ) -> Result<Policy, StoreError> {
+        self.modify_file(|file| {
+            let pos = file
+                .policies
+                .iter()
+                .flatten()
+                .position(|p| p.name.as_bytes() == name.as_bytes())
+                .ok_or_else(|| {
+                    StoreError::not_found(format!("Policy \"{name}\" does not exist"))
+                })?;
+            let list = file.policies.as_mut().expect("found above");
+            let mut policy = policy_from_record(&list[pos]);
+            f(&mut policy)?;
+            list[pos] = policy_to_record(&policy)?;
+            Ok(policy)
+        })
+    }
+
     /// Every principal with decrypted keys.
     pub fn list(&self) -> Result<Vec<PrincipalEntry>, StoreError> {
         self.refresh(false)?;
@@ -424,7 +687,214 @@ impl PrincipalStore for FileStore {
         &self,
         name: &PrincipalName,
         realm: &str,
-    ) -> Result<Option<PrincipalEntry>, StoreError> {
-        Ok(self.get_record(name, realm)?.map(|r| r.entry))
+    ) -> impl std::future::Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
+        std::future::ready(self.get_record(name, realm).map(|r| r.map(|r| r.entry)))
+    }
+}
+
+impl PolicyStore for FileStore {
+    fn policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Policy>, StoreError>> + Send {
+        std::future::ready(self.get_policy(name))
+    }
+}
+
+impl HealthCheck for FileStore {
+    fn health(&self) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(
+            self.refresh(false)
+                .map_err(|e| StoreError::new(StoreErrorKind::Unavailable, e.message().to_string())),
+        )
+    }
+}
+
+/// The file backend applies each operation under its write lock; the futures
+/// complete immediately.
+impl AdminStore for FileStore {
+    fn get_record(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl std::future::Future<Output = Result<Option<PrincipalRecord>, StoreError>> + Send {
+        std::future::ready(FileStore::get_record(self, name, realm))
+    }
+
+    fn create_principal(
+        &self,
+        entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(self.create_record(entry, last_pwd_change))
+    }
+
+    fn update_principal<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<PrincipalRecord, StoreError>> + Send
+    where
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send,
+    {
+        std::future::ready(self.update_record(name, realm, f))
+    }
+
+    fn delete_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+        std::future::ready(self.delete(name, realm))
+    }
+
+    fn list_principals(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<PrincipalRecord>, StoreError>> + Send {
+        std::future::ready(self.list_records())
+    }
+
+    fn get_policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Policy>, StoreError>> + Send {
+        std::future::ready(FileStore::get_policy(self, name))
+    }
+
+    fn create_policy(
+        &self,
+        policy: Policy,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(self.create_policy_record(policy))
+    }
+
+    fn update_policy<F>(
+        &self,
+        name: &str,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<Policy, StoreError>> + Send
+    where
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send,
+    {
+        std::future::ready(self.update_policy_record(name, f))
+    }
+
+    fn delete_policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+        std::future::ready(FileStore::delete_policy(self, name))
+    }
+
+    fn list_policies(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<Policy>, StoreError>> + Send {
+        std::future::ready(FileStore::list_policies(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kdc::kdb::master_key_from_password;
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("krb5rs_file_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("principal")
+    }
+
+    fn user(name: &str) -> PrincipalEntry {
+        PrincipalEntry {
+            name: PrincipalName::new_principal(name),
+            realm: "R".into(),
+            attributes: PrincipalAttributes::empty(),
+            max_life: None,
+            max_renewable_life: None,
+            expiration: None,
+            pw_expiration: None,
+            keys: random_keys(1, &[18]).expect("keys"),
+            allowed_to_delegate_to: Vec::new(),
+            allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
+        }
+    }
+
+    #[test]
+    fn serial_starts_at_one_and_increments_on_every_write() {
+        let path = temp("serial");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = FileStore::create(&path, "R", &master).expect("create");
+        assert_eq!(store.serial(), 1);
+        store.put(user("a")).expect("put");
+        assert_eq!(store.serial(), 2);
+        store
+            .delete(&PrincipalName::new_principal("a"), "R")
+            .expect("delete");
+        assert_eq!(store.serial(), 3);
+        let (serial, bytes) = store.snapshot().expect("snapshot");
+        assert_eq!(serial, 3);
+        assert_eq!(bytes, std::fs::read(&path).expect("read"));
+        assert_eq!(FileStore::open(&path, &master).expect("open").serial(), 3);
+        assert_eq!(
+            FileStore::verify_image(&path, "R", &master).expect("verify"),
+            3
+        );
+        assert!(FileStore::verify_image(&path, "OTHER", &master).is_err());
+        let wrong = master_key_from_password("R", "wrong", 18).expect("key");
+        assert!(FileStore::verify_image(&path, "R", &wrong).is_err());
+    }
+
+    #[test]
+    fn a_file_without_a_serial_loads_as_zero_and_gets_one_on_the_next_write() {
+        let path = temp("legacy");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        drop(FileStore::create(&path, "R", &master).expect("create"));
+        let (_, mut file) = read_file(&path).expect("read");
+        file.serial = None;
+        write_atomic(&path, &file).expect("rewrite without serial");
+
+        let store = FileStore::open(&path, &master).expect("old file opens");
+        assert_eq!(store.serial(), 0);
+        store.put(user("a")).expect("put");
+        assert_eq!(store.serial(), 1);
+        assert!(store
+            .get_record(&PrincipalName::new_principal("a"), "R")
+            .expect("record")
+            .is_some());
+    }
+
+    #[test]
+    fn a_truncated_image_is_corrupt() {
+        let path = temp("truncated");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend([0x30, 0x82, 0x01]);
+        std::fs::write(&path, bytes).expect("write truncated image");
+
+        let error = match FileStore::open(&path, &master) {
+            Ok(_) => panic!("truncated database unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+    }
+
+    #[test]
+    fn an_incorrect_master_key_is_a_backend_error() {
+        let path = temp("wrong-master");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        drop(FileStore::create(&path, "R", &master).expect("create"));
+        let wrong = master_key_from_password("R", "wrong", 18).expect("wrong key");
+
+        let error = match FileStore::open(&path, &wrong) {
+            Ok(_) => panic!("database opened with wrong master key"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StoreErrorKind::Backend);
+        assert!(error.message().contains("incorrect master key"));
     }
 }

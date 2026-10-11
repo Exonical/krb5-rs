@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-primary
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: primary
+spec:
+  replicas: 1
+  serviceName: {{ include "krb5-rs-kdc.primaryService" . }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "krb5-rs-kdc.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: primary
+  template:
+    metadata:
+      labels:
+        {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: primary
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.primary.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "krb5-rs-kdc.scheduling" (dict "ctx" . "cfg" .Values.primary) | nindent 6 }}
+      initContainers:
+        - name: init-database
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kdb"]
+          args:
+            - --config
+            - /etc/krb5-rs/kdc.conf
+            - --krb5-config
+            - /etc/krb5-rs/krb5.conf
+            - --realm
+            - {{ .Values.realm }}
+            - init
+            - --master-password-file
+            - /secrets/master-password
+            - --stash
+            - --randkey
+            - {{ .Values.propagation.servicePrincipal }}
+            - --password
+            - {{ .Values.propagation.clientPrincipal }}=/secrets/kprop-password
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/krb5-rs
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+      containers:
+        - name: kdc
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config=/etc/krb5-rs/kdc.conf
+            - --krb5-config=/etc/krb5-rs/krb5.conf
+            - --realm={{ .Values.realm }}
+          ports:
+            - name: kdc-udp
+              containerPort: {{ .Values.kdc.containerPort }}
+              protocol: UDP
+            - name: kdc-tcp
+              containerPort: {{ .Values.kdc.containerPort }}
+              protocol: TCP
+            - name: kprop
+              containerPort: {{ .Values.propagation.port }}
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: kdc-tcp
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket:
+              port: kdc-tcp
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: kdc-tcp
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.primary.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/krb5-rs
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "krb5-rs-kdc.fullname" . }}
+            items:
+              - key: primary-kdc.conf
+                path: kdc.conf
+              - key: krb5.conf
+                path: krb5.conf
+        - name: secrets
+          secret:
+            secretName: {{ include "krb5-rs-kdc.secretName" . }}
+            defaultMode: 0440
+        {{- if not .Values.primary.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.primary.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.primary.persistence.accessModes | nindent 10 }}
+        {{- with .Values.primary.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.primary.persistence.size }}
+  {{- end }}

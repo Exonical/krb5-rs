@@ -38,7 +38,7 @@ impl AsExchange {
 
         // Determine encryption type from enc-part
         let etype = rep.enc_part.etype;
-        let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
+        find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
 
         // Derive key from password, preferring params from AS-REP padata
         // (which is the FAST response padata when armored — MIT overwrites
@@ -51,13 +51,7 @@ impl AsExchange {
             Some(key) => key,
             None => {
                 let (salt, s2kparams) = self.compute_reply_key_params(rep);
-                EncryptionKey::new(
-                    etype,
-                    profile
-                        .string_to_key(self.password.as_bytes(), &salt, s2kparams.as_deref())
-                        .map_err(|e| Krb5Error::Crypto(e.to_string()))?
-                        .to_vec(),
-                )
+                self.long_term_key(etype, &salt, s2kparams.as_deref())?
             }
         };
 

@@ -170,7 +170,11 @@ impl<S: PrincipalStore> Kdc<S> {
     /// `find_alternate_tgs` (do_tgs_req.c:371-418): the cross-realm TGT
     /// nearest the target on the realm path, trying the target first and
     /// skipping the local-realm entry.
-    fn find_alternate_tgs(&self, princ: &PrincipalName, realm: &str) -> Option<PrincipalEntry> {
+    async fn find_alternate_tgs(
+        &self,
+        princ: &PrincipalName,
+        realm: &str,
+    ) -> Option<PrincipalEntry> {
         let target = princ.name_string[1].as_bytes();
         let hops = walk_realm_tree(
             realm.as_bytes(),
@@ -179,18 +183,26 @@ impl<S: PrincipalStore> Kdc<S> {
             REALM_BRANCH_CHAR,
         )
         .ok()?;
-        hops.iter().skip(1).rev().find_map(|hop| {
-            let name = krbtgt_name(&String::from_utf8_lossy(&hop.instance)).ok()?;
-            self.lookup(&name, realm, "LOOKING_UP_SERVER")
+        for hop in hops.iter().skip(1).rev() {
+            let Ok(name) = krbtgt_name(&String::from_utf8_lossy(&hop.instance)) else {
+                continue;
+            };
+            if let Some(found) = self
+                .lookup(&name, realm, "LOOKING_UP_SERVER")
+                .await
                 .ok()
                 .flatten()
-        })
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     /// `search_sprinc` (do_tgs_req.c:541-581): the requested server, else a
     /// referral TGT, else an alternate cross-realm TGT. Returns whether a
     /// referral/alternate TGT is being issued (:668-671).
-    fn search_sprinc(
+    async fn search_sprinc(
         &self,
         opts: KdcOptions,
         sname: &PrincipalName,
@@ -199,6 +211,7 @@ impl<S: PrincipalStore> Kdc<S> {
         let unknown = || KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "LOOKING_UP_SERVER");
         if let Some(found) = self
             .lookup(sname, realm, "LOOKING_UP_SERVER")
+            .await
             .ok()
             .flatten()
         {
@@ -214,6 +227,7 @@ impl<S: PrincipalStore> Kdc<S> {
                 .ok_or_else(unknown)?;
             if let Some(found) = self
                 .lookup(&reftgs, realm, "LOOKING_UP_SERVER")
+                .await
                 .ok()
                 .flatten()
             {
@@ -221,12 +235,15 @@ impl<S: PrincipalStore> Kdc<S> {
             }
             princ = reftgs;
         }
-        let found = self.find_alternate_tgs(&princ, realm).ok_or_else(unknown)?;
+        let found = self
+            .find_alternate_tgs(&princ, realm)
+            .await
+            .ok_or_else(unknown)?;
         Ok((found, true))
     }
 
     /// MIT `process_tgs_req` (do_tgs_req.c:1163-1229).
-    pub(super) fn process_tgs_req(
+    pub(super) async fn process_tgs_req(
         &self,
         req: &KdcReq,
         raw: &[u8],
@@ -257,6 +274,7 @@ impl<S: PrincipalStore> Kdc<S> {
         let tkt_realm = realm_string(&ap.ticket.realm);
         let header_server = self
             .lookup(&ap.ticket.sname, &tkt_realm, STATUS)
+            .await
             .ok()
             .flatten()
             .filter(|s| {
@@ -333,6 +351,7 @@ impl<S: PrincipalStore> Kdc<S> {
                 now,
                 &mut ctx.fast,
             )
+            .await
             .map_err(|e| KdcError {
                 e_text: Some("FIND_FAST".into()),
                 ..e
@@ -352,13 +371,13 @@ impl<S: PrincipalStore> Kdc<S> {
             .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "NULL_SERVER"))?;
         let realm = &self.config.realm;
 
-        let local_tgt = self.require_local_tgt()?;
+        let local_tgt = self.require_local_tgt().await?;
 
         // get_verified_pac (do_tgs_req.c:636-644): HEADER_PAC.
         let header_pac =
             self.verify_header_pac(&header, &ap.ticket.sname, &header_key, &local_tgt)?;
 
-        let (mut server, is_referral) = self.search_sprinc(opts, sname, realm)?;
+        let (mut server, is_referral) = self.search_sprinc(opts, sname, realm).await?;
 
         // The request is cross-realm if the header ticket server is not from
         // this realm (do_tgs_req.c:693-695).
@@ -367,8 +386,9 @@ impl<S: PrincipalStore> Kdc<S> {
 
         // S4U2Self padata names the requested client; S4U2Proxy takes the
         // evidence ticket (do_tgs_req.c:692-756).
-        let s4u2self =
-            self.process_s4u2self_req(req, &server, auth.subkey.as_ref(), &header.key)?;
+        let s4u2self = self
+            .process_s4u2self_req(req, &server, auth.subkey.as_ref(), &header.key)
+            .await?;
         if s4u2self.is_some() {
             // Authorization data stays enabled for S4U2Self (:712-717).
             server
@@ -377,11 +397,10 @@ impl<S: PrincipalStore> Kdc<S> {
         }
         let proxy = opts.contains(KdcOptions::CNAME_IN_ADDL_TKT);
         let stkt = if proxy {
-            body.additional_tickets
-                .as_ref()
-                .and_then(|t| t.first())
-                .map(|t| self.decrypt_2ndtkt(t, &local_tgt))
-                .transpose()?
+            match body.additional_tickets.as_ref().and_then(|t| t.first()) {
+                Some(t) => Some(self.decrypt_2ndtkt(t, &local_tgt).await?),
+                None => None,
+            }
         } else {
             None
         };
@@ -393,6 +412,10 @@ impl<S: PrincipalStore> Kdc<S> {
         };
         let tkt_realm_str = realm_string(&tkt_crealm);
         let subject_realm = realm_string(&subject_tkt.crealm);
+        let (subject_client_name, subject_client_realm) = match &s4u2self {
+            Some(s) => (s.user.clone(), s.user_realm.clone()),
+            None => (subject_tkt.cname.clone(), subject_realm.clone()),
+        };
 
         // The client is looked up only when it belongs to this realm, and
         // NO_AUTH_DATA_REQUIRED servers skip the lookup (do_tgs_req.c:757-779).
@@ -406,6 +429,7 @@ impl<S: PrincipalStore> Kdc<S> {
             None
         } else {
             self.lookup(&subject_tkt.cname, &subject_realm, STATUS)
+                .await
                 .ok()
                 .flatten()
         };
@@ -494,6 +518,60 @@ impl<S: PrincipalStore> Kdc<S> {
                 is_referral,
             )?;
         }
+
+        let s4u_subject_client = if (s4u2self.is_some() || proxy) && subject_client_realm == *realm
+        {
+            match &client {
+                Some(c) => Some(c.clone()),
+                None => {
+                    self.lookup(
+                        &subject_client_name,
+                        &subject_client_realm,
+                        "LOOKING_UP_CLIENT",
+                    )
+                    .await?
+                }
+            }
+        } else {
+            None
+        };
+
+        // Not in MIT: re-check the header ticket's local client
+        // (docs/architecture/kdb.md §7.4).
+        let header_client = if client_realm == *realm {
+            match (&client, &s4u2self, proxy) {
+                (Some(c), None, false) => Some(c.clone()),
+                _ => {
+                    self.lookup(&header.cname, &client_realm, "LOOKING_UP_CLIENT")
+                        .await?
+                }
+            }
+        } else {
+            None
+        };
+        // MIT ignores a missing result from this lookup (do_tgs_req.c:774-778); this
+        // extension rejects a missing local client only when re-checking is on.
+        if client_realm == *realm && self.config.tgs_recheck_client && header_client.is_none() {
+            return Err(KdcError::new(
+                KDC_ERR_C_PRINCIPAL_UNKNOWN,
+                "CLIENT_NOT_FOUND",
+            ));
+        }
+        if let Some(c) = &header_client {
+            if self.config.tgs_recheck_client {
+                self.recheck_tgs_client(c, kdc_time).await?;
+            }
+        }
+        if proxy {
+            self.recheck_s4u2proxy_subject(
+                s4u_subject_client.as_ref(),
+                subject_client_realm == *realm,
+                kdc_time,
+            )
+            .await?;
+        }
+        self.gate_tgs_principals(header_client.as_ref(), s4u_subject_client.as_ref(), &server)
+            .await?;
 
         // get_ticket_flags / compute_ticket_times (do_tgs_req.c:809-852).
         let mut flags = get_ticket_flags(opts, client.as_ref(), &server, Some(header_flags));
@@ -746,5 +824,106 @@ impl<S: PrincipalStore> Kdc<S> {
             },
         });
         Ok(rasn::der::encode(&rep)?)
+    }
+}
+
+impl<S: PrincipalStore> Kdc<S> {
+    async fn recheck_s4u2proxy_subject(
+        &self,
+        subject: Option<&PrincipalEntry>,
+        is_local: bool,
+        now: i64,
+    ) -> Result<(), KdcError> {
+        if !is_local || !self.config.tgs_recheck_client {
+            return Ok(());
+        }
+        let subject = subject
+            .ok_or_else(|| KdcError::new(KDC_ERR_C_PRINCIPAL_UNKNOWN, "CLIENT_NOT_FOUND"))?;
+        self.recheck_tgs_client(subject, now).await
+    }
+
+    async fn gate_tgs_principals(
+        &self,
+        header_client: Option<&PrincipalEntry>,
+        subject_client: Option<&PrincipalEntry>,
+        server: &PrincipalEntry,
+    ) -> Result<(), KdcError> {
+        let mut involved = Vec::new();
+        involved.extend(header_client);
+        involved.extend(subject_client);
+        involved.push(server);
+        self.consistency_gate(&involved).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::kdc::{ConsistencyGate, GateDecision, KdcConfig, MemoryStore};
+
+    struct RecordingGate(Arc<Mutex<Vec<PrincipalName>>>);
+
+    impl ConsistencyGate for RecordingGate {
+        async fn check(&self, principals: &[&PrincipalEntry]) -> GateDecision {
+            self.0
+                .lock()
+                .expect("gate record lock")
+                .extend(principals.iter().map(|principal| principal.name.clone()));
+            GateDecision::Allow
+        }
+    }
+
+    fn principal(name: &str, attributes: super::super::PrincipalAttributes) -> PrincipalEntry {
+        let mut store = MemoryStore::new();
+        let name = PrincipalName::new_principal(name);
+        store
+            .add_random_key(name.clone(), "R", 1, &[18], attributes)
+            .expect("principal");
+        store.get(&name, "R").expect("entry")
+    }
+
+    #[tokio::test]
+    async fn tgs_gate_receives_a_local_s4u_subject() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kdc = Kdc::builder(KdcConfig::new("R"), MemoryStore::new())
+            .consistency(RecordingGate(Arc::clone(&seen)))
+            .build();
+        let subject = principal("impersonated", super::super::PrincipalAttributes::empty());
+        let server = principal("service", super::super::PrincipalAttributes::empty());
+
+        kdc.gate_tgs_principals(None, Some(&subject), &server)
+            .await
+            .expect("gate");
+
+        assert!(seen
+            .lock()
+            .expect("gate record lock")
+            .contains(&subject.name));
+    }
+
+    #[tokio::test]
+    async fn s4u2proxy_recheck_rejects_a_disabled_subject() {
+        let subject = principal(
+            "disabled",
+            super::super::PrincipalAttributes::DISALLOW_ALL_TIX,
+        );
+        let kdc = Kdc::new(KdcConfig::new("R"), MemoryStore::new());
+        let error = kdc
+            .recheck_s4u2proxy_subject(Some(&subject), true, chrono::Utc::now().timestamp())
+            .await
+            .expect_err("disabled subject must be rejected");
+        assert_eq!(error.code, KDC_ERR_CLIENT_REVOKED);
+    }
+
+    #[tokio::test]
+    async fn s4u2proxy_recheck_rejects_a_missing_local_subject() {
+        let kdc = Kdc::new(KdcConfig::new("R"), MemoryStore::new());
+        let error = kdc
+            .recheck_s4u2proxy_subject(None, true, chrono::Utc::now().timestamp())
+            .await
+            .expect_err("missing subject must be rejected");
+        assert_eq!(error.code, KDC_ERR_C_PRINCIPAL_UNKNOWN);
     }
 }

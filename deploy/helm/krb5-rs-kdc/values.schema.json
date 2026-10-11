@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["realm"],
+  "properties": {
+    "realm": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9._-]+$", "description": "Kerberos realm, e.g. EXAMPLE.COM"},
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "digest": {"type": "string", "pattern": "^(sha256:[0-9a-f]{64})?$"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array"},
+    "kdc": {
+      "type": "object",
+      "properties": {
+        "containerPort": {"type": "integer", "minimum": 1024, "maximum": 65535},
+        "maxLife": {"type": "string"},
+        "maxRenewableLife": {"type": "string"},
+        "supportedEnctypes": {"type": "string"},
+        "domainRealm": {"type": "object", "additionalProperties": {"type": "string"}},
+        "extraKdcConf": {"type": "string"},
+        "extraKrb5Conf": {"type": "string"}
+      }
+    },
+    "primary": {
+      "type": "object",
+      "properties": {
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "size": {"type": "string"},
+            "storageClass": {"type": "string"},
+            "accessModes": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "resources": {"type": "object"},
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"},
+        "affinity": {"type": "object"},
+        "podAnnotations": {"type": "object"}
+      }
+    },
+    "replicas": {
+      "type": "object",
+      "properties": {
+        "replicaCount": {"type": "integer", "minimum": 0},
+        "pdb": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "minAvailable": {"type": ["integer", "string"]}
+          }
+        },
+        "resources": {"type": "object"},
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"},
+        "affinity": {"type": "object"},
+        "podAnnotations": {"type": "object"}
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": {"type": "string", "enum": ["LoadBalancer", "ClusterIP", "NodePort"]},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "annotations": {"type": "object"},
+        "loadBalancerIP": {"type": "string"},
+        "loadBalancerSourceRanges": {"type": "array", "items": {"type": "string"}},
+        "externalTrafficPolicy": {"type": "string", "enum": ["", "Cluster", "Local"]}
+      }
+    },
+    "propagation": {
+      "type": "object",
+      "properties": {
+        "port": {"type": "integer", "minimum": 1024, "maximum": 65535},
+        "servicePrincipal": {"type": "string", "minLength": 1},
+        "clientPrincipal": {"type": "string", "minLength": 1},
+        "pollInterval": {"type": "string", "minLength": 1}
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "properties": {"existingSecret": {"type": "string"}}
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {"enabled": {"type": "boolean"}}
+    },
+    "topology": {
+      "type": "object",
+      "properties": {
+        "antiAffinity": {"type": "object", "properties": {"enabled": {"type": "boolean"}}},
+        "spread": {
+          "type": "object",
+          "properties": {"enabled": {"type": "boolean"}, "topologyKey": {"type": "string"}}
+        }
+      }
+    },
+    "priorityClassName": {"type": "string"},
+    "podSecurityContext": {"type": "object"},
+    "securityContext": {"type": "object"},
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"}
+  }
+}

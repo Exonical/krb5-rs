@@ -43,7 +43,7 @@ struct Builder {
 }
 
 impl Builder {
-    fn realm(mut self, name: &str, krb5_conf: Option<&str>) -> Self {
+    async fn realm(mut self, name: &str, krb5_conf: Option<&str>) -> Self {
         let mut store = MemoryStore::new();
         store
             .add_random_key(
@@ -56,6 +56,7 @@ impl Builder {
             .expect("local krbtgt");
         let key = store
             .lookup(&tgs_name(name), name)
+            .await
             .expect("lookup")
             .expect("entry")
             .keys[0]
@@ -85,7 +86,7 @@ impl Builder {
         self
     }
 
-    fn service(mut self, realm: &str, name: PrincipalName) -> Self {
+    async fn service(mut self, realm: &str, name: PrincipalName) -> Self {
         let store = self.stores.get_mut(realm).expect("realm");
         store
             .add_random_key(
@@ -98,6 +99,7 @@ impl Builder {
             .expect("service");
         let key = store
             .lookup(&name, realm)
+            .await
             .expect("lookup")
             .expect("entry")
             .keys[0]
@@ -173,28 +175,29 @@ struct World {
 }
 
 impl World {
-    fn send(&self, realm: &str, data: &[u8]) -> Vec<u8> {
+    async fn send(&self, realm: &str, data: &[u8]) -> Vec<u8> {
         self.kdcs
             .get(realm)
             .unwrap_or_else(|| panic!("no KDC for {realm}"))
             .handle(data)
+            .await
     }
 
-    fn login(&self, realm: &str, user: &str) -> Credential {
+    async fn login(&self, realm: &str, user: &str) -> Credential {
         let config = AsExchangeConfig::new(PrincipalName::new_principal(user), realm);
         let mut ex = AsExchange::new(config, PASSWORD);
         let mut reply = Vec::new();
         while let StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } =
             ex.step(&reply).expect("AS step")
         {
-            reply = self.send(realm, &data);
+            reply = self.send(realm, &data).await;
         }
         ex.credential().expect("TGT").clone()
     }
 
     /// Run a TGS exchange, returning the credential and every
     /// (realm, reply) pair seen.
-    fn tgs(
+    async fn tgs(
         &self,
         tgt: &Credential,
         target: PrincipalName,
@@ -207,7 +210,7 @@ impl World {
             match ex.step(&reply) {
                 Ok(TgsStepResult::SendToKdc { data, realm })
                 | Ok(TgsStepResult::RetryTcp { data, realm }) => {
-                    reply = self.send(&realm, &data);
+                    reply = self.send(&realm, &data).await;
                     seen.push((realm, reply.clone()));
                 }
                 Ok(TgsStepResult::Complete) => {
@@ -232,7 +235,7 @@ fn flags_of(part: &EncTicketPart) -> TicketFlags {
 }
 
 /// The trust key `krbtgt/target@issuing` as derived from `TRUST_PW`.
-fn trust_key(issuing: &str, target: &str, password: &str) -> EncryptionKey {
+async fn trust_key(issuing: &str, target: &str, password: &str) -> EncryptionKey {
     let mut s = MemoryStore::new();
     s.add_with_password(
         tgs_name(target),
@@ -244,6 +247,7 @@ fn trust_key(issuing: &str, target: &str, password: &str) -> EncryptionKey {
     )
     .expect("key");
     s.lookup(&tgs_name(target), issuing)
+        .await
         .expect("lookup")
         .expect("entry")
         .keys[0]
@@ -255,24 +259,29 @@ const ALPHA: &str = "ALPHA.COM";
 const BETA: &str = "BETA.ORG";
 
 /// ALPHA.COM <-> BETA.ORG with a direct, bidirectional trust.
-fn two_realm_builder() -> Builder {
+async fn two_realm_builder() -> Builder {
     Builder::default()
         .realm(ALPHA, Some("[domain_realm]\n .beta.org = BETA.ORG\n"))
+        .await
         .realm(BETA, Some("[domain_realm]\n .alpha.com = ALPHA.COM\n"))
+        .await
         .user(ALPHA, "alice")
         .user(BETA, "bob")
         .service(BETA, host_service("web.beta.org"))
+        .await
         .trust(ALPHA, ALPHA, BETA, TRUST_PW)
         .trust(BETA, ALPHA, BETA, TRUST_PW)
         .trust(BETA, BETA, ALPHA, TRUST_PW)
         .trust(ALPHA, BETA, ALPHA, TRUST_PW)
 }
 
-#[test]
-fn referral_direct_trust_issues_referral_tgt_then_service_ticket() {
-    let w = two_realm_builder().build();
-    let tgt = w.login(ALPHA, "alice");
-    let (res, seen) = w.tgs(&tgt, host_service("web.beta.org"), TgsOptions::default());
+#[tokio::test]
+async fn referral_direct_trust_issues_referral_tgt_then_service_ticket() {
+    let w = two_realm_builder().await.build();
+    let tgt = w.login(ALPHA, "alice").await;
+    let (res, seen) = w
+        .tgs(&tgt, host_service("web.beta.org"), TgsOptions::default())
+        .await;
     let cred = res.expect("service ticket via referral");
 
     assert_eq!(seen.len(), 2);
@@ -283,7 +292,7 @@ fn referral_direct_trust_issues_referral_tgt_then_service_ticket() {
     let first: TgsRep = rasn::der::decode(&seen[0].1).expect("referral TGS-REP");
     assert_eq!(first.0.ticket.realm.as_bytes(), ALPHA.as_bytes());
     assert_eq!(first.0.ticket.sname, tgs_name(BETA));
-    let part = decrypt_ticket(&trust_key(ALPHA, BETA, TRUST_PW), &first.0.ticket)
+    let part = decrypt_ticket(&trust_key(ALPHA, BETA, TRUST_PW).await, &first.0.ticket)
         .expect("trust key decrypts the referral TGT");
     assert_eq!(part.crealm.as_bytes(), ALPHA.as_bytes());
     assert_eq!(part.cname, PrincipalName::new_principal("alice"));
@@ -300,35 +309,41 @@ fn referral_direct_trust_issues_referral_tgt_then_service_ticket() {
     assert!(flags_of(&svc).contains(TicketFlags::TRANSITED_POLICY_CHECKED));
 }
 
-#[test]
-fn explicit_cross_realm_tgt_request_returns_ticket_encrypted_under_trust_key() {
-    let w = two_realm_builder().build();
-    let tgt = w.login(ALPHA, "alice");
+#[tokio::test]
+async fn explicit_cross_realm_tgt_request_returns_ticket_encrypted_under_trust_key() {
+    let w = two_realm_builder().await.build();
+    let tgt = w.login(ALPHA, "alice").await;
     let options = TgsOptions {
         canonicalize: false,
         ..TgsOptions::default()
     };
-    let (res, seen) = w.tgs(&tgt, tgs_name(BETA), options);
+    let (res, seen) = w.tgs(&tgt, tgs_name(BETA), options).await;
     let cred = res.expect("cross-realm TGT");
     assert_eq!(seen.len(), 1);
     assert_eq!(cred.server, tgs_name(BETA));
-    let part = decrypt_ticket(&trust_key(ALPHA, BETA, TRUST_PW), &cred.ticket).expect("trust key");
+    let part =
+        decrypt_ticket(&trust_key(ALPHA, BETA, TRUST_PW).await, &cred.ticket).expect("trust key");
     assert_eq!(part.cname, PrincipalName::new_principal("alice"));
     assert!(part.transited.contents.is_empty());
 }
 
-#[test]
-fn referral_reverse_direction_works() {
+#[tokio::test]
+async fn referral_reverse_direction_works() {
     let w = Builder::default()
         .realm(ALPHA, Some("[domain_realm]\n .beta.org = BETA.ORG\n"))
+        .await
         .realm(BETA, Some("[domain_realm]\n .alpha.com = ALPHA.COM\n"))
+        .await
         .user(BETA, "bob")
         .service(ALPHA, host_service("files.alpha.com"))
+        .await
         .trust(ALPHA, BETA, ALPHA, TRUST_PW)
         .trust(BETA, BETA, ALPHA, TRUST_PW)
         .build();
-    let tgt = w.login(BETA, "bob");
-    let (res, _) = w.tgs(&tgt, host_service("files.alpha.com"), TgsOptions::default());
+    let tgt = w.login(BETA, "bob").await;
+    let (res, _) = w
+        .tgs(&tgt, host_service("files.alpha.com"), TgsOptions::default())
+        .await;
     let cred = res.expect("reverse direction");
     let svc = decrypt_ticket(&w.service_keys[ALPHA], &cred.ticket).expect("service key");
     assert_eq!(svc.crealm.as_bytes(), BETA.as_bytes());
@@ -340,29 +355,35 @@ const EX: &str = "EXAMPLE.COM";
 const B_EX: &str = "B.EXAMPLE.COM";
 
 /// A.EXAMPLE.COM -> EXAMPLE.COM -> B.EXAMPLE.COM (hierarchical trusts).
-fn hierarchy_builder() -> Builder {
+async fn hierarchy_builder() -> Builder {
     let map = "[domain_realm]\n .b.example.com = B.EXAMPLE.COM\n";
     Builder::default()
         .realm(A_EX, Some(map))
+        .await
         .realm(EX, Some(map))
+        .await
         .realm(B_EX, None)
+        .await
         .user(A_EX, "alice")
         .service(B_EX, host_service("web.b.example.com"))
+        .await
         .trust(A_EX, A_EX, EX, TRUST_PW)
         .trust(EX, A_EX, EX, TRUST_PW)
         .trust(EX, EX, B_EX, TRUST_PW)
         .trust(B_EX, EX, B_EX, TRUST_PW)
 }
 
-#[test]
-fn hierarchical_path_records_intermediate_realm_in_transited() {
-    let w = hierarchy_builder().build();
-    let tgt = w.login(A_EX, "alice");
-    let (res, seen) = w.tgs(
-        &tgt,
-        host_service("web.b.example.com"),
-        TgsOptions::default(),
-    );
+#[tokio::test]
+async fn hierarchical_path_records_intermediate_realm_in_transited() {
+    let w = hierarchy_builder().await.build();
+    let tgt = w.login(A_EX, "alice").await;
+    let (res, seen) = w
+        .tgs(
+            &tgt,
+            host_service("web.b.example.com"),
+            TgsOptions::default(),
+        )
+        .await;
     let cred = res.expect("service ticket across three realms");
     let hops: Vec<&str> = seen.iter().map(|(r, _)| r.as_str()).collect();
     assert_eq!(hops, vec![A_EX, EX, B_EX]);
@@ -370,7 +391,8 @@ fn hierarchical_path_records_intermediate_realm_in_transited() {
     // EXAMPLE.COM's referral keeps the (empty) transited list: the client
     // realm equals the header ticket's issuer (do_tgs_req.c:787-790).
     let mid: TgsRep = rasn::der::decode(&seen[1].1).expect("TGS-REP");
-    let mid_part = decrypt_ticket(&trust_key(EX, B_EX, TRUST_PW), &mid.0.ticket).expect("key");
+    let mid_part =
+        decrypt_ticket(&trust_key(EX, B_EX, TRUST_PW).await, &mid.0.ticket).expect("key");
     assert!(mid_part.transited.contents.is_empty());
 
     // The final ticket records EXAMPLE.COM (add_to_transited,
@@ -382,12 +404,13 @@ fn hierarchical_path_records_intermediate_realm_in_transited() {
     assert!(flags_of(&svc).contains(TicketFlags::TRANSITED_POLICY_CHECKED));
 }
 
-#[test]
-fn capaths_that_forbid_the_transited_realm_are_rejected_with_policy_error() {
+#[tokio::test]
+async fn capaths_that_forbid_the_transited_realm_are_rejected_with_policy_error() {
     // B.EXAMPLE.COM requires A -> B to go through HUB.NET, so a ticket that
     // transited EXAMPLE.COM fails the check; reject_bad_transit refuses it
     // (do_tgs_req.c:951-958, KRB5KDC_ERR_POLICY).
     let w = hierarchy_builder()
+        .await
         .tweak(B_EX, |c| {
             c.realm_profile = Some(
                 Profile::parse("[capaths]\n A.EXAMPLE.COM = {\n  B.EXAMPLE.COM = HUB.NET\n }\n")
@@ -395,18 +418,21 @@ fn capaths_that_forbid_the_transited_realm_are_rejected_with_policy_error() {
             );
         })
         .build();
-    let tgt = w.login(A_EX, "alice");
-    let (res, _) = w.tgs(
-        &tgt,
-        host_service("web.b.example.com"),
-        TgsOptions::default(),
-    );
+    let tgt = w.login(A_EX, "alice").await;
+    let (res, _) = w
+        .tgs(
+            &tgt,
+            host_service("web.b.example.com"),
+            TgsOptions::default(),
+        )
+        .await;
     assert_eq!(kdc_code(&res.expect_err("must fail")), 12);
 }
 
-#[test]
-fn capaths_allowing_the_transited_realm_are_accepted() {
+#[tokio::test]
+async fn capaths_allowing_the_transited_realm_are_accepted() {
     let w = hierarchy_builder()
+        .await
         .tweak(B_EX, |c| {
             c.realm_profile = Some(
                 Profile::parse(
@@ -416,18 +442,21 @@ fn capaths_allowing_the_transited_realm_are_accepted() {
             );
         })
         .build();
-    let tgt = w.login(A_EX, "alice");
-    let (res, _) = w.tgs(
-        &tgt,
-        host_service("web.b.example.com"),
-        TgsOptions::default(),
-    );
+    let tgt = w.login(A_EX, "alice").await;
+    let (res, _) = w
+        .tgs(
+            &tgt,
+            host_service("web.b.example.com"),
+            TgsOptions::default(),
+        )
+        .await;
     res.expect("capaths path through EXAMPLE.COM");
 }
 
-#[test]
-fn reject_bad_transit_off_issues_ticket_without_policy_checked_flag() {
+#[tokio::test]
+async fn reject_bad_transit_off_issues_ticket_without_policy_checked_flag() {
     let w = hierarchy_builder()
+        .await
         .tweak(B_EX, |c| {
             c.reject_bad_transit = false;
             c.realm_profile = Some(
@@ -436,105 +465,123 @@ fn reject_bad_transit_off_issues_ticket_without_policy_checked_flag() {
             );
         })
         .build();
-    let tgt = w.login(A_EX, "alice");
-    let (res, _) = w.tgs(
-        &tgt,
-        host_service("web.b.example.com"),
-        TgsOptions::default(),
-    );
+    let tgt = w.login(A_EX, "alice").await;
+    let (res, _) = w
+        .tgs(
+            &tgt,
+            host_service("web.b.example.com"),
+            TgsOptions::default(),
+        )
+        .await;
     let cred = res.expect("ticket without policy flag");
     let svc = decrypt_ticket(&w.service_keys[B_EX], &cred.ticket).expect("service key");
     assert!(!flags_of(&svc).contains(TicketFlags::TRANSITED_POLICY_CHECKED));
     assert_eq!(svc.transited.contents.as_ref(), EX.as_bytes());
 }
 
-#[test]
-fn cross_realm_tgt_under_wrong_trust_key_returns_bad_integrity() {
+#[tokio::test]
+async fn cross_realm_tgt_under_wrong_trust_key_returns_bad_integrity() {
     let w = Builder::default()
         .realm(ALPHA, Some("[domain_realm]\n .beta.org = BETA.ORG\n"))
+        .await
         .realm(BETA, None)
+        .await
         .user(ALPHA, "alice")
         .service(BETA, host_service("web.beta.org"))
+        .await
         .trust(ALPHA, ALPHA, BETA, TRUST_PW)
         .trust(BETA, ALPHA, BETA, "a-different-password")
         .build();
-    let tgt = w.login(ALPHA, "alice");
-    let (res, _) = w.tgs(&tgt, host_service("web.beta.org"), TgsOptions::default());
+    let tgt = w.login(ALPHA, "alice").await;
+    let (res, _) = w
+        .tgs(&tgt, host_service("web.beta.org"), TgsOptions::default())
+        .await;
     assert_eq!(kdc_code(&res.expect_err("must fail")), 31);
 }
 
-#[test]
-fn local_user_ticket_returning_through_foreign_realm_is_rejected_as_lineage_violation() {
+#[tokio::test]
+async fn local_user_ticket_returning_through_foreign_realm_is_rejected_as_lineage_violation() {
     // A ticket for ALPHA.COM's alice issued by BETA.ORG (the header ticket is
     // krbtgt/ALPHA.COM@BETA.ORG): tgs_policy.c:248-258.
     let w = two_realm_builder()
+        .await
         .service(ALPHA, host_service("x.alpha.com"))
+        .await
         .build();
-    let tgt = w.login(ALPHA, "alice");
+    let tgt = w.login(ALPHA, "alice").await;
     let options = TgsOptions {
         canonicalize: false,
         ..TgsOptions::default()
     };
-    let (res, _) = w.tgs(&tgt, tgs_name(BETA), options.clone());
+    let (res, _) = w.tgs(&tgt, tgs_name(BETA), options.clone()).await;
     let to_beta = res.expect("cross-realm TGT");
     // Ask BETA.ORG for a TGT back to ALPHA.COM, then present it to ALPHA.COM.
-    let (res, _) = w.tgs(&to_beta, tgs_name(ALPHA), options.clone());
+    let (res, _) = w.tgs(&to_beta, tgs_name(ALPHA), options.clone()).await;
     let back = res.expect("TGT back to ALPHA.COM");
-    let (res, _) = w.tgs(&back, host_service("x.alpha.com"), options);
+    let (res, _) = w.tgs(&back, host_service("x.alpha.com"), options).await;
     assert_eq!(kdc_code(&res.expect_err("must fail")), 12);
 }
 
-#[test]
-fn unknown_non_host_service_gets_no_referral() {
-    let w = two_realm_builder().build();
-    let tgt = w.login(ALPHA, "alice");
-    let (res, _) = w.tgs(
-        &tgt,
-        PrincipalName::new_principal("nosuchservice"),
-        TgsOptions::default(),
-    );
+#[tokio::test]
+async fn unknown_non_host_service_gets_no_referral() {
+    let w = two_realm_builder().await.build();
+    let tgt = w.login(ALPHA, "alice").await;
+    let (res, _) = w
+        .tgs(
+            &tgt,
+            PrincipalName::new_principal("nosuchservice"),
+            TgsOptions::default(),
+        )
+        .await;
     assert_eq!(kdc_code(&res.expect_err("must fail")), 7);
 }
 
-#[test]
-fn host_without_domain_realm_mapping_gets_no_referral() {
-    let w = two_realm_builder().build();
-    let tgt = w.login(ALPHA, "alice");
-    let (res, _) = w.tgs(
-        &tgt,
-        host_service("web.unmapped.net"),
-        TgsOptions::default(),
-    );
+#[tokio::test]
+async fn host_without_domain_realm_mapping_gets_no_referral() {
+    let w = two_realm_builder().await.build();
+    let tgt = w.login(ALPHA, "alice").await;
+    let (res, _) = w
+        .tgs(
+            &tgt,
+            host_service("web.unmapped.net"),
+            TgsOptions::default(),
+        )
+        .await;
     assert_eq!(kdc_code(&res.expect_err("must fail")), 7);
 }
 
-#[test]
-fn host_without_dot_gets_no_referral() {
-    let w = two_realm_builder().build();
-    let tgt = w.login(ALPHA, "alice");
-    let (res, _) = w.tgs(&tgt, host_service("web"), TgsOptions::default());
+#[tokio::test]
+async fn host_without_dot_gets_no_referral() {
+    let w = two_realm_builder().await.build();
+    let tgt = w.login(ALPHA, "alice").await;
+    let (res, _) = w
+        .tgs(&tgt, host_service("web"), TgsOptions::default())
+        .await;
     assert_eq!(kdc_code(&res.expect_err("must fail")), 7);
 }
 
-#[test]
-fn no_host_referral_blocks_referrals() {
+#[tokio::test]
+async fn no_host_referral_blocks_referrals() {
     let w = two_realm_builder()
+        .await
         .tweak(ALPHA, |c| c.no_host_referral = vec!["HTTP".into()])
         .build();
-    let tgt = w.login(ALPHA, "alice");
-    let (res, _) = w.tgs(&tgt, host_service("web.beta.org"), TgsOptions::default());
+    let tgt = w.login(ALPHA, "alice").await;
+    let (res, _) = w
+        .tgs(&tgt, host_service("web.beta.org"), TgsOptions::default())
+        .await;
     assert_eq!(kdc_code(&res.expect_err("must fail")), 7);
 }
 
-#[test]
-fn referral_requires_canonicalize_option() {
-    let w = two_realm_builder().build();
-    let tgt = w.login(ALPHA, "alice");
+#[tokio::test]
+async fn referral_requires_canonicalize_option() {
+    let w = two_realm_builder().await.build();
+    let tgt = w.login(ALPHA, "alice").await;
     let options = TgsOptions {
         canonicalize: false,
         ..TgsOptions::default()
     };
-    let (res, _) = w.tgs(&tgt, host_service("web.beta.org"), options);
+    let (res, _) = w.tgs(&tgt, host_service("web.beta.org"), options).await;
     assert_eq!(kdc_code(&res.expect_err("must fail")), 7);
 }
 
@@ -545,36 +592,46 @@ fn unknown_type_service() -> PrincipalName {
     }
 }
 
-#[test]
-fn nt_unknown_names_are_referred_only_when_host_based_services_allows() {
-    let denied = two_realm_builder().build();
-    let tgt = denied.login(ALPHA, "alice");
-    let (res, _) = denied.tgs(&tgt, unknown_type_service(), TgsOptions::default());
+#[tokio::test]
+async fn nt_unknown_names_are_referred_only_when_host_based_services_allows() {
+    let denied = two_realm_builder().await.build();
+    let tgt = denied.login(ALPHA, "alice").await;
+    let (res, _) = denied
+        .tgs(&tgt, unknown_type_service(), TgsOptions::default())
+        .await;
     assert_eq!(kdc_code(&res.expect_err("must fail")), 7);
 
     let allowed = two_realm_builder()
+        .await
         .tweak(ALPHA, |c| c.host_based_services = vec!["HTTP".into()])
         .build();
-    let tgt = allowed.login(ALPHA, "alice");
-    let (res, seen) = allowed.tgs(&tgt, unknown_type_service(), TgsOptions::default());
+    let tgt = allowed.login(ALPHA, "alice").await;
+    let (res, seen) = allowed
+        .tgs(&tgt, unknown_type_service(), TgsOptions::default())
+        .await;
     res.expect("NT-UNKNOWN referral");
     assert_eq!(seen.len(), 2);
 }
 
-#[test]
-fn referral_with_nt_principal_trust_entry_is_followed_by_the_client() {
+#[tokio::test]
+async fn referral_with_nt_principal_trust_entry_is_followed_by_the_client() {
     // As MIT's `addprinc krbtgt/BETA.ORG@ALPHA.COM` stores the name type
     // NT-PRINCIPAL (tests/kdc/setup-other.sh), the referral TGT carries it.
     let w = Builder::default()
         .realm(ALPHA, Some("[domain_realm]\n .beta.org = BETA.ORG\n"))
+        .await
         .realm(BETA, None)
+        .await
         .user(ALPHA, "alice")
         .service(BETA, host_service("web.beta.org"))
+        .await
         .trust_typed(ALPHA, ALPHA, BETA, TRUST_PW, 1)
         .trust(BETA, ALPHA, BETA, TRUST_PW)
         .build();
-    let tgt = w.login(ALPHA, "alice");
-    let (res, seen) = w.tgs(&tgt, host_service("web.beta.org"), TgsOptions::default());
+    let tgt = w.login(ALPHA, "alice").await;
+    let (res, seen) = w
+        .tgs(&tgt, host_service("web.beta.org"), TgsOptions::default())
+        .await;
     let cred = res.expect("referral with NT-PRINCIPAL trust entry");
     assert_eq!(seen.len(), 2);
     let first: TgsRep = rasn::der::decode(&seen[0].1).expect("TGS-REP");
@@ -583,11 +640,13 @@ fn referral_with_nt_principal_trust_entry_is_followed_by_the_client() {
     decrypt_ticket(&w.service_keys[BETA], &cred.ticket).expect("service key");
 }
 
-#[test]
-fn cross_realm_pac_is_signed_with_trust_key_then_resigned_for_the_service() {
-    let w = two_realm_builder().build();
-    let tgt = w.login(ALPHA, "alice");
-    let (res, seen) = w.tgs(&tgt, host_service("web.beta.org"), TgsOptions::default());
+#[tokio::test]
+async fn cross_realm_pac_is_signed_with_trust_key_then_resigned_for_the_service() {
+    let w = two_realm_builder().await.build();
+    let tgt = w.login(ALPHA, "alice").await;
+    let (res, seen) = w
+        .tgs(&tgt, host_service("web.beta.org"), TgsOptions::default())
+        .await;
     let cred = res.expect("service ticket via referral");
     let alice = PrincipalName::new_principal("alice");
 
@@ -595,7 +654,7 @@ fn cross_realm_pac_is_signed_with_trust_key_then_resigned_for_the_service() {
     // signature under ALPHA's krbtgt key (handle_pac: server = the trust
     // principal, privsvr = the local TGT key).
     let first: TgsRep = rasn::der::decode(&seen[0].1).expect("TGS-REP");
-    let trust = trust_key(ALPHA, BETA, TRUST_PW);
+    let trust = trust_key(ALPHA, BETA, TRUST_PW).await;
     let part = decrypt_ticket(&trust, &first.0.ticket).expect("trust key");
     let pac = ticket_pac(&part).expect("parse").expect("PAC");
     pac.verify(

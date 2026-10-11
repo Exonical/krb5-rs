@@ -7,7 +7,9 @@
 use chrono::{DateTime, Timelike, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use krb5_rs::crypto::{find_etype, key_usage};
-use krb5_rs::kdc::{Kdc, KdcConfig, MemoryStore, PrincipalAttributes, PrincipalStore};
+use krb5_rs::kdc::{
+    ConsistencyGate, GateDecision, Kdc, KdcConfig, MemoryStore, PrincipalAttributes,
+};
 use krb5_rs::pac::{ticket_pac, verify_ticket_pac, DelegationInfo, PAC_DELEGATION_INFO};
 use krb5_rs::protocol::ap::{decrypt_ticket, encrypt_ticket_part};
 use krb5_rs::protocol::{
@@ -17,6 +19,7 @@ use krb5_rs::types::*;
 use krb5_rs::Krb5Error;
 use md5::{Digest, Md5};
 use rasn::types::{BitString, GeneralString, OctetString};
+use std::sync::{Arc, Mutex};
 
 const REALM: &str = "S4U.REALM";
 const PW: &str = "s4u-password";
@@ -75,7 +78,31 @@ struct Fix {
     other_key: EncryptionKey,
 }
 
-fn fixture(cfg: Cfg) -> Fix {
+async fn fixture(cfg: Cfg) -> Fix {
+    fixture_with_gate(cfg, AllowGate).await
+}
+
+struct AllowGate;
+
+impl ConsistencyGate for AllowGate {
+    async fn check(&self, _principals: &[&PrincipalEntry]) -> GateDecision {
+        GateDecision::Allow
+    }
+}
+
+struct RecordingGate(Arc<Mutex<Vec<PrincipalName>>>);
+
+impl ConsistencyGate for RecordingGate {
+    async fn check(&self, principals: &[&PrincipalEntry]) -> GateDecision {
+        self.0
+            .lock()
+            .expect("gate record lock")
+            .extend(principals.iter().map(|principal| principal.name.clone()));
+        GateDecision::Allow
+    }
+}
+
+async fn fixture_with_gate(cfg: Cfg, gate: impl ConsistencyGate + 'static) -> Fix {
     let mut store = MemoryStore::new();
     let none = PrincipalAttributes::empty();
     store
@@ -90,7 +117,7 @@ fn fixture(cfg: Cfg) -> Fix {
             .expect("service");
     }
     let edit = |store: &mut MemoryStore, name: &PrincipalName, f: &dyn Fn(&mut PrincipalEntry)| {
-        let mut e = store.lookup(name, REALM).expect("lookup").expect("entry");
+        let mut e = store.get(name, REALM).expect("entry");
         f(&mut e);
         store.insert(e);
     };
@@ -106,9 +133,7 @@ fn fixture(cfg: Cfg) -> Fix {
         });
     }
     let key = |store: &MemoryStore, n: &PrincipalName| {
-        store.lookup(n, REALM).expect("lookup").expect("entry").keys[0]
-            .key
-            .clone()
+        store.get(n, REALM).expect("entry").keys[0].key.clone()
     };
     let (tgs_key, front_key, back_key, other_key) = (
         key(&store, &tgs_name()),
@@ -119,7 +144,7 @@ fn fixture(cfg: Cfg) -> Fix {
     let mut config = KdcConfig::new(REALM);
     config.max_renewable_life = std::time::Duration::from_secs(7 * 86400);
     Fix {
-        kdc: Kdc::new(config, store),
+        kdc: Kdc::builder(config, store).consistency(gate).build(),
         tgs_key,
         front_key,
         back_key,
@@ -130,7 +155,7 @@ fn fixture(cfg: Cfg) -> Fix {
 use krb5_rs::kdc::PrincipalEntry;
 
 impl Fix {
-    fn login(&self, name: &PrincipalName, request_pac: bool) -> Credential {
+    async fn login(&self, name: &PrincipalName, request_pac: bool) -> Credential {
         let mut config = AsExchangeConfig::new(name.clone(), REALM);
         config.request_pac = request_pac;
         let mut ex = AsExchange::new(config, PW);
@@ -138,33 +163,38 @@ impl Fix {
         while let StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } =
             ex.step(&reply).expect("AS step")
         {
-            reply = self.kdc.handle(&data);
+            reply = self.kdc.handle(&data).await;
         }
         ex.credential().expect("TGT").clone()
     }
 
-    fn run(&self, mut ex: TgsExchange) -> Result<Credential, Krb5Error> {
+    async fn run(&self, mut ex: TgsExchange) -> Result<Credential, Krb5Error> {
         let mut reply = Vec::new();
         loop {
             match ex.step(&reply)? {
                 TgsStepResult::SendToKdc { data, .. } | TgsStepResult::RetryTcp { data, .. } => {
-                    reply = self.kdc.handle(&data);
+                    reply = self.kdc.handle(&data).await;
                 }
                 TgsStepResult::Complete => return Ok(ex.credential().expect("cred").clone()),
             }
         }
     }
 
-    fn s4u2self(&self, tgt: &Credential, user: &PrincipalName) -> Result<Credential, Krb5Error> {
+    async fn s4u2self(
+        &self,
+        tgt: &Credential,
+        user: &PrincipalName,
+    ) -> Result<Credential, Krb5Error> {
         self.run(TgsExchange::s4u2self(
             tgt.clone(),
             user.clone(),
             REALM,
             TgsOptions::default(),
         ))
+        .await
     }
 
-    fn s4u2proxy(
+    async fn s4u2proxy(
         &self,
         tgt: &Credential,
         evidence: &Credential,
@@ -176,11 +206,12 @@ impl Fix {
             target.clone(),
             TgsOptions::default(),
         ))
+        .await
     }
 
-    fn raw(&self, req: Raw<'_>) -> Reply {
+    async fn raw(&self, req: Raw<'_>) -> Reply {
         let (bytes, subkey) = req.build();
-        let reply = self.kdc.handle(&bytes);
+        let reply = self.kdc.handle(&bytes).await;
         if let Ok(rep) = rasn::der::decode::<TgsRep>(&reply) {
             let plain = find_etype(subkey.keytype)
                 .expect("etype")
@@ -455,19 +486,19 @@ fn kdc_err(r: Result<Credential, Krb5Error>) -> (i32, String) {
 
 const SELF_OK: PrincipalAttributes = PrincipalAttributes::OK_TO_AUTH_AS_DELEGATE;
 
-fn evidence(f: &Fix) -> (Credential, Credential) {
-    let tgt = f.login(&front(), true);
-    let ev = f.s4u2self(&tgt, &alice()).expect("S4U2Self");
+async fn evidence(f: &Fix) -> (Credential, Credential) {
+    let tgt = f.login(&front(), true).await;
+    let ev = f.s4u2self(&tgt, &alice()).await.expect("S4U2Self");
     (tgt, ev)
 }
 
 // ---------------------------------------------------------------- S4U2Self
 
-#[test]
-fn s4u2self_issues_a_ticket_for_the_user_to_the_service_with_the_users_pac() {
-    let f = fixture(Cfg::default());
-    let tgt = f.login(&front(), true);
-    let cred = f.s4u2self(&tgt, &alice()).expect("S4U2Self");
+#[tokio::test]
+async fn s4u2self_issues_a_ticket_for_the_user_to_the_service_with_the_users_pac() {
+    let f = fixture(Cfg::default()).await;
+    let tgt = f.login(&front(), true).await;
+    let cred = f.s4u2self(&tgt, &alice()).await.expect("S4U2Self");
     assert_eq!(cred.client, alice());
     assert_eq!(cred.server, front());
     let part = decrypt_ticket(&f.front_key, &cred.ticket).expect("decrypt");
@@ -483,8 +514,8 @@ fn s4u2self_issues_a_ticket_for_the_user_to_the_service_with_the_users_pac() {
     assert_eq!(part.authtime, tgt_part.authtime);
 }
 
-#[test]
-fn s4u2self_forwardable_follows_ok_to_auth_as_delegate_and_delegation_targets() {
+#[tokio::test]
+async fn s4u2self_forwardable_follows_ok_to_auth_as_delegate_and_delegation_targets() {
     // s4u2self_forwardable (kdc_util.c:1626-1644).
     let cases = [
         (Cfg::default(), true),
@@ -505,92 +536,105 @@ fn s4u2self_forwardable_follows_ok_to_auth_as_delegate_and_delegation_targets() 
         ),
     ];
     for (cfg, want) in cases {
-        let f = fixture(cfg);
-        let tgt = f.login(&front(), true);
-        let cred = f.s4u2self(&tgt, &alice()).expect("S4U2Self");
+        let f = fixture(cfg).await;
+        let tgt = f.login(&front(), true).await;
+        let cred = f.s4u2self(&tgt, &alice()).await.expect("S4U2Self");
         assert_eq!(forwardable(&cred), want);
     }
 }
 
-#[test]
-fn s4u2self_ignores_password_expiration_of_the_user() {
+#[tokio::test]
+async fn s4u2self_ignores_password_expiration_of_the_user() {
     let f = fixture(Cfg {
         alice_pw_expired: true,
         ..Cfg::default()
-    });
-    let tgt = f.login(&front(), true);
-    f.s4u2self(&tgt, &alice()).expect("S4U2Self");
+    })
+    .await;
+    let tgt = f.login(&front(), true).await;
+    f.s4u2self(&tgt, &alice()).await.expect("S4U2Self");
 }
 
-#[test]
-fn s4u2self_keeps_a_pac_for_services_with_no_auth_data_required() {
+#[tokio::test]
+async fn s4u2self_keeps_a_pac_for_services_with_no_auth_data_required() {
     let f = fixture(Cfg {
         front_attrs: PrincipalAttributes::NO_AUTH_DATA_REQUIRED,
         ..Cfg::default()
-    });
-    let tgt = f.login(&front(), true);
-    let cred = f.s4u2self(&tgt, &alice()).expect("S4U2Self");
+    })
+    .await;
+    let tgt = f.login(&front(), true).await;
+    let cred = f.s4u2self(&tgt, &alice()).await.expect("S4U2Self");
     let part = decrypt_ticket(&f.front_key, &cred.ticket).expect("decrypt");
     assert!(ticket_pac(&part).expect("pac").is_some());
 }
 
-#[test]
-fn s4u2self_unknown_user_is_c_principal_unknown() {
-    let f = fixture(Cfg::default());
-    let tgt = f.login(&front(), true);
-    let err = kdc_err(f.s4u2self(&tgt, &PrincipalName::new_principal("nobody")));
+#[tokio::test]
+async fn s4u2self_unknown_user_is_c_principal_unknown() {
+    let f = fixture(Cfg::default()).await;
+    let tgt = f.login(&front(), true).await;
+    let err = kdc_err(
+        f.s4u2self(&tgt, &PrincipalName::new_principal("nobody"))
+            .await,
+    );
     assert_eq!(err, (6, "UNKNOWN_S4U2SELF_PRINCIPAL".to_string()));
 }
 
-#[test]
-fn s4u2self_for_a_user_of_another_realm_is_refused_with_policy() {
-    let f = fixture(Cfg::default());
-    let tgt = f.login(&front(), true);
-    let r = f.run(TgsExchange::s4u2self(
-        tgt,
-        alice(),
-        "OTHER.REALM",
-        TgsOptions::default(),
-    ));
+#[tokio::test]
+async fn s4u2self_for_a_user_of_another_realm_is_refused_with_policy() {
+    let f = fixture(Cfg::default()).await;
+    let tgt = f.login(&front(), true).await;
+    let r = f
+        .run(TgsExchange::s4u2self(
+            tgt,
+            alice(),
+            "OTHER.REALM",
+            TgsOptions::default(),
+        ))
+        .await;
     assert_eq!(kdc_err(r).0, 12);
 }
 
-#[test]
-fn s4u2self_checksum_failures_use_mit_codes() {
-    let f = fixture(Cfg::default());
-    let tgt = f.login(&front(), true);
+#[tokio::test]
+async fn s4u2self_checksum_failures_use_mit_codes() {
+    let f = fixture(Cfg::default()).await;
+    let tgt = f.login(&front(), true).await;
     let base = || Raw::new(&tgt, front(), KdcOptions::CANONICALIZE);
 
     // PA-FOR-USER: bad hmac-md5 checksum -> AP_ERR_MODIFIED.
     f.raw(base().pa(for_user_pa(&tgt, &alice(), REALM, true)))
+        .await
         .assert_err(41, "INVALID_S4U2SELF_CHECKSUM");
     // PA-S4U-X509-USER: bad checksum, wrong nonce.
     let mut x = X509::new(&alice());
     x.flip = true;
     f.raw(base().pa(x.pa()))
+        .await
         .assert_err(41, "INVALID_S4U2SELF_CHECKSUM");
     let mut x = X509::new(&alice());
     x.nonce ^= 1;
     f.raw(base().pa(x.pa()))
+        .await
         .assert_err(41, "INVALID_S4U2SELF_CHECKSUM");
     // Empty user and no certificate -> C_PRINCIPAL_UNKNOWN.
     let mut x = X509::new(&alice());
     x.user = None;
     f.raw(base().pa(x.pa()))
+        .await
         .assert_err(6, "INVALID_S4U2SELF_REQUEST");
 }
 
-#[test]
-fn s4u2self_reply_carries_a_checksummed_pa_s4u_x509_user() {
+#[tokio::test]
+async fn s4u2self_reply_carries_a_checksummed_pa_s4u_x509_user() {
     // kdc_make_s4u2self_rep (kdc_util.c:1431-1500): usage 27 when the
     // request set USE_REPLY_KEY_USAGE.
-    let f = fixture(Cfg::default());
-    let tgt = f.login(&front(), true);
-    let reply = f.raw(
-        Raw::new(&tgt, front(), KdcOptions::CANONICALIZE)
-            .pa(X509::new(&alice()).pa())
-            .pa(for_user_pa(&tgt, &alice(), REALM, false)),
-    );
+    let f = fixture(Cfg::default()).await;
+    let tgt = f.login(&front(), true).await;
+    let reply = f
+        .raw(
+            Raw::new(&tgt, front(), KdcOptions::CANONICALIZE)
+                .pa(X509::new(&alice()).pa())
+                .pa(for_user_pa(&tgt, &alice(), REALM, false)),
+        )
+        .await;
     let Reply::Ok(rep, sub) = &reply else {
         panic!("expected a ticket, got {} {}", reply.code(), reply.text());
     };
@@ -611,18 +655,20 @@ fn s4u2self_reply_carries_a_checksummed_pa_s4u_x509_user() {
     assert_eq!(x.user_id.cname, Some(alice()));
 }
 
-#[test]
-fn s4u2self_with_only_pa_for_user_gets_no_reply_padata() {
-    let f = fixture(Cfg::default());
-    let tgt = f.login(&front(), true);
-    let reply = f.raw(
-        Raw::new(&tgt, front(), KdcOptions::CANONICALIZE).pa(for_user_pa(
-            &tgt,
-            &alice(),
-            REALM,
-            false,
-        )),
-    );
+#[tokio::test]
+async fn s4u2self_with_only_pa_for_user_gets_no_reply_padata() {
+    let f = fixture(Cfg::default()).await;
+    let tgt = f.login(&front(), true).await;
+    let reply = f
+        .raw(
+            Raw::new(&tgt, front(), KdcOptions::CANONICALIZE).pa(for_user_pa(
+                &tgt,
+                &alice(),
+                REALM,
+                false,
+            )),
+        )
+        .await;
     let Reply::Ok(rep, _) = &reply else {
         panic!("expected a ticket, got {} {}", reply.code(), reply.text());
     };
@@ -630,23 +676,26 @@ fn s4u2self_with_only_pa_for_user_gets_no_reply_padata() {
     assert_eq!(rep.0.cname, alice());
 }
 
-#[test]
-fn s4u2self_policy_checks_use_mit_codes() {
-    let f = fixture(Cfg::default());
-    let tgt = f.login(&front(), true);
+#[tokio::test]
+async fn s4u2self_policy_checks_use_mit_codes() {
+    let f = fixture(Cfg::default()).await;
+    let tgt = f.login(&front(), true).await;
     let pa = || X509::new(&alice()).pa();
     // Request for a service other than the requester.
     f.raw(Raw::new(&tgt, back(), KdcOptions::CANONICALIZE).pa(pa()))
+        .await
         .assert_err(36, "INVALID_S4U2SELF_REQUEST_SERVER_MISMATCH");
     // Options invalid for AS-style requests (U2U is not offered here).
     assert_eq!(
         f.raw(Raw::new(&tgt, front(), KdcOptions::ENC_TKT_IN_SKEY).pa(pa()))
+            .await
             .code(),
         13
     );
     // The header ticket must carry a PAC.
-    let no_pac = f.login(&front(), false);
+    let no_pac = f.login(&front(), false).await;
     f.raw(Raw::new(&no_pac, front(), KdcOptions::CANONICALIZE).pa(pa()))
+        .await
         .assert_err(20, "S4U2SELF_NO_PAC");
 }
 
@@ -660,11 +709,11 @@ fn proxy_cfg() -> Cfg {
     }
 }
 
-#[test]
-fn s4u2proxy_traditional_delegation_issues_ticket_for_the_user_with_delegation_info() {
-    let f = fixture(proxy_cfg());
-    let (tgt, ev) = evidence(&f);
-    let cred = f.s4u2proxy(&tgt, &ev, &back()).expect("S4U2Proxy");
+#[tokio::test]
+async fn s4u2proxy_traditional_delegation_issues_ticket_for_the_user_with_delegation_info() {
+    let f = fixture(proxy_cfg()).await;
+    let (tgt, ev) = evidence(&f).await;
+    let cred = f.s4u2proxy(&tgt, &ev, &back()).await.expect("S4U2Proxy");
     assert_eq!(cred.client, alice());
     assert_eq!(cred.server, back());
     let part = decrypt_ticket(&f.back_key, &cred.ticket).expect("decrypt");
@@ -689,62 +738,81 @@ fn s4u2proxy_traditional_delegation_issues_ticket_for_the_user_with_delegation_i
     assert_eq!(part.authtime, ev_part.authtime);
 }
 
-#[test]
-fn s4u2proxy_denied_without_a_delegation_entry() {
+#[tokio::test]
+async fn s4u2proxy_consistency_gate_includes_the_impersonated_client() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let f = fixture_with_gate(proxy_cfg(), RecordingGate(Arc::clone(&seen))).await;
+    let (tgt, ev) = evidence(&f).await;
+    seen.lock().expect("gate record lock").clear();
+
+    f.s4u2proxy(&tgt, &ev, &back()).await.expect("S4U2Proxy");
+
+    assert!(
+        seen.lock().expect("gate record lock").contains(&alice()),
+        "gate saw {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn s4u2proxy_denied_without_a_delegation_entry() {
     let f = fixture(Cfg {
         front_attrs: SELF_OK,
         ..Cfg::default()
-    });
-    let (tgt, ev) = evidence(&f);
-    let err = kdc_err(f.s4u2proxy(&tgt, &ev, &back()));
+    })
+    .await;
+    let (tgt, ev) = evidence(&f).await;
+    let err = kdc_err(f.s4u2proxy(&tgt, &ev, &back()).await);
     assert_eq!(err, (13, "NOT_ALLOWED_TO_DELEGATE".to_string()));
     // A target outside the list is denied too.
-    let f = fixture(proxy_cfg());
-    let (tgt, ev) = evidence(&f);
-    let err = kdc_err(f.s4u2proxy(&tgt, &ev, &other()));
+    let f = fixture(proxy_cfg()).await;
+    let (tgt, ev) = evidence(&f).await;
+    let err = kdc_err(f.s4u2proxy(&tgt, &ev, &other()).await);
     assert_eq!(err, (13, "NOT_ALLOWED_TO_DELEGATE".to_string()));
 }
 
-#[test]
-fn s4u2proxy_rbcd_allowed_and_denied() {
+#[tokio::test]
+async fn s4u2proxy_rbcd_allowed_and_denied() {
     // Resource-based: the resource lists the impersonating service.
     let f = fixture(Cfg {
         front_attrs: SELF_OK,
         back_from: vec!["HTTP/front.s4u.realm@S4U.REALM"],
         ..Cfg::default()
-    });
-    let (tgt, ev) = evidence(&f);
-    let cred = f.s4u2proxy(&tgt, &ev, &back()).expect("RBCD");
+    })
+    .await;
+    let (tgt, ev) = evidence(&f).await;
+    let cred = f.s4u2proxy(&tgt, &ev, &back()).await.expect("RBCD");
     assert_eq!(cred.client, alice());
 
     let f = fixture(Cfg {
         front_attrs: SELF_OK,
         back_from: vec!["HTTP/other.s4u.realm@S4U.REALM"],
         ..Cfg::default()
-    });
-    let (tgt, ev) = evidence(&f);
-    let err = kdc_err(f.s4u2proxy(&tgt, &ev, &back()));
+    })
+    .await;
+    let (tgt, ev) = evidence(&f).await;
+    let err = kdc_err(f.s4u2proxy(&tgt, &ev, &back()).await);
     assert_eq!(err, (13, "NOT_ALLOWED_TO_DELEGATE".to_string()));
 }
 
-#[test]
-fn s4u2proxy_requires_a_forwardable_evidence_ticket() {
+#[tokio::test]
+async fn s4u2proxy_requires_a_forwardable_evidence_ticket() {
     // Delegation targets without ok-to-auth-as-delegate make the S4U2Self
     // ticket non-forwardable (s4u2self_forwardable).
     let f = fixture(Cfg {
         front_to: vec!["HTTP/back.s4u.realm"],
         ..Cfg::default()
-    });
-    let (tgt, ev) = evidence(&f);
+    })
+    .await;
+    let (tgt, ev) = evidence(&f).await;
     assert!(!forwardable(&ev));
-    let err = kdc_err(f.s4u2proxy(&tgt, &ev, &back()));
+    let err = kdc_err(f.s4u2proxy(&tgt, &ev, &back()).await);
     assert_eq!(err, (13, "EVIDENCE_TKT_NOT_FORWARDABLE".to_string()));
 }
 
-#[test]
-fn s4u2proxy_request_shape_checks_use_mit_codes() {
-    let f = fixture(proxy_cfg());
-    let (tgt, ev) = evidence(&f);
+#[tokio::test]
+async fn s4u2proxy_request_shape_checks_use_mit_codes() {
+    let f = fixture(proxy_cfg()).await;
+    let (tgt, ev) = evidence(&f).await;
     let rbcd = || PaData {
         padata_type: 167,
         padata_value: rasn::der::encode(&PaPacOptions {
@@ -756,15 +824,20 @@ fn s4u2proxy_request_shape_checks_use_mit_codes() {
     let opts = KdcOptions::CNAME_IN_ADDL_TKT | KdcOptions::CANONICALIZE;
     // No second ticket.
     f.raw(Raw::new(&tgt, back(), opts).pa(rbcd()))
+        .await
         .assert_err(13, "NO_2ND_TKT");
     // Options that need a non-TGT header ticket.
     f.raw(Raw::new(&tgt, tgs_name(), opts | KdcOptions::RENEW).evidence(&ev.ticket))
+        .await
         .assert_err(13, "INVALID_S4U2PROXY_OPTIONS");
     // A TGT cannot be the target (that would be unconstrained delegation).
     f.raw(Raw::new(&tgt, tgs_name(), opts).evidence(&ev.ticket))
+        .await
         .assert_err(12, "NOT_ALLOWED_TO_DELEGATE");
     // The same request done right succeeds, and echoes only the RBCD bit.
-    let reply = f.raw(Raw::new(&tgt, back(), opts).pa(rbcd()).evidence(&ev.ticket));
+    let reply = f
+        .raw(Raw::new(&tgt, back(), opts).pa(rbcd()).evidence(&ev.ticket))
+        .await;
     let Reply::Ok(rep, _) = &reply else {
         panic!("expected a ticket, got {} {}", reply.code(), reply.text());
     };
@@ -778,10 +851,10 @@ fn s4u2proxy_request_shape_checks_use_mit_codes() {
     assert_eq!(o.flags.as_raw_slice(), &RBCD.to_be_bytes());
 }
 
-#[test]
-fn s4u2proxy_pac_option_echo_drops_other_bits() {
-    let f = fixture(proxy_cfg());
-    let (tgt, ev) = evidence(&f);
+#[tokio::test]
+async fn s4u2proxy_pac_option_echo_drops_other_bits() {
+    let f = fixture(proxy_cfg()).await;
+    let (tgt, ev) = evidence(&f).await;
     let both = PaData {
         padata_type: 167,
         padata_value: rasn::der::encode(&PaPacOptions {
@@ -791,7 +864,9 @@ fn s4u2proxy_pac_option_echo_drops_other_bits() {
         .into(),
     };
     let opts = KdcOptions::CNAME_IN_ADDL_TKT | KdcOptions::CANONICALIZE;
-    let reply = f.raw(Raw::new(&tgt, back(), opts).pa(both).evidence(&ev.ticket));
+    let reply = f
+        .raw(Raw::new(&tgt, back(), opts).pa(both).evidence(&ev.ticket))
+        .await;
     let Reply::Ok(rep, _) = &reply else {
         panic!("expected a ticket, got {} {}", reply.code(), reply.text());
     };
@@ -805,20 +880,20 @@ fn s4u2proxy_pac_option_echo_drops_other_bits() {
     assert_eq!(o.flags.as_raw_slice(), &RBCD.to_be_bytes());
 }
 
-#[test]
-fn s4u2proxy_evidence_for_a_different_service_is_server_nomatch() {
-    let f = fixture(proxy_cfg());
-    let front_tgt = f.login(&front(), true);
-    let other_tgt = f.login(&other(), true);
-    let ev_for_other = f.s4u2self(&other_tgt, &alice()).expect("evidence");
-    let err = kdc_err(f.s4u2proxy(&front_tgt, &ev_for_other, &back()));
+#[tokio::test]
+async fn s4u2proxy_evidence_for_a_different_service_is_server_nomatch() {
+    let f = fixture(proxy_cfg()).await;
+    let front_tgt = f.login(&front(), true).await;
+    let other_tgt = f.login(&other(), true).await;
+    let ev_for_other = f.s4u2self(&other_tgt, &alice()).await.expect("evidence");
+    let err = kdc_err(f.s4u2proxy(&front_tgt, &ev_for_other, &back()).await);
     assert_eq!(err, (26, "EVIDENCE_TICKET_MISMATCH".to_string()));
 }
 
-#[test]
-fn s4u2proxy_evidence_pac_problems_use_mit_codes() {
-    let f = fixture(proxy_cfg());
-    let (tgt, ev) = evidence(&f);
+#[tokio::test]
+async fn s4u2proxy_evidence_pac_problems_use_mit_codes() {
+    let f = fixture(proxy_cfg()).await;
+    let (tgt, ev) = evidence(&f).await;
     let part = decrypt_ticket(&f.front_key, &ev.ticket).expect("evidence");
     let reissue = |part: &EncTicketPart| {
         let mut c = ev.clone();
@@ -830,45 +905,49 @@ fn s4u2proxy_evidence_pac_problems_use_mit_codes() {
     // No PAC in the evidence ticket -> AP_ERR_MODIFIED.
     let mut stripped = part.clone();
     stripped.authorization_data = None;
-    let err = kdc_err(f.s4u2proxy(&tgt, &reissue(&stripped), &back()));
+    let err = kdc_err(f.s4u2proxy(&tgt, &reissue(&stripped), &back()).await);
     assert_eq!(err, (41, "S4U2PROXY_NO_STKT_PAC".to_string()));
 
     // Changing the ticket after it was signed breaks the ticket checksum.
     let mut changed = part.clone();
     changed.endtime += chrono::Duration::seconds(1);
-    let err = kdc_err(f.s4u2proxy(&tgt, &reissue(&changed), &back()));
+    let err = kdc_err(f.s4u2proxy(&tgt, &reissue(&changed), &back()).await);
     assert_eq!(err, (41, "2ND_TKT_PAC".to_string()));
 
     // The evidence server key must decrypt the ticket.
     let mut bad = ev.clone();
     bad.ticket = encrypt_ticket_part(&f.other_key, Some(1), REALM, ev.ticket.sname.clone(), &part)
         .expect("wrong key");
-    let err = kdc_err(f.s4u2proxy(&tgt, &bad, &back()));
+    let err = kdc_err(f.s4u2proxy(&tgt, &bad, &back()).await);
     assert_eq!(err, (31, "2ND_TKT_DECRYPT".to_string()));
 }
 
-#[test]
-fn s4u2proxy_requires_a_pac_in_the_header_ticket() {
-    let f = fixture(proxy_cfg());
-    let (_, ev) = evidence(&f);
-    let no_pac = f.login(&front(), false);
-    let err = kdc_err(f.s4u2proxy(&no_pac, &ev, &back()));
+#[tokio::test]
+async fn s4u2proxy_requires_a_pac_in_the_header_ticket() {
+    let f = fixture(proxy_cfg()).await;
+    let (_, ev) = evidence(&f).await;
+    let no_pac = f.login(&front(), false).await;
+    let err = kdc_err(f.s4u2proxy(&no_pac, &ev, &back()).await);
     assert_eq!(err, (20, "S4U2PROXY_NO_HEADER_PAC".to_string()));
 }
 
-#[test]
-fn s4u2proxy_second_target_gets_its_own_delegation_info() {
+#[tokio::test]
+async fn s4u2proxy_second_target_gets_its_own_delegation_info() {
     // A second hop through the same service appends to the delegation info
     // carried by the evidence PAC (update_delegation_info).
     let f = fixture(Cfg {
         front_attrs: SELF_OK,
         front_to: vec!["HTTP/back.s4u.realm", "HTTP/other.s4u.realm"],
         ..Cfg::default()
-    });
-    let (tgt, ev) = evidence(&f);
-    let first = f.s4u2proxy(&tgt, &ev, &back()).expect("first hop");
+    })
+    .await;
+    let (tgt, ev) = evidence(&f).await;
+    let first = f.s4u2proxy(&tgt, &ev, &back()).await.expect("first hop");
     assert_eq!(first.client, alice());
-    let second = f.s4u2proxy(&tgt, &ev, &other()).expect("second target");
+    let second = f
+        .s4u2proxy(&tgt, &ev, &other())
+        .await
+        .expect("second target");
     let part = decrypt_ticket(&f.other_key, &second.ticket).expect("decrypt");
     let pac = ticket_pac(&part).expect("pac").expect("present");
     let di = DelegationInfo::decode(pac.get_buffer(PAC_DELEGATION_INFO).expect("buffer"))

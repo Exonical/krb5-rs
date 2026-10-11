@@ -169,3 +169,16 @@ pub(crate) fn ap_key_for<K: Keytab + ?Sized>(
         Err(e) => Err(kt_to_ap(e)),
     }
 }
+
+/// The current key for `principal@realm` in `keytab` (highest kvno; the
+/// first such entry if several enctypes share it), for
+/// [`crate::protocol::AsExchange::with_key`].
+pub fn key_for_principal<K: Keytab>(
+    keytab: &K,
+    principal: &PrincipalName,
+    realm: &str,
+) -> Result<crate::types::EncryptionKey, KtError> {
+    keytab
+        .get_entry(principal, realm, None, None)
+        .map(|e| e.key)
+}

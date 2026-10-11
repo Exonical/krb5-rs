@@ -1,0 +1,20 @@
+# Quadlet unit: runs krb5-rs-kdc.yaml under systemd (`podman kube play`).
+# Install (see README.md): copy this file and krb5-rs-kdc.yaml to
+# ~/.config/containers/systemd/ (rootless) or /etc/containers/systemd/ (root).
+[Unit]
+Description=krb5-rs Kerberos KDC
+After=network-online.target
+Wants=network-online.target
+
+[Kube]
+Yaml=krb5-rs-kdc.yaml
+# Host port 88 -> the unprivileged port the container listens on.
+PublishPort=88:8888/udp
+PublishPort=88:8888/tcp
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

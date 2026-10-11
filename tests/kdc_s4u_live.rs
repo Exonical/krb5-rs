@@ -20,7 +20,6 @@ use std::sync::{Arc, OnceLock};
 use krb5_rs::crypto::find_etype;
 use krb5_rs::kdc::{
     serve_tcp, serve_udp, Kdc, KdcConfig, MemoryStore, PrincipalAttributes, PrincipalEntry,
-    PrincipalStore,
 };
 use krb5_rs::keytab::{FileKeytab, Keytab, KeytabEntry};
 use krb5_rs::pac::{ticket_pac, verify_ticket_pac};
@@ -80,7 +79,7 @@ fn live() -> &'static Live {
             store
                 .add_with_password(n.clone(), REALM, "svc-password", 1, &[18, 17], attrs)
                 .expect("service");
-            let mut e: PrincipalEntry = store.lookup(&n, REALM).expect("lookup").expect("entry");
+            let mut e: PrincipalEntry = store.get(&n, REALM).expect("entry");
             e.allowed_to_delegate_to = to.iter().map(|s| s.to_string()).collect();
             e.allowed_to_delegate_from = from.iter().map(|s| s.to_string()).collect();
             store.insert(e);
@@ -104,7 +103,7 @@ fn live() -> &'static Live {
         let mut kt = FileKeytab::new(&keytab);
         for name in ["s4u", "nofwd"] {
             let n = svc(name);
-            let e = store.lookup(&n, REALM).expect("lookup").expect("entry");
+            let e = store.get(&n, REALM).expect("entry");
             for k in &e.keys {
                 kt.add_entry(&KeytabEntry {
                     principal: n.clone(),

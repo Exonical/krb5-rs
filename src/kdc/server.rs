@@ -1,18 +1,21 @@
 //! UDP and TCP serving for [`Kdc`] (MIT lib/apputils/net-server.c).
 //!
 //! The caller binds the sockets; the functions here run until an I/O error
-//! on the socket or listener itself.
+//! on the socket or listener itself, or until the optional shutdown signal
+//! (a [`tokio::sync::watch`] channel set to `true`) fires.
 
 use std::collections::VecDeque;
 use std::io;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex, Notify};
 use tokio::task::AbortHandle;
 
-use super::{Kdc, PrincipalStore};
+use super::{Kdc, PrincipalStore, RequestSummary, Transport};
 use crate::types::error_codes::KRB_ERR_FIELD_TOOLONG;
 
 /// MIT `MAX_DGRAM_SIZE` (osconf.hin:113): UDP receive buffer size.
@@ -24,6 +27,36 @@ const MAX_TCP_MESSAGE: u32 = 1024 * 1024 - 4;
 /// open stream connections the oldest is closed (:1192-1230).
 const MAX_STREAM_CONNECTIONS: usize = 45;
 
+/// Called with a summary of every request and the peer it came from
+/// (MIT `log_as_req` / `log_tgs_req`).
+pub type RequestLogger = Arc<dyn Fn(&RequestSummary, SocketAddr) + Send + Sync>;
+
+/// Optional behaviour for [`serve_udp_with`] and [`serve_tcp_with`].
+#[derive(Clone, Default)]
+pub struct ServeOptions {
+    /// Per-request callback.
+    pub logger: Option<RequestLogger>,
+    /// When the value becomes `true` the server stops accepting; TCP serving
+    /// then waits for the connections already open before returning.
+    pub shutdown: Option<watch::Receiver<bool>>,
+}
+
+/// Resolves once `rx` holds `true`; never resolves without a receiver or if
+/// the sender is dropped without signalling.
+async fn shutdown_requested(rx: &mut Option<watch::Receiver<bool>>) {
+    let Some(rx) = rx else {
+        return std::future::pending().await;
+    };
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+}
+
 /// Serve UDP requests on `socket` until the socket itself fails
 /// (MIT `process_packet`, net-server.c:1130-1190). Replies longer than
 /// `max_dgram_reply_size` become KRB_ERR_RESPONSE_TOO_BIG
@@ -32,16 +65,32 @@ pub async fn serve_udp<S: PrincipalStore + 'static>(
     kdc: Arc<Kdc<S>>,
     socket: UdpSocket,
 ) -> io::Result<()> {
+    serve_udp_with(kdc, socket, ServeOptions::default()).await
+}
+
+/// [`serve_udp`] with a request logger and/or shutdown signal.
+pub async fn serve_udp_with<S: PrincipalStore + 'static>(
+    kdc: Arc<Kdc<S>>,
+    socket: UdpSocket,
+    mut options: ServeOptions,
+) -> io::Result<()> {
     let mut buf = vec![0u8; MAX_DGRAM_SIZE];
     loop {
-        let (n, peer) = match socket.recv_from(&mut buf).await {
+        let received = tokio::select! {
+            r = socket.recv_from(&mut buf) => r,
+            () = shutdown_requested(&mut options.shutdown) => return Ok(()),
+        };
+        let (n, peer) = match received {
             Ok(v) => v,
             // Windows reports ICMP port-unreachable for an earlier reply
             // as a receive error on an unconnected socket.
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
             Err(e) => return Err(e),
         };
-        let reply = kdc.handle_udp(&buf[..n]);
+        let (reply, summary) = kdc.handle_summarized(&buf[..n], Transport::Udp).await;
+        if let Some(log) = &options.logger {
+            log(&summary, peer);
+        }
         // MIT logs and drops on send failure (net-server.c:1112-1124).
         let _ = socket.send_to(&reply, peer).await;
     }
@@ -59,10 +108,45 @@ pub async fn serve_tcp<S: PrincipalStore + 'static>(
     kdc: Arc<Kdc<S>>,
     listener: TcpListener,
 ) -> io::Result<()> {
+    serve_tcp_with(kdc, listener, ServeOptions::default()).await
+}
+
+/// Counts open connections and wakes a waiter when the count reaches zero.
+#[derive(Default)]
+struct InFlight {
+    count: AtomicUsize,
+    idle: Notify,
+}
+
+struct InFlightGuard(Arc<InFlight>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+/// [`serve_tcp`] with a request logger and/or shutdown signal. On shutdown
+/// the listener stops accepting and this future completes once every open
+/// connection has finished; callers that cannot wait forever (a client that
+/// never sends its request keeps its connection open) should bound it with a
+/// timeout.
+pub async fn serve_tcp_with<S: PrincipalStore + 'static>(
+    kdc: Arc<Kdc<S>>,
+    listener: TcpListener,
+    mut options: ServeOptions,
+) -> io::Result<()> {
     let open: Arc<Mutex<VecDeque<(u64, AbortHandle)>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let in_flight = Arc::new(InFlight::default());
     let mut next_id: u64 = 0;
     loop {
-        let (stream, _) = match listener.accept().await {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            () = shutdown_requested(&mut options.shutdown) => break,
+        };
+        let (stream, peer) = match accepted {
             Ok(v) => v,
             Err(e)
                 if matches!(
@@ -78,17 +162,33 @@ pub async fn serve_tcp<S: PrincipalStore + 'static>(
         next_id += 1;
         let conn_kdc = Arc::clone(&kdc);
         let registry = Arc::clone(&open);
-        let mut guard = open.lock().await;
+        let logger = options.logger.clone();
+        in_flight.count.fetch_add(1, Ordering::SeqCst);
+        let guard = InFlightGuard(Arc::clone(&in_flight));
+        let mut open_guard = open.lock().await;
         let handle = tokio::spawn(async move {
-            let _ = serve_connection(&conn_kdc, stream).await;
+            let _guard = guard;
+            let _ = serve_connection(&conn_kdc, stream, peer, logger.as_ref()).await;
             registry.lock().await.retain(|(i, _)| *i != id);
         });
-        guard.push_back((id, handle.abort_handle()));
-        if guard.len() > MAX_STREAM_CONNECTIONS {
-            if let Some((_, oldest)) = guard.pop_front() {
+        open_guard.push_back((id, handle.abort_handle()));
+        if open_guard.len() > MAX_STREAM_CONNECTIONS {
+            if let Some((_, oldest)) = open_guard.pop_front() {
                 oldest.abort();
             }
         }
+    }
+    // Stop listening (new connections are refused), then wait for the open
+    // ones.
+    drop(listener);
+    loop {
+        let notified = in_flight.idle.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if in_flight.count.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        notified.await;
     }
 }
 
@@ -104,6 +204,8 @@ async fn write_framed(stream: &mut TcpStream, reply: &[u8]) -> io::Result<()> {
 async fn serve_connection<S: PrincipalStore>(
     kdc: &Kdc<S>,
     mut stream: TcpStream,
+    peer: SocketAddr,
+    logger: Option<&RequestLogger>,
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
@@ -114,5 +216,9 @@ async fn serve_connection<S: PrincipalStore>(
     }
     let mut request = vec![0u8; usize::try_from(len).map_err(|_| io::ErrorKind::InvalidData)?];
     stream.read_exact(&mut request).await?;
-    write_framed(&mut stream, &kdc.handle(&request)).await
+    let (reply, summary) = kdc.handle_summarized(&request, Transport::Tcp).await;
+    if let Some(log) = logger {
+        log(&summary, peer);
+    }
+    write_framed(&mut stream, &reply).await
 }

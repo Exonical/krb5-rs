@@ -188,7 +188,7 @@ pub(crate) fn get_ticket_renewtime(
     times.renew_till = rtime;
 }
 
-fn expired(limit: &Option<KerberosTime>, now: i64) -> bool {
+pub(crate) fn expired(limit: &Option<KerberosTime>, now: i64) -> bool {
     limit.as_ref().map(ts).is_some_and(|l| l != 0 && now > l)
 }
 
@@ -440,6 +440,9 @@ mod tests {
         PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
             name: PrincipalName::new_principal("p"),
             realm: "R".into(),
             attributes: PrincipalAttributes::empty(),

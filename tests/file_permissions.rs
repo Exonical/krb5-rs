@@ -114,6 +114,9 @@ mod kdc {
             .put(krb5_rs::kdc::PrincipalEntry {
                 allowed_to_delegate_to: Vec::new(),
                 allowed_to_delegate_from: Vec::new(),
+                policy: None,
+                security_epoch: 0,
+                last_admin_unlock: None,
                 name,
                 realm: "R".into(),
                 attributes: krb5_rs::kdc::PrincipalAttributes::empty(),

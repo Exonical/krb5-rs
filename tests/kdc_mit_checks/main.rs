@@ -66,9 +66,10 @@ struct FixtureOptions {
     max_renewable_life: Option<Duration>,
 }
 
-fn first_key(store: &MemoryStore, name: &PrincipalName, etype: i32) -> EncryptionKey {
+async fn first_key(store: &MemoryStore, name: &PrincipalName, etype: i32) -> EncryptionKey {
     store
         .lookup(name, REALM)
+        .await
         .expect("lookup")
         .expect("principal present")
         .keys
@@ -78,7 +79,7 @@ fn first_key(store: &MemoryStore, name: &PrincipalName, etype: i32) -> Encryptio
         .key
 }
 
-fn fixture_with(opts: FixtureOptions) -> Fixture {
+async fn fixture_with(opts: FixtureOptions) -> Fixture {
     let mut store = MemoryStore::new();
     let tgt_etypes = opts.krbtgt_etypes.unwrap_or_else(|| vec![18, 17]);
     store
@@ -140,8 +141,8 @@ fn fixture_with(opts: FixtureOptions) -> Fixture {
             PrincipalAttributes::empty(),
         )
         .expect("service");
-    let tgs_key = first_key(&store, &krbtgt(), 18);
-    let service_key = first_key(&store, &service(), 18);
+    let tgs_key = first_key(&store, &krbtgt(), 18).await;
+    let service_key = first_key(&store, &service(), 18).await;
 
     let mut config = KdcConfig::new(REALM);
     config.max_renewable_life = opts
@@ -157,8 +158,8 @@ fn fixture_with(opts: FixtureOptions) -> Fixture {
     }
 }
 
-fn fixture() -> Fixture {
-    fixture_with(FixtureOptions::default())
+async fn fixture() -> Fixture {
+    fixture_with(FixtureOptions::default()).await
 }
 
 /// Result of an in-process exchange plus every KDC reply seen.
@@ -167,13 +168,17 @@ struct Run<T> {
     replies: Vec<Vec<u8>>,
 }
 
-fn run_as(kdc: &Kdc<MemoryStore>, config: AsExchangeConfig, password: &str) -> Run<Credential> {
-    run_as_keep(kdc, config, password).1
+async fn run_as<S: PrincipalStore>(
+    kdc: &Kdc<S>,
+    config: AsExchangeConfig,
+    password: &str,
+) -> Run<Credential> {
+    run_as_keep(kdc, config, password).await.1
 }
 
 /// [`run_as`] that also returns the exchange for accessor checks.
-fn run_as_keep(
-    kdc: &Kdc<MemoryStore>,
+async fn run_as_keep<S: PrincipalStore>(
+    kdc: &Kdc<S>,
     config: AsExchangeConfig,
     password: &str,
 ) -> (AsExchange, Run<Credential>) {
@@ -183,7 +188,7 @@ fn run_as_keep(
     let result = loop {
         match exchange.step(&input) {
             Ok(StepResult::SendToKdc { data, .. }) | Ok(StepResult::RetryTcp { data, .. }) => {
-                input = kdc.handle(&data);
+                input = kdc.handle(&data).await;
                 replies.push(input.clone());
             }
             Ok(StepResult::Complete) => break exchange.credential().cloned(),
@@ -197,14 +202,19 @@ fn as_config(name: &str) -> AsExchangeConfig {
     AsExchangeConfig::new(PrincipalName::new_principal(name), REALM)
 }
 
-fn get_tgt(f: &Fixture) -> Credential {
-    run_as(&f.kdc, as_config(USER), PASSWORD)
+async fn get_tgt(f: &Fixture) -> Credential {
+    get_tgt_from(&f.kdc).await
+}
+
+async fn get_tgt_from<S: PrincipalStore>(kdc: &Kdc<S>) -> Credential {
+    run_as(kdc, as_config(USER), PASSWORD)
+        .await
         .result
         .expect("AS exchange")
 }
 
-fn run_tgs(
-    kdc: &Kdc<MemoryStore>,
+async fn run_tgs<S: PrincipalStore>(
+    kdc: &Kdc<S>,
     tgt: &Credential,
     target: PrincipalName,
     options: TgsOptions,
@@ -216,7 +226,7 @@ fn run_tgs(
         match exchange.step(&input) {
             Ok(TgsStepResult::SendToKdc { data, .. })
             | Ok(TgsStepResult::RetryTcp { data, .. }) => {
-                input = kdc.handle(&data);
+                input = kdc.handle(&data).await;
                 replies.push(input.clone());
             }
             Ok(TgsStepResult::Complete) => break exchange.credential().cloned(),

@@ -1,0 +1,25 @@
+[package]
+name = "krb5-rs-kdb-cockroach"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+authors = ["Dmitry Prudnikov <mail@polaz.com>"]
+description = "CockroachDB authoritative database module for the krb5-rs KDC"
+repository = "https://github.com/structured-world/krb5-rs"
+publish = false
+
+[dependencies]
+deadpool-postgres = "0.14.2"
+rand = "0.10"
+krb5-rs = { path = "../..", features = ["kdc", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+rustls-pki-types = "1.15.1"
+tokio = { version = "1.53.2", features = ["rt", "sync", "time", "macros"] }
+tokio-postgres = "0.7.18"
+tokio-postgres-rustls = "0.14"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+krb5-rs-kdb-turso = { path = "../krb5-rs-kdb-turso" }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time"] }

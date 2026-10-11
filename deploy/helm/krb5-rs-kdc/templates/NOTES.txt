@@ -1,0 +1,35 @@
+krb5-rs KDC for realm {{ .Values.realm }}: one primary and {{ .Values.replicas.replicaCount }} replica(s).
+
+1. Find the KDC address (Service "{{ include "krb5-rs-kdc.fullname" . }}-kdc", port {{ .Values.service.port }} UDP+TCP):
+{{- if eq .Values.service.type "LoadBalancer" }}
+
+     kubectl get svc {{ include "krb5-rs-kdc.fullname" . }}-kdc --namespace {{ .Release.Namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}'
+{{- else if eq .Values.service.type "NodePort" }}
+
+     kubectl get svc {{ include "krb5-rs-kdc.fullname" . }}-kdc --namespace {{ .Release.Namespace }} -o wide
+{{- else }}
+
+     {{ include "krb5-rs-kdc.fullname" . }}-kdc.{{ .Release.Namespace }}.svc (ClusterIP, in-cluster only)
+{{- end }}
+
+2. Client krb5.conf:
+
+     [libdefaults]
+       default_realm = {{ .Values.realm }}
+     [realms]
+       {{ .Values.realm }} = {
+         kdc = <address from step 1>:{{ .Values.service.port }}
+       }
+
+3. Administer the database. Writes go ONLY to the primary pod; replicas are read-only copies
+   that pull every {{ .Values.propagation.pollInterval }}. Passwords are read from stdin (use -i):
+
+     printf 'the-password\n' | kubectl exec -i --namespace {{ .Release.Namespace }} statefulset/{{ include "krb5-rs-kdc.fullname" . }}-primary -c kdc -- \
+       krb5-rs-kdb --config /etc/krb5-rs/kdc.conf --krb5-config /etc/krb5-rs/krb5.conf --realm {{ .Values.realm }} addprinc alice
+
+   Other commands: delprinc, cpw, modprinc, getprinc, listprincs, ktadd -k PATH NAME.
+
+What HA means here: the replicas keep answering AS and TGS requests while the primary is down
+or restarting, using the last database they pulled. Administrative changes wait for the
+primary (as with MIT kprop) and reach the replicas within one poll interval after it returns.
+The "master-password" and "kprop-password" keys live in Secret "{{ include "krb5-rs-kdc.secretName" . }}".

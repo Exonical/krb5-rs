@@ -1,0 +1,14 @@
+# https://release-plz.dev/docs/config
+# krb5-rs-kdc is the deployable daemon (published as a container image, never
+# to crates.io): release-plz must neither version, publish, nor tag it.
+[[package]]
+name = "krb5-rs-kdc"
+release = false
+
+[[package]]
+name = "krb5-rs-kdb-turso"
+release = false
+
+[[package]]
+name = "krb5-rs-kdb-cockroach"
+release = false

@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 *.swp
 *.swo
 .DS_Store
@@ -9,3 +8,4 @@ donors/
 .refs/
 arch/
 ROADMAP.md
+tests/crdb/certs/

@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-features
+      - run: cargo build --workspace --all-features
 
   test:
     runs-on: ubuntu-latest
@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      - run: cargo test --workspace --all-features
 
   clippy:
     runs-on: ubuntu-latest
@@ -34,7 +34,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
   fmt:
     runs-on: ubuntu-latest
@@ -44,6 +44,62 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout
+      - name: Build the KDC image (not pushed)
+        run: docker build -f deploy/docker/Dockerfile .
+
+  helm:
+    runs-on: ubuntu-latest
+    env:
+      KUBECONFORM: ghcr.io/yannh/kubeconform@sha256:5103f6f5e89061728aad4ad5a250627dd0fc9b2a92eb876f3762677a4222f9e0 # v0.8.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.22.0
+      - name: Lint
+        run: helm lint deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM
+      - name: The realm is required
+        run: "! helm lint deploy/helm/krb5-rs-kdc"
+      - name: Render and validate (defaults)
+        run: |
+          helm template rel deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM \
+            | docker run --rm -i "$KUBECONFORM" -strict -summary -kubernetes-version 1.30.0 -
+      - name: Render and validate (non-default values)
+        run: |
+          helm template rel deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/alt-values.yaml \
+            | docker run --rm -i "$KUBECONFORM" -strict -summary -kubernetes-version 1.30.0 -
+
+  helm-e2e:
+    runs-on: ubuntu-latest
+    env:
+      K3D_VERSION: v5.9.0
+      K3D_SHA256: 06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0
+      K3S_IMAGE: docker.io/rancher/k3s:v1.36.5-k3s1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.22.0
+      - name: Install k3d
+        run: |
+          curl -fsSL -o k3d "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64"
+          echo "${K3D_SHA256}  k3d" | sha256sum -c -
+          sudo install -m 0755 k3d /usr/local/bin/k3d
+      - name: Build the KDC image
+        run: docker build -f deploy/docker/Dockerfile -t localhost/krb5-rs-kdc:e2e .
+      - name: Build the MIT client image
+        run: docker build -t krb5-rs-mit-test:1.22.2 tests/kdc
+      - name: Create the cluster and load the images
+        run: |
+          k3d cluster create e2e --image "$K3S_IMAGE" --wait --timeout 180s
+          k3d image import localhost/krb5-rs-kdc:e2e krb5-rs-mit-test:1.22.2 -c e2e
+      - name: Chart end-to-end
+        run: bash deploy/helm/krb5-rs-kdc/ci/e2e.sh
 
   live:
     runs-on: ubuntu-latest
@@ -59,10 +115,17 @@ jobs:
           # test listens) through their network's gateway address.
           gw=$(docker network inspect krb5-rs_default -f '{{(index .IPAM.Config 0).Gateway}}')
           echo "KDC_LIVE_HOST=$gw" >> "$GITHUB_ENV"
+      - name: Start the CockroachDB test cluster
+        env:
+          CONTAINER_CLI: docker
+          CRDB_HOST: 127.0.0.1
+        run: bash tests/crdb/cluster.sh up
       - name: Live interop tests
         env:
           CONTAINER_CLI: docker
-        run: cargo test --all-features -- --ignored --test-threads=1
+        run: cargo test --workspace --all-features -- --ignored --test-threads=1
       - name: Container logs
         if: failure()
-        run: docker compose -p krb5-rs -f docker-compose.test.yml logs
+        run: |
+          docker compose -p krb5-rs -f docker-compose.test.yml logs
+          docker logs crdb1 2>&1 | tail -200 || true

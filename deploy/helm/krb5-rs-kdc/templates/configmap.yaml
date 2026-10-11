@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+data:
+  primary-kdc.conf: |
+    {{- include "krb5-rs-kdc.kdcConf" (dict "ctx" . "role" "primary") | nindent 4 }}
+  replica-kdc.conf: |
+    {{- include "krb5-rs-kdc.kdcConf" (dict "ctx" . "role" "replica") | nindent 4 }}
+  krb5.conf: |
+    [libdefaults]
+     default_realm = {{ required "realm is required" .Values.realm }}
+     dns_lookup_kdc = false
+     dns_lookup_realm = false
+    {{- if .Values.kdc.domainRealm }}
+
+    [domain_realm]
+    {{- range $domain, $realm := .Values.kdc.domainRealm }}
+     {{ $domain }} = {{ $realm }}
+    {{- end }}
+    {{- end }}
+    {{- with .Values.kdc.extraKrb5Conf }}
+
+    {{- . | nindent 4 }}
+    {{- end }}

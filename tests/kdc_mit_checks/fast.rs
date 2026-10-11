@@ -201,11 +201,11 @@ fn armored_config(tgt: &Credential) -> AsExchangeConfig {
     config
 }
 
-#[test]
-fn as_exchange_fast_required_completes_with_armored_replies() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
-    let (exchange, run) = run_as_keep(&f.kdc, armored_config(&tgt), PASSWORD);
+#[tokio::test]
+async fn as_exchange_fast_required_completes_with_armored_replies() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
+    let (exchange, run) = run_as_keep(&f.kdc, armored_config(&tgt), PASSWORD).await;
     let cred = run.result.expect("FAST AS exchange");
 
     assert_eq!(run.replies.len(), 2);
@@ -228,12 +228,15 @@ fn as_exchange_fast_required_completes_with_armored_replies() {
     assert_eq!(part.cname, user());
 }
 
-#[test]
-fn as_req_fast_first_error_hints_inner_list_in_mit_order() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_first_error_hints_inner_list_in_mit_order() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
-    let reply = f.kdc.handle(&build_fast_as(&armor, FastAs::new(USER)));
+    let reply = f
+        .kdc
+        .handle(&build_fast_as(&armor, FastAs::new(USER)))
+        .await;
     let (outer, resp, inner) = open_fast_error(&reply, &armor.key);
     assert_eq!(outer.error_code, 25);
     assert_eq!(inner.error_code, 25);
@@ -254,13 +257,13 @@ fn as_req_fast_first_error_hints_inner_list_in_mit_order() {
     assert_eq!(resp.padata[3].padata_value.as_ref(), b"MIT");
 }
 
-#[test]
-fn as_exchange_fast_opportunistic_upgrades_after_unarmored_preauth_required() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_exchange_fast_opportunistic_upgrades_after_unarmored_preauth_required() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let mut config = as_config(USER);
     config.fast = FastMode::Opportunistic(tgt.clone());
-    let (exchange, run) = run_as_keep(&f.kdc, config, PASSWORD);
+    let (exchange, run) = run_as_keep(&f.kdc, config, PASSWORD).await;
     let cred = run.result.expect("opportunistic FAST exchange");
 
     let first = krb_error(&run.replies[0]);
@@ -278,46 +281,48 @@ fn as_exchange_fast_opportunistic_upgrades_after_unarmored_preauth_required() {
     assert!(cred.flags.contains(TicketFlags::PRE_AUTHENT));
 }
 
-#[test]
-fn as_exchange_without_fast_but_enc_pa_rep_reports_fast_available() {
-    let f = fixture();
-    let (exchange, run) = run_as_keep(&f.kdc, as_config(USER), PASSWORD);
+#[tokio::test]
+async fn as_exchange_without_fast_but_enc_pa_rep_reports_fast_available() {
+    let f = fixture().await;
+    let (exchange, run) = run_as_keep(&f.kdc, as_config(USER), PASSWORD).await;
     run.result.expect("AS exchange");
     assert!(exchange.fast_avail());
     assert!(!exchange.kdc_verified());
 }
 
-#[test]
-fn as_exchange_fast_wrong_password_surfaces_preauth_failed() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
-    let run = run_as(&f.kdc, armored_config(&tgt), "wrong-password");
+#[tokio::test]
+async fn as_exchange_fast_wrong_password_surfaces_preauth_failed() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
+    let run = run_as(&f.kdc, armored_config(&tgt), "wrong-password").await;
     assert_eq!(kdc_code(&run.result.expect_err("must fail")), 24);
 }
 
-#[test]
-fn as_req_fast_wrong_challenge_error_is_armored_with_hints() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_wrong_challenge_error_is_armored_with_hints() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let bad_key = EncryptionKey::new(18, vec![1; 32]);
     let pa = build_pa_encrypted_challenge(&armor.key, &bad_key, at(0), Some(0)).expect("challenge");
     let mut spec = FastAs::new(USER);
     spec.inner_padata = vec![pa];
-    let (outer, resp, inner) =
-        open_fast_error(&f.kdc.handle(&build_fast_as(&armor, spec)), &armor.key);
+    let (outer, resp, inner) = open_fast_error(
+        &f.kdc.handle(&build_fast_as(&armor, spec)).await,
+        &armor.key,
+    );
     assert_eq!((outer.error_code, inner.error_code), (24, 24));
     assert!(types(&resp.padata).contains(&PA_ENCRYPTED_CHALLENGE));
 }
 
-#[test]
-fn as_req_fast_encrypted_timestamp_inside_tunnel_is_accepted() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_encrypted_timestamp_inside_tunnel_is_accepted() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let mut spec = FastAs::new(USER);
     spec.inner_padata = vec![enc_timestamp_padata(USER, PASSWORD, at(0))];
-    let reply = f.kdc.handle(&build_fast_as(&armor, spec));
+    let reply = f.kdc.handle(&build_fast_as(&armor, spec)).await;
     let rep: AsRep = rasn::der::decode(&reply).expect("AS-REP");
     let padata = rep.0.padata.expect("padata");
     assert_eq!(types(&padata), vec![PA_FX_FAST]);
@@ -350,9 +355,9 @@ fn as_req_fast_encrypted_timestamp_inside_tunnel_is_accepted() {
         .expect("ticket checksum");
 }
 
-#[test]
-fn as_req_encrypted_challenge_without_fast_is_preauth_failed_with_enc_timestamp_hint() {
-    let f = fixture();
+#[tokio::test]
+async fn as_req_encrypted_challenge_without_fast_is_preauth_failed_with_enc_timestamp_hint() {
+    let f = fixture().await;
     let pa = build_pa_encrypted_challenge(
         &EncryptionKey::new(18, vec![2; 32]),
         &user_as_key(),
@@ -361,7 +366,7 @@ fn as_req_encrypted_challenge_without_fast_is_preauth_failed_with_enc_timestamp_
     )
     .expect("challenge");
     let req = build_as_req(USER, KdcOptions::FORWARDABLE, vec![18], vec![pa]);
-    let err = krb_error(&f.kdc.handle(&req));
+    let err = krb_error(&f.kdc.handle(&req).await);
     assert_eq!(err.error_code, 24);
     assert_eq!(
         types(&method_data(&err)),
@@ -369,87 +374,102 @@ fn as_req_encrypted_challenge_without_fast_is_preauth_failed_with_enc_timestamp_
     );
 }
 
-#[test]
-fn as_req_fast_checksum_mismatch_returns_modified_in_armored_error() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_checksum_mismatch_returns_modified_in_armored_error() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let mut spec = FastAs::new(USER);
     spec.flip_checksum = true;
-    let (outer, _, inner) =
-        open_fast_error(&f.kdc.handle(&build_fast_as(&armor, spec)), &armor.key);
+    let (outer, _, inner) = open_fast_error(
+        &f.kdc.handle(&build_fast_as(&armor, spec)).await,
+        &armor.key,
+    );
     assert_eq!((outer.error_code, inner.error_code), (41, 41));
 }
 
-#[test]
-fn as_req_fast_armor_ticket_for_non_krbtgt_service_returns_server_nomatch_unarmored() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_armor_ticket_for_non_krbtgt_service_returns_server_nomatch_unarmored() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let svc = run_tgs(&f.kdc, &tgt, service(), TgsOptions::default())
+        .await
         .result
         .expect("service ticket");
     let armor = ap_armor(&svc, true);
-    let err = krb_error(&f.kdc.handle(&build_fast_as(&armor, FastAs::new(USER))));
+    let err = krb_error(
+        &f.kdc
+            .handle(&build_fast_as(&armor, FastAs::new(USER)))
+            .await,
+    );
     assert_eq!(err.error_code, 26);
     assert!(err.e_data.is_none());
 }
 
-#[test]
-fn as_req_fast_armor_ap_req_without_subkey_returns_policy() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_armor_ap_req_without_subkey_returns_policy() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, false);
-    let err = krb_error(&f.kdc.handle(&build_fast_as(&armor, FastAs::new(USER))));
+    let err = krb_error(
+        &f.kdc
+            .handle(&build_fast_as(&armor, FastAs::new(USER)))
+            .await,
+    );
     assert_eq!(err.error_code, 12);
 }
 
-#[test]
-fn as_req_fast_unknown_armor_type_returns_preauth_failed() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_unknown_armor_type_returns_preauth_failed() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let mut spec = FastAs::new(USER);
     spec.armor_type = Some(2);
     assert_eq!(
-        krb_error(&f.kdc.handle(&build_fast_as(&armor, spec))).error_code,
+        krb_error(&f.kdc.handle(&build_fast_as(&armor, spec)).await).error_code,
         24
     );
 }
 
-#[test]
-fn as_req_fast_without_armor_returns_preauth_failed() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_without_armor_returns_preauth_failed() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let mut spec = FastAs::new(USER);
     spec.armor_type = None;
     assert_eq!(
-        krb_error(&f.kdc.handle(&build_fast_as(&armor, spec))).error_code,
+        krb_error(&f.kdc.handle(&build_fast_as(&armor, spec)).await).error_code,
         24
     );
 }
 
-#[test]
-fn as_req_fast_critical_option_bit_returns_unknown_critical_option_armored() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_critical_option_bit_returns_unknown_critical_option_armored() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let mut spec = FastAs::new(USER);
     spec.fast_options = vec![0x80, 0, 0, 0];
-    let (outer, _, inner) =
-        open_fast_error(&f.kdc.handle(&build_fast_as(&armor, spec)), &armor.key);
+    let (outer, _, inner) = open_fast_error(
+        &f.kdc.handle(&build_fast_as(&armor, spec)).await,
+        &armor.key,
+    );
     assert_eq!((outer.error_code, inner.error_code), (93, 93));
 }
 
-#[test]
-fn as_req_fast_hide_client_names_anonymizes_outer_error_but_not_inner() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_hide_client_names_anonymizes_outer_error_but_not_inner() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let mut spec = FastAs::new(USER);
     spec.fast_options = vec![0x40, 0, 0, 0];
-    let (outer, _, inner) =
-        open_fast_error(&f.kdc.handle(&build_fast_as(&armor, spec)), &armor.key);
+    let (outer, _, inner) = open_fast_error(
+        &f.kdc.handle(&build_fast_as(&armor, spec)).await,
+        &armor.key,
+    );
     let anon = outer.cname.expect("outer cname");
     assert_eq!(anon.name_type, 11);
     assert_eq!(anon.to_string(), "WELLKNOWN/ANONYMOUS");
@@ -464,15 +484,15 @@ fn as_req_fast_hide_client_names_anonymizes_outer_error_but_not_inner() {
     );
 }
 
-#[test]
-fn as_req_fast_hide_client_names_anonymizes_outer_reply_and_keeps_finished_name() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_req_fast_hide_client_names_anonymizes_outer_reply_and_keeps_finished_name() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let mut spec = FastAs::new(USER);
     spec.fast_options = vec![0x40, 0, 0, 0];
     spec.inner_padata = vec![enc_timestamp_padata(USER, PASSWORD, at(0))];
-    let reply = f.kdc.handle(&build_fast_as(&armor, spec));
+    let reply = f.kdc.handle(&build_fast_as(&armor, spec)).await;
     let rep: AsRep = rasn::der::decode(&reply).expect("AS-REP");
     assert_eq!(rep.0.cname.name_type, 11);
     assert_eq!(rep.0.crealm.as_bytes(), b"WELLKNOWN:ANONYMOUS");
@@ -482,11 +502,11 @@ fn as_req_fast_hide_client_names_anonymizes_outer_reply_and_keeps_finished_name(
     assert_eq!(finished.crealm.as_bytes(), REALM.as_bytes());
 }
 
-#[test]
-fn tgs_exchange_fast_reply_is_armored_and_credential_authenticates() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
-    let run = run_tgs(&f.kdc, &tgt, service(), TgsOptions::default());
+#[tokio::test]
+async fn tgs_exchange_fast_reply_is_armored_and_credential_authenticates() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
+    let run = run_tgs(&f.kdc, &tgt, service(), TgsOptions::default()).await;
     let cred = run.result.expect("TGS exchange");
 
     let rep: TgsRep = rasn::der::decode(run.replies.last().expect("reply")).expect("TGS-REP");
@@ -512,16 +532,17 @@ fn tgs_exchange_fast_reply_is_armored_and_credential_authenticates() {
     assert_eq!(rd.ticket.cname, user());
 }
 
-#[test]
-fn tgs_exchange_fast_unknown_service_surfaces_inner_error_code() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_exchange_fast_unknown_service_surfaces_inner_error_code() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let run = run_tgs(
         &f.kdc,
         &tgt,
         PrincipalName::new_srv_hst("HTTP", "missing.test.realm"),
         TgsOptions::default(),
-    );
+    )
+    .await;
     assert_eq!(kdc_code(&run.result.expect_err("must fail")), 7);
     let outer = krb_error(run.replies.last().expect("reply"));
     assert_eq!(outer.error_code, 7);
@@ -529,10 +550,10 @@ fn tgs_exchange_fast_unknown_service_surfaces_inner_error_code() {
     assert_eq!(outer.cname, Some(user()));
 }
 
-#[test]
-fn tgs_req_fast_ap_request_armor_with_subkey_returns_preauth_failed() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_req_fast_ap_request_armor_with_subkey_returns_preauth_failed() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let (req, _) = build_tgs_req(&tgt, TgsReqSpec::new(service(), KdcOptions::empty()));
     let mut decoded: TgsReq = rasn::der::decode(&req).expect("decode");
@@ -547,7 +568,7 @@ fn tgs_req_fast_ap_request_armor_with_subkey_returns_preauth_failed() {
         .expect("PA-FX-FAST");
     decoded.0.padata.as_mut().expect("padata").push(fx);
     let der = rasn::der::encode(&decoded).expect("encode");
-    assert_eq!(krb_error(&f.kdc.handle(&der)).error_code, 24);
+    assert_eq!(krb_error(&f.kdc.handle(&der).await).error_code, 24);
 }
 
 /// Replace the outer client of a KDC-REP with the anonymous principal, as a
@@ -561,16 +582,16 @@ fn anonymize_outer_client(rep: &mut KdcRep) {
     rep.crealm = gs("WELLKNOWN:ANONYMOUS");
 }
 
-#[test]
-fn fast_hide_client_reply_finished_restores_real_client_realm() {
+#[tokio::test]
+async fn fast_hide_client_reply_finished_restores_real_client_realm() {
     use krb5_rs::protocol::fast::FastState;
-    let f = fixture();
-    let tgt = get_tgt(&f);
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let armor = ap_armor(&tgt, true);
     let mut spec = FastAs::new(USER);
     spec.fast_options = vec![0x40, 0, 0, 0];
     spec.inner_padata = vec![enc_timestamp_padata(USER, PASSWORD, at(0))];
-    let reply = f.kdc.handle(&build_fast_as(&armor, spec));
+    let reply = f.kdc.handle(&build_fast_as(&armor, spec)).await;
     let rep: AsRep = rasn::der::decode(&reply).expect("AS-REP");
     assert_eq!(rep.0.crealm.as_bytes(), b"WELLKNOWN:ANONYMOUS");
 
@@ -600,16 +621,16 @@ fn fast_hide_client_reply_finished_restores_real_client_realm() {
     assert_eq!(out.client, user());
 }
 
-#[test]
-fn as_exchange_fast_anonymous_outer_client_completes_with_real_client() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn as_exchange_fast_anonymous_outer_client_completes_with_real_client() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let mut exchange = AsExchange::new(armored_config(&tgt), PASSWORD);
     let mut reply = Vec::new();
     while let StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } =
         exchange.step(&reply).expect("step")
     {
-        reply = f.kdc.handle(&data);
+        reply = f.kdc.handle(&data).await;
         if let Ok(mut rep) = rasn::der::decode::<AsRep>(&reply) {
             anonymize_outer_client(&mut rep.0);
             reply = rasn::der::encode(&rep).expect("encode");
@@ -620,16 +641,16 @@ fn as_exchange_fast_anonymous_outer_client_completes_with_real_client() {
     assert_eq!(cred.crealm, REALM);
 }
 
-#[test]
-fn tgs_exchange_fast_anonymous_outer_client_completes_with_real_client() {
-    let f = fixture();
-    let tgt = get_tgt(&f);
+#[tokio::test]
+async fn tgs_exchange_fast_anonymous_outer_client_completes_with_real_client() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
     let mut exchange = TgsExchange::new(tgt, service(), TgsOptions::default());
     let mut reply = Vec::new();
     while let TgsStepResult::SendToKdc { data, .. } | TgsStepResult::RetryTcp { data, .. } =
         exchange.step(&reply).expect("step")
     {
-        reply = f.kdc.handle(&data);
+        reply = f.kdc.handle(&data).await;
         if let Ok(mut rep) = rasn::der::decode::<TgsRep>(&reply) {
             anonymize_outer_client(&mut rep.0);
             reply = rasn::der::encode(&rep).expect("encode");

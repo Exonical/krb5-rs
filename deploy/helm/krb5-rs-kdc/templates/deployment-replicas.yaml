@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-replicas
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: replica
+spec:
+  replicas: {{ .Values.replicas.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "krb5-rs-kdc.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: replica
+  template:
+    metadata:
+      labels:
+        {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: replica
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.replicas.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "krb5-rs-kdc.scheduling" (dict "ctx" . "cfg" .Values.replicas) | nindent 6 }}
+      containers:
+        - name: kdc
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config=/etc/krb5-rs/kdc.conf
+            - --krb5-config=/etc/krb5-rs/krb5.conf
+            - --realm={{ .Values.realm }}
+            - --master-password-file=/secrets/master-password
+          ports:
+            - name: kdc-udp
+              containerPort: {{ .Values.kdc.containerPort }}
+              protocol: UDP
+            - name: kdc-tcp
+              containerPort: {{ .Values.kdc.containerPort }}
+              protocol: TCP
+          # The daemon binds its ports only after the first database pull, so
+          # these probes pass only once the replica has data.
+          startupProbe:
+            tcpSocket:
+              port: kdc-tcp
+            periodSeconds: 2
+            failureThreshold: 90
+          readinessProbe:
+            tcpSocket:
+              port: kdc-tcp
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: kdc-tcp
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.replicas.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/krb5-rs
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: {{ include "krb5-rs-kdc.fullname" . }}
+            items:
+              - key: replica-kdc.conf
+                path: kdc.conf
+              - key: krb5.conf
+                path: krb5.conf
+        - name: secrets
+          secret:
+            secretName: {{ include "krb5-rs-kdc.secretName" . }}
+            defaultMode: 0440

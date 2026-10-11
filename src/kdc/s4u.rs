@@ -224,7 +224,7 @@ fn list_names(entry: &str, default_realm: &str, name: &PrincipalName, realm: &st
 impl<S: PrincipalStore> Kdc<S> {
     /// `kdc_process_s4u2self_req` (kdc_util.c:1580-1645). `session` is the
     /// header ticket session key and `subkey` the authenticator subkey.
-    pub(super) fn process_s4u2self_req(
+    pub(super) async fn process_s4u2self_req(
         &self,
         req: &KdcReq,
         server: &PrincipalEntry,
@@ -283,7 +283,8 @@ impl<S: PrincipalStore> Kdc<S> {
                 return Err(KdcError::generic("LOOKING_UP_S4U2SELF_PRINCIPAL"));
             }
             let mut entry = self
-                .lookup(&user, &user_realm, "LOOKING_UP_S4U2SELF_PRINCIPAL")?
+                .lookup(&user, &user_realm, "LOOKING_UP_S4U2SELF_PRINCIPAL")
+                .await?
                 .ok_or_else(|| {
                     KdcError::new(KDC_ERR_C_PRINCIPAL_UNKNOWN, "UNKNOWN_S4U2SELF_PRINCIPAL")
                 })?;
@@ -378,6 +379,9 @@ impl<S: PrincipalStore> Kdc<S> {
             keys: Vec::new(),
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            policy: None,
+            security_epoch: 0,
+            last_admin_unlock: None,
         };
         let client = s4u.client.as_ref().expect("checked above");
         validate_as_request(opts, client, &empty, kdc_time)
@@ -444,7 +448,7 @@ impl<S: PrincipalStore> Kdc<S> {
     /// ticket is decrypted with its server's key and its PAC verified like a
     /// header ticket's (statuses 2ND_TKT_SERVER / 2ND_TKT_DECRYPT /
     /// 2ND_TKT_PAC).
-    pub(super) fn decrypt_2ndtkt(
+    pub(super) async fn decrypt_2ndtkt(
         &self,
         ticket: &Ticket,
         local_tgt: &PrincipalEntry,
@@ -453,6 +457,7 @@ impl<S: PrincipalStore> Kdc<S> {
         let realm = text(&ticket.realm);
         let server = self
             .lookup(&ticket.sname, &realm, "2ND_TKT_SERVER")
+            .await
             .ok()
             .flatten()
             .filter(|s| {

@@ -22,8 +22,8 @@ use super::fast::{
     build_pa_encrypted_challenge, verify_kdc_challenge, FastMode, FastMsgType, FastState,
 };
 use super::preauth::{
-    build_empty_padata, build_pa_enc_timestamp, build_pa_pac_request, default_salt,
-    extract_preauth_hint_padata, PreauthHint,
+    build_empty_padata, build_pa_enc_timestamp, build_pa_enc_timestamp_with_key,
+    build_pa_pac_request, default_salt, extract_preauth_hint_padata, PreauthHint,
 };
 use super::validate::{validate_as_reply, DEFAULT_MAX_CLOCK_SKEW, UTC_OFFSET};
 
@@ -198,6 +198,8 @@ pub struct AsExchange {
     state: AsState,
     config: AsExchangeConfig,
     password: Zeroizing<String>,
+    /// A long-term key used instead of the password ([`AsExchange::with_key`]).
+    long_term_key: Option<EncryptionKey>,
     nonce: u32,
     /// The most recent AS-REQ body (for validation on reply).
     last_req_body: Option<KdcReqBody>,
@@ -276,6 +278,7 @@ impl AsExchange {
             state: AsState::Initial,
             config,
             password: Zeroizing::new(password.into()),
+            long_term_key: None,
             nonce: 0,
             last_req_body: None,
             last_req_bytes: Vec::new(),
@@ -302,6 +305,17 @@ impl AsExchange {
             #[cfg(feature = "pkinit")]
             freshness_token: None,
         }
+    }
+
+    /// Create an AS exchange that authenticates with a long-term key
+    /// instead of a password (MIT `krb5_get_init_creds_keytab`): the key's
+    /// enctype is the only one requested, and the salt and string-to-key
+    /// parameters the KDC reports are irrelevant.
+    pub fn with_key(mut config: AsExchangeConfig, key: EncryptionKey) -> Self {
+        config.etypes = vec![key.keytype];
+        let mut exchange = Self::new(config, String::new());
+        exchange.long_term_key = Some(key);
+        exchange
     }
 
     /// Advance the state machine.
@@ -572,20 +586,9 @@ impl AsExchange {
                         continue;
                     }
                     let hint = hint();
-                    let profile = find_etype(hint.etype)
-                        .map_err(|_| Krb5Error::UnsupportedEtype(hint.etype))?;
                     let salt = hint.salt.clone().unwrap_or_else(|| self.default_salt());
-                    let as_key = EncryptionKey::new(
-                        hint.etype,
-                        profile
-                            .string_to_key(
-                                self.password.as_bytes(),
-                                &salt,
-                                hint.s2kparams.as_deref(),
-                            )
-                            .map_err(|e| Krb5Error::Crypto(e.to_string()))?
-                            .to_vec(),
-                    );
+                    let as_key =
+                        self.long_term_key(hint.etype, &salt, hint.s2kparams.as_deref())?;
                     // Encrypted challenge requires the authenticated offset
                     // (get_preauth_time allow_unauth=FALSE).
                     let (ts, usec) = self.preauth_time(false);

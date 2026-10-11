@@ -1,0 +1,30 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Kerberos requests from anywhere.
+    - ports:
+        - port: {{ .Values.kdc.containerPort }}
+          protocol: UDP
+        - port: {{ .Values.kdc.containerPort }}
+          protocol: TCP
+    # Database propagation only from the replicas.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "krb5-rs-kdc.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: replica
+      ports:
+        - port: {{ .Values.propagation.port }}
+          protocol: TCP
+{{- end }}
