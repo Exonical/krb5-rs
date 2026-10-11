@@ -8,3 +8,4 @@ donors/
 .refs/
 arch/
 ROADMAP.md
+tests/crdb/certs/
