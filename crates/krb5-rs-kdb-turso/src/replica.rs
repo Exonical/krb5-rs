@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
+use tokio::sync::RwLock as AsyncRwLock;
+
 use krb5_rs::kdc::replication::{
     ApplyOutcome, Change, ChangeBatch, RebuildWriter, ReplicaCheckpoint, ReplicaSink, ReplicationTs,
 };
@@ -21,8 +23,8 @@ use crate::changes::{
     write_checkpoint, LOOKUP_SQL, POLICY_SQL,
 };
 use crate::db::{
-    backoff, exec, int, is_conflict, journal_mode, map_err, now_unix, query, schema_version, Inner,
-    TxError, SCHEMA_VERSION,
+    backoff, exec, int, is_conflict, journal_mode, map_err, now_unix, query, schema_version, text,
+    Inner, TxError, SCHEMA_VERSION,
 };
 use crate::TursoOptions;
 
@@ -77,6 +79,7 @@ struct Shared {
     options: TursoOptions,
     master: EncryptionKey,
     current: RwLock<Arc<Inner>>,
+    auth_state_writes: AsyncRwLock<()>,
     pending: Mutex<Vec<Pending>>,
     metrics: ReplicaMetrics,
     last_apply_error: Mutex<Option<String>>,
@@ -164,6 +167,7 @@ impl TursoReplica {
             options,
             master: master_key,
             current: RwLock::new(inner),
+            auth_state_writes: AsyncRwLock::new(()),
             pending: Mutex::new(Vec::new()),
             metrics: ReplicaMetrics::default(),
             last_apply_error: Mutex::new(None),
@@ -280,6 +284,63 @@ impl TursoReplica {
                 }
             }
         }
+    }
+
+    async fn copy_auth_state(&self, from: &Inner, to: &Inner) -> Result<(), StoreError> {
+        let conn = from.conn().await;
+        let rows = query(
+            &conn,
+            "SELECT realm, name, fail_count, last_failed, last_success \
+             FROM auth_state ORDER BY realm, name",
+            Vec::new(),
+        )
+        .await
+        .map_err(map_err)?;
+        let rows = rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    text(row, 0)?,
+                    text(row, 1)?,
+                    int(row, 2)?,
+                    int(row, 3)?,
+                    int(row, 4)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        drop(conn);
+
+        for chunk in rows.chunks(1000) {
+            let chunk = Arc::new(chunk.to_vec());
+            self.write_tx(to, &self.0.metrics.auth_retries, |conn| {
+                let chunk = Arc::clone(&chunk);
+                Box::pin(async move {
+                    for (realm, name, fail_count, last_failed, last_success) in chunk.iter() {
+                        exec(
+                            conn,
+                            "INSERT INTO auth_state \
+                             (realm, name, fail_count, last_failed, last_success) \
+                             VALUES (?, ?, ?, ?, ?) \
+                             ON CONFLICT (realm, name) DO UPDATE SET \
+                             fail_count = excluded.fail_count, \
+                             last_failed = excluded.last_failed, \
+                             last_success = excluded.last_success",
+                            vec![
+                                Value::Text(realm.clone()),
+                                Value::Text(name.clone()),
+                                Value::Integer(*fail_count),
+                                Value::Integer(*last_failed),
+                                Value::Integer(*last_success),
+                            ],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// Health details: journal mode, schema version, checkpoint, last error.
@@ -419,6 +480,7 @@ impl AuthStateStore for TursoReplica {
         update: &AuthStateUpdate,
     ) -> Result<AuthState, StoreError> {
         let key = encode_name(name)?;
+        let _guard = self.0.auth_state_writes.read().await;
         let inner = self.current();
         let (key, realm, update) = (key, realm.to_string(), *update);
         self.write_tx(&inner, &self.0.metrics.auth_retries, |conn| {
@@ -578,6 +640,9 @@ impl RebuildWriter for TursoRebuild {
             file_name,
             snapshot_ts,
         } = self;
+        let _auth_state_guard = replica.0.auth_state_writes.write().await;
+        let old_current = replica.current();
+        replica.copy_auth_state(&old_current, &inner).await?;
         let ts = snapshot_ts;
         replica
             .write_tx(&inner, &replica.0.metrics.apply_retries, |conn| {
@@ -602,6 +667,7 @@ impl RebuildWriter for TursoRebuild {
             let mut current = replica.0.current.write().unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut *current, inner)
         };
+        drop(old_current);
         let old_name = old
             .path
             .file_name()

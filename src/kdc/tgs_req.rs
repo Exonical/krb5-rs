@@ -412,6 +412,10 @@ impl<S: PrincipalStore> Kdc<S> {
         };
         let tkt_realm_str = realm_string(&tkt_crealm);
         let subject_realm = realm_string(&subject_tkt.crealm);
+        let (subject_client_name, subject_client_realm) = match &s4u2self {
+            Some(s) => (s.user.clone(), s.user_realm.clone()),
+            None => (subject_tkt.cname.clone(), subject_realm.clone()),
+        };
 
         // The client is looked up only when it belongs to this realm, and
         // NO_AUTH_DATA_REQUIRED servers skip the lookup (do_tgs_req.c:757-779).
@@ -515,30 +519,59 @@ impl<S: PrincipalStore> Kdc<S> {
             )?;
         }
 
-        // Not in MIT: re-check the header ticket's client when it is local
-        // (docs/architecture/kdb.md §7.4), then the consistency gate over
-        // the client and the server.
-        let header_client = if client_realm == *realm {
-            match (&client, &s4u2self, proxy) {
-                (Some(c), None, false) => Some(c.clone()),
-                _ => self
-                    .lookup(&header.cname, &client_realm, STATUS)
-                    .await
-                    .ok()
-                    .flatten(),
+        let s4u_subject_client = if (s4u2self.is_some() || proxy) && subject_client_realm == *realm
+        {
+            match &client {
+                Some(c) => Some(c.clone()),
+                None => {
+                    self.lookup(
+                        &subject_client_name,
+                        &subject_client_realm,
+                        "LOOKING_UP_CLIENT",
+                    )
+                    .await?
+                }
             }
         } else {
             None
         };
+
+        // Not in MIT: re-check the header ticket's local client
+        // (docs/architecture/kdb.md §7.4).
+        let header_client = if client_realm == *realm {
+            match (&client, &s4u2self, proxy) {
+                (Some(c), None, false) => Some(c.clone()),
+                _ => {
+                    self.lookup(&header.cname, &client_realm, "LOOKING_UP_CLIENT")
+                        .await?
+                }
+            }
+        } else {
+            None
+        };
+        // MIT ignores a missing result from this lookup (do_tgs_req.c:774-778); this
+        // extension rejects a missing local client only when re-checking is on.
+        if client_realm == *realm && self.config.tgs_recheck_client && header_client.is_none() {
+            return Err(KdcError::new(
+                KDC_ERR_C_PRINCIPAL_UNKNOWN,
+                "CLIENT_NOT_FOUND",
+            ));
+        }
         if let Some(c) = &header_client {
             if self.config.tgs_recheck_client {
                 self.recheck_tgs_client(c, kdc_time).await?;
             }
         }
-        let mut involved: Vec<&PrincipalEntry> = Vec::new();
-        involved.extend(header_client.as_ref());
-        involved.push(&server);
-        self.consistency_gate(&involved).await?;
+        if proxy {
+            self.recheck_s4u2proxy_subject(
+                s4u_subject_client.as_ref(),
+                subject_client_realm == *realm,
+                kdc_time,
+            )
+            .await?;
+        }
+        self.gate_tgs_principals(header_client.as_ref(), s4u_subject_client.as_ref(), &server)
+            .await?;
 
         // get_ticket_flags / compute_ticket_times (do_tgs_req.c:809-852).
         let mut flags = get_ticket_flags(opts, client.as_ref(), &server, Some(header_flags));
@@ -791,5 +824,106 @@ impl<S: PrincipalStore> Kdc<S> {
             },
         });
         Ok(rasn::der::encode(&rep)?)
+    }
+}
+
+impl<S: PrincipalStore> Kdc<S> {
+    async fn recheck_s4u2proxy_subject(
+        &self,
+        subject: Option<&PrincipalEntry>,
+        is_local: bool,
+        now: i64,
+    ) -> Result<(), KdcError> {
+        if !is_local || !self.config.tgs_recheck_client {
+            return Ok(());
+        }
+        let subject = subject
+            .ok_or_else(|| KdcError::new(KDC_ERR_C_PRINCIPAL_UNKNOWN, "CLIENT_NOT_FOUND"))?;
+        self.recheck_tgs_client(subject, now).await
+    }
+
+    async fn gate_tgs_principals(
+        &self,
+        header_client: Option<&PrincipalEntry>,
+        subject_client: Option<&PrincipalEntry>,
+        server: &PrincipalEntry,
+    ) -> Result<(), KdcError> {
+        let mut involved = Vec::new();
+        involved.extend(header_client);
+        involved.extend(subject_client);
+        involved.push(server);
+        self.consistency_gate(&involved).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::kdc::{ConsistencyGate, GateDecision, KdcConfig, MemoryStore};
+
+    struct RecordingGate(Arc<Mutex<Vec<PrincipalName>>>);
+
+    impl ConsistencyGate for RecordingGate {
+        async fn check(&self, principals: &[&PrincipalEntry]) -> GateDecision {
+            self.0
+                .lock()
+                .expect("gate record lock")
+                .extend(principals.iter().map(|principal| principal.name.clone()));
+            GateDecision::Allow
+        }
+    }
+
+    fn principal(name: &str, attributes: super::super::PrincipalAttributes) -> PrincipalEntry {
+        let mut store = MemoryStore::new();
+        let name = PrincipalName::new_principal(name);
+        store
+            .add_random_key(name.clone(), "R", 1, &[18], attributes)
+            .expect("principal");
+        store.get(&name, "R").expect("entry")
+    }
+
+    #[tokio::test]
+    async fn tgs_gate_receives_a_local_s4u_subject() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kdc = Kdc::builder(KdcConfig::new("R"), MemoryStore::new())
+            .consistency(RecordingGate(Arc::clone(&seen)))
+            .build();
+        let subject = principal("impersonated", super::super::PrincipalAttributes::empty());
+        let server = principal("service", super::super::PrincipalAttributes::empty());
+
+        kdc.gate_tgs_principals(None, Some(&subject), &server)
+            .await
+            .expect("gate");
+
+        assert!(seen
+            .lock()
+            .expect("gate record lock")
+            .contains(&subject.name));
+    }
+
+    #[tokio::test]
+    async fn s4u2proxy_recheck_rejects_a_disabled_subject() {
+        let subject = principal(
+            "disabled",
+            super::super::PrincipalAttributes::DISALLOW_ALL_TIX,
+        );
+        let kdc = Kdc::new(KdcConfig::new("R"), MemoryStore::new());
+        let error = kdc
+            .recheck_s4u2proxy_subject(Some(&subject), true, chrono::Utc::now().timestamp())
+            .await
+            .expect_err("disabled subject must be rejected");
+        assert_eq!(error.code, KDC_ERR_CLIENT_REVOKED);
+    }
+
+    #[tokio::test]
+    async fn s4u2proxy_recheck_rejects_a_missing_local_subject() {
+        let kdc = Kdc::new(KdcConfig::new("R"), MemoryStore::new());
+        let error = kdc
+            .recheck_s4u2proxy_subject(None, true, chrono::Utc::now().timestamp())
+            .await
+            .expect_err("missing subject must be rejected");
+        assert_eq!(error.code, KDC_ERR_C_PRINCIPAL_UNKNOWN);
     }
 }

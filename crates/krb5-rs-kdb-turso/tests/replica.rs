@@ -684,6 +684,104 @@ async fn an_apply_and_an_auth_state_write_race_without_losing_either() {
     );
 }
 
+#[tokio::test]
+async fn recorded_auth_failures_survive_a_rebuild() {
+    let dir = TmpDir::new();
+    let r = open(&dir.0).await;
+    let who = name("victim");
+    for stamp in [100, 200] {
+        AuthStateStore::apply(
+            &r,
+            &who,
+            REALM,
+            &AuthStateUpdate::Failure {
+                stamp,
+                failcnt_interval: 0,
+                last_admin_unlock: None,
+            },
+        )
+        .await
+        .expect("record failure");
+    }
+    let before = r.auth_state(&who, REALM).await.expect("state before");
+    assert_eq!((before.fail_count, before.last_failed), (2, 200));
+
+    let mut rebuild = r.begin_rebuild(ts(100)).await.expect("begin rebuild");
+    rebuild.write(Vec::new()).await.expect("empty snapshot");
+    rebuild.commit().await.expect("commit rebuild");
+
+    let after = r.auth_state(&who, REALM).await.expect("state after");
+    assert_eq!(after.fail_count, before.fail_count);
+    assert_eq!(after.last_failed, before.last_failed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_auth_failures_racing_a_rebuild_are_all_preserved() {
+    let dir = TmpDir::new();
+    let options = TursoOptions {
+        max_retries: 128,
+        ..TursoOptions::default()
+    };
+    let r = open_with(&dir.0, options).await;
+    let who = name("racer");
+    for stamp in 0..7 {
+        AuthStateStore::apply(
+            &r,
+            &who,
+            REALM,
+            &AuthStateUpdate::Failure {
+                stamp,
+                failcnt_interval: 0,
+                last_admin_unlock: None,
+            },
+        )
+        .await
+        .expect("seed failure");
+    }
+
+    let mut rebuild = r.begin_rebuild(ts(100)).await.expect("begin rebuild");
+    rebuild.write(Vec::new()).await.expect("empty snapshot");
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(52));
+    let mut writers = Vec::new();
+    for _ in 0..50 {
+        let (r, who, barrier) = (r.clone(), who.clone(), Arc::clone(&barrier));
+        writers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            AuthStateStore::apply(
+                &r,
+                &who,
+                REALM,
+                &AuthStateUpdate::Failure {
+                    stamp: 10,
+                    failcnt_interval: 0,
+                    last_admin_unlock: None,
+                },
+            )
+            .await
+            .expect("concurrent failure");
+        }));
+    }
+    let commit_barrier = Arc::clone(&barrier);
+    let commit = tokio::spawn(async move {
+        commit_barrier.wait().await;
+        rebuild.commit().await.expect("commit rebuild");
+    });
+    barrier.wait().await;
+    for writer in writers {
+        writer.await.expect("writer task");
+    }
+    commit.await.expect("rebuild task");
+
+    assert_eq!(
+        r.auth_state(&who, REALM)
+            .await
+            .expect("final state")
+            .fail_count,
+        57
+    );
+}
+
 // ------------------------------------------------------------ rebuild
 
 fn files_of(dir: &TmpDir) -> Vec<String> {

@@ -33,7 +33,7 @@ use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, FileStore};
 use krb5_rs::kdc::{
     default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
     MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig, RequestLogger,
-    ServeOptions, StoreError,
+    ServeOptions, StoreError, StoreErrorKind,
 };
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
@@ -588,9 +588,24 @@ async fn cockroach_mode(
     ))
 }
 
-/// Load kdc.conf and open the database. A replica without a local database
-/// pulls one first (retrying until the primary answers) and only then lets
-/// the caller bind its listeners; `None` means shutdown arrived meanwhile.
+async fn initial_pull_or_shutdown(
+    client: &PropClientConfig,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> std::io::Result<bool> {
+    let mut rx = shutdown_rx.clone();
+    let pulled = tokio::select! {
+        result = initial_pull(client, &mut rx) => result,
+        signal = termination_signal() => {
+            info!("received {}, exiting", signal?);
+            None
+        }
+    };
+    Ok(pulled.is_some())
+}
+
+/// Load kdc.conf and open the database. A replica without a valid local
+/// database pulls one first (retrying until the primary answers) and only then
+/// lets the caller bind its listeners; `None` means shutdown arrived meanwhile.
 async fn config_mode(
     cli: &Cli,
     krb5_conf_explicit: bool,
@@ -640,7 +655,7 @@ async fn config_mode(
     }
 
     let mut parts = PropParts::default();
-    if cfg.propagation.is_replica() {
+    let replica_client = if cfg.propagation.is_replica() {
         let client = replica_config(&cfg, &realm, &master)?;
         if !cfg.database_name.exists() {
             info!(
@@ -648,22 +663,33 @@ async fn config_mode(
                 cfg.database_name.display(),
                 client.primary
             );
-            let mut rx = shutdown_rx.clone();
-            let pulled = tokio::select! {
-                r = initial_pull(&client, &mut rx) => r,
-                signal = termination_signal() => {
-                    info!("received {}, exiting", signal?);
-                    None
-                }
-            };
-            if pulled.is_none() {
+            if !initial_pull_or_shutdown(&client, shutdown_rx).await? {
                 return Ok(None);
             }
         }
-        parts.replica = Some(client);
-    }
+        Some(client)
+    } else {
+        None
+    };
 
-    let store = Arc::new(FileStore::open(&cfg.database_name, &master).map_err(io_err)?);
+    let store = match FileStore::open(&cfg.database_name, &master) {
+        Ok(store) => Arc::new(store),
+        Err(error) if replica_client.is_some() && error.kind() == StoreErrorKind::Corrupt => {
+            let client = replica_client.as_ref().expect("replica client is present");
+            warn!(
+                "local replica database {} is damaged; pulling a fresh copy from {}: {}",
+                cfg.database_name.display(),
+                client.primary,
+                error.message()
+            );
+            if !initial_pull_or_shutdown(client, shutdown_rx).await? {
+                return Ok(None);
+            }
+            Arc::new(FileStore::open(&cfg.database_name, &master).map_err(io_err)?)
+        }
+        Err(error) => return Err(io_err(error)),
+    };
+    parts.replica = replica_client;
     if !cfg.propagation.listen.is_empty() {
         let service = principal(&cfg.propagation.service, &realm)?;
         if store

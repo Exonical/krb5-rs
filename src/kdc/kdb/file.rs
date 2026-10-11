@@ -140,11 +140,11 @@ fn read_file(path: &Path) -> Result<(Stamp, KdbFile), StoreError> {
 fn parse_image(bytes: &[u8]) -> Result<KdbFile, StoreError> {
     let body = bytes
         .strip_prefix(MAGIC.as_slice())
-        .ok_or_else(|| err("not a krb5-rs database (bad magic)"))?;
-    let file: KdbFile =
-        rasn::der::decode(body).map_err(|e| err(format!("corrupt database: {e}")))?;
+        .ok_or_else(|| StoreError::corrupt("not a krb5-rs database (bad magic)"))?;
+    let file: KdbFile = rasn::der::decode(body)
+        .map_err(|e| StoreError::corrupt(format!("corrupt database: {e}")))?;
     if file.version != VERSION {
-        return Err(err(format!(
+        return Err(StoreError::corrupt(format!(
             "unsupported database version {}",
             file.version
         )));
@@ -260,6 +260,20 @@ impl FileStore {
     pub fn open(path: &Path, master: &EncryptionKey) -> Result<Self, StoreError> {
         let (_, file) = read_file(path)?;
         let realm = String::from_utf8_lossy(file.realm.as_bytes()).to_string();
+        let master_name = master_principal()?;
+        let km = file
+            .principals
+            .iter()
+            .find(|p| p.name == master_name && p.realm.as_bytes() == realm.as_bytes())
+            .ok_or_else(|| err("database has no K/M principal"))?;
+        let stored = km.keys.first().ok_or_else(|| err("K/M has no key"))?;
+        let stored_master = decrypt_key(master, stored.enctype, stored.enc_key.as_ref())
+            .map_err(|_| err("incorrect master key"))?;
+        if stored_master.key_bytes() != master.key_bytes()
+            || stored_master.keytype != master.keytype
+        {
+            return Err(err("incorrect master key"));
+        }
         let store = Self {
             path: path.to_path_buf(),
             realm,
@@ -267,13 +281,6 @@ impl FileStore {
             cache: RwLock::new(Cache::default()),
         };
         store.refresh(true)?;
-        let km = store
-            .get_record(&master_principal()?, &store.realm)?
-            .ok_or_else(|| err("database has no K/M principal"))?;
-        let stored = km.entry.keys.first().ok_or_else(|| err("K/M has no key"))?;
-        if stored.key.key_bytes() != master.key_bytes() || stored.key.keytype != master.keytype {
-            return Err(err("incorrect master key"));
-        }
         Ok(store)
     }
 
@@ -859,5 +866,35 @@ mod tests {
             .get_record(&PrincipalName::new_principal("a"), "R")
             .expect("record")
             .is_some());
+    }
+
+    #[test]
+    fn a_truncated_image_is_corrupt() {
+        let path = temp("truncated");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend([0x30, 0x82, 0x01]);
+        std::fs::write(&path, bytes).expect("write truncated image");
+
+        let error = match FileStore::open(&path, &master) {
+            Ok(_) => panic!("truncated database unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StoreErrorKind::Corrupt);
+    }
+
+    #[test]
+    fn an_incorrect_master_key_is_a_backend_error() {
+        let path = temp("wrong-master");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        drop(FileStore::create(&path, "R", &master).expect("create"));
+        let wrong = master_key_from_password("R", "wrong", 18).expect("wrong key");
+
+        let error = match FileStore::open(&path, &wrong) {
+            Ok(_) => panic!("database opened with wrong master key"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StoreErrorKind::Backend);
+        assert!(error.message().contains("incorrect master key"));
     }
 }

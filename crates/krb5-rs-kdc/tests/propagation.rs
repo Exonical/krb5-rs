@@ -290,6 +290,79 @@ async fn replica_pulls_follows_the_primary_and_is_read_only() {
     }
 }
 
+#[tokio::test]
+async fn a_replica_with_a_corrupt_database_pulls_and_serves_a_fresh_copy() {
+    let dir = TempDir::new("corrupt");
+    let (kdc_port, kprop_port) = (free_port(), free_port());
+    let primary_conf = conf(
+        &dir,
+        "primary",
+        &format!("  kprop_listen = 127.0.0.1:{kprop_port}"),
+    );
+    kdb_ok(&primary_conf, &["create", "-s"], "master\n");
+    kdb_ok(
+        &primary_conf,
+        &["addprinc", "-randkey", "kprop/primary"],
+        "",
+    );
+    kdb_ok(
+        &primary_conf,
+        &["addprinc", "-randkey", "kprop/replica"],
+        "",
+    );
+    kdb_ok(&primary_conf, &["addprinc", "alice"], "alice-pw\n");
+    let keytab = dir.path("replica.keytab");
+    kdb_ok(
+        &primary_conf,
+        &[
+            "ktadd",
+            "-norandkey",
+            "-k",
+            &keytab.to_string_lossy(),
+            "kprop/replica",
+        ],
+        "",
+    );
+
+    let replica_conf = conf(
+        &dir,
+        "replica",
+        &format!(
+            "  kprop_primary = 127.0.0.1:{kprop_port}\n  kprop_primary_kdc = 127.0.0.1:{kdc_port}\n  \
+             kprop_keytab = {}\n  kprop_poll_interval = 1s",
+            slash(&keytab)
+        ),
+    );
+    std::fs::copy(dir.path("primary.stash"), dir.path("replica.stash")).expect("copy stash");
+    std::fs::write(dir.path("replica.db"), b"truncated database image").expect("corrupt replica");
+
+    #[allow(unused_mut)]
+    let mut primary = Daemon::start(&primary_conf, &format!("127.0.0.1:{kdc_port}"));
+    primary.wait_for("(kprop)");
+    #[allow(unused_mut)]
+    let mut replica = Daemon::start(&replica_conf, "127.0.0.1:0");
+    replica.wait_for("(tcp)");
+    let lines = replica.snapshot();
+    let recovered = lines
+        .iter()
+        .position(|line| line.contains("installed database serial"));
+    let listening = lines.iter().position(|line| line.contains("listening on"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("local replica database") && line.contains("damaged")),
+        "{lines:?}"
+    );
+    assert!(recovered.is_some() && recovered < listening, "{lines:?}");
+    assert!(login(replica.listening("(tcp)"), "alice", "alice-pw").await);
+
+    #[cfg(unix)]
+    {
+        assert!(terminate(&mut replica.child).success());
+        assert!(terminate(&mut primary.child).success());
+    }
+}
+
 #[test]
 fn a_replica_with_no_database_and_no_primary_waits_and_exits_cleanly_on_sigterm() {
     let dir = TempDir::new("wait");

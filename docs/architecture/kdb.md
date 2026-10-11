@@ -210,12 +210,15 @@ seconds of propagation latency, which the consistency policy (§7) accounts for.
    - **Complete:** the timestamp cache and closed timestamps guarantee that
      nothing can later commit into those spans at a timestamp ≤ T.
    - **Cheap:** the scan is limited to D plus the poll window.
-4. **Applying a batch.** For each batch, the KDC reads every affected entity
-   row, including tombstones, at the same T, with the row's MVCC timestamp as
-   its version. It applies them in one Turso transaction that also sets
-   `checkpoint_ts = T`. All rows of one admin transaction share its commit
-   timestamp, so logically related changes land together. A truncated batch
-   never splits one commit timestamp.
+4. **Applying a batch.** For an untruncated poll, the KDC reads every affected
+   entity row, including tombstones, at T, with the row's MVCC timestamp as
+   its version. For a truncated poll, it selects the log rows and cutoff in
+   the T1 read at T, then materializes the entity state in a second read-only
+   transaction `AS OF SYSTEM TIME cutoff`. Both paths apply changes in one
+   Turso transaction that also sets the checkpoint to the batch's `upto`.
+   All rows of one admin transaction share its commit timestamp, so logically
+   related changes land together. A truncated batch never splits one commit
+   timestamp.
 5. **Version check.** Rows are applied only if the incoming version is greater
    than the local version. This makes apply idempotent, handles duplicates and
    out-of-order re-reads, and stops stale overwrites.
@@ -260,7 +263,7 @@ seconds of propagation latency, which the consistency policy (§7) accounts for.
 **Caveats found while building it:**
 
 - A follower read is about 4.2 s in the past, so right after a database, its tables, columns or grants are created they do not exist at the read timestamp (SQLSTATE 3D000, 42P01, 42501, 42703). `changes_since` and `snapshot` then read once at the present; a real error repeats there and is returned. A batch whose read timestamp is not above the caller's checkpoint is empty, so the checkpoint never goes backwards after such a fallback.
-- When `changes_since` truncates at `limit`, the entities are still read at the full read timestamp `T`, so an entity may arrive with a version newer than the batch's `upto`; it appears again in a later batch and the replica's version check makes that idempotent.
+- When `changes_since` truncates at `limit`, it materializes every entity at the batch's `upto` in a second read-only transaction. Entity versions therefore cannot be newer than the batch checkpoint, even when a later commit changed an entity also present in the truncated batch.
 - The `kdc_replica` role inserts log rows with UUID ids and transaction ids; it has no UPDATE or DELETE privilege on the log. Transaction markers are local per-attempt rows indexed by logical transaction id.
 
 ### Replication engine and consistency gates
@@ -299,9 +302,14 @@ rejects it as soon as CockroachDB reports the disable.
 
 Every KDC upserts `replica_status(kdc_id, region, applied_ts, seen_at)` every
 few seconds. Lag is `now - applied_ts`, exported as a metric (§9). The admin CLI
-can wait on these heartbeats (`krb5-rs-kdb replication wait-applied --since <ts>`) to report
-how many KDCs have applied a change. A committed transaction is **not** treated
-as applied anywhere until the heartbeats show it.
+can wait on these heartbeats to report how many live KDCs have applied a
+change; use `krb5-rs-kdb replication wait-applied --since <ts> --live-within 2m`
+to choose a 2m live window (the default). For all serving KDCs to be represented, use
+`live_within >= max_staleness + heartbeat_interval`. A KDC unable to reach
+CockroachDB for that long has already failed closed. A KDC whose heartbeats
+fail while its replication polls succeed is excluded from the live count, but
+it still converges within `max_staleness`. A committed transaction is **not**
+treated as applied anywhere until the heartbeats show it.
 
 ### Transport security
 

@@ -7,7 +7,9 @@
 use chrono::{DateTime, Timelike, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use krb5_rs::crypto::{find_etype, key_usage};
-use krb5_rs::kdc::{Kdc, KdcConfig, MemoryStore, PrincipalAttributes};
+use krb5_rs::kdc::{
+    ConsistencyGate, GateDecision, Kdc, KdcConfig, MemoryStore, PrincipalAttributes,
+};
 use krb5_rs::pac::{ticket_pac, verify_ticket_pac, DelegationInfo, PAC_DELEGATION_INFO};
 use krb5_rs::protocol::ap::{decrypt_ticket, encrypt_ticket_part};
 use krb5_rs::protocol::{
@@ -17,6 +19,7 @@ use krb5_rs::types::*;
 use krb5_rs::Krb5Error;
 use md5::{Digest, Md5};
 use rasn::types::{BitString, GeneralString, OctetString};
+use std::sync::{Arc, Mutex};
 
 const REALM: &str = "S4U.REALM";
 const PW: &str = "s4u-password";
@@ -76,6 +79,30 @@ struct Fix {
 }
 
 async fn fixture(cfg: Cfg) -> Fix {
+    fixture_with_gate(cfg, AllowGate).await
+}
+
+struct AllowGate;
+
+impl ConsistencyGate for AllowGate {
+    async fn check(&self, _principals: &[&PrincipalEntry]) -> GateDecision {
+        GateDecision::Allow
+    }
+}
+
+struct RecordingGate(Arc<Mutex<Vec<PrincipalName>>>);
+
+impl ConsistencyGate for RecordingGate {
+    async fn check(&self, principals: &[&PrincipalEntry]) -> GateDecision {
+        self.0
+            .lock()
+            .expect("gate record lock")
+            .extend(principals.iter().map(|principal| principal.name.clone()));
+        GateDecision::Allow
+    }
+}
+
+async fn fixture_with_gate(cfg: Cfg, gate: impl ConsistencyGate + 'static) -> Fix {
     let mut store = MemoryStore::new();
     let none = PrincipalAttributes::empty();
     store
@@ -117,7 +144,7 @@ async fn fixture(cfg: Cfg) -> Fix {
     let mut config = KdcConfig::new(REALM);
     config.max_renewable_life = std::time::Duration::from_secs(7 * 86400);
     Fix {
-        kdc: Kdc::new(config, store),
+        kdc: Kdc::builder(config, store).consistency(gate).build(),
         tgs_key,
         front_key,
         back_key,
@@ -709,6 +736,21 @@ async fn s4u2proxy_traditional_delegation_issues_ticket_for_the_user_with_delega
     // The ticket keeps the evidence ticket's authtime (do_tgs_req.c:750).
     let ev_part = decrypt_ticket(&f.front_key, &ev.ticket).expect("evidence");
     assert_eq!(part.authtime, ev_part.authtime);
+}
+
+#[tokio::test]
+async fn s4u2proxy_consistency_gate_includes_the_impersonated_client() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let f = fixture_with_gate(proxy_cfg(), RecordingGate(Arc::clone(&seen))).await;
+    let (tgt, ev) = evidence(&f).await;
+    seen.lock().expect("gate record lock").clear();
+
+    f.s4u2proxy(&tgt, &ev, &back()).await.expect("S4U2Proxy");
+
+    assert!(
+        seen.lock().expect("gate record lock").contains(&alice()),
+        "gate saw {seen:?}"
+    );
 }
 
 #[tokio::test]

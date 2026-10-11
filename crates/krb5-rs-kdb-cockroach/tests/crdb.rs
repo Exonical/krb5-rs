@@ -1310,6 +1310,159 @@ async fn one_commit_timestamp_is_never_split_across_batches() {
     db.drop_db().await;
 }
 
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn a_truncated_batch_materializes_entities_at_its_checkpoint() {
+    use krb5_rs::kdc::replication::ReplicaSink;
+    use krb5_rs_kdb_cockroach::ReplicationRead;
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    let (db, store) = TestDb::with_realm("truncatedmaterialize").await;
+    let mut config = db.replica();
+    config.replication_read = ReplicationRead::Present;
+    let source = CockroachStore::connect(config, master(), REALM)
+        .await
+        .expect("present-time source");
+    let dir = std::env::temp_dir().join(format!("krb5rs_crdb_truncated_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("replica directory");
+    let replica = TursoReplica::open(&dir, TursoOptions::default(), master())
+        .await
+        .expect("open replica");
+
+    let initial = source
+        .poll(ReplicationTs::ZERO, 1000)
+        .await
+        .expect("initial poll");
+    assert!(!initial.truncated);
+    let s0 = initial.batch.upto;
+    ReplicaSink::apply(&replica, initial.batch)
+        .await
+        .expect("seed replica");
+
+    let admin = ops(&store);
+    let a = name("a");
+    let b = name("b");
+    admin
+        .add_principal(
+            &a,
+            REALM,
+            Some("a-password"),
+            &PrincipalOptions {
+                max_life: Some(Some(Duration::from_secs(3600))),
+                ..plain()
+            },
+        )
+        .await
+        .expect("add a");
+    let after_a = source.poll(s0, 1000).await.expect("poll after a");
+    let t1 = after_a
+        .batch
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            Change::UpsertPrincipal { principal, version } if principal.name == a => {
+                assert_eq!(principal.max_life, Some(3600));
+                Some(*version)
+            }
+            _ => None,
+        })
+        .expect("a at t1");
+
+    admin
+        .add_principal(&b, REALM, Some("b-password"), &plain())
+        .await
+        .expect("add b");
+    admin
+        .modify_principal(
+            &a,
+            REALM,
+            &PrincipalOptions {
+                max_life: Some(Some(Duration::from_secs(7200))),
+                ..plain()
+            },
+        )
+        .await
+        .expect("modify a");
+
+    let all = source.poll(s0, 1000).await.expect("complete preview");
+    let mut t2 = None;
+    let mut t3 = None;
+    for change in &all.batch.changes {
+        match change {
+            Change::UpsertPrincipal { principal, version } if principal.name == b => {
+                t2 = Some(*version);
+            }
+            Change::UpsertPrincipal { principal, version } if principal.name == a => {
+                assert_eq!(principal.max_life, Some(7200));
+                t3 = Some(*version);
+            }
+            _ => {}
+        }
+    }
+    let t2 = t2.expect("b at t2");
+    let t3 = t3.expect("a at t3");
+    assert!(t1 < t2 && t2 < t3);
+
+    let first = source.poll(s0, 1).await.expect("truncated poll");
+    assert!(first.truncated);
+    assert_eq!(first.batch.upto, t1);
+    assert!(
+        first
+            .batch
+            .changes
+            .iter()
+            .all(|change| change.version() <= first.batch.upto),
+        "{:?}",
+        first.batch
+    );
+    assert!(matches!(
+        first.batch.changes.as_slice(),
+        [Change::UpsertPrincipal { principal, version }]
+            if principal.name == a
+                && *version == t1
+                && principal.max_life == Some(3600)
+    ));
+    ReplicaSink::apply(&replica, first.batch.clone())
+        .await
+        .expect("apply t1");
+
+    let second = source
+        .poll(first.batch.upto, 1)
+        .await
+        .expect("poll after t1");
+    assert!(second.truncated);
+    assert_eq!(second.batch.upto, t2);
+    assert!(matches!(
+        second.batch.changes.as_slice(),
+        [Change::UpsertPrincipal { principal, version }]
+            if principal.name == b && *version == t2
+    ));
+    ReplicaSink::apply(&replica, second.batch.clone())
+        .await
+        .expect("apply t2");
+
+    let third = source
+        .poll(second.batch.upto, 1)
+        .await
+        .expect("poll after t2");
+    assert!(!third.truncated);
+    assert!(matches!(
+        third.batch.changes.as_slice(),
+        [Change::UpsertPrincipal { principal, version }]
+            if principal.name == a
+                && *version == t3
+                && principal.max_life == Some(7200)
+    ));
+    ReplicaSink::apply(&replica, third.batch)
+        .await
+        .expect("apply t3");
+    assert_principal_mirror(&store, &replica).await;
+
+    db.drop_db().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the CockroachDB test cluster"]
 async fn a_snapshot_plus_changes_since_equals_the_final_state_under_concurrent_writes() {
@@ -1725,12 +1878,13 @@ async fn heartbeats_drive_wait_applied() {
     let target = ReplicationTs::new(2_000, 0);
     assert_eq!(
         store
-            .wait_applied(target, Duration::from_millis(300))
+            .wait_applied(target, Duration::from_millis(300), Duration::from_secs(120),)
             .await
             .expect("wait"),
         krb5_rs_kdb_cockroach::WaitOutcome {
             applied: 0,
-            total: 0
+            total: 0,
+            stale: 0,
         },
         "nobody has reported"
     );
@@ -1741,10 +1895,11 @@ async fn heartbeats_drive_wait_applied() {
         .await
         .expect("hb");
     let out = store
-        .wait_applied(target, Duration::from_millis(500))
+        .wait_applied(target, Duration::from_millis(500), Duration::from_secs(120))
         .await
         .expect("wait");
     assert_eq!((out.applied, out.total), (1, 2));
+    assert_eq!(out.stale, 0);
     assert!(!out.complete());
     let statuses = store.replica_statuses().await.expect("status");
     assert_eq!(statuses.len(), 2);
@@ -1752,7 +1907,11 @@ async fn heartbeats_drive_wait_applied() {
     // The slow KDC catches up while we wait.
     let waiter = {
         let store = store.clone();
-        tokio::spawn(async move { store.wait_applied(target, Duration::from_secs(10)).await })
+        tokio::spawn(async move {
+            store
+                .wait_applied(target, Duration::from_secs(10), Duration::from_secs(120))
+                .await
+        })
     };
     tokio::time::sleep(Duration::from_millis(500)).await;
     b.heartbeat("kdc-b", rb, ReplicationTs::new(2_500, 0))
@@ -1760,6 +1919,41 @@ async fn heartbeats_drive_wait_applied() {
         .expect("hb");
     let out = waiter.await.expect("task").expect("wait");
     assert!(out.complete(), "{out:?}");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn wait_applied_ignores_stale_heartbeat_rows() {
+    use krb5_rs_kdb_cockroach::run_sql;
+
+    let (db, store) = TestDb::with_realm("staleheartbeat").await;
+    let target = ReplicationTs::new(2_000, 0);
+    store
+        .heartbeat("kdc-old", "california", ReplicationTs::new(3_000, 0))
+        .await
+        .expect("old heartbeat");
+    run_sql(
+        &db.root(),
+        "UPDATE replica_status SET seen_at = now() - INTERVAL '10 minutes' \
+         WHERE kdc_id = 'kdc-old'",
+    )
+    .await
+    .expect("age heartbeat");
+
+    let out = store
+        .wait_applied(target, Duration::ZERO, Duration::from_secs(60))
+        .await
+        .expect("wait");
+    assert_eq!(
+        out,
+        krb5_rs_kdb_cockroach::WaitOutcome {
+            applied: 0,
+            total: 0,
+            stale: 1,
+        }
+    );
+    assert!(!out.complete());
     db.drop_db().await;
 }
 

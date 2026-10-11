@@ -95,14 +95,16 @@ pub struct ReplicaStatus {
 /// Result of [`CockroachStore::wait_applied`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaitOutcome {
-    /// KDCs whose checkpoint is at or past the timestamp.
+    /// Live KDCs whose checkpoint is at or past the timestamp.
     pub applied: usize,
-    /// KDCs that sent a heartbeat at all.
+    /// KDCs with a heartbeat within the live window.
     pub total: usize,
+    /// KDCs ignored because their last heartbeat is outside the live window.
+    pub stale: usize,
 }
 
 impl WaitOutcome {
-    /// Every known KDC has applied the timestamp.
+    /// Every live KDC has applied the timestamp, and at least one is live.
     pub fn complete(&self) -> bool {
         self.total > 0 && self.applied == self.total
     }
@@ -666,21 +668,42 @@ impl CockroachStore {
             .collect()
     }
 
-    /// Poll the heartbeats until every KDC is at or past `since`, or
-    /// `timeout` elapses; reports how many are. A committed transaction counts
-    /// as applied nowhere until a heartbeat shows it.
+    /// Poll the heartbeats until every KDC seen within `live_within` is at or
+    /// past `since`, or `timeout` elapses. Stale heartbeat rows are reported
+    /// separately and do not count as live KDCs.
     pub async fn wait_applied(
         &self,
         since: ReplicationTs,
         timeout: std::time::Duration,
+        live_within: std::time::Duration,
     ) -> Result<WaitOutcome, StoreError> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let live_millis = i64::try_from(live_within.as_millis()).unwrap_or(i64::MAX);
         loop {
-            let all = self.replica_statuses().await?;
-            let outcome = WaitOutcome {
-                applied: all.iter().filter(|s| s.applied_ts >= since).count(),
-                total: all.len(),
+            let rows = self
+                .db
+                .rows(
+                    "SELECT applied_ts::STRING, \
+                     now() - seen_at <= ($1::INT8 * INTERVAL '1 millisecond') \
+                     FROM replica_status ORDER BY region, kdc_id",
+                    &[&live_millis],
+                )
+                .await?;
+            let mut outcome = WaitOutcome {
+                applied: 0,
+                total: 0,
+                stale: 0,
             };
+            for row in &rows {
+                if row.get::<_, bool>(1) {
+                    outcome.total += 1;
+                    if ts_of(&row.get::<_, String>(0))? >= since {
+                        outcome.applied += 1;
+                    }
+                } else {
+                    outcome.stale += 1;
+                }
+            }
             if outcome.complete() || tokio::time::Instant::now() >= deadline {
                 return Ok(outcome);
             }
@@ -1341,6 +1364,126 @@ fn log_row(r: &Row) -> Result<LogRow, StoreError> {
     })
 }
 
+enum PollMaterialization {
+    Complete(Vec<Change>),
+    Truncated(Vec<LogRow>),
+}
+
+struct PollRead {
+    upto: ReplicationTs,
+    materialization: PollMaterialization,
+    source_now: ReplicationTs,
+    truncated: bool,
+}
+
+async fn materialize_changes(tx: &Tx, rows: &[LogRow]) -> Result<Vec<Change>, TxError> {
+    // The state of each changed entity at the same read timestamp; absent
+    // means deleted, with the log row's version.
+    let mut seen: Vec<(String, String, String)> = Vec::new();
+    let mut changes = Vec::new();
+    for r in rows.iter().rev() {
+        let id = (r.entity.clone(), r.realm.clone(), r.key.clone());
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        let fallback_version = rows
+            .iter()
+            .filter(|o| o.entity == r.entity && o.realm == r.realm && o.key == r.key)
+            .map(|o| o.mvcc_ts)
+            .max()
+            .unwrap_or(r.mvcc_ts);
+        changes.push(match r.entity.as_str() {
+            "principal" => {
+                let found = tx
+                    .query(
+                        &principal_sql("WHERE p.realm = $1 AND p.name = $2"),
+                        &[&r.realm, &r.key],
+                    )
+                    .await?;
+                match stored_principals(&found)?.into_iter().next() {
+                    Some((_, version, true)) => Change::DeletePrincipal {
+                        realm: r.realm.clone(),
+                        name: decode_principal_key(&r.key, 1)?,
+                        version,
+                    },
+                    Some((principal, version, false)) => {
+                        Change::UpsertPrincipal { principal, version }
+                    }
+                    None => Change::DeletePrincipal {
+                        realm: r.realm.clone(),
+                        name: decode_principal_key(&r.key, 1)?,
+                        version: fallback_version,
+                    },
+                }
+            }
+            "policy" => {
+                let found = tx
+                    .query(
+                        &format!("SELECT {POLICY_COLUMNS} FROM policies WHERE name = $1"),
+                        &[&r.key],
+                    )
+                    .await?;
+                match found.first() {
+                    Some(row) => {
+                        let (policy, version, deleted) = policy_of(row)?;
+                        if deleted {
+                            Change::DeletePolicy {
+                                name: r.key.clone(),
+                                version,
+                            }
+                        } else {
+                            Change::UpsertPolicy { policy, version }
+                        }
+                    }
+                    None => Change::DeletePolicy {
+                        name: r.key.clone(),
+                        version: fallback_version,
+                    },
+                }
+            }
+            "lockout" => {
+                let found = tx
+                    .query(
+                        &format!(
+                            "SELECT {LOCKOUT_COLUMNS} FROM lockouts \
+                             WHERE realm = $1 AND name = $2"
+                        ),
+                        &[&r.realm, &r.key],
+                    )
+                    .await?;
+                match found.first() {
+                    Some(row) => {
+                        let (record, version, deleted) = lockout_of(row)?;
+                        if deleted {
+                            Change::DeleteLockout {
+                                realm: r.realm.clone(),
+                                name: decode_principal_key(&r.key, 1)?,
+                                version,
+                            }
+                        } else {
+                            Change::UpsertLockout { record, version }
+                        }
+                    }
+                    None => Change::DeleteLockout {
+                        realm: r.realm.clone(),
+                        name: decode_principal_key(&r.key, 1)?,
+                        version: fallback_version,
+                    },
+                }
+            }
+            other => {
+                return Err(
+                    StoreError::corrupt(format!("unknown replication entity {other:?}")).into(),
+                )
+            }
+        });
+    }
+    // `rev()` above walked newest first; keep commit order.
+    changes.reverse();
+    Ok(changes)
+}
+
 const LOG_COLUMNS: &str = "crdb_internal_mvcc_timestamp::STRING, entity, realm, \"key\", op";
 
 impl ReplicationSource for CockroachStore {
@@ -1379,214 +1522,134 @@ impl ReplicationSource for CockroachStore {
         let since = &since;
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX - 1);
         let fetch_limit = limit.saturating_add(1);
-        self.read_tx(|tx| {
-            Box::pin(async move {
-                let upto_read = tx.ts;
-                let meta = tx
-                    .query_one(
-                        "SELECT pruned_before::STRING, bucket_width_seconds, \
+        let read = self
+            .read_tx(|tx| {
+                Box::pin(async move {
+                    let upto_read = tx.ts;
+                    let meta = tx
+                        .query_one(
+                            "SELECT pruned_before::STRING, bucket_width_seconds, \
                          transaction_timeout_ms FROM replication_meta WHERE id = 1",
-                        &[],
-                    )
-                    .await?;
-                let watermark = ts_of(&meta.get::<_, String>(0))?;
-                let bucket_width: i64 = meta.get(1);
-                let transaction_timeout_ms: i64 = meta.get(2);
-                if bucket_width <= 0 || transaction_timeout_ms <= 0 {
-                    return Err(StoreError::corrupt(
-                        "replication bucket width and transaction timeout must be positive",
-                    )
-                    .into());
-                }
-                if since_ts < watermark {
-                    return Err(StoreError::stale(
-                        "replication checkpoint is below pruned_before; rebuild required",
-                    )
-                    .into());
-                }
-                if upto_read <= since_ts {
-                    // A read timestamp at or below the checkpoint (a follower
-                    // read right after a fallback to the present) knows
-                    // nothing new, and the checkpoint must not go backwards.
-                    return Ok(PollResult {
-                        batch: ChangeBatch {
+                            &[],
+                        )
+                        .await?;
+                    let watermark = ts_of(&meta.get::<_, String>(0))?;
+                    let bucket_width: i64 = meta.get(1);
+                    let transaction_timeout_ms: i64 = meta.get(2);
+                    if bucket_width <= 0 || transaction_timeout_ms <= 0 {
+                        return Err(StoreError::corrupt(
+                            "replication bucket width and transaction timeout must be positive",
+                        )
+                        .into());
+                    }
+                    if since_ts < watermark {
+                        return Err(StoreError::stale(
+                            "replication checkpoint is below pruned_before; rebuild required",
+                        )
+                        .into());
+                    }
+                    if upto_read <= since_ts {
+                        // A read timestamp at or below the checkpoint (a follower
+                        // read right after a fallback to the present) knows
+                        // nothing new, and the checkpoint must not go backwards.
+                        return Ok(PollRead {
                             upto: since_ts,
-                            changes: Vec::new(),
-                        },
-                        source_now: tx.source_now,
-                        truncated: false,
-                    });
-                }
-                let t = upto_read.to_string();
-                let (first_bucket, last_bucket) =
-                    scan_buckets(since_ts, upto_read, transaction_timeout_ms, bucket_width);
-                let first = tx
-                    .query(
-                        &format!(
-                            "SELECT {LOG_COLUMNS} FROM replication_log \
+                            materialization: PollMaterialization::Complete(Vec::new()),
+                            source_now: tx.source_now,
+                            truncated: false,
+                        });
+                    }
+                    let t = upto_read.to_string();
+                    let (first_bucket, last_bucket) =
+                        scan_buckets(since_ts, upto_read, transaction_timeout_ms, bucket_width);
+                    let first = tx
+                        .query(
+                            &format!(
+                                "SELECT {LOG_COLUMNS} FROM replication_log \
                              WHERE bucket BETWEEN $1 AND $2 \
                              AND crdb_internal_mvcc_timestamp::STRING::DECIMAL > \
                                  $3::STRING::DECIMAL \
                              AND crdb_internal_mvcc_timestamp::STRING::DECIMAL <= \
                                  $4::STRING::DECIMAL \
                              ORDER BY crdb_internal_mvcc_timestamp, bucket, id LIMIT $5"
-                        ),
-                        &[&first_bucket, &last_bucket, since, &t, &fetch_limit],
-                    )
-                    .await?;
-                let candidates: Vec<LogRow> =
-                    first.iter().map(log_row).collect::<Result<_, _>>()?;
-                let mut truncated = false;
-                let mut upto = upto_read;
-                let mut rows = candidates;
-                if rows.len() > limit as usize {
-                    let cutoff = rows[limit as usize - 1].mvcc_ts;
-                    let cutoff_s = cutoff.to_string();
-                    truncated = tx
-                        .query_opt(
-                            "SELECT 1 FROM replication_log \
+                            ),
+                            &[&first_bucket, &last_bucket, since, &t, &fetch_limit],
+                        )
+                        .await?;
+                    let candidates: Vec<LogRow> =
+                        first.iter().map(log_row).collect::<Result<_, _>>()?;
+                    let mut truncated = false;
+                    let mut upto = upto_read;
+                    let mut rows = candidates;
+                    if rows.len() > limit as usize {
+                        let cutoff = rows[limit as usize - 1].mvcc_ts;
+                        let cutoff_s = cutoff.to_string();
+                        truncated = tx
+                            .query_opt(
+                                "SELECT 1 FROM replication_log \
                              WHERE bucket BETWEEN $1 AND $2 \
                              AND crdb_internal_mvcc_timestamp::STRING::DECIMAL > \
                                  $3::STRING::DECIMAL \
                              AND crdb_internal_mvcc_timestamp::STRING::DECIMAL <= \
                                  $4::STRING::DECIMAL LIMIT 1",
-                            &[&first_bucket, &last_bucket, &cutoff_s, &t],
-                        )
-                        .await?
-                        .is_some();
-                    upto = if truncated { cutoff } else { upto_read };
-                    let upto_s = upto.to_string();
-                    let all = tx
-                        .query(
-                            &format!(
-                                "SELECT {LOG_COLUMNS} FROM replication_log \
+                                &[&first_bucket, &last_bucket, &cutoff_s, &t],
+                            )
+                            .await?
+                            .is_some();
+                        upto = if truncated { cutoff } else { upto_read };
+                        let upto_s = upto.to_string();
+                        let all = tx
+                            .query(
+                                &format!(
+                                    "SELECT {LOG_COLUMNS} FROM replication_log \
                                  WHERE bucket BETWEEN $1 AND $2 \
                                  AND crdb_internal_mvcc_timestamp::STRING::DECIMAL > \
                                      $3::STRING::DECIMAL \
                                  AND crdb_internal_mvcc_timestamp::STRING::DECIMAL <= \
                                      $4::STRING::DECIMAL \
                                  ORDER BY crdb_internal_mvcc_timestamp, bucket, id"
-                            ),
-                            &[&first_bucket, &last_bucket, since, &upto_s],
-                        )
-                        .await?;
-                    rows = all.iter().map(log_row).collect::<Result<_, _>>()?;
-                }
-                // The state of each changed entity at the same read timestamp;
-                // absent means deleted, with the log row's version.
-                let mut seen: Vec<(String, String, String)> = Vec::new();
-                let mut changes = Vec::new();
-                for r in rows.iter().rev() {
-                    let id = (r.entity.clone(), r.realm.clone(), r.key.clone());
-                    if seen.contains(&id) {
-                        continue;
+                                ),
+                                &[&first_bucket, &last_bucket, since, &upto_s],
+                            )
+                            .await?;
+                        rows = all.iter().map(log_row).collect::<Result<_, _>>()?;
                     }
-                    seen.push(id);
-                    let fallback_version = rows
-                        .iter()
-                        .filter(|o| o.entity == r.entity && o.realm == r.realm && o.key == r.key)
-                        .map(|o| o.mvcc_ts)
-                        .max()
-                        .unwrap_or(r.mvcc_ts);
-                    changes.push(match r.entity.as_str() {
-                        "principal" => {
-                            let found = tx
-                                .query(
-                                    &principal_sql("WHERE p.realm = $1 AND p.name = $2"),
-                                    &[&r.realm, &r.key],
-                                )
-                                .await?;
-                            match stored_principals(&found)?.into_iter().next() {
-                                Some((_, version, true)) => Change::DeletePrincipal {
-                                    realm: r.realm.clone(),
-                                    name: decode_principal_key(&r.key, 1)?,
-                                    version,
-                                },
-                                Some((principal, version, false)) => {
-                                    Change::UpsertPrincipal { principal, version }
-                                }
-                                None => Change::DeletePrincipal {
-                                    realm: r.realm.clone(),
-                                    name: decode_principal_key(&r.key, 1)?,
-                                    version: fallback_version,
-                                },
-                            }
-                        }
-                        "policy" => {
-                            let found = tx
-                                .query(
-                                    &format!(
-                                        "SELECT {POLICY_COLUMNS} FROM policies WHERE name = $1"
-                                    ),
-                                    &[&r.key],
-                                )
-                                .await?;
-                            match found.first() {
-                                Some(row) => {
-                                    let (policy, version, deleted) = policy_of(row)?;
-                                    if deleted {
-                                        Change::DeletePolicy {
-                                            name: r.key.clone(),
-                                            version,
-                                        }
-                                    } else {
-                                        Change::UpsertPolicy { policy, version }
-                                    }
-                                }
-                                None => Change::DeletePolicy {
-                                    name: r.key.clone(),
-                                    version: fallback_version,
-                                },
-                            }
-                        }
-                        "lockout" => {
-                            let found = tx
-                                .query(
-                                    &format!(
-                                        "SELECT {LOCKOUT_COLUMNS} FROM lockouts \
-                                         WHERE realm = $1 AND name = $2"
-                                    ),
-                                    &[&r.realm, &r.key],
-                                )
-                                .await?;
-                            match found.first() {
-                                Some(row) => {
-                                    let (record, version, deleted) = lockout_of(row)?;
-                                    if deleted {
-                                        Change::DeleteLockout {
-                                            realm: r.realm.clone(),
-                                            name: decode_principal_key(&r.key, 1)?,
-                                            version,
-                                        }
-                                    } else {
-                                        Change::UpsertLockout { record, version }
-                                    }
-                                }
-                                None => Change::DeleteLockout {
-                                    realm: r.realm.clone(),
-                                    name: decode_principal_key(&r.key, 1)?,
-                                    version: fallback_version,
-                                },
-                            }
-                        }
-                        other => {
-                            return Err(StoreError::corrupt(format!(
-                                "unknown replication entity {other:?}"
-                            ))
-                            .into())
-                        }
-                    });
-                }
-                // `rev()` above walked newest first; keep commit order.
-                changes.reverse();
-                Ok(PollResult {
-                    batch: ChangeBatch { upto, changes },
-                    source_now: tx.source_now,
-                    truncated,
+                    let materialization = if truncated {
+                        PollMaterialization::Truncated(rows)
+                    } else {
+                        PollMaterialization::Complete(materialize_changes(&tx, &rows).await?)
+                    };
+                    Ok(PollRead {
+                        upto,
+                        materialization,
+                        source_now: tx.source_now,
+                        truncated,
+                    })
                 })
             })
+            .await?;
+
+        let changes = match read.materialization {
+            PollMaterialization::Complete(changes) => changes,
+            PollMaterialization::Truncated(rows) => {
+                let aost = format!("'{}'", read.upto);
+                let rows = Arc::new(rows);
+                self.db
+                    .run_read(Some(&aost), &mut |tx| {
+                        let rows = Arc::clone(&rows);
+                        Box::pin(async move { materialize_changes(&tx, &rows).await })
+                    })
+                    .await?
+            }
+        };
+        Ok(PollResult {
+            batch: ChangeBatch {
+                upto: read.upto,
+                changes,
+            },
+            source_now: read.source_now,
+            truncated: read.truncated,
         })
-        .await
     }
 
     async fn pruned_before(&self) -> Result<Option<ReplicationTs>, StoreError> {

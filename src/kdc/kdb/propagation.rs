@@ -418,15 +418,24 @@ impl KeySource for StoreKeys<'_> {
             .map_err(|_| ApError::NoKey)?
             .ok_or(ApError::NoKey)?
             .entry;
-        let mut etype_seen = false;
-        for k in &entry.keys {
-            if k.key.keytype != etype {
-                continue;
+        let etype_seen = entry.keys.iter().any(|k| k.key.keytype == etype);
+        let selected = match kvno {
+            Some(version) => entry
+                .keys
+                .iter()
+                .find(|k| k.key.keytype == etype && i64::from(k.kvno) == i64::from(version)),
+            None => {
+                // MIT's kvno-0 path selects the latest key data instead of
+                // the first matching enctype (kdb_default.c:65-67).
+                entry
+                    .keys
+                    .iter()
+                    .filter(|k| k.key.keytype == etype)
+                    .max_by_key(|k| k.kvno)
             }
-            etype_seen = true;
-            if kvno.is_none_or(|v| i64::from(k.kvno) == i64::from(v)) {
-                return Ok(k.key.clone());
-            }
+        };
+        if let Some(key) = selected {
+            return Ok(key.key.clone());
         }
         Err(if etype_seen {
             ApError::BadKeyver
@@ -1057,6 +1066,8 @@ pub(crate) fn jittered(interval: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kdc::db::{KeyEntry, PrincipalAttributes, PrincipalEntry};
+    use crate::kdc::kdb::master_key_from_password;
 
     #[test]
     fn backoff_doubles_and_is_capped_at_the_poll_interval() {
@@ -1065,6 +1076,68 @@ mod tests {
         assert_eq!(seq, vec![1, 2, 4, 8, 10, 10]);
         assert_eq!(backoff(0, Duration::ZERO), Duration::from_secs(1));
         assert_eq!(backoff(u32::MAX, cap), cap);
+    }
+
+    #[test]
+    fn missing_kvno_selects_the_highest_key_version_for_the_etype() {
+        let dir = std::env::temp_dir().join(format!("krb5rs_prop_keys_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        let path = dir.join("principal");
+        let master = master_key_from_password("R", "master", 18).expect("master key");
+        let store = FileStore::create_with(&path, "R", &master, &[18]).expect("create");
+        let service = PrincipalName::new_srv_inst("kprop", "primary");
+        let old_key = EncryptionKey::new(18, vec![1; 32]);
+        let latest_key = EncryptionKey::new(18, vec![2; 32]);
+        store
+            .put(PrincipalEntry {
+                name: service.clone(),
+                realm: "R".into(),
+                attributes: PrincipalAttributes::empty(),
+                max_life: None,
+                max_renewable_life: None,
+                expiration: None,
+                pw_expiration: None,
+                keys: vec![
+                    KeyEntry {
+                        kvno: 1,
+                        key: old_key.clone(),
+                        salt: None,
+                        s2kparams: None,
+                    },
+                    KeyEntry {
+                        kvno: 2,
+                        key: latest_key.clone(),
+                        salt: None,
+                        s2kparams: None,
+                    },
+                ],
+                allowed_to_delegate_to: Vec::new(),
+                allowed_to_delegate_from: Vec::new(),
+                policy: None,
+                security_epoch: 0,
+                last_admin_unlock: None,
+            })
+            .expect("store service");
+        let keys = StoreKeys {
+            store: &store,
+            service: &service,
+        };
+
+        assert_eq!(
+            keys.get_key(&service, b"R", None, 18)
+                .expect("latest key")
+                .key_bytes(),
+            latest_key.key_bytes()
+        );
+        assert_eq!(
+            keys.get_key(&service, b"R", Some(1), 18)
+                .expect("explicit old key")
+                .key_bytes(),
+            old_key.key_bytes()
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

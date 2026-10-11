@@ -188,15 +188,26 @@ impl Metrics {
             Outcome::Issued => ("issued".to_string(), None),
             Outcome::Error { code, status } => (code.to_string(), status.as_deref()),
         };
-        if status.is_some_and(|s| {
-            matches!(
-                s,
-                "LOOKING_UP_AUTH_STATE"
-                    | "LOOKING_UP_POLICY"
-                    | "LOOKING_UP_PRINCIPAL"
-                    | "ISSUING_TICKET"
-            )
-        }) {
+        // Store failures surface as SVC_UNAVAILABLE or GENERIC with the lookup
+        // status; the same statuses also label not-found errors, which are not
+        // database failures.
+        let store_failure = matches!(&summary.outcome, Outcome::Error { code: 29 | 60, .. });
+        if store_failure
+            && status.is_some_and(|s| {
+                matches!(
+                    s,
+                    "LOOKING_UP_AUTH_STATE"
+                        | "LOOKING_UP_POLICY"
+                        | "LOOKING_UP_CLIENT"
+                        | "LOOKING_UP_SERVER"
+                        | "LOOKING_UP_S4U2SELF_PRINCIPAL"
+                        | "GET_LOCAL_TGT"
+                        | "UNKNOWN_SERVER"
+                        | "2ND_TKT_SERVER"
+                        | "FIND_FAST"
+                )
+            })
+        {
             self.local_db_errors.inc();
         }
         self.requests
@@ -417,7 +428,11 @@ async fn handle_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle, serve, Metrics, StatusSnapshot, CONNECTION_TIMEOUT};
+    use super::{
+        handle, serve, Metrics, Outcome, RequestKind, RequestSummary, StatusSnapshot,
+        CONNECTION_TIMEOUT,
+    };
+    use krb5_rs::kdc::Transport;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -505,5 +520,48 @@ mod tests {
         };
         let response = ready_response(fresh).await;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn client_lookup_service_error_counts_as_a_local_database_error() {
+        let metrics = Metrics::new();
+        metrics.record_request(&RequestSummary {
+            kind: RequestKind::Tgs,
+            transport: Transport::Tcp,
+            client: None,
+            server: None,
+            etypes: Vec::new(),
+            outcome: Outcome::Error {
+                code: 29,
+                status: Some("LOOKING_UP_CLIENT".into()),
+            },
+            reply_etype: None,
+            ticket_etype: None,
+            gate_rejected: false,
+            store_time: Duration::ZERO,
+        });
+
+        assert_eq!(metrics.local_db_errors.get(), 1);
+
+        metrics.record_request(&RequestSummary {
+            kind: RequestKind::Tgs,
+            transport: Transport::Tcp,
+            client: None,
+            server: None,
+            etypes: Vec::new(),
+            outcome: Outcome::Error {
+                code: 7,
+                status: Some("UNKNOWN_SERVER".into()),
+            },
+            reply_etype: None,
+            ticket_etype: None,
+            gate_rejected: false,
+            store_time: Duration::ZERO,
+        });
+        assert_eq!(
+            metrics.local_db_errors.get(),
+            1,
+            "not found is not a DB error"
+        );
     }
 }

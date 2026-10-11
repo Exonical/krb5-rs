@@ -1,8 +1,11 @@
 //! TGS exchange against the KDC (do_tgs_req.c, kdc_util.c, tgs_policy.c).
 
 use super::*;
+use krb5_rs::kdc::StoreError;
 use krb5_rs::keytab::{KeytabEntry, MemoryKeytab};
 use krb5_rs::protocol::ap::{ApReqOptions, AuthContext};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 const RENEWABLE_TGT: TicketFlags = TicketFlags::INITIAL
     .union(TicketFlags::PRE_AUTHENT)
@@ -15,6 +18,83 @@ async fn tgs_error_code(f: &Fixture, req: &[u8]) -> i32 {
 
 async fn plain_tgs(f: &Fixture, tgt: &Credential) -> Run<Credential> {
     run_tgs(&f.kdc, tgt, service(), TgsOptions::default()).await
+}
+
+#[derive(Clone)]
+struct ToggleLookupStore {
+    inner: Arc<Mutex<MemoryStore>>,
+    mode: Arc<AtomicU8>,
+    toggled_name: PrincipalName,
+}
+
+impl ToggleLookupStore {
+    fn new(inner: MemoryStore, toggled_name: PrincipalName) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+            mode: Arc::new(AtomicU8::new(0)),
+            toggled_name,
+        }
+    }
+
+    fn mark_missing(&self) {
+        self.mode.store(1, Ordering::SeqCst);
+    }
+
+    fn mark_unavailable(&self) {
+        self.mode.store(2, Ordering::SeqCst);
+    }
+}
+
+impl PrincipalStore for ToggleLookupStore {
+    async fn lookup(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<krb5_rs::kdc::PrincipalEntry>, StoreError> {
+        if name == &self.toggled_name {
+            match self.mode.load(Ordering::SeqCst) {
+                1 => return Ok(None),
+                2 => return Err(StoreError::unavailable("test lookup unavailable")),
+                _ => {}
+            }
+        }
+        Ok(self
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(name, realm))
+    }
+}
+
+fn toggle_lookup_kdc(recheck: bool) -> (Kdc<ToggleLookupStore>, ToggleLookupStore) {
+    let mut inner = MemoryStore::new();
+    inner
+        .add_random_key(krbtgt(), REALM, 1, &[18, 17], PrincipalAttributes::empty())
+        .expect("krbtgt");
+    inner
+        .add_with_password(
+            user(),
+            REALM,
+            PASSWORD,
+            1,
+            &[18, 17],
+            PrincipalAttributes::REQUIRES_PRE_AUTH,
+        )
+        .expect("user");
+    inner
+        .add_with_password(
+            service(),
+            REALM,
+            SERVICE_PASSWORD,
+            1,
+            &[18, 17],
+            PrincipalAttributes::empty(),
+        )
+        .expect("service");
+    let store = ToggleLookupStore::new(inner, user());
+    let mut config = KdcConfig::new(REALM);
+    config.tgs_recheck_client = recheck;
+    (Kdc::new(config, store.clone()), store)
 }
 
 #[tokio::test]
@@ -541,4 +621,50 @@ async fn tgs_req_renew_of_service_ticket_resigns_pac_with_ticket_checksums() {
     krb5_rs::pac::verify_ticket_pac(&part, &service(), &f.service_key, Some(&f.tgs_key))
         .expect("ticket, server, KDC and full checksums")
         .expect("PAC present");
+}
+
+#[tokio::test]
+async fn a_deleted_local_tgt_client_is_unknown_at_tgs_time() {
+    let (kdc, store) = toggle_lookup_kdc(true);
+    let tgt = get_tgt_from(&kdc).await;
+    store.mark_missing();
+
+    let run = run_tgs(&kdc, &tgt, service(), TgsOptions::default()).await;
+    assert_eq!(
+        kdc_code(&run.result.expect_err("deleted client rejected")),
+        6
+    );
+    let error = krb_error(run.replies.last().expect("KRB-ERROR"));
+    assert_eq!(
+        error.e_text.as_ref().map(|text| text.as_bytes()),
+        Some(b"CLIENT_NOT_FOUND".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn deleted_local_tgt_client_is_allowed_when_tgs_recheck_is_disabled() {
+    let (kdc, store) = toggle_lookup_kdc(false);
+    let tgt = get_tgt_from(&kdc).await;
+    store.mark_missing();
+
+    let run = run_tgs(&kdc, &tgt, service(), TgsOptions::default()).await;
+    assert!(run.result.is_ok(), "{:?}", run.result);
+}
+
+#[tokio::test]
+async fn unavailable_local_tgt_client_lookup_returns_service_unavailable() {
+    let (kdc, store) = toggle_lookup_kdc(true);
+    let tgt = get_tgt_from(&kdc).await;
+    store.mark_unavailable();
+
+    let run = run_tgs(&kdc, &tgt, service(), TgsOptions::default()).await;
+    assert_eq!(
+        kdc_code(&run.result.expect_err("unavailable lookup rejected")),
+        29
+    );
+    let error = krb_error(run.replies.last().expect("KRB-ERROR"));
+    assert_eq!(
+        error.e_text.as_ref().map(|text| text.as_bytes()),
+        Some(b"LOOKING_UP_CLIENT".as_slice())
+    );
 }

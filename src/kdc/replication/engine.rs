@@ -510,6 +510,11 @@ impl<A: AuthoritativeState> ConsistencyGate for StrictGate<A> {
             .await;
             let authoritative = match authoritative {
                 Ok(Ok(state)) => state,
+                Ok(Err(error)) if error.kind() == StoreErrorKind::NotFound => {
+                    return GateDecision::Reject {
+                        reason: "AUTHORITATIVE_MISMATCH".to_string(),
+                    }
+                }
                 Ok(Err(_)) | Err(_) => {
                     return GateDecision::Reject {
                         reason: "AUTHORITY_UNAVAILABLE".to_string(),
@@ -704,6 +709,21 @@ mod tests {
             gate.check(&[&entry]).await,
             GateDecision::Reject {
                 reason: "AUTHORITY_UNAVAILABLE".into()
+            }
+        );
+
+        let gate = StrictGate::new(
+            fresh_status(),
+            Duration::from_secs(30),
+            Arc::new(Authority {
+                state: Err(crate::kdc::StoreError::not_found("deleted")),
+            }),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            gate.check(&[&entry]).await,
+            GateDecision::Reject {
+                reason: "AUTHORITATIVE_MISMATCH".into()
             }
         );
 

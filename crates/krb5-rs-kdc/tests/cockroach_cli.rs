@@ -221,10 +221,15 @@ async fn kdb_administers_a_cockroachdb_realm_and_reports_replication() {
             "4000",
             "--timeout",
             "2s",
+            "--live-within",
+            "2m",
         ],
         "",
     );
-    assert!(out.contains("1 of 1 KDCs"), "{out}");
+    assert!(
+        out.contains("1 of 1 live KDCs") && out.contains("0 not seen within 2m ignored"),
+        "{out}"
+    );
     let late = kdb(
         &admin,
         &[
@@ -234,11 +239,17 @@ async fn kdb_administers_a_cockroachdb_realm_and_reports_replication() {
             "9000",
             "--timeout",
             "1s",
+            "--live-within",
+            "2m",
         ],
         "",
     );
     assert_eq!(late.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&late.stdout).contains("0 of 1 KDCs"));
+    assert!(
+        String::from_utf8_lossy(&late.stdout).contains("0 of 1 live KDCs"),
+        "{}",
+        String::from_utf8_lossy(&late.stdout)
+    );
     let out = ok(&admin, &["replication", "prune", "--older-than", "0s"], "");
     assert!(
         out.contains("Pruned") && out.contains("pruned_before"),

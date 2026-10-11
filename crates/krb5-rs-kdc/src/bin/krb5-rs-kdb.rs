@@ -30,7 +30,7 @@ fn usage() -> ! {
          addpol|modpol [-maxlife T] [-minlife T] [-minlength N] [-minclasses N] [-history N] [-maxfailure N] [-failurecountinterval T] [-lockoutduration T] [-allowedkeysalts K] POLICY\n  \
          delpol POLICY\n  getpol [-terse] POLICY\n  listpols\n  \
          database migrate [--create-roles] [--multi-region --primary-region R --regions R1,R2,...]   (CockroachDB)\n  \
-         replication status | prune --older-than D | wait-applied --since TS [--timeout D]   (CockroachDB)\n  \
+         replication status | prune --older-than D | wait-applied --since TS [--timeout D] [--live-within D]   (CockroachDB)\n  \
          getprinc NAME\n  listprincs\n  ktadd -k PATH [-norandkey] NAME..."
     );
     std::process::exit(2);
@@ -678,10 +678,17 @@ fn cockroach_command(cmd: &str, mut args: Vec<String>, cfg: &RealmConfig, realm:
                         .map_or(std::time::Duration::from_secs(30), |t| {
                             ok(parse_lifetime(&t)).unwrap_or_default()
                         });
-                    let out = ok(rt.block_on(store.wait_applied(since, timeout)));
+                    let live_within_arg = flag(&mut args, "--live-within");
+                    let live_within = live_within_arg
+                        .as_deref()
+                        .map_or(std::time::Duration::from_secs(2 * 60), |d| {
+                            ok(parse_lifetime(d)).unwrap_or_default()
+                        });
+                    let live_within_text = live_within_arg.as_deref().unwrap_or("2m");
+                    let out = ok(rt.block_on(store.wait_applied(since, timeout, live_within)));
                     println!(
-                        "{} of {} KDCs are at or past {since}.",
-                        out.applied, out.total
+                        "{} of {} live KDCs are at or past {since} ({} not seen within {} ignored).",
+                        out.applied, out.total, out.stale, live_within_text
                     );
                     if !out.complete() {
                         std::process::exit(1);

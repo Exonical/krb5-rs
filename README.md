@@ -172,6 +172,9 @@ The settings below go in the kdc.conf realm section. They are krb5-rs extensions
 
 `kprop_listen` and `kprop_primary` together are a configuration error. A replica needs the same master key stash as the primary. With no local database it pulls before binding its KDC listeners, retrying with backoff; with one it serves immediately and syncs in the background. `krb5-rs-kdb` refuses to modify a replica's database unless given `--force`.
 
+File-mode replicas have no freshness bound, as with MIT kpropd. Use
+CockroachDB mode for bounded staleness.
+
 ### Deployment
 
 - **Kubernetes** (`deploy/helm/krb5-rs-kdc`): one primary (StatefulSet with a PVC) plus two replicas that pull the database from it, behind a `LoadBalancer` Service on UDP+TCP 88. `realm` is required:

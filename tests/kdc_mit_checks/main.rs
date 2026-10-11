@@ -168,8 +168,8 @@ struct Run<T> {
     replies: Vec<Vec<u8>>,
 }
 
-async fn run_as(
-    kdc: &Kdc<MemoryStore>,
+async fn run_as<S: PrincipalStore>(
+    kdc: &Kdc<S>,
     config: AsExchangeConfig,
     password: &str,
 ) -> Run<Credential> {
@@ -177,8 +177,8 @@ async fn run_as(
 }
 
 /// [`run_as`] that also returns the exchange for accessor checks.
-async fn run_as_keep(
-    kdc: &Kdc<MemoryStore>,
+async fn run_as_keep<S: PrincipalStore>(
+    kdc: &Kdc<S>,
     config: AsExchangeConfig,
     password: &str,
 ) -> (AsExchange, Run<Credential>) {
@@ -203,14 +203,18 @@ fn as_config(name: &str) -> AsExchangeConfig {
 }
 
 async fn get_tgt(f: &Fixture) -> Credential {
-    run_as(&f.kdc, as_config(USER), PASSWORD)
+    get_tgt_from(&f.kdc).await
+}
+
+async fn get_tgt_from<S: PrincipalStore>(kdc: &Kdc<S>) -> Credential {
+    run_as(kdc, as_config(USER), PASSWORD)
         .await
         .result
         .expect("AS exchange")
 }
 
-async fn run_tgs(
-    kdc: &Kdc<MemoryStore>,
+async fn run_tgs<S: PrincipalStore>(
+    kdc: &Kdc<S>,
     tgt: &Credential,
     target: PrincipalName,
     options: TgsOptions,
