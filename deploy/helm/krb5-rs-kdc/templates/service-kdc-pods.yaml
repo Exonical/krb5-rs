@@ -1,0 +1,27 @@
+{{- if eq .Values.database.mode "cockroach" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-kdc-pods
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kdc
+spec:
+  clusterIP: None
+  ports:
+    - name: kdc-udp
+      port: {{ .Values.service.port }}
+      targetPort: kdc-udp
+      protocol: UDP
+    - name: kdc-tcp
+      port: {{ .Values.service.port }}
+      targetPort: kdc-tcp
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kdc
+{{- end }}

@@ -40,12 +40,20 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
+{{- define "krb5-rs-kdc.fileConfigChecksum" -}}
+{{- include (print $.Template.BasePath "/configmap.yaml") . | replace (printf "helm.sh/chart: %s" (include "krb5-rs-kdc.chart" .)) (printf "helm.sh/chart: %s-%s" .Chart.Name (.Chart.AppVersion | replace "+" "_")) | sha256sum }}
+{{- end }}
+
 {{/* Container image: digest wins over tag. */}}
 {{- define "krb5-rs-kdc.image" -}}
 {{- if .Values.image.digest -}}
 {{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
 {{- else -}}
-{{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) -}}
+{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- if and (eq .Values.database.mode "cockroach") (not .Values.image.tag) -}}
+{{- $tag = printf "%s-cockroach" .Chart.AppVersion -}}
+{{- end -}}
+{{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
 {{- end }}
 
@@ -56,6 +64,92 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/* Service name of the primary (propagation + KDC port for replicas). */}}
 {{- define "krb5-rs-kdc.primaryService" -}}
 {{- printf "%s-primary" (include "krb5-rs-kdc.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Shared CockroachDB module stanza. Args: dict "ctx" root "url" URL "certDir" path.
+Set "kdc" to include the KDC replication and local-replica options.
+*/}}
+{{- define "krb5-rs-kdc.cockroachDbmodule" -}}
+{{- $v := .ctx.Values }}
+[dbmodules]
+ crdb = {
+  db_library = krb5-rs-cockroach
+  cockroach_url = {{ required "CockroachDB URL is required" .url }}
+  cockroach_ca = {{ .certDir }}/ca.crt
+  cockroach_cert = {{ .certDir }}/tls.crt
+  cockroach_key = {{ .certDir }}/tls.key
+  cockroach_pool_size = {{ $v.cockroach.poolSize }}
+  cockroach_connect_timeout = {{ $v.cockroach.connectTimeout }}
+  cockroach_statement_timeout = {{ $v.cockroach.statementTimeout }}
+  cockroach_transaction_timeout = {{ $v.cockroach.transactionTimeout }}
+{{- if .kdc }}
+  replication_read = {{ $v.cockroach.replicationRead }}
+  replica_path = /var/lib/krb5-rs/replica
+  turso_pool_size = {{ $v.cockroach.turso.poolSize }}
+  region = {{ required "cockroach.region is required" $v.cockroach.region }}
+  consistency_mode = {{ $v.cockroach.consistencyMode }}
+  max_staleness = {{ $v.cockroach.maxStaleness }}
+  authoritative_timeout = {{ $v.cockroach.authoritativeTimeout }}
+  replication_poll_interval = {{ $v.cockroach.replication.pollInterval }}
+  replication_batch_limit = {{ $v.cockroach.replication.batchLimit }}
+  replication_retry_min = {{ $v.cockroach.replication.retryMin }}
+  replication_retry_max = {{ $v.cockroach.replication.retryMax }}
+  replication_rebuild = {{ $v.cockroach.replication.rebuild }}
+  replication_heartbeat_interval = {{ $v.cockroach.replication.heartbeatInterval }}
+{{- end }}
+ }
+{{- end }}
+
+{{- define "krb5-rs-kdc.cockroachClientConf" -}}
+{{- $v := .ctx.Values }}
+[realms]
+ {{ required "realm is required" $v.realm }} = {
+  database_module = crdb
+  supported_enctypes = {{ $v.kdc.supportedEnctypes }}
+ }
+
+{{ include "krb5-rs-kdc.cockroachDbmodule" (dict "ctx" .ctx "url" .url "certDir" .certDir "kdc" false) }}
+{{- end }}
+
+{{- define "krb5-rs-kdc.krb5Conf" -}}
+{{- $v := .Values }}
+[libdefaults]
+ default_realm = {{ required "realm is required" $v.realm }}
+ dns_lookup_kdc = false
+ dns_lookup_realm = false
+{{- if $v.kdc.domainRealm }}
+
+[domain_realm]
+{{- range $domain, $realm := $v.kdc.domainRealm }}
+ {{ $domain }} = {{ $realm }}
+{{- end }}
+{{- end }}
+{{- with $v.kdc.extraKrb5Conf }}
+
+{{ . }}
+{{- end }}
+{{- end }}
+
+{{- define "krb5-rs-kdc.cockroachKdcConf" -}}
+{{- $v := .Values }}
+[kdcdefaults]
+ kdc_ports = {{ $v.kdc.containerPort }}
+ kdc_tcp_ports = {{ $v.kdc.containerPort }}
+
+[realms]
+ {{ required "realm is required" $v.realm }} = {
+  database_module = crdb
+  max_life = {{ $v.kdc.maxLife }}
+  max_renewable_life = {{ $v.kdc.maxRenewableLife }}
+  supported_enctypes = {{ $v.kdc.supportedEnctypes }}
+ }
+{{- with $v.kdc.extraKdcConf }}
+
+{{ . }}
+{{- end }}
+
+{{ include "krb5-rs-kdc.cockroachDbmodule" (dict "ctx" . "url" $v.cockroach.url "certDir" "/crdb" "kdc" true) }}
 {{- end }}
 
 {{/*

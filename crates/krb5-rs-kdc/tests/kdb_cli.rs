@@ -197,6 +197,49 @@ fn init_is_idempotent_and_reads_secrets_only_from_files() {
 }
 
 #[test]
+fn global_master_password_file_opens_file_database_without_a_stash() {
+    let env = Env::new("global-master");
+    let master = env.dir.join("master");
+    let wrong = env.dir.join("wrong-master");
+    std::fs::write(&master, "master-secret\n").expect("master file");
+    std::fs::write(&wrong, "not-the-master\n").expect("wrong master file");
+
+    let master_path = master.to_string_lossy().into_owned();
+    env.ok(&["create"], "master-secret\n");
+    env.ok(
+        &["--master-password-file", &master_path, "addprinc", "alice"],
+        "alice-password\n",
+    );
+    assert!(!env.dir.join("stash").exists());
+
+    let listed = env.ok(&["--master-password-file", &master_path, "listprincs"], "");
+    assert!(listed.contains(&format!("alice@{REALM}")), "{listed}");
+
+    let wrong_path = wrong.to_string_lossy().into_owned();
+    let failed = env.run(&["--master-password-file", &wrong_path, "listprincs"], "");
+    assert!(!failed.status.success());
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("master key"),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+}
+
+#[test]
+fn init_falls_back_to_the_global_master_password_file() {
+    let env = Env::new("global-init");
+    let master = env.dir.join("master");
+    std::fs::write(&master, "master-secret\n").expect("master file");
+    let master_path = master.to_string_lossy().into_owned();
+
+    let output = env.ok(&["--master-password-file", &master_path, "init"], "");
+    assert!(
+        output.contains("Database") && output.contains("created"),
+        "{output}"
+    );
+}
+
+#[test]
 fn policy_commands_and_principal_policy_options() {
     let env = Env::new("policy");
     env.ok(&["create", "-s"], "master\n");

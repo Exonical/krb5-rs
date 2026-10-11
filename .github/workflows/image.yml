@@ -10,6 +10,17 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: default
+            features: ""
+            suffix: ""
+            description: "Pure Rust Kerberos V5 KDC and database administration tool"
+          - name: cockroach
+            features: cockroach
+            suffix: "-cockroach"
+            description: "Kerberos V5 KDC with the CockroachDB and Turso database modules"
     permissions:
       contents: read
       packages: write
@@ -27,6 +38,7 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
+          flavor: suffix=${{ matrix.suffix }},onlatest=true
           tags: |
             type=sha
             type=ref,event=branch
@@ -43,7 +55,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            FEATURES=${{ matrix.features }}
+            DESCRIPTION=${{ matrix.description }}
           provenance: true
           sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}

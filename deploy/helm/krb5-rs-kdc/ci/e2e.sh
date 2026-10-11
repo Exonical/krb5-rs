@@ -78,8 +78,34 @@ EOF"
 
 step "addprinc on the primary, kinit through the kdc Service"
 addprinc alice alice-pw
-[ "$(kinit_ok alice alice-pw 1)" = 1 ]
+kinit_ready=0
+for _ in $(seq 1 30); do
+  if [ "$(kinit_ok alice alice-pw 1)" = 1 ]; then
+    kinit_ready=1
+    break
+  fi
+  sleep 1
+done
+[ "$kinit_ready" = 1 ]
 echo "kinit through the Service works"
+
+for ip in $(kubectl get pods -l app.kubernetes.io/component=replica -o jsonpath='{.items[*].status.podIP}'); do
+  seen=0
+  for _ in $(seq 1 30); do
+    mit "cat > /tmp/r.conf <<EOF
+[libdefaults]
+ default_realm = ${REALM}
+ dns_lookup_kdc = false
+[realms]
+ ${REALM} = {
+  kdc = ${ip}:8888
+ }
+EOF
+echo alice-pw | KRB5_CONFIG=/tmp/r.conf KRB5CCNAME=/tmp/cca kinit alice@${REALM} >/dev/null 2>&1" && { seen=1; break; }
+    sleep 1
+  done
+  [ "$seen" = 1 ] || { echo "replica $ip never learned alice"; exit 1; }
+done
 
 step "primary down: replicas keep serving"
 kubectl scale "statefulset/${PRIMARY}" --replicas=0

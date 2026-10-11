@@ -263,3 +263,89 @@ async fn kdb_administers_a_cockroachdb_realm_and_reports_replication() {
     .await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn init_and_global_master_password_file_work_without_a_stash() {
+    let dir = std::env::temp_dir().join(format!("krb5rs_crdb_init_cli_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let db = format!("krb5t_cli_init_{}", std::process::id());
+    run_sql(
+        &crdb_config("root", "defaultdb"),
+        &format!("CREATE DATABASE \"{db}\""),
+    )
+    .await
+    .expect("create database");
+    let root = write_conf(&dir, "root.conf", "root", &db);
+    let admin = write_conf(&dir, "admin.conf", "kdc_admin", &db);
+    ok(&root, &["database", "migrate", "--create-roles"], "");
+
+    let master = dir.join("master");
+    let wrong_master = dir.join("wrong-master");
+    std::fs::write(&master, "master-password\n").expect("master password");
+    std::fs::write(&wrong_master, "wrong-password\n").expect("wrong password");
+    let master_path = master.to_string_lossy().into_owned();
+    let wrong_master_path = wrong_master.to_string_lossy().into_owned();
+
+    let first = ok(
+        &admin,
+        &["--master-password-file", &master_path, "init"],
+        "",
+    );
+    assert!(
+        first.contains(&format!("Realm {REALM} created.")),
+        "{first}"
+    );
+    let second = ok(
+        &admin,
+        &["--master-password-file", &master_path, "init"],
+        "",
+    );
+    assert!(
+        second.contains(&format!("Realm {REALM} already exists.")),
+        "{second}"
+    );
+    assert!(!dir.join("stash").exists());
+
+    let wrong = kdb(
+        &admin,
+        &["--master-password-file", &wrong_master_path, "init"],
+        "",
+    );
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("master key"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+
+    let added = ok(
+        &admin,
+        &[
+            "--master-password-file",
+            &master_path,
+            "addprinc",
+            "-randkey",
+            "alice",
+        ],
+        "",
+    );
+    assert!(
+        added.contains("Principal \"alice@CLI.CRDB\" created."),
+        "{added}"
+    );
+    let listed = ok(
+        &admin,
+        &["--master-password-file", &master_path, "listprincs"],
+        "",
+    );
+    assert!(listed.contains("alice@CLI.CRDB"), "{listed}");
+
+    let _ = run_sql(
+        &crdb_config("root", "defaultdb"),
+        &format!("DROP DATABASE \"{db}\" CASCADE"),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

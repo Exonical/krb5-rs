@@ -1,0 +1,73 @@
+{{- if and (eq .Values.database.mode "cockroach") .Values.cockroach.prune.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-prune
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prune
+spec:
+  schedule: {{ .Values.cockroach.prune.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "krb5-rs-kdc.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: prune
+        spec:
+          restartPolicy: OnFailure
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: prune
+              image: {{ include "krb5-rs-kdc.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["/usr/local/bin/krb5-rs-kdb"]
+              args:
+                - --config
+                - /etc/krb5-rs/admin-kdc.conf
+                - --krb5-config
+                - /etc/krb5-rs/krb5.conf
+                - --realm
+                - {{ .Values.realm | quote }}
+                - --master-password-file
+                - /secrets/master-password
+                - replication
+                - prune
+                - --older-than
+                - {{ .Values.cockroach.prune.olderThan | quote }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              volumeMounts:
+                - name: config
+                  mountPath: /etc/krb5-rs
+                  readOnly: true
+                - name: secrets
+                  mountPath: /secrets
+                  readOnly: true
+                - name: cockroach-admin
+                  mountPath: /crdb-admin
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: config
+              configMap:
+                name: {{ include "krb5-rs-kdc.fullname" . }}
+            - name: secrets
+              secret:
+                secretName: {{ include "krb5-rs-kdc.secretName" . }}
+                defaultMode: 0440
+            - name: cockroach-admin
+              secret:
+                secretName: {{ .Values.cockroach.admin.tlsSecret }}
+                defaultMode: 0440
+            - name: tmp
+              emptyDir: {}
+{{- end }}

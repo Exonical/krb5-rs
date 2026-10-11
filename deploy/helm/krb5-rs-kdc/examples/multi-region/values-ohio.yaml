@@ -1,0 +1,19 @@
+realm: EXAMPLE.COM
+
+database:
+  mode: cockroach
+
+secrets:
+  existingSecret: krb5-master
+
+cockroach:
+  url: postgresql://kdc_replica@crdb-ohio.example.com:26257/krb5?sslmode=verify-full
+  tlsSecret: krb5-kdc-replica-tls
+  region: ohio
+  admin:
+    url: postgresql://kdc_admin@crdb-ohio.example.com:26257/krb5?sslmode=verify-full
+    tlsSecret: krb5-kdc-admin-tls
+  bootstrap:
+    enabled: false
+  prune:
+    enabled: false

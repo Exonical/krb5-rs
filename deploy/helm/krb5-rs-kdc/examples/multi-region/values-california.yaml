@@ -1,0 +1,28 @@
+realm: EXAMPLE.COM
+
+database:
+  mode: cockroach
+
+secrets:
+  existingSecret: krb5-master
+
+cockroach:
+  url: postgresql://kdc_replica@crdb-california.example.com:26257/krb5?sslmode=verify-full
+  tlsSecret: krb5-kdc-replica-tls
+  region: california
+  admin:
+    url: postgresql://kdc_admin@crdb-california.example.com:26257/krb5?sslmode=verify-full
+    tlsSecret: krb5-kdc-admin-tls
+  bootstrap:
+    enabled: true
+    migrateUrl: postgresql://root@crdb-california.example.com:26257/krb5?sslmode=verify-full
+    migrateTlsSecret: krb5-crdb-root-tls
+    multiRegion:
+      enabled: true
+      primaryRegion: california
+      regions:
+        - california
+        - ohio
+        - washington-dc
+  prune:
+    enabled: true

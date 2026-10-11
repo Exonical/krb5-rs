@@ -47,10 +47,23 @@ jobs:
 
   image:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: default
+            features: ""
+            description: "Pure Rust Kerberos V5 KDC and database administration tool"
+          - name: cockroach
+            features: cockroach
+            description: "Kerberos V5 KDC with the CockroachDB and Turso database modules"
     steps:
-      - uses: actions/checkout
+      - uses: actions/checkout@v7
       - name: Build the KDC image (not pushed)
-        run: docker build -f deploy/docker/Dockerfile .
+        run: |
+          docker build -f deploy/docker/Dockerfile \
+            --build-arg "FEATURES=${{ matrix.features }}" \
+            --build-arg "DESCRIPTION=${{ matrix.description }}" \
+            -t "localhost/krb5-rs-kdc:ci-${{ matrix.name }}" .
 
   helm:
     runs-on: ubuntu-latest
@@ -63,6 +76,8 @@ jobs:
           version: v3.22.0
       - name: Lint
         run: helm lint deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM
+      - name: Lint (CockroachDB)
+        run: helm lint deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/cockroach-values.yaml
       - name: The realm is required
         run: "! helm lint deploy/helm/krb5-rs-kdc"
       - name: Render and validate (defaults)
@@ -73,6 +88,39 @@ jobs:
         run: |
           helm template rel deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/alt-values.yaml \
             | docker run --rm -i "$KUBECONFORM" -strict -summary -kubernetes-version 1.30.0 -
+      - name: Render and validate (CockroachDB)
+        run: |
+          helm template rel deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/cockroach-values.yaml \
+            | docker run --rm -i "$KUBECONFORM" -strict -summary -kubernetes-version 1.30.0 -
+      - name: Render and validate (multi-region examples)
+        run: |
+          for values in deploy/helm/krb5-rs-kdc/examples/multi-region/values-*.yaml; do
+            helm template rel deploy/helm/krb5-rs-kdc -f "$values" \
+              | docker run --rm -i "$KUBECONFORM" -strict -summary -kubernetes-version 1.30.0 -
+          done
+      - name: CockroachDB mode requires a Secret
+        run: |
+          ! helm lint deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM \
+            --set database.mode=cockroach \
+            --set cockroach.url=postgresql://kdc_replica@crdb/krb5 \
+            --set cockroach.tlsSecret=replica-tls --set cockroach.region=california
+      - name: CockroachDB mode requires a URL
+        run: |
+          ! helm lint deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM \
+            --set database.mode=cockroach --set secrets.existingSecret=master \
+            --set cockroach.tlsSecret=replica-tls --set cockroach.region=california
+      - name: CockroachDB mode requires a TLS Secret
+        run: |
+          ! helm lint deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM \
+            --set database.mode=cockroach --set secrets.existingSecret=master \
+            --set cockroach.url=postgresql://kdc_replica@crdb/krb5 \
+            --set cockroach.region=california
+      - name: CockroachDB mode requires a region
+        run: |
+          ! helm lint deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM \
+            --set database.mode=cockroach --set secrets.existingSecret=master \
+            --set cockroach.url=postgresql://kdc_replica@crdb/krb5 \
+            --set cockroach.tlsSecret=replica-tls
 
   helm-e2e:
     runs-on: ubuntu-latest
@@ -100,6 +148,39 @@ jobs:
           k3d image import localhost/krb5-rs-kdc:e2e krb5-rs-mit-test:1.22.2 -c e2e
       - name: Chart end-to-end
         run: bash deploy/helm/krb5-rs-kdc/ci/e2e.sh
+
+  helm-e2e-cockroach:
+    runs-on: ubuntu-latest
+    env:
+      K3D_VERSION: v5.9.0
+      K3D_SHA256: 06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0
+      K3S_IMAGE: docker.io/rancher/k3s:v1.36.5-k3s1
+      CRDB_PINNED_IMAGE: docker.io/cockroachdb/cockroach:v26.3.2@sha256:84f0c929fdd4284b40a0c4afb1f284573fb281abc0323f8329e4e5f1650a3e00
+      CONTAINER_CLI: docker
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.22.0
+      - name: Install k3d
+        run: |
+          curl -fsSL -o k3d "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64"
+          echo "${K3D_SHA256}  k3d" | sha256sum -c -
+          sudo install -m 0755 k3d /usr/local/bin/k3d
+      - name: Build CockroachDB-enabled KDC and MIT client images
+        run: |
+          docker build -f deploy/docker/Dockerfile --build-arg FEATURES=cockroach \
+            -t localhost/krb5-rs-kdc:e2e-cockroach .
+          docker build -t krb5-rs-mit-test:1.22.2 tests/kdc
+      - name: Pull CockroachDB test image
+        run: docker pull "$CRDB_PINNED_IMAGE"
+      - name: Create the cluster and load images
+        run: |
+          k3d cluster create e2e-cockroach --image "$K3S_IMAGE" --wait --timeout 180s
+          k3d image import localhost/krb5-rs-kdc:e2e-cockroach \
+            krb5-rs-mit-test:1.22.2 "$CRDB_PINNED_IMAGE" -c e2e-cockroach
+      - name: CockroachDB chart end-to-end
+        run: bash deploy/helm/krb5-rs-kdc/ci/e2e-cockroach.sh
 
   live:
     runs-on: ubuntu-latest

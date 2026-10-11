@@ -13,17 +13,19 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use krb5_rs::kdc::kdb::admin::{
-    format_policy, format_principal, parse_lifetime, parse_principal, parse_time, Admin, AdminOps,
+    format_policy, format_principal, parse_lifetime, parse_principal, parse_time, AdminOps,
     AttrChange, PolicyChange, PrincipalOptions,
 };
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, write_stash, FileStore};
+#[cfg(feature = "cockroach")]
+use krb5_rs::kdc::StoreErrorKind;
 use krb5_rs::kdc::{default_realm, AdminStore, RealmConfig, StoreError};
 use krb5_rs::profile::Profile;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] [--force] <command>\n\
-         commands:\n  init --master-password-file F [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash\n  \
+        "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] [--master-password-file PATH] [--force] <command>\n\
+         commands:\n  init [--master-password-file F] [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash\n  \
          addprinc [-randkey] [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
          delprinc NAME\n  cpw [-randkey] [-keepold] NAME\n  \
          modprinc [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] [-allow_delegate_to P]... [-allow_delegate_from P]... [-clear_delegate_to] [-clear_delegate_from] [-policy P | -clearpolicy] [-unlock] NAME\n  \
@@ -64,9 +66,29 @@ fn read_secret_file(path: &str) -> String {
     line.to_string()
 }
 
+fn master_key(
+    cfg: &RealmConfig,
+    realm: &str,
+    master_password_file: Option<&str>,
+) -> krb5_rs::types::EncryptionKey {
+    match master_password_file {
+        Some(path) => ok(master_key_from_password(
+            realm,
+            &read_secret_file(path),
+            cfg.master_key_type,
+        )),
+        None => ok(read_stash(&cfg.key_stash_file, realm)),
+    }
+}
+
 /// Idempotent bootstrap: create the database (and stash) if missing, then
 /// make sure every listed principal exists, leaving existing ones alone.
-fn init(args: Vec<String>, cfg: &RealmConfig, realm: &str) {
+fn init(
+    args: Vec<String>,
+    cfg: &RealmConfig,
+    realm: &str,
+    global_master_password_file: Option<&str>,
+) {
     let mut master_file: Option<String> = None;
     let mut stash = false;
     let mut randkeys: Vec<String> = Vec::new();
@@ -87,12 +109,11 @@ fn init(args: Vec<String>, cfg: &RealmConfig, realm: &str) {
             _ => usage(),
         }
     }
-    let master_file = master_file.unwrap_or_else(|| fail("init requires --master-password-file"));
-    let key = ok(master_key_from_password(
-        realm,
-        &read_secret_file(&master_file),
-        cfg.master_key_type,
-    ));
+    let master_file = master_file
+        .as_deref()
+        .or(global_master_password_file)
+        .unwrap_or_else(|| fail("init requires --master-password-file"));
+    let key = master_key(cfg, realm, Some(master_file));
     let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
     let store = if cfg.database_name.exists() {
         ok(FileStore::open(&cfg.database_name, &key))
@@ -110,23 +131,8 @@ fn init(args: Vec<String>, cfg: &RealmConfig, realm: &str) {
         ok(write_stash(&cfg.key_stash_file, realm, &key));
         println!("Stash {} written.", cfg.key_stash_file.display());
     }
-    let admin = Admin::new(&store, cfg.supported_keysalts.clone());
-    let opts = PrincipalOptions::default();
-    let wanted = randkeys.iter().map(|n| (n.as_str(), None)).chain(
-        passwords
-            .iter()
-            .map(|(n, f)| (n.as_str(), Some(f.as_str()))),
-    );
-    for (spec, password_file) in wanted {
-        let (name, r) = ok(parse_principal(spec, realm));
-        if ok(store.get_record(&name, &r)).is_some() {
-            println!("Principal \"{name}@{r}\" already exists.");
-            continue;
-        }
-        let password = password_file.map(read_secret_file);
-        ok(admin.add_principal(&name, &r, password.as_deref(), &opts));
-        println!("Principal \"{name}@{r}\" created.");
-    }
+    let admin = Blocking::new(runtime(), store, cfg.supported_keysalts.clone());
+    ensure_init_principals(&admin, realm, &randkeys, &passwords);
 }
 
 /// Parse addpol/modpol options (kadmin.c:1646-1695); the policy name is the
@@ -206,6 +212,7 @@ fn main() {
     let mut config: Option<PathBuf> = std::env::var_os("KRB5_KDC_PROFILE").map(PathBuf::from);
     let mut krb5_config: Option<PathBuf> = std::env::var_os("KRB5_CONFIG").map(PathBuf::from);
     let mut realm: Option<String> = None;
+    let mut master_password_file: Option<String> = None;
     let mut force = false;
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     while let Some(first) = args.first().map(String::as_str) {
@@ -214,7 +221,7 @@ fn main() {
                 force = true;
                 args.remove(0);
             }
-            "--config" | "--krb5-config" | "--realm" => {
+            "--config" | "--krb5-config" | "--realm" | "--master-password-file" => {
                 if args.len() < 2 {
                     usage();
                 }
@@ -222,7 +229,8 @@ fn main() {
                 match args.remove(0).as_str() {
                     "--config" => config = Some(PathBuf::from(value)),
                     "--krb5-config" => krb5_config = Some(PathBuf::from(value)),
-                    _ => realm = Some(value),
+                    "--realm" => realm = Some(value),
+                    _ => master_password_file = Some(value),
                 }
             }
             _ => break,
@@ -258,7 +266,7 @@ fn main() {
     match cfg.db_module.library.as_deref() {
         None => {}
         Some("krb5-rs-cockroach") => {
-            cockroach_command(&cmd, args, &cfg, &realm);
+            cockroach_command(&cmd, args, &cfg, &realm, master_password_file.as_deref());
             return;
         }
         Some(other) => fail(format!("unknown db_library {other:?}")),
@@ -269,7 +277,7 @@ fn main() {
 
     match cmd.as_str() {
         "init" => {
-            init(args, &cfg, &realm);
+            init(args, &cfg, &realm, master_password_file.as_deref());
             return;
         }
         "create" => {
@@ -306,7 +314,7 @@ fn main() {
         _ => {}
     }
 
-    let master = ok(read_stash(&cfg.key_stash_file, &realm));
+    let master = master_key(&cfg, &realm, master_password_file.as_deref());
     let store = ok(FileStore::open(&cfg.database_name, &master));
     let admin = Blocking::new(runtime(), &store, cfg.supported_keysalts.clone());
     run_admin(&admin, &cmd, args, &realm);
@@ -399,6 +407,18 @@ impl<S: AdminStore> Blocking<S> {
         self.rt.block_on(self.ops.get_principal(n, r))
     }
 
+    fn principal_exists(
+        &self,
+        n: &krb5_rs::types::PrincipalName,
+        r: &str,
+    ) -> Result<bool, StoreError> {
+        match self.rt.block_on(self.ops.get_principal(n, r)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == krb5_rs::kdc::StoreErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn list_principals(&self) -> Result<Vec<String>, StoreError> {
         self.rt.block_on(self.ops.list_principals())
     }
@@ -411,6 +431,30 @@ impl<S: AdminStore> Blocking<S> {
         randomize: bool,
     ) -> Result<u32, StoreError> {
         self.rt.block_on(self.ops.ktadd(n, r, keytab, randomize))
+    }
+}
+
+fn ensure_init_principals<S: AdminStore>(
+    admin: &Blocking<S>,
+    realm: &str,
+    randkeys: &[String],
+    passwords: &[(String, String)],
+) {
+    let opts = PrincipalOptions::default();
+    let wanted = randkeys.iter().map(|name| (name.as_str(), None)).chain(
+        passwords
+            .iter()
+            .map(|(name, path)| (name.as_str(), Some(path.as_str()))),
+    );
+    for (spec, password_file) in wanted {
+        let (name, realm) = ok(parse_principal(spec, realm));
+        if ok(admin.principal_exists(&name, &realm)) {
+            println!("Principal \"{name}@{realm}\" already exists.");
+            continue;
+        }
+        let password = password_file.map(read_secret_file);
+        ok(admin.add_principal(&name, &realm, password.as_deref(), &opts));
+        println!("Principal \"{name}@{realm}\" created.");
     }
 }
 
@@ -546,7 +590,13 @@ fn run_admin<S: AdminStore>(admin: &Blocking<S>, cmd: &str, args: Vec<String>, r
 /// kadmin commands, plus `create`, `stash`, `database migrate` and
 /// `replication status|prune|wait-applied`.
 #[cfg(feature = "cockroach")]
-fn cockroach_command(cmd: &str, mut args: Vec<String>, cfg: &RealmConfig, realm: &str) {
+fn cockroach_command(
+    cmd: &str,
+    mut args: Vec<String>,
+    cfg: &RealmConfig,
+    realm: &str,
+    global_master_password_file: Option<&str>,
+) {
     use krb5_rs::kdc::replication::ReplicationTs;
     use krb5_rs_kdb_cockroach::{CockroachConfig, CockroachStore, MigrateOptions, MultiRegion};
 
@@ -567,6 +617,66 @@ fn cockroach_command(cmd: &str, mut args: Vec<String>, cfg: &RealmConfig, realm:
         }
     };
     match cmd {
+        "init" => {
+            let mut subcommand_master_file = None;
+            let mut stash = false;
+            let mut randkeys = Vec::new();
+            let mut passwords = Vec::new();
+            let mut it = args.into_iter();
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--master-password-file" => {
+                        subcommand_master_file = Some(next(&mut it));
+                    }
+                    "--stash" => stash = true,
+                    "--randkey" => randkeys.push(next(&mut it)),
+                    "--password" => {
+                        let spec = next(&mut it);
+                        let Some((name, path)) = spec.split_once('=') else {
+                            fail("--password expects NAME=FILE");
+                        };
+                        passwords.push((name.to_string(), path.to_string()));
+                    }
+                    _ => usage(),
+                }
+            }
+            let master_file = subcommand_master_file
+                .as_deref()
+                .or(global_master_password_file)
+                .unwrap_or_else(|| fail("init requires --master-password-file"));
+            let key = master_key(cfg, realm, Some(master_file));
+            let store = ok(rt.block_on(CockroachStore::connect(config, key.clone(), realm)));
+            let created = match rt.block_on(store.verify_master()) {
+                Ok(()) => false,
+                Err(error) if error.kind() == StoreErrorKind::NotFound => {
+                    let etypes: Vec<i32> = cfg
+                        .supported_keysalts
+                        .iter()
+                        .map(|(etype, _)| *etype)
+                        .collect();
+                    match rt.block_on(store.create_realm(&etypes)) {
+                        Ok(()) => true,
+                        Err(error) if error.kind() == StoreErrorKind::Conflict => {
+                            ok(rt.block_on(store.verify_master()));
+                            false
+                        }
+                        Err(error) => fail(error),
+                    }
+                }
+                Err(error) => fail(error),
+            };
+            if created {
+                println!("Realm {realm} created.");
+            } else {
+                println!("Realm {realm} already exists.");
+            }
+            if stash && !cfg.key_stash_file.exists() {
+                ok(write_stash(&cfg.key_stash_file, realm, &key));
+                println!("Stash {} written.", cfg.key_stash_file.display());
+            }
+            let admin = Blocking::new(rt, store, cfg.supported_keysalts.clone());
+            ensure_init_principals(&admin, realm, &randkeys, &passwords);
+        }
         "database" => {
             if args.first().map(String::as_str) != Some("migrate") {
                 usage();
@@ -636,7 +746,7 @@ fn cockroach_command(cmd: &str, mut args: Vec<String>, cfg: &RealmConfig, realm:
             ok(write_stash(&cfg.key_stash_file, realm, &key));
         }
         "replication" => {
-            let master = ok(read_stash(&cfg.key_stash_file, realm));
+            let master = master_key(cfg, realm, global_master_password_file);
             let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
             let sub = if args.is_empty() {
                 usage()
@@ -698,7 +808,7 @@ fn cockroach_command(cmd: &str, mut args: Vec<String>, cfg: &RealmConfig, realm:
             }
         }
         _ => {
-            let master = ok(read_stash(&cfg.key_stash_file, realm));
+            let master = master_key(cfg, realm, global_master_password_file);
             let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
             let admin = Blocking::new(rt, store, cfg.supported_keysalts.clone());
             run_admin(&admin, cmd, args, realm);
@@ -707,6 +817,12 @@ fn cockroach_command(cmd: &str, mut args: Vec<String>, cfg: &RealmConfig, realm:
 }
 
 #[cfg(not(feature = "cockroach"))]
-fn cockroach_command(_cmd: &str, _args: Vec<String>, _cfg: &RealmConfig, _realm: &str) {
+fn cockroach_command(
+    _cmd: &str,
+    _args: Vec<String>,
+    _cfg: &RealmConfig,
+    _realm: &str,
+    _global_master_password_file: Option<&str>,
+) {
     fail("db_library krb5-rs-cockroach needs a krb5-rs-kdb built with the `cockroach` feature");
 }

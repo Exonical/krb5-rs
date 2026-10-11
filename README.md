@@ -170,22 +170,42 @@ The settings below go in the kdc.conf realm section. They are krb5-rs extensions
 | `kprop_keytab` / `kprop_password_file` | replica | Exactly one: where the replica's key comes from |
 | `kprop_poll_interval` | replica | Time between pulls (deltat, default 60s, ±10% jitter; failures back off from 1s up to this value) |
 
-`kprop_listen` and `kprop_primary` together are a configuration error. A replica needs the same master key stash as the primary. With no local database it pulls before binding its KDC listeners, retrying with backoff; with one it serves immediately and syncs in the background. `krb5-rs-kdb` refuses to modify a replica's database unless given `--force`.
+`kprop_listen` and `kprop_primary` together are a configuration error. A replica needs the same master key stash as the primary. With no local database, or a damaged one, it pulls before binding its KDC listeners, retrying with backoff; with a valid one it serves immediately and syncs in the background. `krb5-rs-kdb` refuses to modify a replica's database unless given `--force`.
 
 File-mode replicas have no freshness bound, as with MIT kpropd. Use
 CockroachDB mode for bounded staleness.
 
 ### Deployment
 
-- **Kubernetes** (`deploy/helm/krb5-rs-kdc`): one primary (StatefulSet with a PVC) plus two replicas that pull the database from it, behind a `LoadBalancer` Service on UDP+TCP 88. `realm` is required:
+- **Kubernetes** (`deploy/helm/krb5-rs-kdc`): `database.mode=file` (default)
+  runs one primary (StatefulSet with a PVC) plus replicas that pull the database
+  from it. `database.mode=cockroach` runs a CockroachDB-backed KDC StatefulSet
+  with a PVC per pod and a local Turso replica. `realm` is required:
 
   ```sh
   helm install kdc deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM
   ```
 
-  Secrets (master and kprop passwords) are generated on first install and kept; use `secrets.existingSecret` to supply your own. `helm install` prints how to find the address and administer the database. Replicas keep serving while the primary is down; administrative changes wait for it.
+  File mode generates and retains its master and kprop Secrets unless
+  `secrets.existingSecret` is supplied. CockroachDB mode requires an existing
+  master Secret and the kdc_replica TLS Secret; enable the bootstrap Job in
+  exactly one release per database. `helm install` prints how to find the
+  address and administer the database. File replicas keep serving while their
+  primary is down; CockroachDB replicas fail closed when stale. The KDC
+  StatefulSet uses a PVC per pod for its local Turso replica. Enable the prune
+  CronJob in exactly one release, and give administration a separate
+  `kdc_admin` URL and TLS Secret. See
+  [`deploy/helm/krb5-rs-kdc/examples/multi-region`](deploy/helm/krb5-rs-kdc/examples/multi-region)
+  for three regional values files.
 - **Podman** (`deploy/podman`): a single pod via `podman kube play` or a Quadlet unit (no replicas). See `deploy/podman/README.md`.
-- **Image**: `ghcr.io/exonical/krb5-rs-kdc` (built from `deploy/docker/Dockerfile`, published from `main` and `v*` tags; linux/amd64 for now, arm64 needs an aarch64 musl build). Bootstrap helpers for shell-less containers: `krb5-rs-kdb init` (idempotent database/stash/principal creation from secret files) and `krb5-rs-kdc --master-password-file` (derive the master key instead of reading a stash).
+- **Image**: `ghcr.io/exonical/krb5-rs-kdc:<tag>` is the pure Rust image;
+  `ghcr.io/exonical/krb5-rs-kdc:<tag>-cockroach` includes the CockroachDB and
+  Turso modules. Both are built from `deploy/docker/Dockerfile` and published
+  from `main` and `v*` tags; linux/amd64 for now, arm64 needs an
+  aarch64-musl build. Bootstrap helpers for shell-less containers:
+  `krb5-rs-kdb init` (idempotent database/stash/principal creation from secret
+  files) and `krb5-rs-kdc --master-password-file` (derive the master key
+  instead of reading a stash).
 
 ## License
 
