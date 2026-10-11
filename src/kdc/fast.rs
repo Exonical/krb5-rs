@@ -236,11 +236,10 @@ impl<S: PrincipalStore> Kdc<S> {
         // entry first (the ticket names it in the clear).
         let entry = match rasn::der::decode::<ApReq>(ap_bytes) {
             Ok(ap) => self
-                .store
-                .lookup(
+                .measure_store(self.store.lookup(
                     &ap.ticket.sname,
                     &String::from_utf8_lossy(ap.ticket.realm.as_bytes()),
-                )
+                ))
                 .await
                 .ok()
                 .flatten(),

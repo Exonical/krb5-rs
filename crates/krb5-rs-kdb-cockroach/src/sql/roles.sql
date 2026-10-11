@@ -11,8 +11,11 @@ CREATE USER IF NOT EXISTS kdc_admin;
 GRANT CONNECT ON DATABASE {db} TO kdc_replica;
 GRANT ALL ON DATABASE {db} TO kdc_admin;
 GRANT SELECT ON TABLE realms, principals, principal_keys, policies, lockouts,
-    replication_log, replication_meta, replica_status, schema_migrations TO kdc_replica;
+    replication_log, replication_meta, replica_status, schema_migrations,
+    transaction_markers TO kdc_replica;
 GRANT INSERT, UPDATE ON TABLE lockouts, replica_status TO kdc_replica;
 GRANT INSERT ON TABLE replication_log TO kdc_replica;
+GRANT INSERT ON TABLE transaction_markers TO kdc_replica;
 GRANT ALL ON TABLE realms, principals, principal_keys, policies, lockouts,
-    replication_log, replication_meta, replica_status, schema_migrations TO kdc_admin;
+    replication_log, replication_meta, replica_status, schema_migrations,
+    transaction_markers TO kdc_admin;

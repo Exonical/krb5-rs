@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 deadpool-postgres = "0.14.2"
+rand = "0.10"
 krb5-rs = { path = "../..", features = ["kdc", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 rustls-pki-types = "1.15.1"
@@ -20,4 +21,5 @@ tokio-postgres-rustls = "0.14"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+krb5-rs-kdb-turso = { path = "../krb5-rs-kdb-turso" }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time"] }

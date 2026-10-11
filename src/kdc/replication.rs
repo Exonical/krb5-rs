@@ -406,10 +406,41 @@ pub trait Snapshot: Send {
     /// The timestamp the snapshot is read at: the checkpoint after loading it.
     fn ts(&self) -> ReplicationTs;
 
+    /// The authority's clock (as an HLC wall time) when the snapshot's read
+    /// timestamp was chosen, from the same read: `source_now() - ts()` is how
+    /// far behind the present the snapshot is, independent of the KDC clock.
+    fn source_now(&self) -> ReplicationTs;
+
     /// The next page of `Change` upserts, or `None` when the snapshot is
     /// exhausted. The versions are those of the stored rows.
     fn next_page(&mut self)
         -> impl Future<Output = Result<Option<Vec<Change>>, StoreError>> + Send;
+}
+
+/// One read of the authoritative log ([`ReplicationSource::poll`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollResult {
+    /// The changes and the timestamp they are complete up to.
+    pub batch: ChangeBatch,
+    /// The authority's clock (an HLC wall time) in the same read. `source_now
+    /// - batch.upto` is the replication lag as the authority sees it; it never
+    ///   compares the KDC's wall clock with an HLC timestamp.
+    pub source_now: ReplicationTs,
+    /// More changes are waiting: the batch stopped at the limit, so poll again
+    /// at once.
+    pub truncated: bool,
+}
+
+/// Where a replica reports its progress (CockroachDB `replica_status`).
+pub trait ReplicaRegistry: Send + Sync {
+    /// Record that `kdc_id` in `region` has applied everything up to
+    /// `applied_ts`.
+    fn heartbeat(
+        &self,
+        kdc_id: &str,
+        region: &str,
+        applied_ts: ReplicationTs,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 /// The authoritative side of replication (docs §5): complete, ordered change
@@ -425,17 +456,26 @@ pub trait ReplicationSource: Send + Sync {
     /// Start a snapshot at a fresh read timestamp.
     fn snapshot(&self) -> impl Future<Output = Result<Self::Snapshot, StoreError>> + Send;
 
+    /// [`ReplicationSource::poll`] without the freshness details.
+    fn changes_since(
+        &self,
+        since: ReplicationTs,
+        limit: usize,
+    ) -> impl Future<Output = Result<ChangeBatch, StoreError>> + Send {
+        async move { Ok(self.poll(since, limit).await?.batch) }
+    }
+
     /// The changes with commit timestamp in `(since, upto]`, in commit order,
     /// as the current state of each changed entity read at `upto` (absent
     /// means deleted: the change is a `Delete` carrying the log row's
     /// version). `upto` is the read timestamp, or, when more than `limit` log
     /// rows qualify, the last commit timestamp included. One commit timestamp
     /// is never split across batches, so a batch can exceed `limit`.
-    fn changes_since(
+    fn poll(
         &self,
         since: ReplicationTs,
         limit: usize,
-    ) -> impl Future<Output = Result<ChangeBatch, StoreError>> + Send;
+    ) -> impl Future<Output = Result<PollResult, StoreError>> + Send;
 
     /// The low watermark of retained log rows: a replica whose checkpoint is
     /// below it must rebuild from a snapshot. `None` if nothing was pruned.
@@ -443,6 +483,14 @@ pub trait ReplicationSource: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<Option<ReplicationTs>, StoreError>> + Send;
 }
+
+#[cfg(feature = "tokio")]
+mod engine;
+#[cfg(feature = "tokio")]
+pub use engine::{
+    FreshnessGate, RebuildPolicy, ReplicaStatus, ReplicationConfig, ReplicationEngine,
+    StatusSnapshot, StrictGate,
+};
 
 /// A replica database that applies replicated changes (docs §5).
 pub trait ReplicaSink: Send + Sync {

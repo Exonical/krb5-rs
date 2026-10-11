@@ -23,7 +23,7 @@ path = "src/bin/krb5-rs-kdb.rs"
 turso = ["dep:krb5-rs-kdb-turso"]
 # The CockroachDB authoritative database module (db_library = krb5-rs-cockroach),
 # used by `krb5-rs-kdb`. Off by default: it pulls rustls with aws-lc-rs (C code).
-cockroach = ["dep:krb5-rs-kdb-cockroach"]
+cockroach = ["dep:krb5-rs-kdb-cockroach", "turso"]
 
 [dependencies]
 krb5-rs-kdb-turso = { path = "../krb5-rs-kdb-turso", optional = true }
@@ -33,3 +33,7 @@ krb5-rs = { path = "../..", features = ["kdc", "tokio", "pkinit"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+prometheus-client = "=0.25.1"
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["test-util"] }

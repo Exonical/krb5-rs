@@ -110,25 +110,45 @@ client-side retry protocol (`SAVEPOINT cockroach_restart`).
 | Table | Key | Notes |
 |---|---|---|
 | `realms` | `name` | Realm parameters and master key kvno |
-| `principals` | `(realm, name)` | Attributes, policy, lifetimes, expirations, delegation lists, `security_epoch`, `version`, admin metadata (`created_at`, `mod_time`, `mod_by`, `last_pwd_change`) |
+| `principals` | `(realm, name)` | Attributes, policy, lifetimes, expirations, delegation lists, `security_epoch`, `deleted` (tombstone), admin metadata (`created_at`, `mod_time`, `mod_by`, `last_pwd_change`) |
 | `principal_keys` | `(realm, name, kvno, enctype)` | Master-key-encrypted key, salt, s2kparams, mkvno. Old kvnos are kept for key history |
-| `policies` | `name` | Policy fields, `security_epoch`, `version` |
-| `lockouts` | `(realm, name)` | Replicated lockout records written by KDCs (§8) |
-| `replication_log` | `(commit_ts, entity, realm, key)` | One row per changed entity per transaction. `commit_ts` is the transaction's HLC timestamp (`cluster_logical_timestamp()`), indexed |
-| `replication_meta` | singleton | `pruned_before`, the low watermark of retained log rows |
+| `policies` | `name` | Policy fields, `security_epoch`, `deleted` (tombstone) |
+| `lockouts` | `(realm, name)` | Replicated lockout records written by KDCs (§8), `deleted` (tombstone) |
+| `replication_log` | `(bucket, id)` | One row per changed entity per transaction: `entity`, `realm`, `key`, `op`, `txn_id`. `bucket = floor(now() / bucket_width)`, where `now()` is the transaction's start timestamp, which does not pin the commit timestamp. Polling scans from `bucket(since − D − margin)` and pruning retains the same margin. Rows are ordered by their own MVCC commit timestamp (`crdb_internal_mvcc_timestamp`) |
+| `transaction_markers` | per-attempt `id` | Stable logical transaction id plus a fresh physical attempt id, for SQLSTATE 40003 resolution |
+| `replication_meta` | singleton | `pruned_before`, the low watermark of retained log rows; `bucket_width_seconds` (10 by default) and `transaction_timeout_ms` (D) shared by writers/readers |
 | `replica_status` | `kdc_id` | Heartbeats: region, applied checkpoint, last seen. `REGIONAL BY ROW` |
 | `schema_migrations` | `version` | Versioned migrations |
 
-`version` on an entity row is the commit HLC timestamp of the transaction
-that last changed it. It is monotonic per entity and needs no application
-counter.
+An entity's `version` is not stored. It is the entity row's MVCC commit
+timestamp (`crdb_internal_mvcc_timestamp`), read together with the row at the
+replication read timestamp T. CockroachDB assigns it at commit, so it is
+monotonic per row and needs no application counter and no timestamp pinning.
+
+Rules that make this sufficient:
+- Any transaction that changes a principal's keys also updates the
+  `principals` row (`mod_time`). The principal row's version therefore covers
+  its keys.
+- Deletes are tombstones (`deleted = true`, keys removed), so a delete has a
+  version and a later re-create has a higher one.
+- Tombstones are pruned together with the log: they are only removed below
+  `pruned_before`, and a replica behind `pruned_before` rebuilds anyway.
+
+Admin transactions must **never** call `cluster_logical_timestamp()`.
+Calling it freezes the transaction's timestamp, so the transaction can no
+longer be moved forward. A SERIALIZABLE read-modify-write is then
+restart-only: on GLOBAL tables writes must land at a future timestamp, and
+any uncertainty or timestamp-cache push forces a restart. That livelocked in
+PR 7.
 
 **Multi-region.** The database has `PRIMARY REGION` plus the regions
 California, Ohio and Washington DC. `principals`, `principal_keys`, `policies`,
 `lockouts`, `replication_log` and `replication_meta` are `LOCALITY GLOBAL`:
 reads are served consistently by the local region, and writes pay commit-wait.
-That suits rarely written administrative data. Multi-region DDL is a separate,
-opt-in migration step.
+`realms` remains regional: it holds bootstrap metadata and making realm
+initialization a GLOBAL transaction adds commit-wait without improving the
+per-principal replication model. Multi-region DDL is a separate, opt-in
+migration step.
 
 ### Turso (local replica)
 
@@ -168,28 +188,41 @@ seconds of propagation latency, which the consistency policy (§7) accounts for.
 
 ### Correctness argument (verified against CockroachDB v26.3.2, PR 6)
 
-1. Every admin transaction writes its entity rows and one `replication_log`
-   row per changed entity, with `commit_ts = cluster_logical_timestamp()`.
-   This pins the commit timestamp: if the transaction is pushed, it restarts
-   rather than committing with a stale value.
-2. A KDC reads in a read-only transaction at a fixed historical timestamp T
-   (`AS OF SYSTEM TIME`). CockroachDB's timestamp cache guarantees that once a
-   span has been read at T, no transaction can later commit a write into that
-   span at a timestamp ≤ T. So the set of log rows with `commit_ts ∈ (ckpt, T]`
-   is complete and final once read.
-3. For each batch, the KDC reads the current state of every affected entity at
-   the same T. Absent means deleted, which is the tombstone. It applies them in
-   one Turso transaction that also sets `checkpoint_ts = T`. Every row from one
-   admin transaction shares a `commit_ts`, so logically related changes land
-   together.
-4. Rows are applied only if the incoming `version` is greater than the local
-   `version`. This makes the process idempotent, handles duplicates and
-   out-of-order re-reads, and stops stale overwrites. Deletes carry the log
-   row's version, and a later re-create has a higher version.
-5. A checkpoint advances only in the same Turso transaction that commits the
+1. **What each admin transaction writes.** An ordinary SERIALIZABLE
+   transaction that never pins its timestamp writes:
+   - its entity rows, as tombstones for deletes;
+   - one `replication_log` row per changed entity, in
+     `bucket = floor(now() / bucket_width)`;
+   - a transaction marker for resolving SQLSTATE 40003.
+   On 40001 it retries normally. On 40003 it reads the logical transaction
+   marker at the present before deciding whether to replay.
+2. **Bounded transaction duration.** The server enforces a maximum transaction
+   duration D (CockroachDB `transaction_timeout`). The commit MVCC timestamp
+   can be ahead of the transaction's start time because of GLOBAL commit-wait
+   and gateway HLC skew. A 5s `COMMIT_SKEW_MARGIN` covers the approximately 1s
+   closed-timestamp lead plus the 500ms maximum HLC offset, so the oldest
+   possible start bucket for a commit at C is `bucket(C - D - margin)`.
+   Pruning uses this same overlap.
+3. **The read.** A KDC reads in a read-only transaction at a fixed timestamp T
+   (`AS OF SYSTEM TIME`, with T taken from inside that transaction). It scans
+   buckets `bucket(ckpt - D - margin) ..= bucket(T)` and keeps rows whose
+   `crdb_internal_mvcc_timestamp ∈ (ckpt, T]`.
+   - **Complete:** the timestamp cache and closed timestamps guarantee that
+     nothing can later commit into those spans at a timestamp ≤ T.
+   - **Cheap:** the scan is limited to D plus the poll window.
+4. **Applying a batch.** For each batch, the KDC reads every affected entity
+   row, including tombstones, at the same T, with the row's MVCC timestamp as
+   its version. It applies them in one Turso transaction that also sets
+   `checkpoint_ts = T`. All rows of one admin transaction share its commit
+   timestamp, so logically related changes land together. A truncated batch
+   never splits one commit timestamp.
+5. **Version check.** Rows are applied only if the incoming version is greater
+   than the local version. This makes apply idempotent, handles duplicates and
+   out-of-order re-reads, and stops stale overwrites.
+6. A checkpoint advances only in the same Turso transaction that commits the
    data, so a crash never moves it ahead of durable state.
 
-**Verified facts (PR 6, `crates/krb5-rs-kdb-cockroach/tests/facts.rs`, v26.3.2, 3 nodes):**
+**Verified facts (`crates/krb5-rs-kdb-cockroach/tests/facts.rs`, CockroachDB v26.3.2, 3 nodes):**
 
 - `cluster_logical_timestamp()` returns `wall_nanos.logical` with a 10-digit logical part.
 - Inside `BEGIN READ ONLY AS OF SYSTEM TIME t` it returns the AOST timestamp, not the present: the replication read gets its `T` from inside the read-only transaction (`follower_read_timestamp()` or the present). An explicit decimal `T` is accepted by AOST and returned unchanged.
@@ -197,12 +230,58 @@ seconds of propagation latency, which the consistency policy (§7) accounts for.
 - The timestamp cache: a writer into a span another transaction already read commits above that reader's timestamp.
 - GLOBAL (non-blocking) write transactions: the pinned timestamp still equals the commit timestamp (difference 0 ms in four runs), and commit-wait on the local test cluster was 2 to 23 ms.
 - Licensing: without a license key a cluster has a 7-day grace period from initialisation, then is throttled (5 concurrent open transactions) unless an Enterprise Free/Trial license is installed (docs.cockroachlabs.com/docs/stable/licensing-faqs; `pkg/server/license/enforcer.go`). Multi-region features worked on the unlicensed cluster inside the grace period.
+- `transaction_timeout` is the v26.3 server-side transaction-duration bound.
+  With `statement_timeout=0` and `transaction_timeout=1s` supplied as startup
+  connection options, an explicit transaction with an uncommitted insert was
+  left idle for 1.5s. `COMMIT` returned a closed connection and a new session
+  found no inserted row. Thus the server, not a client future deadline,
+  aborted it. The production pool sets this option on every connection; the
+  configured D must equal `replication_meta.transaction_timeout_ms`.
+- `crdb_internal_mvcc_timestamp` was read inside AOST on a GLOBAL row after an
+  insert and two updates. Each AOST timestamp matched the selected row version,
+  and the versions increased monotonically across all three writes.
+- With D=3s and the default 10s bucket width, a long-running writer began in
+  bucket B, then a reader completed an AOST scan at checkpoint T in the next
+  bucket before the writer inserted its log row. After the writer committed,
+  the row was found in `bucket(ckpt-D-margin)..=bucket(T2)` with MVCC timestamp
+  in `(ckpt,T2]`. The observed start bucket was included by the D-plus-margin
+  overlap, and pruning uses the same lower bound.
+- Sequential GLOBAL `modprinc` hunts completed **50/50 and 200/200** with zero
+  failures. A separate 50-operation regional hunt with a concurrent
+  present-time replication reader also completed with zero failures.
+- The cuttable-proxy test exercises an actual network partition; the ambiguous
+  commit test is explicitly simulated: the database transaction commits, then
+  a failpoint synthesizes a lost COMMIT response and verifies the marker. No
+  real SQLSTATE 40003 was observed.
+- Licensing: this unlicensed CCL v26.3.2 cluster was inside its 7-day grace
+  period (initialised 2026-10-10); `enterprise.license` was empty. It was not
+  yet subject to the documented 5-open-transaction throttle.
 
 **Caveats found while building it:**
 
-- A follower read is about 4.2 s in the past, so right after a database, its tables or its grants are created they do not exist at the read timestamp (SQLSTATE 3D000, 42P01, 42501). `changes_since` and `snapshot` then read once at the present; a real error repeats there and is returned. A batch whose read timestamp is not above the caller's checkpoint is empty, so the checkpoint never goes backwards after such a fallback.
+- A follower read is about 4.2 s in the past, so right after a database, its tables, columns or grants are created they do not exist at the read timestamp (SQLSTATE 3D000, 42P01, 42501, 42703). `changes_since` and `snapshot` then read once at the present; a real error repeats there and is returned. A batch whose read timestamp is not above the caller's checkpoint is empty, so the checkpoint never goes backwards after such a fallback.
 - When `changes_since` truncates at `limit`, the entities are still read at the full read timestamp `T`, so an entity may arrive with a version newer than the batch's `upto`; it appears again in a later batch and the replica's version check makes that idempotent.
-- `replication_log` rows are inserted with `ON CONFLICT DO NOTHING`, which a KDC's `kdc_replica` user may do with INSERT alone (no UPDATE on the log).
+- The `kdc_replica` role inserts log rows with UUID ids and transaction ids; it has no UPDATE or DELETE privilege on the log. Transaction markers are local per-attempt rows indexed by logical transaction id.
+
+### Replication engine and consistency gates
+
+`ReplicationEngine` bootstraps from a streamed snapshot before daemon listener
+binding, then polls bounded `ChangeBatch`es and atomically applies each batch
+with the checkpoint. It polls immediately after a truncated batch, retries
+failures with bounded exponential backoff/jitter, and heartbeats independently.
+If `pruned_before` passes the checkpoint, `auto` rebuilds and switches Turso
+files; `manual` marks the replica unready.
+
+Freshness is clock-skew safe: the source returns `source_now` and its read
+timestamp T together; the KDC stores `source_now - T` and a local monotonic
+observation instant, then computes `freshness = source_lag + elapsed`. It never
+subtracts the KDC's wall clock from the HLC. `FreshnessGate` is fail-closed
+when the replica is unbootstrapped or stale. `StrictGate` additionally checks
+every involved principal against `AuthoritativeState`, rejecting a greater
+epoch, disabled/locked state, or unavailable authority. Defaults are bounded
+mode, 30 s maximum staleness and 500 ms authoritative timeout. Bounded mode may
+serve a newly disabled principal until its change replicates; strict mode
+rejects it as soon as CockroachDB reports the disable.
 
 ### Bootstrap and rebuild
 
@@ -350,11 +429,21 @@ files:
 - duplicate and out-of-order batches;
 - interruption and reconnect via a cuttable TCP proxy;
 - restart;
+- `strict_mode_rejects_authoritative_security_changes_the_replica_has_not_applied`:
+  strict rejects an unapplied disable, epoch change and unavailable authority,
+  while bounded mode serves during its documented replication window;
+- `an_engine_restarted_on_existing_turso_state_resumes_without_a_snapshot`:
+  restart resumes an existing checkpoint without rebuilding;
+- `shutdown_during_an_apply_waits_for_it_and_leaves_no_partial_batch`:
+  shutdown waits for the active atomic apply, then restart catches up;
+- `a_lagging_kdc_fails_closed_while_a_current_kdc_serves_and_heartbeats_show_progress`:
+  delayed-link lag is local to one KDC, regional progress is reported
+  independently, and the replica recovers;
 - crash during apply (kill between steps);
+- shutdown during an apply, verifying it completes before the engine exits;
 - stale-replica rejection;
 - a partition producing fail-closed behaviour;
 - concurrent admin transactions (retries);
-- lag across regions;
 - Turso MVCC conflicts and retries.
 
 Criterion benchmarks cover:
@@ -385,17 +474,38 @@ treat these as indicative.
 | Apply, batch of 100 | ~235 principals/s |
 | Apply, batch of 1000 | ~181 principals/s |
 
-Open findings, not yet explained:
+The continuous-apply run above used a writer loop that did not match production
+traffic. A second harness applies a batch of 10 principals either every second
+or every 100ms and records per-lookup p50/p99 over two-second windows. Results
+are microseconds, from the same single Windows development machine and
+1000-principal Turso 0.8.1 MVCC fixture.
 
-- **Replication writes slow reads.** When the writer applies batches
-  continuously, reads slow down by about 15× at 1 task and 3× at 64 tasks.
-  Real replication writes are rare: an administrative change, then a short
-  burst. Latency must be re-measured at a realistic write rate, reporting
-  p50 and p99, before claiming reads and writes are isolated.
-- **Apply is slow per principal.** Each upsert runs about 5 statements, and
-  throughput does not improve with batch size. This puts the bootstrap of
-  large realms in the minutes range, so the bulk rebuild path needs
-  optimising.
+| Replication rate | Pool | Concurrency | Lookup p50 | Lookup p99 |
+|---|---:|---:|---:|---:|
+| Idle | 8 | 1 | 33.2 | 173.8 |
+| Idle | 8 | 8 | 49.0 | 307.3 |
+| Idle | 8 | 64 | 50.1 | 2163.0 |
+| 10 principals/s | 8 | 1 | 34.9 | 167.4 |
+| 10 principals/s | 8 | 8 | 48.6 | 303.1 |
+| 10 principals/s | 8 | 64 | 48.2 | 1687.9 |
+| 10 principals/100ms | 8 | 1 | 35.9 | 177.2 |
+| 10 principals/100ms | 8 | 8 | 49.1 | 282.8 |
+| 10 principals/100ms | 8 | 64 | 447.2 | 2705.8 |
+
+At concurrency 64, the default 8-connection pool showed a p50 rise under
+10-principals/100ms traffic. Repeating the same harness with a 64-connection
+pool produced idle p50/p99 of 48.6/1582.5us and 10-principals/100ms p50/p99
+of 45.7/1618.8us. The pool uses a semaphore in `Inner::conn()`; increasing
+the pool removed the p50 regression in this experiment, supporting pool
+checkout contention as the cause rather than a long writer/checkpoint lock.
+This is a local-machine diagnostic, not a cross-region performance claim.
+With the 64-connection pool the 10-principals/100ms apply latency was p50
+3.8ms and p99 6.7ms at concurrency 64 (19 batches).
+
+- **Apply is slow per principal.** The older continuous benchmark applies
+  about 5 statements per upsert, and throughput does not improve with batch
+  size. This puts the bootstrap of large realms in the minutes range, so the
+  bulk rebuild path still needs optimizing.
 - **Turso 0.8.1 drops autocommit writes in MVCC mode.** In our probe, an
   autocommit `INSERT` was not visible after reopening the database; the
   same insert inside an explicit `BEGIN CONCURRENT … COMMIT` was. Every write

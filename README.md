@@ -107,7 +107,20 @@ does, and it is off by default.
         cockroach_pool_size = 8
         cockroach_connect_timeout = 5s
         cockroach_statement_timeout = 10s
+        cockroach_transaction_timeout = 30s
         replication_read = follower     # or present
+        replica_path = /var/lib/krb5-rs/replica
+        replication_poll_interval = 1s
+        replication_batch_limit = 1000
+        replication_retry_min = 100ms
+        replication_retry_max = 30s
+        replication_rebuild = auto      # or manual
+        replication_heartbeat_interval = 5s
+        kdc_id = kdc-0                  # defaults to POD_NAME, then HOSTNAME
+        region = california
+        consistency_mode = bounded      # or strict
+        max_staleness = 30s
+        authoritative_timeout = 500ms
     }
 ```
 
@@ -122,7 +135,21 @@ krb5-rs-kdb replication prune --older-than 7d
 krb5-rs-kdb replication wait-applied --since TS [--timeout 30s]
 ```
 
-`database migrate` applies the embedded, versioned schema (idempotent); `--create-roles` creates the `kdc_admin` and `kdc_replica` users with their grants (a KDC's `kdc_replica` can read the replicated data, report lockouts and heartbeat, and nothing else); `--multi-region` is the opt-in step that sets the database regions, GLOBAL locality on the replicated tables and REGIONAL BY ROW on `replica_status`. Every administrative change is one SERIALIZABLE transaction with the CockroachDB retry protocol and writes its `replication_log` rows stamped with the transaction's `cluster_logical_timestamp()`.
+`database migrate` applies the embedded, versioned schema; migration to the MVCC-versioned bucket log advances `pruned_before`, so existing replicas automatically rebuild rather than missing updates while the old log is replaced. `--create-roles` creates the `kdc_admin` and `kdc_replica` users with their grants (a KDC's `kdc_replica` can read replicated data, report lockouts, heartbeat and insert replication-log rows, but cannot modify principals, keys or policies); `--multi-region` is the opt-in step that sets the database regions, GLOBAL locality on the replicated tables and REGIONAL BY ROW on `replica_status`. The `realms` table remains regional.
+
+Admin writes never call `cluster_logical_timestamp()`. Entity versions come
+from `crdb_internal_mvcc_timestamp` at the replication read timestamp; writes
+also emit UUID log rows into 10-second `now()` buckets. `cockroach_transaction_timeout`
+(default 30s) is set as the server-side `transaction_timeout` on every pooled
+connection and must match the duration stored in `replication_meta`. Bucket
+scans include the D-sized overlap and filter log-row MVCC timestamps, so
+long-running transactions are not missed.
+
+`replication_poll_interval` defaults to 1s, `replication_batch_limit` to 1000, retry backoff defaults to 100ms–30s, and heartbeat interval to 5s. `replication_rebuild` is `auto` (default) or `manual`. `kdc_id` defaults to `POD_NAME`, then `HOSTNAME`; `region` defaults to `unknown`. `consistency_mode` is `bounded` by default (fail closed when source-clock freshness exceeds `max_staleness`, default 30s) or `strict` (also checks each local principal's authoritative epoch/disabled/lockout state, with 500ms `authoritative_timeout`). The clock-safe freshness is source HLC lag plus monotonic time since the read; it never compares KDC wall time to the HLC.
+
+When `replica_path` is set, the daemon opens Turso (MVCC only), bootstraps it from CockroachDB before binding KDC listeners, and then runs the incremental engine. `replication_rebuild = manual` fails readiness if the source pruned past the local checkpoint; `auto` builds a new Turso file and atomically switches to it. Replication freshness uses the source HLC and a monotonic elapsed-time clock, never the KDC's wall clock. `consistency_mode = bounded` (default, fail closed) refuses AS/TGS once freshness exceeds `max_staleness`; `strict` also asks CockroachDB for each involved principal's authoritative epoch/disabled/lockout state and fails closed after `authoritative_timeout`.
+
+`--metrics-listen HOST:PORT` enables the GET-only HTTP endpoints `/metrics`, `/healthz` and `/readyz`. Readiness requires bound KDC listeners, a bootstrapped replica and freshness within bounds. Metrics have low-cardinality labels only; principal names, keys and connection secrets are not included. The HTTP server is a small Tokio HTTP/1.1 implementation; no Hyper dependency is added.
 
 The integration tests need a cluster: `tests/crdb/cluster.sh up` starts a secure 3-node one (localities california, ohio, washington-dc); see `tests/crdb/README.md`.
 

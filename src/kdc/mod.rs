@@ -36,7 +36,12 @@ pub mod store;
 mod summary;
 mod tgs_req;
 
+use std::future::Future;
+#[cfg(feature = "tokio")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+#[cfg(feature = "tokio")]
+use std::time::Instant;
 
 use crate::profile::Profile;
 
@@ -76,6 +81,11 @@ use crate::crypto::find_etype;
 use crate::crypto::util::generate_random;
 use crate::types::error_codes::*;
 use crate::types::{AsReq, EncryptionKey, KdcReq, PrincipalName, TgsReq};
+
+#[cfg(feature = "tokio")]
+tokio::task_local! {
+    static STORE_TIME_NANOS: std::sync::Arc<AtomicU64>;
+}
 
 const TAG_AS_REQ: u8 = 0x6A;
 const TAG_TGS_REQ: u8 = 0x6C;
@@ -279,11 +289,27 @@ impl<S: PrincipalStore> Kdc<S> {
         request: &[u8],
         transport: Transport,
     ) -> (Vec<u8>, RequestSummary) {
+        #[cfg(feature = "tokio")]
+        let timer = std::sync::Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "tokio")]
+        let reply = STORE_TIME_NANOS
+            .scope(std::sync::Arc::clone(&timer), async {
+                match transport {
+                    Transport::Udp => self.handle_udp(request).await,
+                    Transport::Tcp => self.handle(request).await,
+                }
+            })
+            .await;
+        #[cfg(not(feature = "tokio"))]
         let reply = match transport {
             Transport::Udp => self.handle_udp(request).await,
             Transport::Tcp => self.handle(request).await,
         };
-        let summary = RequestSummary::new(request, &reply, transport);
+        let mut summary = RequestSummary::new(request, &reply, transport);
+        #[cfg(feature = "tokio")]
+        {
+            summary.store_time = Duration::from_nanos(timer.load(Ordering::Relaxed));
+        }
         (reply, summary)
     }
 
@@ -404,8 +430,7 @@ impl<S: PrincipalStore> Kdc<S> {
         // A store that cannot be reached (or is too stale) is an unavailable
         // service, so clients move on to another KDC: MIT maps
         // KRB5_KDB_CANTLOCK_DB the same way (do_as_req.c:578-579, 597-598).
-        self.store
-            .lookup(name, realm)
+        self.measure_store(self.store.lookup(name, realm))
             .await
             .map_err(|e| match e.kind() {
                 StoreErrorKind::Unavailable | StoreErrorKind::Stale => {
@@ -413,6 +438,21 @@ impl<S: PrincipalStore> Kdc<S> {
                 }
                 _ => KdcError::generic(status),
             })
+    }
+
+    /// Measure one store await in the current summarized request.
+    pub(crate) async fn measure_store<F: Future>(&self, future: F) -> F::Output {
+        #[cfg(feature = "tokio")]
+        let start = Instant::now();
+        let result = future.await;
+        #[cfg(feature = "tokio")]
+        {
+            let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let _ = STORE_TIME_NANOS.try_with(|timer| {
+                timer.fetch_add(nanos, Ordering::Relaxed);
+            });
+        }
+        result
     }
 
     /// Ask the consistency gate whether tickets involving `principals` may

@@ -6,8 +6,9 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::*;
@@ -17,8 +18,9 @@ use krb5_rs::kdc::replication::{
 };
 use krb5_rs::kdc::{
     AdminStore, AuthoritativeState, LockoutReport, LockoutReporter, PrincipalAttributes,
-    StoreErrorKind,
+    PrincipalStore, StoreErrorKind,
 };
+use krb5_rs::types::PrincipalName;
 use krb5_rs_kdb_cockroach::{
     CockroachConfig, CockroachLockoutReporter, CockroachStore, FailPoint, MigrateOptions,
     MultiRegion,
@@ -44,6 +46,307 @@ async fn count(db: &TestDb, table: &str) -> i64 {
         .await[0]
         .parse()
         .expect("count")
+}
+
+async fn assert_principal_mirror(
+    authority: &CockroachStore,
+    replica: &krb5_rs_kdb_turso::TursoReplica,
+) {
+    for record in authority.list_principals().await.expect("authority list") {
+        let local = replica
+            .lookup(&record.entry.name, REALM)
+            .await
+            .expect("replica lookup")
+            .unwrap_or_else(|| panic!("replica is missing {}", record.entry.name));
+        let source = record.entry;
+        assert_eq!(local.attributes, source.attributes, "{}", source.name);
+        assert_eq!(
+            local.security_epoch, source.security_epoch,
+            "{}",
+            source.name
+        );
+        assert_eq!(local.policy, source.policy, "{}", source.name);
+        assert_eq!(local.expiration, source.expiration, "{}", source.name);
+        assert_eq!(local.pw_expiration, source.pw_expiration, "{}", source.name);
+        assert_eq!(
+            local.allowed_to_delegate_to, source.allowed_to_delegate_to,
+            "{}",
+            source.name
+        );
+        assert_eq!(
+            local.allowed_to_delegate_from, source.allowed_to_delegate_from,
+            "{}",
+            source.name
+        );
+        assert_eq!(local.keys.len(), source.keys.len(), "{}", source.name);
+        for (local_key, source_key) in local.keys.iter().zip(&source.keys) {
+            assert_eq!(local_key.kvno, source_key.kvno, "{}", source.name);
+            assert_eq!(
+                local_key.key.keytype, source_key.key.keytype,
+                "{}",
+                source.name
+            );
+            assert_eq!(
+                local_key.key.key_bytes(),
+                source_key.key.key_bytes(),
+                "{}",
+                source.name
+            );
+            assert_eq!(local_key.salt, source_key.salt, "{}", source.name);
+            assert_eq!(local_key.s2kparams, source_key.s2kparams, "{}", source.name);
+        }
+    }
+}
+
+struct Proxy {
+    address: std::net::SocketAddr,
+    cut: tokio::sync::watch::Sender<bool>,
+    delay: tokio::sync::watch::Sender<Duration>,
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Proxy {
+    async fn start(bind_ip: &str, upstream: std::net::SocketAddr) -> Self {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((bind_ip, 0)).await.expect("proxy bind");
+        let address = listener.local_addr().expect("proxy address");
+        let (cut, mut cut_rx) = tokio::sync::watch::channel(false);
+        let (delay, delay_rx) = tokio::sync::watch::channel(Duration::ZERO);
+        let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((client, _)) = accepted else { continue };
+                        if *cut_rx.borrow() || *stop_rx.borrow() {
+                            drop(client);
+                            continue;
+                        }
+                        let cut_conn = cut_rx.clone();
+                        let delay_conn = delay_rx.clone();
+                        let stop_conn = stop_rx.clone();
+                        tokio::spawn(async move {
+                            if *cut_conn.borrow() || *stop_conn.borrow() {
+                                return;
+                            }
+                            let Ok(server) = tokio::net::TcpStream::connect(upstream).await else {
+                                return;
+                            };
+                            let (client_read, client_write) = client.into_split();
+                            let (server_read, server_write) = server.into_split();
+                            let to_server = proxy_stream(
+                                client_read,
+                                server_write,
+                                cut_conn.clone(),
+                                delay_conn.clone(),
+                                stop_conn.clone(),
+                            );
+                            let to_client = proxy_stream(
+                                server_read,
+                                client_write,
+                                cut_conn,
+                                delay_conn,
+                                stop_conn,
+                            );
+                            let _ = tokio::try_join!(to_server, to_client);
+                        });
+                    }
+                    changed = cut_rx.changed() => {
+                        if changed.is_err() { break; }
+                    }
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() { break; }
+                    }
+                }
+            }
+        });
+        Self {
+            address,
+            cut,
+            delay,
+            stop,
+            task,
+        }
+    }
+
+    fn set_cut(&self, cut: bool) {
+        self.cut.send(cut).expect("proxy cut state");
+    }
+
+    fn set_delay(&self, delay: Duration) {
+        self.delay.send(delay).expect("proxy delay");
+    }
+
+    async fn stop(self) {
+        let _ = self.stop.send(true);
+        let _ = self.task.await;
+    }
+}
+
+async fn proxy_stream<R, W>(
+    mut read: R,
+    mut write: W,
+    mut cut: tokio::sync::watch::Receiver<bool>,
+    mut delay: tokio::sync::watch::Receiver<Duration>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = [0; 16 * 1024];
+    loop {
+        if *cut.borrow() || *stop.borrow() {
+            return Ok(());
+        }
+        let n = tokio::select! {
+            result = read.read(&mut buf) => result?,
+            changed = cut.changed() => {
+                if changed.is_err() || *cut.borrow() { return Ok(()); }
+                continue;
+            }
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { return Ok(()); }
+                continue;
+            }
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        let mut until = tokio::time::Instant::now() + *delay.borrow();
+        loop {
+            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(remaining) => break,
+                changed = delay.changed() => {
+                    if changed.is_err() { return Ok(()); }
+                    until = tokio::time::Instant::now() + *delay.borrow();
+                }
+                changed = cut.changed() => {
+                    if changed.is_err() || *cut.borrow() { return Ok(()); }
+                }
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() { return Ok(()); }
+                }
+            }
+        }
+        tokio::select! {
+            result = write.write_all(&buf[..n]) => result?,
+            changed = cut.changed() => {
+                if changed.is_err() || *cut.borrow() { return Ok(()); }
+            }
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { return Ok(()); }
+            }
+        }
+    }
+}
+
+async fn as_login<S: PrincipalStore>(
+    kdc: &krb5_rs::kdc::Kdc<S>,
+    principal: &PrincipalName,
+    password: &str,
+) -> Result<krb5_rs::protocol::Credential, i32> {
+    use krb5_rs::protocol::{AsExchange, AsExchangeConfig, StepResult};
+
+    let mut exchange = AsExchange::new(AsExchangeConfig::new(principal.clone(), REALM), password);
+    let mut reply = Vec::new();
+    loop {
+        match exchange.step(&reply) {
+            Ok(StepResult::SendToKdc { data, .. }) | Ok(StepResult::RetryTcp { data, .. }) => {
+                reply = kdc.handle(&data).await
+            }
+            Ok(StepResult::Complete) => {
+                return Ok(exchange.credential().expect("TGT").clone());
+            }
+            Err(krb5_rs::Krb5Error::KdcError(error)) => return Err(error.error_code),
+            Err(_) => return Err(-1),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CountingSource {
+    inner: CockroachStore,
+    snapshots: Arc<AtomicUsize>,
+}
+
+impl ReplicationSource for CountingSource {
+    type Snapshot = <CockroachStore as ReplicationSource>::Snapshot;
+
+    fn snapshot(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Self::Snapshot, krb5_rs::kdc::StoreError>> + Send
+    {
+        self.snapshots.fetch_add(1, Ordering::SeqCst);
+        self.inner.snapshot()
+    }
+
+    fn poll(
+        &self,
+        since: ReplicationTs,
+        limit: usize,
+    ) -> impl std::future::Future<
+        Output = Result<krb5_rs::kdc::replication::PollResult, krb5_rs::kdc::StoreError>,
+    > + Send {
+        self.inner.poll(since, limit)
+    }
+
+    fn pruned_before(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<ReplicationTs>, krb5_rs::kdc::StoreError>> + Send
+    {
+        self.inner.pruned_before()
+    }
+}
+
+#[derive(Clone)]
+struct GatedSink {
+    inner: krb5_rs_kdb_turso::TursoReplica,
+    started: Arc<tokio::sync::Notify>,
+    applied: Arc<AtomicUsize>,
+    batches: Arc<Mutex<Vec<krb5_rs::kdc::replication::ChangeBatch>>>,
+}
+
+impl krb5_rs::kdc::replication::ReplicaSink for GatedSink {
+    type Rebuild =
+        <krb5_rs_kdb_turso::TursoReplica as krb5_rs::kdc::replication::ReplicaSink>::Rebuild;
+
+    async fn checkpoint(
+        &self,
+    ) -> Result<Option<krb5_rs::kdc::replication::ReplicaCheckpoint>, krb5_rs::kdc::StoreError>
+    {
+        self.inner.checkpoint().await
+    }
+
+    async fn apply(
+        &self,
+        batch: krb5_rs::kdc::replication::ChangeBatch,
+    ) -> Result<krb5_rs::kdc::replication::ApplyOutcome, krb5_rs::kdc::StoreError> {
+        self.started.notify_one();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let result = self.inner.apply(batch.clone()).await?;
+        self.batches
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(batch);
+        self.applied.fetch_add(1, Ordering::SeqCst);
+        Ok(result)
+    }
+
+    async fn begin_rebuild(
+        &self,
+        snapshot_ts: ReplicationTs,
+    ) -> Result<Self::Rebuild, krb5_rs::kdc::StoreError> {
+        self.inner.begin_rebuild(snapshot_ts).await
+    }
 }
 
 // ------------------------------------------------------------ migrations
@@ -78,9 +381,21 @@ async fn migrations_are_idempotent() {
         "replication_log",
         "replication_meta",
         "schema_migrations",
+        "transaction_markers",
     ] {
         assert!(tables[0].contains(t), "{t} missing from {}", tables[0]);
     }
+    let log_columns = db
+        .text("SELECT string_agg(column_name, ',' ORDER BY column_name) FROM [SHOW COLUMNS FROM replication_log]")
+        .await;
+    assert!(
+        log_columns[0].contains("bucket")
+            && log_columns[0].contains("id")
+            && log_columns[0].contains("txn_id")
+            && !log_columns[0].contains("commit_ts"),
+        "{}",
+        log_columns[0]
+    );
     // A store refuses a database that has not been migrated.
     let empty = TestDb::new("unmigrated").await;
     let err = CockroachStore::connect(empty.admin(), master(), REALM)
@@ -135,7 +450,6 @@ async fn the_multi_region_step_sets_regions_global_tables_and_regional_by_row() 
         "lockouts",
         "replication_log",
         "replication_meta",
-        "realms",
     ] {
         let ddl = db
             .text(&format!(
@@ -144,6 +458,14 @@ async fn the_multi_region_step_sets_regions_global_tables_and_regional_by_row() 
             .await;
         assert!(ddl[0].contains("LOCALITY GLOBAL"), "{t}: {}", ddl[0]);
     }
+    let realms_ddl = db
+        .text("SELECT create_statement FROM [SHOW CREATE TABLE realms]")
+        .await;
+    assert!(
+        realms_ddl[0].contains("LOCALITY REGIONAL BY TABLE"),
+        "{}",
+        realms_ddl[0]
+    );
     let ddl = db
         .text("SELECT create_statement FROM [SHOW CREATE TABLE replica_status]")
         .await;
@@ -172,8 +494,7 @@ async fn the_multi_region_step_sets_regions_global_tables_and_regional_by_row() 
 #[tokio::test]
 #[ignore = "needs the CockroachDB test cluster"]
 async fn tls_verify_full_succeeds_wrong_ca_and_missing_client_cert_fail() {
-    let db = TestDb::new("tls").await;
-    db.migrate().await;
+    let db = TestDb::migrated("tls").await;
     CockroachStore::connect(db.admin(), master(), REALM)
         .await
         .expect("verify-full with the right CA and client certificate");
@@ -211,7 +532,7 @@ async fn tls_verify_full_succeeds_wrong_ca_and_missing_client_cert_fail() {
         &format!(
             "CREATE USER IF NOT EXISTS pwuser WITH PASSWORD 'p4ss-word'; \
              GRANT CONNECT ON DATABASE \"{0}\" TO pwuser; \
-             GRANT SELECT ON TABLE schema_migrations TO pwuser;",
+             GRANT SELECT ON TABLE schema_migrations, replication_meta TO pwuser;",
             db.name
         ),
     )
@@ -345,6 +666,366 @@ async fn a_failing_transaction_leaves_nothing_partial() {
     db.drop_db().await;
 }
 
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn a_simulated_ambiguous_commit_is_resolved_by_its_attempt_marker() {
+    let db = TestDb::migrated("ambiguous").await;
+    let store = CockroachStore::connect_with(
+        db.admin(),
+        master(),
+        REALM,
+        FailPoint::ambiguous_commit_once(),
+    )
+    .await
+    .expect("connect");
+    store.create_realm(&[18, 17]).await.expect("realm");
+
+    // Simulation: the database COMMIT succeeds, then the failpoint makes the
+    // client treat its response as lost/SQLSTATE 40003. The attempt marker is
+    // visible, so the operation returns its saved result without replaying.
+    ops(&store)
+        .add_principal(&name("once"), REALM, Some("pw"), &plain())
+        .await
+        .expect("resolve the ambiguous result");
+    assert_eq!(
+        db.text("SELECT count(*)::STRING FROM principals WHERE name = 'once'")
+            .await[0],
+        "1"
+    );
+    assert_eq!(
+        db.text("SELECT count(*)::STRING FROM transaction_markers")
+            .await[0],
+        "2",
+        "realm creation and one add, not a duplicate add"
+    );
+    db.drop_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs CockroachDB; creates a real Turso replica and in-process KDC"]
+async fn engine_bootstrap_incremental_updates_and_kdc_requests_use_turso() {
+    use krb5_rs::kdc::replication::{
+        FreshnessGate, RebuildPolicy, ReplicationConfig, ReplicationEngine,
+    };
+    use krb5_rs::kdc::{AuthStateStore, Kdc, KdcConfig, PolicyStore};
+    use krb5_rs::protocol::{
+        AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions,
+        TgsStepResult,
+    };
+    use krb5_rs_kdb_cockroach::run_sql;
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    fn http() -> PrincipalName {
+        PrincipalName::new_srv_hst("HTTP", "svc.crdb.test")
+    }
+
+    let (db, admin_store) = TestDb::with_realm("engine").await;
+    let admin = ops(&admin_store);
+    admin
+        .add_policy(
+            PolicyChange {
+                pw_max_fail: Some(3),
+                pw_lockout_duration: Some(300),
+                ..PolicyChange::default()
+            }
+            .into_policy("lock"),
+        )
+        .await
+        .expect("add policy");
+    let mut alice_opts = plain();
+    alice_opts.policy = Some(Some("lock".into()));
+    admin
+        .add_principal(&name("alice"), REALM, Some("alice-pw"), &alice_opts)
+        .await
+        .expect("alice");
+    admin
+        .add_principal(&http(), REALM, None, &plain())
+        .await
+        .expect("service");
+    run_sql(
+        &db.admin(),
+        "INSERT INTO principals \
+         (realm, name, name_type, attributes, security_epoch) \
+         SELECT 'CRDB.TEST', 'bulk-' || i::STRING, 1, 0, 1 \
+         FROM generate_series(0, 1999) AS g(i)",
+    )
+    .await
+    .expect("seed 2,000 snapshot principals");
+    assert_eq!(count(&db, "principals").await, 2004);
+
+    let path = std::env::temp_dir().join(format!("krb5rs_crdb_engine_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let replica = TursoReplica::open(&path, TursoOptions::default(), master())
+        .await
+        .expect("open Turso");
+    let mut config = db.replica();
+    config.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    let source = CockroachStore::connect(config, master(), REALM)
+        .await
+        .expect("replication source");
+    let engine = ReplicationEngine::new(
+        source.clone(),
+        replica.clone(),
+        source.clone(),
+        ReplicationConfig {
+            poll_interval: Duration::from_millis(30),
+            heartbeat_interval: Duration::from_millis(30),
+            kdc_id: "engine-kdc".into(),
+            region: "california".into(),
+            rebuild: RebuildPolicy::Auto,
+            ..ReplicationConfig::default()
+        },
+    );
+    // A daemon binds its listeners only after bootstrap resolves.
+    engine.bootstrap().await.expect("snapshot bootstrap");
+    assert!(engine.status().bootstrapped);
+    assert!(replica
+        .lookup(&name("alice"), REALM)
+        .await
+        .expect("lookup")
+        .is_some());
+    assert!(replica
+        .lookup(&name("bulk-1999"), REALM)
+        .await
+        .expect("bulk lookup")
+        .is_some());
+    let gate = FreshnessGate::new(engine.status_handle(), Duration::from_secs(30));
+    let kdc = Kdc::builder(KdcConfig::new(REALM), replica.clone())
+        .policies(replica.clone())
+        .auth_state(replica.clone())
+        .consistency(gate)
+        .build();
+
+    async fn as_exchange<S: PrincipalStore>(
+        kdc: &Kdc<S>,
+        who: &PrincipalName,
+        password: &str,
+    ) -> Result<Credential, i32> {
+        let mut exchange = AsExchange::new(AsExchangeConfig::new(who.clone(), REALM), password);
+        let mut reply = Vec::new();
+        loop {
+            match exchange.step(&reply) {
+                Ok(StepResult::SendToKdc { data, .. }) | Ok(StepResult::RetryTcp { data, .. }) => {
+                    reply = kdc.handle(&data).await
+                }
+                Ok(StepResult::Complete) => return Ok(exchange.credential().expect("TGT").clone()),
+                Err(krb5_rs::Krb5Error::KdcError(e)) => return Err(e.error_code),
+                Err(_) => return Err(-1),
+            }
+        }
+    }
+
+    async fn tgs_exchange<S: PrincipalStore>(
+        kdc: &Kdc<S>,
+        tgt: Credential,
+    ) -> Result<Credential, i32> {
+        let mut exchange = TgsExchange::new(tgt, http(), TgsOptions::default());
+        let mut reply = Vec::new();
+        loop {
+            match exchange.step(&reply) {
+                Ok(TgsStepResult::SendToKdc { data, .. })
+                | Ok(TgsStepResult::RetryTcp { data, .. }) => reply = kdc.handle(&data).await,
+                Ok(TgsStepResult::Complete) => {
+                    return Ok(exchange.credential().expect("service ticket").clone())
+                }
+                Err(krb5_rs::Krb5Error::KdcError(e)) => return Err(e.error_code),
+                Err(_) => return Err(-1),
+            }
+        }
+    }
+
+    let old_tgt = as_exchange(&kdc, &name("alice"), "alice-pw")
+        .await
+        .expect("AS from Turso");
+    assert!(tgs_exchange(&kdc, old_tgt.clone()).await.is_ok());
+
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move { engine.run(rx).await });
+
+    admin
+        .modify_policy(
+            "lock",
+            &PolicyChange {
+                pw_max_fail: Some(5),
+                ..PolicyChange::default()
+            },
+        )
+        .await
+        .expect("modify policy");
+    for _ in 0..200 {
+        if replica
+            .policy("lock")
+            .await
+            .expect("policy")
+            .is_some_and(|p| p.pw_max_fail == 5)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        replica
+            .policy("lock")
+            .await
+            .expect("policy")
+            .expect("lock")
+            .pw_max_fail,
+        5
+    );
+
+    admin
+        .add_principal(&name("bob"), REALM, Some("bob-pw"), &alice_opts)
+        .await
+        .expect("create");
+    for _ in 0..200 {
+        if replica
+            .lookup(&name("bob"), REALM)
+            .await
+            .expect("lookup")
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(replica
+        .lookup(&name("bob"), REALM)
+        .await
+        .expect("lookup")
+        .is_some());
+
+    admin
+        .change_password(&name("alice"), REALM, Some("alice-new"), true)
+        .await
+        .expect("cpw -keepold");
+    let mut alice = None;
+    for _ in 0..200 {
+        alice = replica.lookup(&name("alice"), REALM).await.expect("lookup");
+        if alice
+            .as_ref()
+            .is_some_and(|p| p.keys.iter().any(|k| k.kvno == 2))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(alice
+        .as_ref()
+        .is_some_and(|p| p.keys.iter().any(|k| k.kvno == 1) && p.keys.iter().any(|k| k.kvno == 2)));
+    assert!(
+        tgs_exchange(&kdc, old_tgt).await.is_ok(),
+        "old TGT remains valid after keepold"
+    );
+    assert!(as_exchange(&kdc, &name("alice"), "alice-new").await.is_ok());
+    admin
+        .change_password(&name("alice"), REALM, None, true)
+        .await
+        .expect("randkey -keepold");
+    let mut alice = None;
+    for _ in 0..200 {
+        alice = replica.lookup(&name("alice"), REALM).await.expect("lookup");
+        if alice
+            .as_ref()
+            .is_some_and(|p| p.keys.iter().any(|k| k.kvno == 3))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(alice.as_ref().is_some_and(|p| {
+        p.keys.iter().any(|k| k.kvno == 1) && p.keys.iter().any(|k| k.kvno == 3)
+    }));
+
+    // A lockout written by a KDC using the replica role reaches the AS check
+    // through Turso's local auth-state overlay.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    let replica_writer = CockroachStore::connect(db.replica(), master(), REALM)
+        .await
+        .expect("replica writer");
+    replica_writer
+        .report_lockout(&krb5_rs::kdc::replication::LockoutRecord {
+            realm: REALM.into(),
+            name: name("bob"),
+            locked_at: now,
+            unlock_at: None,
+            source_kdc: "engine-kdc".into(),
+        })
+        .await
+        .expect("report lockout");
+    for _ in 0..200 {
+        if replica
+            .auth_state(&name("bob"), REALM)
+            .await
+            .expect("replicated auth state")
+            .fail_count
+            == u32::MAX
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(matches!(
+        as_exchange(&kdc, &name("bob"), "bob-pw").await,
+        Err(18)
+    ));
+
+    admin
+        .delete_principal(&http(), REALM)
+        .await
+        .expect("delete service");
+    for _ in 0..200 {
+        if replica
+            .lookup(&http(), REALM)
+            .await
+            .expect("lookup")
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(replica
+        .lookup(&http(), REALM)
+        .await
+        .expect("lookup")
+        .is_none());
+    admin
+        .delete_principal(&name("alice"), REALM)
+        .await
+        .expect("delete");
+    for _ in 0..200 {
+        if replica
+            .lookup(&name("alice"), REALM)
+            .await
+            .expect("lookup")
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(replica
+        .lookup(&name("alice"), REALM)
+        .await
+        .expect("lookup")
+        .is_none());
+
+    shutdown.send(true).expect("shutdown");
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("in-flight work drains")
+        .expect("engine task");
+    drop(kdc);
+    drop(replica_writer);
+    drop(source);
+    drop(replica);
+    let _ = std::fs::remove_dir_all(&path);
+    db.drop_db().await;
+}
+
 fn decode(s: &str) -> krb5_rs::types::PrincipalName {
     krb5_rs::kdc::replication::decode_principal_key(
         &s.replace('/', "\\/").replacen("\\/", "/", 1),
@@ -390,21 +1071,25 @@ async fn sixteen_concurrent_modprincs_all_succeed_through_retries() {
         "created at 1, bumped by each of 80 changes"
     );
     let versions = db
-        .text("SELECT commit_ts::STRING FROM replication_log WHERE \"key\" = 'hot' ORDER BY commit_ts")
+        .text(
+            "SELECT crdb_internal_mvcc_timestamp::STRING FROM replication_log \
+             WHERE entity = 'principal' AND \"key\" = 'hot' \
+             ORDER BY crdb_internal_mvcc_timestamp",
+        )
         .await;
     assert_eq!(versions.len(), 81);
     let parsed: Vec<ReplicationTs> = versions.iter().map(|v| v.parse().expect("ts")).collect();
     assert!(
         parsed.windows(2).all(|w| w[0] < w[1]),
-        "versions strictly increase"
+        "row MVCC versions strictly increase"
     );
     let current = db
-        .text("SELECT version::STRING FROM principals WHERE name = 'hot'")
+        .text(
+            "SELECT crdb_internal_mvcc_timestamp::STRING FROM principals \
+              WHERE realm = 'CRDB.TEST' AND name = 'hot'",
+        )
         .await;
-    assert_eq!(
-        current[0].parse::<ReplicationTs>().expect("ts"),
-        *parsed.last().expect("some")
-    );
+    assert_eq!(current[0], *versions.last().expect("version history"));
     println!(
         "tx retries during the 80 contended updates: {}",
         store.metrics().tx_retries()
@@ -487,7 +1172,10 @@ async fn every_committed_change_is_eventually_observed_and_none_is_missed() {
         w.await.expect("writer");
     }
     let last = db
-        .text("SELECT max(commit_ts)::STRING FROM replication_log")
+        .text(
+            "SELECT max(crdb_internal_mvcc_timestamp::STRING::DECIMAL)::STRING \
+             FROM replication_log",
+        )
         .await;
     *final_ts.lock().expect("lock") = Some(last[0].parse().expect("ts"));
     done.store(true, Ordering::SeqCst);
@@ -499,7 +1187,10 @@ async fn every_committed_change_is_eventually_observed_and_none_is_missed() {
 
     // 8 writers x 30 principals, a third deleted again; K/M and krbtgt too.
     let live = db
-        .text("SELECT name || ' ' || version::STRING FROM principals WHERE name LIKE 'w%'")
+        .text(
+            "SELECT name || ' ' || crdb_internal_mvcc_timestamp::STRING \
+              FROM principals WHERE name LIKE 'w%' AND deleted = false",
+        )
         .await;
     assert_eq!(live.len(), 8 * 20);
     for line in &live {
@@ -561,7 +1252,10 @@ async fn one_commit_timestamp_is_never_split_across_batches() {
         .expect("unlock lifts the lockout in the same transaction");
     }
     let pairs = db
-        .text("SELECT count(*)::STRING FROM (SELECT commit_ts FROM replication_log GROUP BY commit_ts HAVING count(*) = 2)")
+        .text(
+            "SELECT count(*)::STRING FROM (SELECT crdb_internal_mvcc_timestamp \
+               FROM replication_log GROUP BY crdb_internal_mvcc_timestamp HAVING count(*) = 2)",
+        )
         .await;
     assert_eq!(
         pairs[0],
@@ -679,7 +1373,10 @@ async fn a_snapshot_plus_changes_since_equals_the_final_state_under_concurrent_w
     // Then the changes since T, applied only when newer, until the
     // checkpoint (a follower read, about 4.2 s behind) passes the last commit.
     let last: ReplicationTs = db
-        .text("SELECT max(commit_ts)::STRING FROM replication_log")
+        .text(
+            "SELECT max(crdb_internal_mvcc_timestamp::STRING::DECIMAL)::STRING \
+             FROM replication_log",
+        )
         .await[0]
         .parse()
         .expect("ts");
@@ -721,7 +1418,8 @@ async fn a_snapshot_plus_changes_since_equals_the_final_state_under_concurrent_w
     for rec in store.list_principals().await.expect("list") {
         let version = db
             .text(&format!(
-                "SELECT version::STRING FROM principals WHERE name = '{}'",
+                "SELECT crdb_internal_mvcc_timestamp::STRING FROM principals \
+                 WHERE realm = 'CRDB.TEST' AND name = '{}'",
                 rec.entry.name.to_string().replace('\'', "''")
             ))
             .await;
@@ -748,8 +1446,35 @@ async fn a_snapshot_plus_changes_since_equals_the_final_state_under_concurrent_w
 #[tokio::test]
 #[ignore = "needs the CockroachDB test cluster"]
 async fn pruned_before_and_prune_follow_the_log() {
-    let (db, store) = TestDb::with_realm("prune").await;
-    let replica = CockroachStore::connect(db.replica(), master(), REALM)
+    use krb5_rs_kdb_cockroach::run_sql;
+
+    let db = TestDb::new("prune").await;
+    let mut migrator_cfg = db.root();
+    migrator_cfg.transaction_timeout = Duration::from_secs(1);
+    CockroachStore::migrate(
+        migrator_cfg,
+        &MigrateOptions {
+            create_roles: true,
+            multi_region: None,
+        },
+    )
+    .await
+    .expect("migrate");
+    run_sql(
+        &db.root(),
+        "UPDATE replication_meta SET bucket_width_seconds = 1 WHERE id = 1",
+    )
+    .await
+    .expect("short test bucket");
+    let mut admin_cfg = db.admin();
+    admin_cfg.transaction_timeout = Duration::from_secs(1);
+    let store = CockroachStore::connect(admin_cfg, master(), REALM)
+        .await
+        .expect("admin store");
+    store.create_realm(&[18, 17]).await.expect("realm");
+    let mut replica_cfg = db.replica();
+    replica_cfg.transaction_timeout = Duration::from_secs(1);
+    let replica = CockroachStore::connect(replica_cfg, master(), REALM)
         .await
         .expect("replica");
     assert_eq!(replica.pruned_before().await.expect("pruned"), None);
@@ -759,7 +1484,7 @@ async fn pruned_before_and_prune_follow_the_log() {
             .await
             .expect("add");
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
     for i in 0..3 {
         o.add_principal(&name(&format!("new{i}")), REALM, Some("pw"), &plain())
             .await
@@ -771,7 +1496,7 @@ async fn pruned_before_and_prune_follow_the_log() {
     let (cutoff, deleted) = store.prune(Duration::from_secs(2)).await.expect("prune");
     assert_eq!(
         deleted, 5,
-        "the realm rows and the three old additions are older than 2s"
+        "the realm rows and three old additions are beyond retention, D, and the skew margin"
     );
     assert_eq!(count(&db, "replication_log").await, 3);
     assert_eq!(replica.pruned_before().await.expect("pruned"), Some(cutoff));
@@ -874,7 +1599,10 @@ async fn authoritative_state_reports_epoch_disabled_and_lockout() {
         .await
         .expect("state");
     assert_eq!((s.epoch, s.locked), (3, false));
-    assert_eq!(count(&db, "lockouts").await, 0);
+    let lockout = db
+        .text("SELECT deleted::STRING FROM lockouts WHERE realm = 'CRDB.TEST' AND name = 'bob'")
+        .await;
+    assert_eq!(lockout[0], "true", "unlock leaves a replicated tombstone");
 
     let err = replica
         .security_state(&name("nobody"), REALM)
@@ -1275,7 +2003,15 @@ async fn measure_admin_write_latency_regional_vs_global_and_changes_since() {
         }
     }
     let regional = TestDb::new("latreg").await;
-    regional.migrate().await;
+    CockroachStore::migrate(
+        regional.root(),
+        &MigrateOptions {
+            create_roles: true,
+            multi_region: None,
+        },
+    )
+    .await
+    .expect("regional migration");
     run(&regional, "regional (single-region tables)").await;
     regional.drop_db().await;
 
@@ -1294,4 +2030,1167 @@ async fn measure_admin_write_latency_regional_vs_global_and_changes_since() {
     .expect("migrate");
     run(&global, "GLOBAL tables, 3 regions").await;
     global.drop_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the CockroachDB and Turso test infrastructure"]
+async fn the_engine_bootstraps_turso_then_propagates_admin_changes_to_a_kdc() {
+    use krb5_rs::kdc::replication::{
+        FreshnessGate, RebuildPolicy, ReplicationConfig, ReplicationEngine,
+    };
+    use krb5_rs::kdc::{Kdc, KdcConfig, PrincipalStore};
+    use krb5_rs::protocol::{
+        AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions,
+        TgsStepResult,
+    };
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("krb5rs_crdb_engine_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("directory");
+            Self(p)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn http() -> PrincipalName {
+        PrincipalName::new_srv_hst("HTTP", "svc.crdb.test")
+    }
+    async fn login<S: PrincipalStore>(
+        kdc: &Kdc<S>,
+        user: &PrincipalName,
+        password: &str,
+    ) -> Result<Credential, i32> {
+        let mut exchange = AsExchange::new(AsExchangeConfig::new(user.clone(), REALM), password);
+        let mut reply = Vec::new();
+        loop {
+            match exchange.step(&reply) {
+                Ok(StepResult::SendToKdc { data, .. }) | Ok(StepResult::RetryTcp { data, .. }) => {
+                    reply = kdc.handle(&data).await;
+                }
+                Ok(StepResult::Complete) => return Ok(exchange.credential().expect("TGT").clone()),
+                Err(krb5_rs::Krb5Error::KdcError(err)) => return Err(err.error_code),
+                Err(_) => return Err(-1),
+            }
+        }
+    }
+    async fn service_ticket<S: PrincipalStore>(
+        kdc: &Kdc<S>,
+        tgt: Credential,
+    ) -> Result<Credential, i32> {
+        let mut exchange = TgsExchange::new(tgt, http(), TgsOptions::default());
+        let mut reply = Vec::new();
+        loop {
+            match exchange.step(&reply) {
+                Ok(TgsStepResult::SendToKdc { data, .. })
+                | Ok(TgsStepResult::RetryTcp { data, .. }) => {
+                    reply = kdc.handle(&data).await;
+                }
+                Ok(TgsStepResult::Complete) => {
+                    return Ok(exchange.credential().expect("ST").clone())
+                }
+                Err(krb5_rs::Krb5Error::KdcError(err)) => return Err(err.error_code),
+                Err(_) => return Err(-1),
+            }
+        }
+    }
+    let (db, authority) = TestDb::with_realm("engine").await;
+    let admin = ops(&authority);
+    admin
+        .add_principal(&name("alice"), REALM, Some("alice-pw"), &plain())
+        .await
+        .expect("alice");
+    admin
+        .add_principal(&http(), REALM, None, &plain())
+        .await
+        .expect("service");
+
+    let temp = Tmp::new();
+    let mut authority_cfg = db.admin();
+    authority_cfg.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    let source = CockroachStore::connect(authority_cfg, master(), REALM)
+        .await
+        .expect("source");
+    let replica = TursoReplica::open(&temp.0, TursoOptions::default(), master())
+        .await
+        .expect("Turso replica");
+    let engine = ReplicationEngine::new(
+        source.clone(),
+        replica.clone(),
+        source.clone(),
+        ReplicationConfig {
+            poll_interval: Duration::from_millis(50),
+            heartbeat_interval: Duration::from_millis(50),
+            kdc_id: "engine-test-kdc".into(),
+            region: "california".into(),
+            rebuild: RebuildPolicy::Auto,
+            ..ReplicationConfig::default()
+        },
+    );
+    // Listener binding in the daemon happens after this returns.
+    engine.bootstrap().await.expect("snapshot bootstrap");
+    assert!(engine.status().bootstrapped);
+    assert!(replica
+        .lookup(&name("alice"), REALM)
+        .await
+        .expect("lookup")
+        .is_some());
+
+    let gate = FreshnessGate::new(engine.status_handle(), Duration::from_secs(30));
+    let kdc = Kdc::builder(KdcConfig::new(REALM), replica.clone())
+        .policies(replica.clone())
+        .auth_state(replica.clone())
+        .consistency(gate)
+        .build();
+    let old_tgt = login(&kdc, &name("alice"), "alice-pw")
+        .await
+        .expect("AS from Turso");
+    assert!(
+        service_ticket(&kdc, old_tgt.clone()).await.is_ok(),
+        "TGS from Turso"
+    );
+
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move { engine.run(rx).await });
+    admin
+        .modify_principal(&name("alice"), REALM, &delegate("HTTP/one"))
+        .await
+        .expect("modprinc");
+    let mut updated = None;
+    for _ in 0..200 {
+        updated = replica.lookup(&name("alice"), REALM).await.expect("lookup");
+        if updated.as_ref().is_some_and(|p| {
+            p.allowed_to_delegate_to
+                .iter()
+                .any(|name| name.contains("HTTP/one"))
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(updated.is_some_and(|p| {
+        p.allowed_to_delegate_to
+            .iter()
+            .any(|name| name.contains("HTTP/one"))
+    }));
+
+    // cpw retains the old kvno when keepold=true, so a TGT issued just before
+    // the password change continues to obtain a service ticket.
+    admin
+        .change_password(&name("alice"), REALM, Some("alice-new"), true)
+        .await
+        .expect("cpw -keepold");
+    let mut rotated = None;
+    for _ in 0..200 {
+        rotated = replica.lookup(&name("alice"), REALM).await.expect("lookup");
+        if rotated
+            .as_ref()
+            .is_some_and(|p| p.keys.iter().any(|key| key.kvno == 2))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let rotated = rotated.expect("rotated principal");
+    assert!(rotated.keys.iter().any(|k| k.kvno == 1));
+    assert!(rotated.keys.iter().any(|k| k.kvno == 2));
+    assert!(
+        service_ticket(&kdc, old_tgt).await.is_ok(),
+        "old TGT survives keepold"
+    );
+    assert!(
+        login(&kdc, &name("alice"), "alice-new").await.is_ok(),
+        "new key propagated"
+    );
+
+    let mut disabled = PrincipalOptions::default();
+    disabled
+        .attributes
+        .add_spec("+disallow_all_tix")
+        .expect("attribute");
+    admin
+        .modify_principal(&name("alice"), REALM, &disabled)
+        .await
+        .expect("disable");
+    let mut local = None;
+    for _ in 0..200 {
+        local = replica.lookup(&name("alice"), REALM).await.expect("lookup");
+        if local
+            .as_ref()
+            .is_some_and(|p| p.attributes.contains(PrincipalAttributes::DISALLOW_ALL_TIX))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(local.is_some_and(|p| { p.attributes.contains(PrincipalAttributes::DISALLOW_ALL_TIX) }));
+    assert!(matches!(
+        login(&kdc, &name("alice"), "alice-new").await,
+        Err(18)
+    ));
+
+    shutdown.send(true).expect("shutdown");
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("clean shutdown")
+        .expect("join");
+    db.drop_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a CockroachDB cluster; exercises a cuttable TCP proxy"]
+async fn a_partition_stales_one_kdc_while_a_healthy_kdc_serves_and_the_replica_recovers() {
+    use krb5_rs::kdc::replication::{
+        FreshnessGate, RebuildPolicy, ReplicationConfig, ReplicationEngine,
+    };
+    use krb5_rs::kdc::{Kdc, KdcConfig};
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    let (db, admin_store) = TestDb::with_realm("partition").await;
+    let admin = ops(&admin_store);
+    admin
+        .add_principal(&name("hot"), REALM, Some("pw"), &plain())
+        .await
+        .expect("hot");
+    let replica1_dir =
+        std::env::temp_dir().join(format!("krb5rs_partition_a_{}", std::process::id()));
+    let replica2_dir =
+        std::env::temp_dir().join(format!("krb5rs_partition_b_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&replica1_dir);
+    let _ = std::fs::remove_dir_all(&replica2_dir);
+    let replica1 = TursoReplica::open(&replica1_dir, TursoOptions::default(), master())
+        .await
+        .expect("replica A");
+    let replica2 = TursoReplica::open(&replica2_dir, TursoOptions::default(), master())
+        .await
+        .expect("replica B");
+    let upstream = format!("{}:{}", host(), port())
+        .parse()
+        .expect("upstream address");
+    let proxy_host = "127.0.0.1";
+    let proxy = Proxy::start(proxy_host, upstream).await;
+    let mut proxied = db.replica();
+    proxied.url = format!(
+        "postgresql://kdc_replica@{}:{}/{}?sslmode=verify-full",
+        proxy_host,
+        proxy.address.port(),
+        db.name
+    );
+    let mut direct = db.replica();
+    direct.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    proxied.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    let source_a = CockroachStore::connect(proxied, master(), REALM)
+        .await
+        .expect("proxied source");
+    let source_b = CockroachStore::connect(direct, master(), REALM)
+        .await
+        .expect("healthy source");
+    let cfg = |kdc_id: &str| ReplicationConfig {
+        poll_interval: Duration::from_millis(50),
+        heartbeat_interval: Duration::from_millis(50),
+        kdc_id: kdc_id.into(),
+        region: "california".into(),
+        rebuild: RebuildPolicy::Auto,
+        ..ReplicationConfig::default()
+    };
+    let engine_a = ReplicationEngine::new(
+        source_a.clone(),
+        replica1.clone(),
+        source_a.clone(),
+        cfg("kdc-a"),
+    );
+    let engine_b = ReplicationEngine::new(
+        source_b.clone(),
+        replica2.clone(),
+        source_b.clone(),
+        cfg("kdc-b"),
+    );
+    engine_a.bootstrap().await.expect("bootstrap A");
+    engine_b.bootstrap().await.expect("bootstrap B");
+    let kdc_a = Kdc::builder(KdcConfig::new(REALM), replica1.clone())
+        .policies(replica1.clone())
+        .auth_state(replica1.clone())
+        .consistency(FreshnessGate::new(
+            engine_a.status_handle(),
+            Duration::from_millis(300),
+        ))
+        .build();
+    let kdc_b = Kdc::builder(KdcConfig::new(REALM), replica2.clone())
+        .policies(replica2.clone())
+        .auth_state(replica2.clone())
+        .consistency(FreshnessGate::new(
+            engine_b.status_handle(),
+            Duration::from_secs(2),
+        ))
+        .build();
+    let (shutdown_a, rx_a) = tokio::sync::watch::channel(false);
+    let (shutdown_b, rx_b) = tokio::sync::watch::channel(false);
+    let task_a = tokio::spawn(async move { engine_a.run(rx_a).await });
+    let task_b = tokio::spawn(async move { engine_b.run(rx_b).await });
+
+    proxy.set_cut(true);
+    let mut writers = Vec::new();
+    for w in 0..3 {
+        let writer_store = admin_store.clone();
+        let o = ops(&writer_store);
+        writers.push(tokio::spawn(async move {
+            let transient = name(&format!("partition-{w}"));
+            o.add_principal(&transient, REALM, Some("pw"), &plain())
+                .await
+                .expect("create during partition");
+            for i in 0..8 {
+                let _ = o
+                    .modify_principal(&name("hot"), REALM, &delegate(&format!("HTTP/{w}-{i}")))
+                    .await;
+            }
+            o.delete_principal(&transient, REALM)
+                .await
+                .expect("delete during partition");
+        }));
+    }
+    for w in writers {
+        w.await.expect("writer");
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        as_login(&kdc_a, &name("hot"), "pw").await.map(|_| ()),
+        Err(29),
+        "stale KDC fails closed"
+    );
+    assert!(
+        as_login(&kdc_b, &name("hot"), "pw").await.is_ok(),
+        "healthy KDC keeps serving"
+    );
+
+    proxy.set_cut(false);
+    for _ in 0..400 {
+        let source = admin_store
+            .get_record(&name("hot"), REALM)
+            .await
+            .expect("authority")
+            .expect("hot");
+        let replica = replica1
+            .lookup(&name("hot"), REALM)
+            .await
+            .expect("replica")
+            .expect("hot");
+        if source.entry.security_epoch == replica.security_epoch
+            && source.entry.allowed_to_delegate_to == replica.allowed_to_delegate_to
+            && source.entry.keys.len() == replica.keys.len()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let source = admin_store.list_principals().await.expect("authority");
+    for source in source {
+        let replica = replica1
+            .lookup(&source.entry.name, REALM)
+            .await
+            .expect("replica")
+            .unwrap_or_else(|| panic!("missing {}", source.entry.name));
+        assert_eq!(source.entry.security_epoch, replica.security_epoch);
+        assert_eq!(
+            source.entry.allowed_to_delegate_to,
+            replica.allowed_to_delegate_to
+        );
+        assert_eq!(
+            source.entry.keys.iter().map(|k| k.kvno).collect::<Vec<_>>(),
+            replica.keys.iter().map(|k| k.kvno).collect::<Vec<_>>(),
+            "key versions for {}",
+            source.entry.name
+        );
+    }
+    for w in 0..3 {
+        assert!(replica1
+            .lookup(&name(&format!("partition-{w}")), REALM)
+            .await
+            .expect("replica")
+            .is_none());
+    }
+    assert!(
+        as_login(&kdc_a, &name("hot"), "pw").await.is_ok(),
+        "partitioned KDC recovers"
+    );
+
+    shutdown_a.send(true).expect("shutdown A");
+    shutdown_b.send(true).expect("shutdown B");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        task_a.await.expect("engine A");
+        task_b.await.expect("engine B");
+    })
+    .await
+    .expect("engines shut down cleanly");
+    proxy.stop().await;
+    drop((replica1, replica2));
+    let _ = std::fs::remove_dir_all(replica1_dir);
+    let _ = std::fs::remove_dir_all(replica2_dir);
+    db.drop_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn strict_mode_rejects_authoritative_security_changes_the_replica_has_not_applied() {
+    use krb5_rs::kdc::replication::{
+        FreshnessGate, RebuildPolicy, ReplicationConfig, ReplicationEngine, StrictGate,
+    };
+    use krb5_rs::kdc::{ConsistencyGate, GateDecision, Kdc, KdcConfig};
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    let (db, admin_store) = TestDb::with_realm("strict").await;
+    let admin = ops(&admin_store);
+    admin
+        .add_principal(&name("hot"), REALM, Some("pw"), &plain())
+        .await
+        .expect("hot");
+
+    let path = std::env::temp_dir().join(format!("krb5rs_strict_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let replica = TursoReplica::open(&path, TursoOptions::default(), master())
+        .await
+        .expect("replica");
+    let mut source_config = db.replica();
+    source_config.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    let source = CockroachStore::connect(source_config.clone(), master(), REALM)
+        .await
+        .expect("authority source");
+    let engine = ReplicationEngine::new(
+        source.clone(),
+        replica.clone(),
+        source.clone(),
+        ReplicationConfig {
+            poll_interval: Duration::from_millis(25),
+            kdc_id: "strict-test".into(),
+            region: "california".into(),
+            rebuild: RebuildPolicy::Auto,
+            ..ReplicationConfig::default()
+        },
+    );
+    engine.bootstrap().await.expect("initial bootstrap");
+    let status = engine.status_handle();
+    let bounded = Kdc::builder(KdcConfig::new(REALM), replica.clone())
+        .policies(replica.clone())
+        .auth_state(replica.clone())
+        .consistency(FreshnessGate::new(
+            Arc::clone(&status),
+            Duration::from_secs(60),
+        ))
+        .build();
+    let strict = Kdc::builder(KdcConfig::new(REALM), replica.clone())
+        .policies(replica.clone())
+        .auth_state(replica.clone())
+        .consistency(StrictGate::new(
+            Arc::clone(&status),
+            Duration::from_secs(60),
+            Arc::new(source.clone()),
+            Duration::from_millis(500),
+        ))
+        .build();
+
+    assert!(as_login(&bounded, &name("hot"), "pw").await.is_ok());
+    assert!(as_login(&strict, &name("hot"), "pw").await.is_ok());
+
+    let mut disabled = plain();
+    disabled
+        .attributes
+        .add_spec("+disallow_all_tix")
+        .expect("disable attribute");
+    admin
+        .modify_principal(&name("hot"), REALM, &disabled)
+        .await
+        .expect("disable at authority");
+    assert!(
+        matches!(as_login(&strict, &name("hot"), "pw").await, Err(29)),
+        "strict mode checks the authoritative disable immediately"
+    );
+    // Bounded mode keeps serving within the documented replication window.
+    assert!(
+        as_login(&bounded, &name("hot"), "pw").await.is_ok(),
+        "bounded mode may serve before the disable is replicated"
+    );
+
+    let mut reenabled = plain();
+    reenabled
+        .attributes
+        .add_spec("-disallow_all_tix")
+        .expect("enable attribute");
+    admin
+        .modify_principal(&name("hot"), REALM, &reenabled)
+        .await
+        .expect("re-enable at authority");
+    admin
+        .change_password(&name("hot"), REALM, Some("new-pw"), true)
+        .await
+        .expect("cpw -keepold");
+    assert!(
+        matches!(as_login(&strict, &name("hot"), "pw").await, Err(29)),
+        "strict mode rejects the greater authoritative security epoch"
+    );
+    assert!(
+        as_login(&bounded, &name("hot"), "pw").await.is_ok(),
+        "bounded mode still has the old local key until replication"
+    );
+
+    let upstream = format!("{}:{}", host(), port())
+        .parse()
+        .expect("upstream address");
+    let proxy = Proxy::start("127.0.0.1", upstream).await;
+    let mut proxied_config = source_config;
+    proxied_config.url = format!(
+        "postgresql://kdc_replica@127.0.0.1:{}/{}?sslmode=verify-full",
+        proxy.address.port(),
+        db.name
+    );
+    let proxied_authority = CockroachStore::connect(proxied_config, master(), REALM)
+        .await
+        .expect("proxied authority");
+    let unavailable_gate = StrictGate::new(
+        Arc::clone(&status),
+        Duration::from_secs(60),
+        Arc::new(proxied_authority.clone()),
+        Duration::from_millis(500),
+    );
+    let local_hot = replica
+        .lookup(&name("hot"), REALM)
+        .await
+        .expect("local lookup")
+        .expect("local hot");
+    proxy.set_cut(true);
+    assert_eq!(
+        unavailable_gate.check(&[&local_hot]).await,
+        GateDecision::Reject {
+            reason: "AUTHORITY_UNAVAILABLE".into()
+        }
+    );
+    let unavailable_kdc = Kdc::builder(KdcConfig::new(REALM), replica.clone())
+        .policies(replica.clone())
+        .auth_state(replica.clone())
+        .consistency(StrictGate::new(
+            Arc::clone(&status),
+            Duration::from_secs(60),
+            Arc::new(proxied_authority.clone()),
+            Duration::from_millis(500),
+        ))
+        .build();
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            as_login(&unavailable_kdc, &name("hot"), "pw")
+        )
+        .await
+        .expect("authority failure is bounded"),
+        Err(29)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    proxy.set_cut(false);
+    proxy.stop().await;
+    drop(proxied_authority);
+
+    engine.bootstrap().await.expect("apply re-enable and cpw");
+    assert!(as_login(&strict, &name("hot"), "new-pw").await.is_ok());
+    assert!(as_login(&bounded, &name("hot"), "new-pw").await.is_ok());
+
+    admin
+        .modify_principal(&name("hot"), REALM, &disabled)
+        .await
+        .expect("disable again");
+    engine.bootstrap().await.expect("apply second disable");
+    let local_hot = replica
+        .lookup(&name("hot"), REALM)
+        .await
+        .expect("local lookup")
+        .expect("local hot");
+    assert!(local_hot
+        .attributes
+        .contains(PrincipalAttributes::DISALLOW_ALL_TIX));
+    assert!(
+        matches!(as_login(&bounded, &name("hot"), "new-pw").await, Err(18)),
+        "the bounded KDC returns MIT KDC_ERR_CLIENT_REVOKED once the disable is local"
+    );
+    assert!(
+        matches!(as_login(&strict, &name("hot"), "new-pw").await, Err(29)),
+        "strict mode fails closed on the authoritative disabled state"
+    );
+
+    drop((unavailable_kdc, strict, bounded, engine, replica, source));
+    let _ = std::fs::remove_dir_all(&path);
+    db.drop_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn an_engine_restarted_on_existing_turso_state_resumes_without_a_snapshot() {
+    use krb5_rs::kdc::replication::{
+        RebuildPolicy, ReplicaSink, ReplicationConfig, ReplicationEngine,
+    };
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    let (db, admin_store) = TestDb::with_realm("resume").await;
+    let admin = ops(&admin_store);
+    for principal in ["base-update", "base-delete", "base-stable"] {
+        admin
+            .add_principal(&name(principal), REALM, Some("pw"), &plain())
+            .await
+            .expect("seed principal");
+    }
+    let path = std::env::temp_dir().join(format!("krb5rs_resume_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let replica = TursoReplica::open(&path, TursoOptions::default(), master())
+        .await
+        .expect("open replica");
+    let mut config = db.replica();
+    config.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    let source = CockroachStore::connect(config, master(), REALM)
+        .await
+        .expect("source");
+    let cfg = ReplicationConfig {
+        poll_interval: Duration::from_millis(25),
+        heartbeat_interval: Duration::from_millis(50),
+        batch_limit: 50,
+        kdc_id: "resume-kdc".into(),
+        region: "california".into(),
+        rebuild: RebuildPolicy::Auto,
+        ..ReplicationConfig::default()
+    };
+    let engine1 =
+        ReplicationEngine::new(source.clone(), replica.clone(), source.clone(), cfg.clone());
+    engine1.bootstrap().await.expect("initial bootstrap");
+    let status1 = engine1.status_handle();
+    let (shutdown1, rx1) = tokio::sync::watch::channel(false);
+    let task1 = tokio::spawn(async move { engine1.run(rx1).await });
+
+    admin
+        .add_principal(&name("during-run"), REALM, Some("pw"), &plain())
+        .await
+        .expect("add while running");
+    for _ in 0..200 {
+        if replica
+            .lookup(&name("during-run"), REALM)
+            .await
+            .expect("lookup")
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(replica
+        .lookup(&name("during-run"), REALM)
+        .await
+        .expect("lookup")
+        .is_some());
+    shutdown1.send(true).expect("shutdown engine one");
+    tokio::time::timeout(Duration::from_secs(5), task1)
+        .await
+        .expect("engine one drains")
+        .expect("engine one joins");
+    let checkpoint1 = status1.lock().expect("engine one status").applied_ts;
+    drop(replica);
+
+    admin
+        .add_principal(&name("while-stopped"), REALM, Some("pw"), &plain())
+        .await
+        .expect("add while stopped");
+    admin
+        .modify_principal(&name("base-update"), REALM, &delegate("HTTP/resumed"))
+        .await
+        .expect("modify while stopped");
+    admin
+        .delete_principal(&name("base-delete"), REALM)
+        .await
+        .expect("delete while stopped");
+
+    let reopened = TursoReplica::open(&path, TursoOptions::default(), master())
+        .await
+        .expect("reopen replica");
+    let snapshots = Arc::new(AtomicUsize::new(0));
+    let counted_source = CountingSource {
+        inner: source.clone(),
+        snapshots: Arc::clone(&snapshots),
+    };
+    let engine2 = ReplicationEngine::new(counted_source, reopened.clone(), source.clone(), cfg);
+    engine2.bootstrap().await.expect("resume from checkpoint");
+    let status2 = engine2.status_handle();
+    let (shutdown2, rx2) = tokio::sync::watch::channel(false);
+    let task2 = tokio::spawn(async move { engine2.run(rx2).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    shutdown2.send(true).expect("shutdown engine two");
+    tokio::time::timeout(Duration::from_secs(5), task2)
+        .await
+        .expect("engine two stops")
+        .expect("engine two joins");
+    let checkpoint2 = reopened
+        .checkpoint()
+        .await
+        .expect("checkpoint")
+        .expect("existing checkpoint");
+    let status2 = status2.lock().expect("engine two status").clone();
+    assert_eq!(snapshots.load(Ordering::SeqCst), 0);
+    assert_eq!(status2.rebuilds, 0);
+    assert!(status2.applied_ts >= checkpoint1);
+    assert!(checkpoint2.ts >= checkpoint1);
+    assert_principal_mirror(&admin_store, &reopened).await;
+    assert!(reopened
+        .lookup(&name("base-delete"), REALM)
+        .await
+        .expect("deleted lookup")
+        .is_none());
+
+    drop((reopened, source));
+    let _ = std::fs::remove_dir_all(&path);
+    db.drop_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn shutdown_during_an_apply_waits_for_it_and_leaves_no_partial_batch() {
+    use krb5_rs::kdc::replication::{
+        RebuildPolicy, ReplicaSink, ReplicationConfig, ReplicationEngine,
+    };
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    let (db, admin_store) = TestDb::with_realm("shutdownapply").await;
+    let admin = ops(&admin_store);
+    let path = std::env::temp_dir().join(format!("krb5rs_shutdown_apply_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let replica = TursoReplica::open(&path, TursoOptions::default(), master())
+        .await
+        .expect("open replica");
+    let mut source_config = db.replica();
+    source_config.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    let source = CockroachStore::connect(source_config, master(), REALM)
+        .await
+        .expect("source");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let applied = Arc::new(AtomicUsize::new(0));
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let sink = GatedSink {
+        inner: replica.clone(),
+        started: Arc::clone(&started),
+        applied: Arc::clone(&applied),
+        batches: Arc::clone(&batches),
+    };
+    let cfg = ReplicationConfig {
+        poll_interval: Duration::from_millis(10),
+        batch_limit: 50,
+        kdc_id: "shutdown-kdc".into(),
+        region: "california".into(),
+        rebuild: RebuildPolicy::Auto,
+        ..ReplicationConfig::default()
+    };
+    let engine = ReplicationEngine::new(source.clone(), sink.clone(), source.clone(), cfg.clone());
+    engine.bootstrap().await.expect("initial snapshot");
+    let initial = engine.status().applied_ts;
+
+    for i in 0..200 {
+        admin
+            .add_principal(&name(&format!("shutdown-{i}")), REALM, Some("pw"), &plain())
+            .await
+            .expect("seed pending batch");
+    }
+    let waiting = started.notified();
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move { engine.run(rx).await });
+    tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("apply starts");
+    let completed_before_shutdown = applied.load(Ordering::SeqCst);
+    shutdown.send(true).expect("shutdown");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !task.is_finished(),
+        "shutdown must not cancel an in-flight apply"
+    );
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("apply drains")
+        .expect("engine task");
+
+    assert_eq!(completed_before_shutdown, 0);
+    assert_eq!(applied.load(Ordering::SeqCst), 1);
+    let applied_batches = batches.lock().expect("batch log").clone();
+    assert_eq!(applied_batches.len(), 1);
+    let completed = &applied_batches[0];
+    assert!(completed.upto > initial);
+    drop((sink, replica));
+
+    let reopened = TursoReplica::open(&path, TursoOptions::default(), master())
+        .await
+        .expect("reopen");
+    let checkpoint = reopened
+        .checkpoint()
+        .await
+        .expect("checkpoint")
+        .expect("checkpoint exists");
+    assert_eq!(checkpoint.ts, completed.upto);
+    for change in &completed.changes {
+        if let Change::UpsertPrincipal { principal, .. } = change {
+            assert!(reopened
+                .lookup(&principal.name, REALM)
+                .await
+                .expect("replica lookup")
+                .is_some());
+        }
+    }
+
+    let restarted = ReplicationEngine::new(source.clone(), reopened.clone(), source.clone(), cfg);
+    restarted
+        .bootstrap()
+        .await
+        .expect("resume from committed batch");
+    assert_principal_mirror(&admin_store, &reopened).await;
+
+    drop((restarted, reopened, source));
+    let _ = std::fs::remove_dir_all(&path);
+    db.drop_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a CockroachDB cluster; simulates regional link lag"]
+async fn a_lagging_kdc_fails_closed_while_a_current_kdc_serves_and_heartbeats_show_progress() {
+    use krb5_rs::kdc::replication::{
+        FreshnessGate, RebuildPolicy, ReplicationConfig, ReplicationEngine,
+    };
+    use krb5_rs::kdc::{Kdc, KdcConfig};
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    let db = TestDb::new("regionlag").await;
+    CockroachStore::migrate(
+        db.root(),
+        &MigrateOptions {
+            create_roles: true,
+            multi_region: Some(MultiRegion {
+                primary_region: "california".into(),
+                regions: vec!["california".into(), "ohio".into(), "washington-dc".into()],
+            }),
+        },
+    )
+    .await
+    .expect("multi-region migration");
+    let admin_store = CockroachStore::connect(db.admin(), master(), REALM)
+        .await
+        .expect("admin store");
+    admin_store.create_realm(&[18, 17]).await.expect("realm");
+    let admin = ops(&admin_store);
+    admin
+        .add_principal(&name("hot"), REALM, Some("pw"), &plain())
+        .await
+        .expect("hot");
+
+    let replica_a_dir = std::env::temp_dir().join(format!("krb5rs_lag_a_{}", std::process::id()));
+    let replica_b_dir = std::env::temp_dir().join(format!("krb5rs_lag_b_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&replica_a_dir);
+    let _ = std::fs::remove_dir_all(&replica_b_dir);
+    let replica_a = TursoReplica::open(&replica_a_dir, TursoOptions::default(), master())
+        .await
+        .expect("replica A");
+    let replica_b = TursoReplica::open(&replica_b_dir, TursoOptions::default(), master())
+        .await
+        .expect("replica B");
+    let upstream = format!("{}:{}", host(), port())
+        .parse()
+        .expect("upstream address");
+    let proxy = Proxy::start("127.0.0.1", upstream).await;
+    let mut direct_config = db.replica();
+    direct_config.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    let source_a = CockroachStore::connect(direct_config, master(), REALM)
+        .await
+        .expect("direct source");
+    let mut proxied_config = db.replica();
+    proxied_config.url = format!(
+        "postgresql://kdc_replica@127.0.0.1:{}/{}?sslmode=verify-full",
+        proxy.address.port(),
+        db.name
+    );
+    proxied_config.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    let source_b = CockroachStore::connect(proxied_config, master(), REALM)
+        .await
+        .expect("proxied source");
+    let config = |kdc_id: &str, region: &str| ReplicationConfig {
+        poll_interval: Duration::from_millis(50),
+        heartbeat_interval: Duration::from_millis(100),
+        batch_limit: 100,
+        kdc_id: kdc_id.into(),
+        region: region.into(),
+        rebuild: RebuildPolicy::Auto,
+        ..ReplicationConfig::default()
+    };
+    let engine_a = ReplicationEngine::new(
+        source_a.clone(),
+        replica_a.clone(),
+        source_a.clone(),
+        config("kdc-ca", "california"),
+    );
+    let engine_b = ReplicationEngine::new(
+        source_b.clone(),
+        replica_b.clone(),
+        source_b.clone(),
+        config("kdc-oh", "ohio"),
+    );
+    engine_a.bootstrap().await.expect("bootstrap A");
+    engine_b.bootstrap().await.expect("bootstrap B");
+    let status_a = engine_a.status_handle();
+    let status_b = engine_b.status_handle();
+    let kdc_a = Kdc::builder(KdcConfig::new(REALM), replica_a.clone())
+        .policies(replica_a.clone())
+        .auth_state(replica_a.clone())
+        .consistency(FreshnessGate::new(
+            Arc::clone(&status_a),
+            Duration::from_secs(2),
+        ))
+        .build();
+    let kdc_b = Kdc::builder(KdcConfig::new(REALM), replica_b.clone())
+        .policies(replica_b.clone())
+        .auth_state(replica_b.clone())
+        .consistency(FreshnessGate::new(
+            Arc::clone(&status_b),
+            Duration::from_secs(2),
+        ))
+        .build();
+    let (shutdown_a, rx_a) = tokio::sync::watch::channel(false);
+    let (shutdown_b, rx_b) = tokio::sync::watch::channel(false);
+    let task_a = tokio::spawn(async move { engine_a.run(rx_a).await });
+    let task_b = tokio::spawn(async move { engine_b.run(rx_b).await });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // This delay simulates regional lag between nodes on one machine; it is
+    // not a real cross-region latency measurement.
+    proxy.set_delay(Duration::from_millis(1500));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut writers = Vec::new();
+    for writer_id in 0..2 {
+        let writer_store = admin_store.clone();
+        let stop_at = deadline;
+        writers.push(tokio::spawn(async move {
+            let writer = ops(&writer_store);
+            let mut sequence = 0;
+            while tokio::time::Instant::now() < stop_at {
+                let principal = name(&format!("lag-{writer_id}-{sequence}"));
+                writer
+                    .add_principal(&principal, REALM, Some("pw"), &plain())
+                    .await
+                    .expect("concurrent regional write");
+                sequence += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }));
+    }
+
+    let max_staleness = Duration::from_secs(2);
+    let stale_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let a = status_a.lock().expect("status A").clone();
+        let b = status_b.lock().expect("status B").clone();
+        if a.freshness()
+            .is_some_and(|freshness| freshness <= max_staleness)
+            && b.freshness()
+                .is_some_and(|freshness| freshness > max_staleness)
+            && a.applied_ts > b.applied_ts
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < stale_deadline,
+            "the delayed replica did not fall behind"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let current_login = as_login(&kdc_a, &name("hot"), "pw").await;
+    assert!(
+        current_login.is_ok(),
+        "the current KDC must keep serving; status={:?}",
+        status_a.lock().expect("status A").clone()
+    );
+    assert_eq!(
+        as_login(&kdc_b, &name("hot"), "pw").await.map(|_| ()),
+        Err(29)
+    );
+    for writer in writers {
+        writer.await.expect("writer task");
+    }
+    let statuses = source_a.replica_statuses().await.expect("heartbeats");
+    let ca = statuses
+        .iter()
+        .find(|s| s.kdc_id == "kdc-ca")
+        .expect("ca heartbeat");
+    let oh = statuses
+        .iter()
+        .find(|s| s.kdc_id == "kdc-oh")
+        .expect("oh heartbeat");
+    assert_eq!(ca.region, "california");
+    assert_eq!(oh.region, "ohio");
+    assert!(ca.applied_ts > oh.applied_ts);
+
+    proxy.set_delay(Duration::ZERO);
+    let mut converged = false;
+    for _ in 0..400 {
+        let a = status_a.lock().expect("status A").clone();
+        let b = status_b.lock().expect("status B").clone();
+        let heartbeats = source_a
+            .replica_statuses()
+            .await
+            .expect("recovered heartbeats");
+        let ca = heartbeats
+            .iter()
+            .find(|status| status.kdc_id == "kdc-ca")
+            .expect("ca heartbeat");
+        let oh = heartbeats
+            .iter()
+            .find(|status| status.kdc_id == "kdc-oh")
+            .expect("oh heartbeat");
+        if b.applied_ts >= a.applied_ts
+            && b.freshness()
+                .is_some_and(|freshness| freshness <= max_staleness)
+            && oh.applied_ts >= ca.applied_ts
+        {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(converged, "replica and heartbeats did not catch up");
+    assert!(as_login(&kdc_b, &name("hot"), "pw").await.is_ok());
+    assert_principal_mirror(&admin_store, &replica_a).await;
+    assert_principal_mirror(&admin_store, &replica_b).await;
+
+    shutdown_a.send(true).expect("shutdown A");
+    shutdown_b.send(true).expect("shutdown B");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        task_a.await.expect("engine A");
+        task_b.await.expect("engine B");
+    })
+    .await
+    .expect("engines stop");
+    proxy.stop().await;
+    drop((kdc_a, kdc_b, source_a, source_b, replica_a, replica_b));
+    let _ = std::fs::remove_dir_all(replica_a_dir);
+    let _ = std::fs::remove_dir_all(replica_b_dir);
+    db.drop_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "flake hunt: loops the GLOBAL-tables modprinc scenario and prints every full error"]
+async fn hunt_global_modprinc_errors() {
+    let rounds: usize = std::env::var("HUNT_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let db = TestDb::new("hunt").await;
+    CockroachStore::migrate(
+        db.root(),
+        &MigrateOptions {
+            create_roles: true,
+            multi_region: Some(MultiRegion {
+                primary_region: "california".into(),
+                regions: vec!["california".into(), "ohio".into(), "washington-dc".into()],
+            }),
+        },
+    )
+    .await
+    .expect("migrate");
+    let store = CockroachStore::connect(db.admin(), master(), REALM)
+        .await
+        .expect("connect");
+    store.create_realm(&[18]).await.expect("realm");
+    let o = ops(&store);
+    let who = name("lat");
+    o.add_principal(&who, REALM, Some("pw"), &plain())
+        .await
+        .expect("add");
+    let mut errors: Vec<String> = Vec::new();
+    let pause = std::env::var("HUNT_PAUSE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    for round in 0..rounds {
+        let start_retries = store.metrics().tx_retries();
+        let result = o
+            .modify_principal(&who, REALM, &delegate(&format!("HTTP/{round}")))
+            .await;
+        if let Err(e) = result {
+            errors.push(format!(
+                "round {round}: {e:?}; retry_count={}",
+                store.metrics().tx_retries() - start_retries
+            ));
+        }
+        if pause > 0 {
+            tokio::time::sleep(Duration::from_millis(pause)).await;
+        }
+    }
+    println!("hunt: {} errors in {rounds} rounds", errors.len());
+    for e in &errors {
+        println!("{e}");
+    }
+    assert!(errors.is_empty(), "GLOBAL modprinc failures: {errors:#?}");
+    db.drop_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn regional_modprinc_hunt_runs_with_a_concurrent_present_time_reader() {
+    let rounds: usize = std::env::var("HUNT_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let (db, store) = TestDb::with_realm("presentreader").await;
+    let o = ops(&store);
+    let who = name("lat");
+    o.add_principal(&who, REALM, Some("pw"), &plain())
+        .await
+        .expect("add");
+
+    let mut reader_config = db.admin();
+    reader_config.replication_read = krb5_rs_kdb_cockroach::ReplicationRead::Present;
+    let reader = CockroachStore::connect(reader_config, master(), REALM)
+        .await
+        .expect("reader");
+    let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+    let reader_task = tokio::spawn(async move {
+        let mut since = ReplicationTs::ZERO;
+        loop {
+            if *stop_rx.borrow() {
+                break;
+            }
+            let result = tokio::select! {
+                _ = stop_rx.changed() => break,
+                result = reader.poll(since, 32) => result.expect("present poll"),
+            };
+            since = result.batch.upto;
+            if !result.truncated {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    let mut errors = Vec::new();
+    for round in 0..rounds {
+        let retries = store.metrics().tx_retries();
+        if let Err(error) = o
+            .modify_principal(&who, REALM, &delegate(&format!("HTTP/{round}")))
+            .await
+        {
+            errors.push(format!(
+                "round {round}: {error:?}; retries={}",
+                store.metrics().tx_retries() - retries
+            ));
+        }
+    }
+    stop.send(true).expect("stop reader");
+    reader_task.await.expect("reader task");
+    println!(
+        "regional present-reader hunt: {} failures in {rounds} operations",
+        errors.len()
+    );
+    for error in &errors {
+        println!("{error}");
+    }
+    assert!(errors.is_empty(), "regional modprinc errors: {errors:#?}");
+    db.drop_db().await;
 }

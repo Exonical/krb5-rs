@@ -5,11 +5,16 @@
 mod common;
 
 use common::*;
+use krb5_rs::kdc::replication::ReplicationTs;
 use tokio_postgres::{Client, NoTls};
 
 /// A raw session as root (TLS through the crate's own rustls setup is not
 /// public, so build one here).
 async fn raw(database: &str) -> Client {
+    raw_with_options(database, None).await
+}
+
+async fn raw_with_options(database: &str, options: Option<&str>) -> Client {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     let c = config("root", database);
@@ -29,12 +34,16 @@ async fn raw(database: &str) -> Client {
         .with_root_certificates(roots)
         .with_client_auth_cert(chain, key)
         .expect("client auth");
-    let (client, conn) = tokio_postgres::Config::new()
-        .host(host())
+    let mut pg = tokio_postgres::Config::new();
+    pg.host(host())
         .port(port())
         .user("root")
         .dbname(database)
-        .ssl_mode(tokio_postgres::config::SslMode::Require)
+        .ssl_mode(tokio_postgres::config::SslMode::Require);
+    if let Some(options) = options {
+        pg.options(options);
+    }
+    let (client, conn) = pg
         .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls))
         .await
         .expect("connect");
@@ -43,15 +52,328 @@ async fn raw(database: &str) -> Client {
     client
 }
 
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn transaction_timeout_aborts_the_server_transaction_without_a_client_deadline() {
+    // `statement_timeout=0` ensures the abort is not a statement/client timer.
+    // Root only observes `transaction_timeout` when it is supplied as a
+    // connection option, matching the production pool configuration.
+    let c = raw_with_options(
+        "defaultdb",
+        Some("-c transaction_timeout=1s -c statement_timeout=0"),
+    )
+    .await;
+    let setting = one(&c, "SHOW transaction_timeout").await;
+    assert_eq!(setting, "1000");
+    let table = format!("tx_timeout_pr7_{}", std::process::id());
+    c.batch_execute(&format!(
+        "CREATE TABLE IF NOT EXISTS {table} (id INT PRIMARY KEY)"
+    ))
+    .await
+    .expect("create");
+    c.batch_execute(&format!("DELETE FROM {table}"))
+        .await
+        .expect("clear");
+
+    c.batch_execute("BEGIN").await.expect("begin");
+    c.batch_execute(&format!("INSERT INTO {table} VALUES (1)"))
+        .await
+        .expect("insert");
+    // No query is in flight here. The server must abort the open transaction
+    // after its transaction_timeout while the client sleeps.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let commit = c.batch_execute("COMMIT").await;
+    println!("COMMIT after server transaction_timeout: {commit:?}");
+    assert!(commit.is_err(), "the server must abort the expired session");
+    let check = raw("defaultdb").await;
+    let remaining: i64 = check
+        .query_one(&format!("SELECT count(*)::INT8 FROM {table}"), &[])
+        .await
+        .expect("read after abort")
+        .get(0);
+    assert_eq!(
+        remaining, 0,
+        "the server must not commit an expired transaction"
+    );
+    check
+        .batch_execute(&format!("DROP TABLE {table}"))
+        .await
+        .expect("drop");
+}
+
 async fn one(c: &Client, sql: &str) -> String {
     c.query_one(sql, &[]).await.expect(sql).get::<_, String>(0)
+}
+
+async fn aost_mvcc(c: &Client, table: &str, t: &str) -> String {
+    c.batch_execute(&format!("BEGIN READ ONLY AS OF SYSTEM TIME '{t}'"))
+        .await
+        .expect("begin AOST");
+    assert_eq!(
+        one(c, "SELECT cluster_logical_timestamp()::STRING").await,
+        t
+    );
+    let mvcc = one(
+        c,
+        &format!("SELECT crdb_internal_mvcc_timestamp::STRING FROM {table} WHERE id = 1"),
+    )
+    .await;
+    c.batch_execute("COMMIT").await.expect("commit AOST");
+    mvcc
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn fact_mvcc_timestamp_is_the_aost_row_version_and_monotonic_on_global_rows() {
+    use krb5_rs_kdb_cockroach::{CockroachStore, MigrateOptions, MultiRegion};
+
+    let db = TestDb::new("mvccver").await;
+    CockroachStore::migrate(
+        db.root(),
+        &MigrateOptions {
+            create_roles: false,
+            multi_region: Some(MultiRegion {
+                primary_region: "california".into(),
+                regions: vec!["california".into(), "ohio".into(), "washington-dc".into()],
+            }),
+        },
+    )
+    .await
+    .expect("multi-region migration");
+    let c = raw(&db.name).await;
+    c.batch_execute(
+        "CREATE TABLE mvcc_probe (id INT8 PRIMARY KEY, val INT8 NOT NULL) LOCALITY GLOBAL",
+    )
+    .await
+    .expect("create global probe");
+    c.batch_execute("INSERT INTO mvcc_probe VALUES (1, 1)")
+        .await
+        .expect("insert");
+
+    let t1 = one(&c, "SELECT cluster_logical_timestamp()::STRING").await;
+    let v1 = aost_mvcc(&c, "mvcc_probe", &t1)
+        .await
+        .parse::<ReplicationTs>()
+        .expect("initial MVCC");
+    println!("GLOBAL MVCC version after insert: {v1}");
+    assert_eq!(
+        one(&c, "SELECT val::STRING FROM mvcc_probe WHERE id = 1").await,
+        "1"
+    );
+
+    c.batch_execute("UPDATE mvcc_probe SET val = 2 WHERE id = 1")
+        .await
+        .expect("update 1");
+    let t2 = one(&c, "SELECT cluster_logical_timestamp()::STRING").await;
+    let v2 = aost_mvcc(&c, "mvcc_probe", &t2)
+        .await
+        .parse::<ReplicationTs>()
+        .expect("second MVCC");
+    assert!(v2 > v1, "first update did not advance the row MVCC version");
+
+    c.batch_execute("UPDATE mvcc_probe SET val = 3 WHERE id = 1")
+        .await
+        .expect("update 2");
+    let t3 = one(&c, "SELECT cluster_logical_timestamp()::STRING").await;
+    let v3 = aost_mvcc(&c, "mvcc_probe", &t3)
+        .await
+        .parse::<ReplicationTs>()
+        .expect("third MVCC");
+    assert!(
+        v3 > v2,
+        "second update did not advance the row MVCC version"
+    );
+    assert_eq!(
+        one(&c, "SELECT val::STRING FROM mvcc_probe WHERE id = 1").await,
+        "3"
+    );
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn fact_bucket_scan_finds_a_long_transaction_from_its_start_bucket() {
+    use krb5_rs_kdb_cockroach::{CockroachStore, MigrateOptions, MultiRegion};
+
+    let db = TestDb::new("bucketold").await;
+    CockroachStore::migrate(
+        db.root(),
+        &MigrateOptions {
+            create_roles: true,
+            multi_region: Some(MultiRegion {
+                primary_region: "california".into(),
+                regions: vec!["california".into(), "ohio".into(), "washington-dc".into()],
+            }),
+        },
+    )
+    .await
+    .expect("multi-region migration");
+    let setup = raw(&db.name).await;
+    setup
+        .batch_execute("CREATE TABLE bucket_probe (id INT8 PRIMARY KEY, val INT8 NOT NULL)")
+        .await
+        .expect("create probe");
+    setup
+        .batch_execute("UPDATE replication_meta SET transaction_timeout_ms = 3000 WHERE id = 1")
+        .await
+        .expect("test transaction bound");
+
+    let writer = raw_with_options(
+        &db.name,
+        Some("-c transaction_timeout=3s -c statement_timeout=0"),
+    )
+    .await;
+    let observer = raw(&db.name).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let epoch = one(&observer, "SELECT EXTRACT(EPOCH FROM now())::STRING").await;
+        let second = epoch.parse::<f64>().expect("server time");
+        if second % 10.0 >= 8.5 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "missed bucket boundary"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+    let writer_task = tokio::spawn(async move {
+        writer.batch_execute("BEGIN").await.expect("begin writer");
+        let txn_start = one(&writer, "SELECT EXTRACT(EPOCH FROM now())::STRING")
+            .await
+            .parse::<f64>()
+            .expect("txn start");
+        let bucket = one(
+            &writer,
+            "SELECT floor(EXTRACT(EPOCH FROM now()) / bucket_width_seconds)::INT8::STRING \
+             FROM replication_meta WHERE id = 1",
+        )
+        .await
+        .parse::<i64>()
+        .expect("start bucket");
+        started_tx.send((txn_start, bucket)).expect("send start");
+        release_rx.await.expect("release writer");
+        writer
+            .batch_execute(
+                "INSERT INTO bucket_probe VALUES (1, 1); \
+                 INSERT INTO replication_log (bucket,id,entity,realm,\"key\",op,txn_id) \
+                 SELECT floor(EXTRACT(EPOCH FROM now())/bucket_width_seconds)::INT8, \
+                 '00000000-0000-4000-8000-000000000001'::UUID, 'principal', \
+                 'R', 'alice', 'upsert', '00000000-0000-4000-8000-000000000002'::UUID \
+                 FROM replication_meta WHERE id=1",
+            )
+            .await
+            .expect("write data and log");
+        let result = writer.batch_execute("COMMIT").await;
+        committed_tx
+            .send(
+                result
+                    .as_ref()
+                    .map_or_else(|e| e.to_string(), |_| "ok".into()),
+            )
+            .expect("send commit");
+        result.expect("commit writer");
+    });
+
+    let (txn_start, start_bucket) = started_rx.await.expect("writer started");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let checkpoint_bucket = loop {
+        let current_bucket = one(
+            &observer,
+            "SELECT floor(EXTRACT(EPOCH FROM now())/10)::INT8::STRING",
+        )
+        .await
+        .parse::<i64>()
+        .expect("current bucket");
+        if current_bucket > start_bucket {
+            break current_bucket;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "writer did not span a bucket boundary"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let ckpt = one(&observer, "SELECT cluster_logical_timestamp()::STRING").await;
+    let ckpt_ts = ckpt.parse::<ReplicationTs>().expect("checkpoint");
+    let d = 3_000_000_000i64;
+    let width = 10i64;
+    let low_bucket = (ckpt_ts.wall_nanos - d)
+        .div_euclid(1_000_000_000)
+        .div_euclid(width);
+    assert!(
+        start_bucket >= low_bucket,
+        "D scan omitted the writer's bucket"
+    );
+    assert!(start_bucket < checkpoint_bucket);
+    println!(
+        "writer transaction start={txn_start}, log bucket={start_bucket}, \
+         ckpt={ckpt}, scan low bucket={low_bucket}"
+    );
+    observer
+        .batch_execute(&format!("BEGIN READ ONLY AS OF SYSTEM TIME '{ckpt}'"))
+        .await
+        .expect("begin checkpoint scan");
+    let visible = observer
+        .query_one(
+            "SELECT count(*)::INT8 FROM replication_log WHERE bucket BETWEEN $1 AND $2",
+            &[&low_bucket, &checkpoint_bucket],
+        )
+        .await
+        .expect("scan checkpoint bucket range")
+        .get::<_, i64>(0);
+    assert_eq!(visible, 0, "the uncommitted log row is not visible at ckpt");
+    observer
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit checkpoint scan");
+    release_tx.send(()).expect("release writer");
+    let writer_commit = committed_rx.await.expect("writer commit time");
+    println!("writer commit after checkpoint read: {writer_commit}");
+    writer_task.await.expect("writer completes");
+
+    let t = one(&observer, "SELECT cluster_logical_timestamp()::STRING").await;
+    let t_ts = t.parse::<ReplicationTs>().expect("read timestamp");
+    let high_bucket = t_ts.wall_nanos.div_euclid(1_000_000_000).div_euclid(width);
+    assert!(
+        start_bucket < high_bucket,
+        "test did not cross a bucket boundary"
+    );
+    observer
+        .batch_execute(&format!("BEGIN READ ONLY AS OF SYSTEM TIME '{t}'"))
+        .await
+        .expect("begin after-commit AOST");
+    let row = observer
+        .query_opt(
+            "SELECT id::STRING, crdb_internal_mvcc_timestamp::STRING FROM replication_log \
+             WHERE bucket BETWEEN $1 AND $2 \
+             AND crdb_internal_mvcc_timestamp::STRING::DECIMAL > $3::STRING::DECIMAL \
+             AND crdb_internal_mvcc_timestamp::STRING::DECIMAL <= $4::STRING::DECIMAL",
+            &[&low_bucket, &high_bucket, &ckpt, &t],
+        )
+        .await
+        .expect("bucket range scan");
+    let row = row.expect("the start-bucket row must be found in the D window");
+    let row_version = row
+        .get::<_, String>(1)
+        .parse::<ReplicationTs>()
+        .expect("log row MVCC");
+    assert!(row_version > ckpt_ts);
+    observer
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit after-commit AOST");
+    db.drop_db().await;
 }
 
 #[tokio::test]
 #[ignore = "needs the CockroachDB test cluster"]
 async fn fact_cluster_logical_timestamp_inside_an_as_of_system_time_transaction() {
-    let db = TestDb::new("facts1").await;
-    db.migrate().await;
+    let db = TestDb::migrated("facts1").await;
     let c = raw(&db.name).await;
     let now = one(&c, "SELECT cluster_logical_timestamp()::STRING").await;
     println!("present: cluster_logical_timestamp() = {now}");
@@ -108,8 +430,7 @@ async fn fact_cluster_logical_timestamp_inside_an_as_of_system_time_transaction(
 #[tokio::test]
 #[ignore = "needs the CockroachDB test cluster"]
 async fn fact_cluster_logical_timestamp_pins_the_commit_timestamp_of_a_write_transaction() {
-    let db = TestDb::new("facts2").await;
-    db.migrate().await;
+    let db = TestDb::migrated("facts2").await;
     let c = raw(&db.name).await;
     c.batch_execute("CREATE TABLE w (k INT PRIMARY KEY, ts DECIMAL)")
         .await
@@ -209,8 +530,18 @@ async fn fact_cluster_logical_timestamp_pins_the_commit_timestamp_of_a_write_tra
 #[tokio::test]
 #[ignore = "needs the CockroachDB test cluster"]
 async fn fact_global_tables_and_cluster_logical_timestamp() {
+    use krb5_rs_kdb_cockroach::{CockroachStore, MigrateOptions};
+
     let db = TestDb::new("facts3").await;
-    db.migrate().await;
+    CockroachStore::migrate(
+        db.root(),
+        &MigrateOptions {
+            create_roles: true,
+            multi_region: None,
+        },
+    )
+    .await
+    .expect("migrate");
     let c = raw(&db.name).await;
     c.batch_execute(
         "ALTER DATABASE \"x\" SET PRIMARY REGION \"california\""

@@ -7,6 +7,7 @@ mod schema;
 mod store;
 mod tls;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub use config::{redact_url, CockroachConfig, ReplicationRead};
@@ -18,28 +19,51 @@ type Hook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A hook called at named points of a transaction (tests inject failures).
 #[derive(Clone, Default)]
-pub struct FailPoint(Option<Hook>);
+pub struct FailPoint {
+    hook: Option<Hook>,
+    ambiguous_commit: Arc<AtomicBool>,
+}
 
 impl FailPoint {
     /// Call `f` with the name of every point reached.
     pub fn new(f: impl Fn(&str) + Send + Sync + 'static) -> Self {
-        Self(Some(Arc::new(f)))
+        Self {
+            hook: Some(Arc::new(f)),
+            ambiguous_commit: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Simulate a connection losing the response after the server committed.
+    /// The database commit is real; the test hook reports it to the retry
+    /// protocol as if it were SQLSTATE 40003.
+    #[doc(hidden)]
+    pub fn ambiguous_commit_once() -> Self {
+        Self {
+            hook: None,
+            ambiguous_commit: Arc::new(AtomicBool::new(true)),
+        }
     }
 
     pub(crate) fn hit(&self, point: &str) {
-        if let Some(f) = &self.0 {
+        if let Some(f) = &self.hook {
             f(point);
         }
+    }
+
+    pub(crate) fn take_ambiguous_commit(&self) -> bool {
+        self.ambiguous_commit.swap(false, Ordering::SeqCst)
     }
 }
 
 impl std::fmt::Debug for FailPoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() {
-            "FailPoint(set)"
-        } else {
-            "FailPoint(none)"
-        })
+        f.write_str(
+            if self.hook.is_some() || self.ambiguous_commit.load(Ordering::Relaxed) {
+                "FailPoint(set)"
+            } else {
+                "FailPoint(none)"
+            },
+        )
     }
 }
 

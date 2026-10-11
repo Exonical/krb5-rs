@@ -2,6 +2,7 @@
 # A secure 3-node CockroachDB cluster for the krb5-rs-kdb-cockroach tests.
 #
 #   tests/crdb/cluster.sh up      create certs, start the nodes, init, create the users
+#   tests/crdb/cluster.sh clean   drop only scratch databases (no tests may be running)
 #   tests/crdb/cluster.sh down    remove the containers (keeps volumes and certs)
 #   tests/crdb/cluster.sh nuke    remove containers, volumes, network and certs
 #   tests/crdb/cluster.sh status
@@ -76,6 +77,20 @@ up() {
     if "$CLI" exec crdb1 ./cockroach sql --certs-dir=/certs --host=crdb1:26257 -e 'SELECT 1' >/dev/null 2>&1; then break; fi
     sleep 1
   done
+  # Test-only settings from CockroachDB's local-testing guidance:
+  # https://www.cockroachlabs.com/docs/stable/local-testing
+  local setting
+  for setting in \
+    "SET CLUSTER SETTING kv.range_merge.queue_interval = '50ms'" \
+    "SET CLUSTER SETTING jobs.registry.interval.gc = '30s'" \
+    "SET CLUSTER SETTING jobs.registry.interval.cancel = '180s'" \
+    "SET CLUSTER SETTING jobs.retention_time = '15s'" \
+    "SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false" \
+    "SET CLUSTER SETTING kv.range_split.by_load_merge_delay = '5s'" \
+    'ALTER RANGE default CONFIGURE ZONE USING "gc.ttlseconds" = 600' \
+    'ALTER DATABASE system CONFIGURE ZONE USING "gc.ttlseconds" = 600'; do
+    sql "$setting" >/dev/null
+  done
   sql "CREATE USER IF NOT EXISTS kdc_admin; CREATE USER IF NOT EXISTS kdc_replica;" >/dev/null
   echo "CockroachDB is up: $CRDB_HOST:$CRDB_PORT (nodes on +0, +1, +2); client certs in $HOST_CERTS"
 }
@@ -88,9 +103,24 @@ down() {
   for n in "${NODES[@]}"; do "$CLI" rm -f "$n" >/dev/null 2>&1 || true; done
 }
 
+clean() {
+  local db
+  while IFS= read -r db; do
+    [[ -z "$db" ]] && continue
+    sql "DROP DATABASE IF EXISTS \"$db\" CASCADE" >/dev/null
+    echo "dropped scratch database $db"
+  done < <(
+    "$CLI" exec crdb1 ./cockroach sql --certs-dir=/certs --host=crdb1:26257 \
+      --format=tsv -e "SELECT database_name FROM [SHOW DATABASES] \
+                       WHERE substring(database_name, 1, 6) = 'krb5t_' ORDER BY database_name" |
+      tail -n +2
+  )
+}
+
 case "${1:-}" in
   up) up ;;
   down) down ;;
+  clean) clean ;;
   nuke)
     down
     "$CLI" network rm "$NET" >/dev/null 2>&1 || true

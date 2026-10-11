@@ -52,6 +52,8 @@ pub struct CockroachConfig {
     pub connect_timeout: Duration,
     /// Server-side statement timeout, also bounding point reads.
     pub statement_timeout: Duration,
+    /// Server-side transaction duration limit (`transaction_timeout`).
+    pub transaction_timeout: Duration,
     /// Replication read timestamp.
     pub replication_read: ReplicationRead,
     /// Allow a plaintext connection (`sslmode=disable`). For tests only; a
@@ -68,6 +70,7 @@ impl std::fmt::Debug for CockroachConfig {
             .field("key", &self.key)
             .field("pool_size", &self.pool_size)
             .field("replication_read", &self.replication_read)
+            .field("transaction_timeout", &self.transaction_timeout)
             .field("insecure", &self.insecure)
             .finish_non_exhaustive()
     }
@@ -98,6 +101,7 @@ impl CockroachConfig {
             pool_size: 8,
             connect_timeout: Duration::from_secs(5),
             statement_timeout: Duration::from_secs(10),
+            transaction_timeout: Duration::from_secs(30),
             replication_read: ReplicationRead::Follower,
             insecure: false,
         }
@@ -134,6 +138,9 @@ impl CockroachConfig {
         }
         if let Some(d) = duration("cockroach_statement_timeout")? {
             c.statement_timeout = d;
+        }
+        if let Some(d) = duration("cockroach_transaction_timeout")? {
+            c.transaction_timeout = d;
         }
         c.replication_read = match m.get("replication_read") {
             None | Some("follower") => ReplicationRead::Follower,
@@ -201,8 +208,9 @@ pub(crate) fn parse_url(cfg: &CockroachConfig) -> Result<ParsedUrl, StoreError> 
     pg.connect_timeout(cfg.connect_timeout);
     pg.application_name("krb5-rs");
     pg.options(format!(
-        "-c statement_timeout={}",
-        cfg.statement_timeout.as_millis()
+        "-c statement_timeout={} -c transaction_timeout={}",
+        cfg.statement_timeout.as_millis(),
+        cfg.transaction_timeout.as_millis(),
     ));
     pg.ssl_mode(if tls {
         tokio_postgres::config::SslMode::Require
@@ -247,12 +255,14 @@ mod tests {
         let m = module(
             "  db_library = krb5-rs-cockroach\n  cockroach_url = postgresql://kdc@crdb:26257/krb5?sslmode=verify-full\n  \
              cockroach_ca = /ca.crt\n  cockroach_pool_size = 3\n  cockroach_connect_timeout = 2s\n  \
-             cockroach_statement_timeout = 1m\n  replication_read = present",
+             cockroach_statement_timeout = 1m\n  cockroach_transaction_timeout = 30s\n  \
+             replication_read = present",
         );
         let c = CockroachConfig::from_db_module(&m).expect("config");
         assert_eq!(c.pool_size, 3);
         assert_eq!(c.connect_timeout, Duration::from_secs(2));
         assert_eq!(c.statement_timeout, Duration::from_secs(60));
+        assert_eq!(c.transaction_timeout, Duration::from_secs(30));
         assert_eq!(c.replication_read, ReplicationRead::Present);
         assert!(!c.insecure);
         assert!(CockroachConfig::from_db_module(&module("  db_library = x")).is_err());

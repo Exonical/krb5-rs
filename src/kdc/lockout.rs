@@ -72,7 +72,7 @@ impl<S: PrincipalStore> Kdc<S> {
         let Some(name) = entry.policy.as_deref() else {
             return Ok(LockoutPolicy::default());
         };
-        match self.policies.policy(name).await {
+        match self.measure_store(self.policies.policy(name)).await {
             Ok(Some(p)) => Ok(LockoutPolicy {
                 max_fail: p.pw_max_fail,
                 failcnt_interval: p.pw_failcnt_interval,
@@ -100,8 +100,7 @@ impl<S: PrincipalStore> Kdc<S> {
             return Ok(());
         }
         let state = self
-            .auth_state
-            .auth_state(&client.name, &client.realm)
+            .measure_store(self.auth_state.auth_state(&client.name, &client.realm))
             .await
             .map_err(|_| KdcError::new(KDC_ERR_SVC_UNAVAILABLE, "LOOKING_UP_AUTH_STATE"))?;
         if locked_check_p(now, &policy, &state, unlock_time(client)) {
@@ -150,8 +149,7 @@ impl<S: PrincipalStore> Kdc<S> {
             }
         };
         let Ok(state) = self
-            .auth_state
-            .auth_state(&client.name, &client.realm)
+            .measure_store(self.auth_state.auth_state(&client.name, &client.realm))
             .await
         else {
             return;
@@ -189,8 +187,7 @@ impl<S: PrincipalStore> Kdc<S> {
             return;
         };
         let Ok(after) = self
-            .auth_state
-            .apply(&client.name, &client.realm, &update)
+            .measure_store(self.auth_state.apply(&client.name, &client.realm, &update))
             .await
         else {
             return;

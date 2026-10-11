@@ -954,6 +954,97 @@ async fn a_kdc_on_the_replica_serves_as_and_tgs_and_counts_lockouts() {
 }
 
 #[tokio::test]
+async fn an_as_request_honours_a_lockout_replicated_from_the_authority() {
+    let files = TmpDir::new();
+    let changes = file_store_changes(&files);
+    let dir = TmpDir::new();
+    let r = open(&dir.0).await;
+    ReplicaSink::apply(&r, batch(ts(10), changes))
+        .await
+        .expect("principals");
+    ReplicaSink::apply(
+        &r,
+        batch(
+            ts(11),
+            vec![Change::UpsertPolicy {
+                policy: Policy {
+                    name: "lock".into(),
+                    pw_max_fail: 2,
+                    pw_lockout_duration: 0,
+                    ..Policy::default()
+                },
+                version: ts(11),
+            }],
+        ),
+    )
+    .await
+    .expect("policy");
+    let mut alice = r
+        .lookup(&name("alice"), REALM)
+        .await
+        .expect("lookup")
+        .expect("alice");
+    alice.policy = Some("lock".into());
+    alice.attributes |= PrincipalAttributes::REQUIRES_PRE_AUTH;
+    ReplicaSink::apply(
+        &r,
+        batch(
+            ts(12),
+            vec![up(
+                StoredPrincipal::from_entry(&alice, None, None, &master()).expect("stored"),
+                ts(12),
+            )],
+        ),
+    )
+    .await
+    .expect("policy assignment");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    ReplicaSink::apply(
+        &r,
+        batch(
+            ts(13),
+            vec![Change::UpsertLockout {
+                record: LockoutRecord {
+                    realm: REALM.into(),
+                    name: name("alice"),
+                    locked_at: now,
+                    unlock_at: None,
+                    source_kdc: "kdc-primary".into(),
+                },
+                version: ts(13),
+            }],
+        ),
+    )
+    .await
+    .expect("lockout");
+
+    let kdc = Kdc::builder(KdcConfig::new(REALM), r.clone())
+        .policies(r.clone())
+        .auth_state(r.clone())
+        .build();
+    let mut exchange = AsExchange::new(AsExchangeConfig::new(name("alice"), REALM), "alice-pw");
+    let mut reply = Vec::new();
+    let code = loop {
+        match exchange.step(&reply).expect("AS step") {
+            StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } => {
+                reply = kdc.handle(&data).await;
+                if let Ok(err) = rasn::der::decode::<krb5_rs::types::KrbErrorMsg>(&reply) {
+                    break err.error_code;
+                }
+            }
+            StepResult::Complete => panic!("the locked principal unexpectedly received a TGT"),
+        }
+    };
+    assert_eq!(
+        code, 18,
+        "replicated lockout must be KDC_ERR_CLIENT_REVOKED"
+    );
+}
+
+#[tokio::test]
 async fn no_plaintext_key_bytes_reach_the_database_files() {
     let dir = TmpDir::new();
     let r = open(&dir.0).await;

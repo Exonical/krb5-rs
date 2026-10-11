@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use crate::types::{AsReq, KdcReq, KrbErrorMsg, TgsReq};
 
@@ -71,6 +72,8 @@ pub struct RequestSummary {
     /// the only source of that code here): the hook for a
     /// rejected-for-staleness metric.
     pub gate_rejected: bool,
+    /// Time spent awaiting KDC stores during request processing.
+    pub store_time: Duration,
 }
 
 impl RequestSummary {
@@ -160,6 +163,7 @@ impl RequestSummary {
             reply_etype,
             ticket_etype,
             gate_rejected,
+            store_time: Duration::ZERO,
         }
     }
 

@@ -205,8 +205,22 @@ const DBMODULE_OPTION_KEYS: &[&str] = &[
     "cockroach_pool_size",
     "cockroach_connect_timeout",
     "cockroach_statement_timeout",
+    "cockroach_transaction_timeout",
     "cockroach_insecure",
     "replication_read",
+    "replication_poll_interval",
+    "replication_batch_limit",
+    "replication_retry_min",
+    "replication_retry_max",
+    "replication_rebuild",
+    "replication_heartbeat_interval",
+    "replication_bucket_width",
+    "kdc_id",
+    "region",
+    "consistency_mode",
+    "max_staleness",
+    "authoritative_timeout",
+    "metrics_listen",
 ];
 
 /// Everything the KDC needs to know about one realm.

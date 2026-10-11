@@ -44,6 +44,9 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[path = "../daemon_metrics.rs"]
+mod metrics;
+
 /// MIT's default kdc.conf location (`DEFAULT_KDC_PROFILE`).
 const DEFAULT_KDC_PROFILE: &str = "/usr/local/var/krb5kdc/kdc.conf";
 
@@ -87,6 +90,10 @@ struct Cli {
     /// Seconds to wait for open TCP connections after SIGTERM/SIGINT.
     #[arg(long, value_name = "SECS", default_value_t = 10)]
     shutdown_timeout: u64,
+
+    /// Serve Prometheus metrics and health endpoints on this address.
+    #[arg(long, value_name = "ADDR")]
+    metrics_listen: Option<SocketAddr>,
 }
 
 struct Listen {
@@ -98,10 +105,10 @@ struct Listen {
 /// (The store traits use native async, so they are not trait objects; the
 /// daemon picks the backend with an enum.)
 enum DaemonStore {
-    Memory(Arc<MemoryStore>),
-    File(Arc<FileStore>),
+    Memory(Arc<MemoryStore>, Arc<metrics::Metrics>),
+    File(Arc<FileStore>, Arc<metrics::Metrics>),
     #[cfg(feature = "turso")]
-    Turso(krb5_rs_kdb_turso::TursoReplica),
+    Turso(krb5_rs_kdb_turso::TursoReplica, Arc<metrics::Metrics>),
 }
 
 impl PrincipalStore for DaemonStore {
@@ -111,10 +118,25 @@ impl PrincipalStore for DaemonStore {
         realm: &str,
     ) -> Result<Option<PrincipalEntry>, StoreError> {
         match self {
-            DaemonStore::Memory(s) => s.lookup(name, realm).await,
-            DaemonStore::File(s) => s.lookup(name, realm).await,
+            DaemonStore::Memory(s, metrics) => {
+                let start = std::time::Instant::now();
+                let result = s.lookup(name, realm).await;
+                metrics.observe_principal_lookup(start.elapsed(), result.is_ok());
+                result
+            }
+            DaemonStore::File(s, metrics) => {
+                let start = std::time::Instant::now();
+                let result = s.lookup(name, realm).await;
+                metrics.observe_principal_lookup(start.elapsed(), result.is_ok());
+                result
+            }
             #[cfg(feature = "turso")]
-            DaemonStore::Turso(s) => s.lookup(name, realm).await,
+            DaemonStore::Turso(s, metrics) => {
+                let start = std::time::Instant::now();
+                let result = s.lookup(name, realm).await;
+                metrics.observe_principal_lookup(start.elapsed(), result.is_ok());
+                result
+            }
         }
     }
 }
@@ -125,7 +147,27 @@ fn io_err(msg: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(msg.to_string())
 }
 
-async fn keytab_mode(cli: &Cli, keytab: &Path) -> std::io::Result<(DynKdc, Listen)> {
+fn metrics_listen(
+    cli: Option<SocketAddr>,
+    configured: Option<&str>,
+) -> std::io::Result<Option<SocketAddr>> {
+    if cli.is_some() {
+        return Ok(cli);
+    }
+    configured
+        .map(|value| {
+            value
+                .parse::<SocketAddr>()
+                .map_err(|e| io_err(format!("metrics_listen: {e}")))
+        })
+        .transpose()
+}
+
+async fn keytab_mode(
+    cli: &Cli,
+    keytab: &Path,
+    metrics: Arc<metrics::Metrics>,
+) -> std::io::Result<(DynKdc, Listen)> {
     let realm = cli
         .realm
         .clone()
@@ -163,7 +205,7 @@ async fn keytab_mode(cli: &Cli, keytab: &Path) -> std::io::Result<(DynKdc, Liste
     };
     let addrs = parse_listen_addresses(&spec, 88).map_err(io_err)?;
     Ok((
-        Kdc::new(config, DaemonStore::Memory(Arc::new(store))),
+        Kdc::new(config, DaemonStore::Memory(Arc::new(store), metrics)),
         Listen {
             udp: addrs.clone(),
             tcp: addrs,
@@ -176,6 +218,37 @@ async fn keytab_mode(cli: &Cli, keytab: &Path) -> std::io::Result<(DynKdc, Liste
 struct PropParts {
     server: Option<(Arc<FileStore>, PropServerConfig, Vec<SocketAddr>)>,
     replica: Option<PropClientConfig>,
+    metrics_listen: Option<SocketAddr>,
+    #[cfg(feature = "cockroach")]
+    replication: Option<ReplicationRuntime>,
+}
+
+#[cfg(feature = "cockroach")]
+struct ReplicationRuntime {
+    engine: krb5_rs::kdc::replication::ReplicationEngine<
+        krb5_rs_kdb_cockroach::CockroachStore,
+        krb5_rs_kdb_turso::TursoReplica,
+        krb5_rs_kdb_cockroach::CockroachStore,
+    >,
+    reporter: krb5_rs_kdb_cockroach::CockroachLockoutReporter,
+    status: Arc<std::sync::Mutex<krb5_rs::kdc::replication::StatusSnapshot>>,
+    max_staleness: Duration,
+}
+
+#[cfg(feature = "cockroach")]
+enum RuntimeGate {
+    Bounded(krb5_rs::kdc::replication::FreshnessGate),
+    Strict(krb5_rs::kdc::replication::StrictGate<krb5_rs_kdb_cockroach::CockroachStore>),
+}
+
+#[cfg(feature = "cockroach")]
+impl krb5_rs::kdc::ConsistencyGate for RuntimeGate {
+    async fn check(&self, principals: &[&PrincipalEntry]) -> krb5_rs::kdc::GateDecision {
+        match self {
+            RuntimeGate::Bounded(gate) => gate.check(principals).await,
+            RuntimeGate::Strict(gate) => gate.check(principals).await,
+        }
+    }
 }
 
 fn prop_logger() -> PropLogger {
@@ -238,6 +311,7 @@ async fn turso_mode(
     cli: &Cli,
     cfg: RealmConfig,
     master: krb5_rs::types::EncryptionKey,
+    metrics: Arc<metrics::Metrics>,
 ) -> std::io::Result<(DynKdc, Listen, PropParts)> {
     use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
 
@@ -280,11 +354,19 @@ async fn turso_mode(
         let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
         (addrs.clone(), addrs)
     };
-    let kdc = Kdc::builder(cfg.kdc, DaemonStore::Turso(replica.clone()))
+    let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
+    let kdc = Kdc::builder(cfg.kdc, DaemonStore::Turso(replica.clone(), metrics))
         .policies(replica.clone())
         .auth_state(replica)
         .build();
-    Ok((kdc, Listen { udp, tcp }, PropParts::default()))
+    Ok((
+        kdc,
+        Listen { udp, tcp },
+        PropParts {
+            metrics_listen,
+            ..PropParts::default()
+        },
+    ))
 }
 
 #[cfg(not(feature = "turso"))]
@@ -292,9 +374,217 @@ async fn turso_mode(
     _cli: &Cli,
     _cfg: RealmConfig,
     _master: krb5_rs::types::EncryptionKey,
+    _metrics: Arc<metrics::Metrics>,
 ) -> std::io::Result<(DynKdc, Listen, PropParts)> {
     Err(io_err(
         "db_library krb5-rs-turso needs a krb5-rs-kdc built with the `turso` feature",
+    ))
+}
+
+#[cfg(feature = "cockroach")]
+fn module_duration(cfg: &RealmConfig, key: &str, default: Duration) -> std::io::Result<Duration> {
+    let Some(s) = cfg.db_module.get(key) else {
+        return Ok(default);
+    };
+    let (n, unit) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1000)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600_000)
+    } else {
+        (s, 1000)
+    };
+    let n: u64 = n
+        .parse()
+        .map_err(|_| io_err(format!("{key}: not a duration")))?;
+    let millis = n
+        .checked_mul(unit)
+        .ok_or_else(|| io_err(format!("{key}: duration out of range")))?;
+    Ok(Duration::from_millis(millis))
+}
+
+#[cfg(feature = "cockroach")]
+async fn cockroach_mode(
+    cli: &Cli,
+    cfg: RealmConfig,
+    master: EncryptionKey,
+    _shutdown: &watch::Receiver<bool>,
+    metrics: Arc<metrics::Metrics>,
+) -> std::io::Result<Option<(DynKdc, Listen, PropParts)>> {
+    use krb5_rs::kdc::replication::{
+        FreshnessGate, RebuildPolicy, ReplicationConfig, ReplicationEngine, StrictGate,
+    };
+    use krb5_rs_kdb_cockroach::{CockroachConfig, CockroachLockoutReporter, CockroachStore};
+    use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
+
+    if cfg.propagation.is_replica() || !cfg.propagation.listen.is_empty() {
+        return Err(io_err(
+            "kprop_* cannot be combined with db_library = krb5-rs-cockroach",
+        ));
+    }
+    let authority_config = CockroachConfig::from_db_module(&cfg.db_module).map_err(io_err)?;
+    let replica_path = cfg
+        .db_module
+        .get("replica_path")
+        .ok_or_else(|| io_err("db_library krb5-rs-cockroach needs replica_path"))?;
+    let mut turso_options = TursoOptions::default();
+    if let Some(v) = cfg.db_module.get("turso_pool_size") {
+        turso_options.pool_size = v
+            .parse()
+            .map_err(|_| io_err("turso_pool_size: not a number"))?;
+    }
+    if let Some(v) = cfg.db_module.get("turso_checkpoint_threshold") {
+        turso_options.mvcc_checkpoint_threshold = Some(
+            v.parse()
+                .map_err(|_| io_err("turso_checkpoint_threshold: not a number"))?,
+        );
+    }
+    if let Some(v) = cfg.db_module.get("turso_passive_checkpoint") {
+        turso_options.passive_checkpoint =
+            matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1");
+    }
+    if let Some(v) = cfg.db_module.get("turso_max_retries") {
+        turso_options.max_retries = v
+            .parse()
+            .map_err(|_| io_err("turso_max_retries: not a number"))?;
+    }
+
+    let replica = TursoReplica::open(replica_path, turso_options, master.clone())
+        .await
+        .map_err(io_err)?;
+    let authority = CockroachStore::open(authority_config, master, &cfg.kdc.realm)
+        .await
+        .map_err(io_err)?;
+
+    let kdc_id = cfg
+        .db_module
+        .get("kdc_id")
+        .map(str::to_string)
+        .or_else(|| std::env::var("POD_NAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "krb5-rs-kdc".to_string());
+    let region = cfg.db_module.get("region").unwrap_or("unknown").to_string();
+    let rebuild = match cfg.db_module.get("replication_rebuild") {
+        None | Some("auto") => RebuildPolicy::Auto,
+        Some("manual") => RebuildPolicy::Manual,
+        Some(other) => {
+            return Err(io_err(format!(
+                "replication_rebuild: invalid value {other:?}"
+            )))
+        }
+    };
+    let replication = ReplicationConfig {
+        poll_interval: module_duration(&cfg, "replication_poll_interval", Duration::from_secs(1))?,
+        batch_limit: cfg
+            .db_module
+            .get("replication_batch_limit")
+            .map(|v| {
+                v.parse()
+                    .map_err(|_| io_err("replication_batch_limit: not a number"))
+            })
+            .transpose()?
+            .unwrap_or(1000),
+        retry_min: module_duration(&cfg, "replication_retry_min", Duration::from_millis(100))?,
+        retry_max: module_duration(&cfg, "replication_retry_max", Duration::from_secs(30))?,
+        rebuild,
+        heartbeat_interval: module_duration(
+            &cfg,
+            "replication_heartbeat_interval",
+            Duration::from_secs(5),
+        )?,
+        kdc_id: kdc_id.clone(),
+        region,
+    };
+    let max_staleness = module_duration(&cfg, "max_staleness", Duration::from_secs(30))?;
+    let authoritative_timeout =
+        module_duration(&cfg, "authoritative_timeout", Duration::from_millis(500))?;
+    let engine = ReplicationEngine::new(
+        authority.clone(),
+        replica.clone(),
+        authority.clone(),
+        replication,
+    );
+
+    // A pod without a local database is not ready (and does not bind the KDC)
+    // until a snapshot has committed locally.
+    let mut retry = Duration::from_millis(100);
+    loop {
+        tokio::select! {
+            _ = termination_signal() => {
+                info!("received termination during replica bootstrap");
+                return Ok(None);
+            }
+            result = engine.bootstrap() => match result {
+                Ok(()) => break,
+                Err(e) => {
+                    warn!("replica bootstrap failed: {e}");
+                    tokio::select! {
+                        _ = tokio::time::sleep(retry) => {}
+                        _ = termination_signal() => {
+                            info!("received termination during replica bootstrap retry");
+                            return Ok(None);
+                        }
+                    }
+                    retry = retry.saturating_mul(2).min(Duration::from_secs(30));
+                }
+            }
+        }
+    }
+
+    let status = engine.status_handle();
+    let gate = match cfg.db_module.get("consistency_mode").unwrap_or("bounded") {
+        "bounded" => RuntimeGate::Bounded(FreshnessGate::new(Arc::clone(&status), max_staleness)),
+        "strict" => RuntimeGate::Strict(StrictGate::new(
+            Arc::clone(&status),
+            max_staleness,
+            Arc::new(authority.clone()),
+            authoritative_timeout,
+        )),
+        other => return Err(io_err(format!("consistency_mode: invalid value {other:?}"))),
+    };
+    let reporter = CockroachLockoutReporter::spawn(authority.clone(), kdc_id, 256);
+    let kdc = Kdc::builder(
+        cfg.kdc,
+        DaemonStore::Turso(replica.clone(), Arc::clone(&metrics)),
+    )
+    .policies(replica.clone())
+    .auth_state(replica)
+    .consistency(gate)
+    .lockout_reporter(reporter.clone())
+    .build();
+    let (udp, tcp) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen)
+    } else {
+        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
+        (addrs.clone(), addrs)
+    };
+    let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
+    let parts = PropParts {
+        metrics_listen,
+        replication: Some(ReplicationRuntime {
+            engine,
+            reporter,
+            status,
+            max_staleness,
+        }),
+        ..PropParts::default()
+    };
+    Ok(Some((kdc, Listen { udp, tcp }, parts)))
+}
+
+#[cfg(not(feature = "cockroach"))]
+async fn cockroach_mode(
+    _cli: &Cli,
+    _cfg: RealmConfig,
+    _master: EncryptionKey,
+    _shutdown: &watch::Receiver<bool>,
+    _metrics: Arc<metrics::Metrics>,
+) -> std::io::Result<Option<(DynKdc, Listen, PropParts)>> {
+    Err(io_err(
+        "db_library krb5-rs-cockroach needs a krb5-rs-kdc built with the `cockroach` feature",
     ))
 }
 
@@ -305,6 +595,7 @@ async fn config_mode(
     cli: &Cli,
     krb5_conf_explicit: bool,
     shutdown_rx: &watch::Receiver<bool>,
+    metrics: Arc<metrics::Metrics>,
 ) -> std::io::Result<Option<(DynKdc, Listen, PropParts)>> {
     let conf = cli
         .config
@@ -339,7 +630,12 @@ async fn config_mode(
 
     match cfg.db_module.library.as_deref() {
         None => {}
-        Some("krb5-rs-turso") => return turso_mode(cli, cfg, master).await.map(Some),
+        Some("krb5-rs-turso") => {
+            return turso_mode(cli, cfg, master, metrics).await.map(Some);
+        }
+        Some("krb5-rs-cockroach") => {
+            return cockroach_mode(cli, cfg, master, shutdown_rx, metrics).await;
+        }
         Some(other) => return Err(io_err(format!("unknown db_library {other:?}"))),
     }
 
@@ -392,8 +688,9 @@ async fn config_mode(
         let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
         (addrs.clone(), addrs)
     };
+    parts.metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
     Ok(Some((
-        Kdc::builder(cfg.kdc, DaemonStore::File(Arc::clone(&store)))
+        Kdc::builder(cfg.kdc, DaemonStore::File(Arc::clone(&store), metrics))
             .policies(Arc::clone(&store))
             .build(),
         Listen { udp, tcp },
@@ -430,12 +727,13 @@ async fn termination_signal() -> std::io::Result<&'static str> {
 
 async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::io::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let metrics = Arc::new(metrics::Metrics::new());
     let (kdc, addrs, prop) = match &cli.keytab {
         Some(kt) => {
             if config_explicit {
                 return Err(io_err("--keytab and --config are mutually exclusive"));
             }
-            let (kdc, addrs) = keytab_mode(&cli, kt).await?;
+            let (kdc, addrs) = keytab_mode(&cli, kt, Arc::clone(&metrics)).await?;
             (kdc, addrs, PropParts::default())
         }
         None => {
@@ -444,7 +742,7 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
                     "--max-life/--max-renewable-life come from kdc.conf in config mode",
                 ));
             }
-            match config_mode(&cli, krb5_conf_explicit, &shutdown_rx).await? {
+            match config_mode(&cli, krb5_conf_explicit, &shutdown_rx, Arc::clone(&metrics)).await? {
                 Some(parts) => parts,
                 None => return Ok(()),
             }
@@ -452,7 +750,9 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
     };
     let kdc = Arc::new(kdc);
 
-    let logger: RequestLogger = Arc::new(|summary, peer| {
+    let request_metrics = Arc::clone(&metrics);
+    let logger: RequestLogger = Arc::new(move |summary, peer| {
+        request_metrics.record_request(summary);
         info!(target: "request", "{}", summary.log_line(peer));
     });
     let options = ServeOptions {
@@ -461,11 +761,13 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
     };
 
     let mut tasks = JoinSet::new();
+    let mut bound_kdc_listeners = 0usize;
     for addr in &addrs.udp {
         match UdpSocket::bind(addr).await {
             Ok(sock) => {
                 info!("listening on {} (udp)", sock.local_addr()?);
                 tasks.spawn(serve_udp_with(Arc::clone(&kdc), sock, options.clone()));
+                bound_kdc_listeners += 1;
             }
             Err(e) if tolerable(addr, &e) => info!("skipping udp {addr}: {e}"),
             Err(e) => return Err(io_err(format!("bind udp {addr}: {e}"))),
@@ -476,6 +778,7 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
             Ok(l) => {
                 info!("listening on {} (tcp)", l.local_addr()?);
                 tasks.spawn(serve_tcp_with(Arc::clone(&kdc), l, options.clone()));
+                bound_kdc_listeners += 1;
             }
             Err(e) if tolerable(addr, &e) => info!("skipping tcp {addr}: {e}"),
             Err(e) => return Err(io_err(format!("bind tcp {addr}: {e}"))),
@@ -495,6 +798,9 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
             ));
         }
     }
+    let metrics_listen = cli.metrics_listen.or(prop.metrics_listen);
+    #[cfg(feature = "cockroach")]
+    let replication = prop.replication;
     if let Some(client) = prop.replica {
         info!(
             "replica of {}: polling every {:?}",
@@ -506,8 +812,42 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
             Ok(())
         });
     }
-    if tasks.is_empty() {
-        return Err(io_err("no listen address could be bound"));
+    if bound_kdc_listeners == 0 {
+        return Err(io_err("no KDC listen address could be bound"));
+    }
+    #[cfg(feature = "cockroach")]
+    let (replica_status, lockout_counters, max_staleness) = match replication {
+        Some(replication) => {
+            metrics.set_replication(&replication.engine.status());
+            let reporter = replication.reporter.clone();
+            let lockout_counters: Arc<dyn Fn() -> (u64, u64) + Send + Sync> =
+                Arc::new(move || (reporter.reported(), reporter.dropped()));
+            let status = Some(Arc::clone(&replication.status));
+            let max = replication.max_staleness;
+            let rx = shutdown_rx.clone();
+            tasks.spawn(async move {
+                replication.engine.run(rx).await;
+                Ok(())
+            });
+            (status, Some(lockout_counters), max)
+        }
+        None => (None, None, Duration::from_secs(30)),
+    };
+    #[cfg(not(feature = "cockroach"))]
+    let (replica_status, lockout_counters, max_staleness) = (None, None, Duration::from_secs(30));
+    if let Some(addr) = metrics_listen {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| io_err(format!("bind metrics {addr}: {e}")))?;
+        info!("listening on {} (metrics/health)", listener.local_addr()?);
+        tasks.spawn(metrics::serve(
+            listener,
+            Arc::clone(&metrics),
+            replica_status,
+            lockout_counters,
+            max_staleness,
+            shutdown_rx.clone(),
+        ));
     }
 
     tokio::select! {
@@ -564,5 +904,26 @@ async fn main() {
     if let Err(e) = run(cli, from_cli("krb5_config"), from_cli("config")).await {
         error!("{e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::metrics_listen;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn metrics_cli_address_overrides_the_profile_value() {
+        let cli = "127.0.0.1:9001".parse::<SocketAddr>().expect("CLI address");
+        assert_eq!(
+            metrics_listen(Some(cli), Some("not-an-address")).expect("CLI wins"),
+            Some(cli)
+        );
+    }
+
+    #[test]
+    fn invalid_metrics_profile_address_is_an_error() {
+        assert!(metrics_listen(None, Some("not-an-address")).is_err());
+        assert_eq!(metrics_listen(None, None).expect("not configured"), None);
     }
 }

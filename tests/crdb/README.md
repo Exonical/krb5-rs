@@ -9,6 +9,7 @@ digest) with localities `region=california`, `region=ohio` and
 CRDB_HOST=<address that reaches published ports> tests/crdb/cluster.sh up
 CRDB_HOST=<same> cargo test -p krb5-rs-kdb-cockroach -- --ignored --test-threads=1
 CRDB_HOST=<same> cargo test -p krb5-rs-kdc --features cockroach --test cockroach_cli -- --ignored
+cargo bench -p krb5-rs-kdb-turso --bench replication_rate
 tests/crdb/cluster.sh down     # keep volumes and certs
 tests/crdb/cluster.sh nuke     # remove everything
 ```

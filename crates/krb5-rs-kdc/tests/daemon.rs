@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use krb5_rs::kdc::kdb::admin::{Admin, PrincipalOptions};
 use krb5_rs::kdc::kdb::{master_key_from_password, write_stash, FileStore};
-use krb5_rs::kdc::RealmConfig;
+use krb5_rs::kdc::{PrincipalStore, RealmConfig};
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::{
     AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
@@ -171,6 +171,26 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+
+    fn wait_for_count(&self, needle: &str, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let found = self
+                .snapshot()
+                .iter()
+                .filter(|line| line.contains(needle))
+                .count();
+            if found >= count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "found {found} of {count} lines containing {needle:?}: {:?}",
+                self.snapshot()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for Daemon {
@@ -222,7 +242,8 @@ async fn serves_as_and_tgs_over_udp_and_tcp_and_logs_each_request() {
     let tgt = as_exchange(&tcp).await.expect("AS over TCP");
     tgs_exchange(&tcp, &tgt).await.expect("TGS over TCP");
 
-    daemon.wait_for_line("AS_REQ (4 etypes {18 17 20 19}) 127.0.0.1:");
+    daemon.wait_for_count("AS_REQ", 2);
+    daemon.wait_for_count("TGS_REQ", 2);
     let lines = daemon.snapshot();
     let count = |needle: &str| lines.iter().filter(|l| l.contains(needle)).count();
     // Each AS exchange is NEEDED_PREAUTH then ISSUE or just ISSUE; each TGS one ISSUE.
@@ -456,6 +477,74 @@ async fn attempt(addr: std::net::SocketAddr, user: &str, password: &str) -> Resu
             Err(e) => panic!("unexpected error {e:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn metrics_endpoint_scrapes_low_cardinality_data_without_principal_or_key_material() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = TempDir::new("metrics");
+    let conf = make_realm(&dir);
+    let daemon = Daemon::start(&conf, &["--metrics-listen", "127.0.0.1:0"]);
+    assert_eq!(attempt(daemon.tcp, "alice", PASSWORD).await, Ok(()));
+    let address = daemon.listening("(metrics/health)");
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect metrics");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("request");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.expect("response");
+    let response = String::from_utf8(response).expect("utf8");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("krb5_requests"), "{response}");
+    assert!(
+        response.contains("krb5_kdc_store_time_seconds"),
+        "{response}"
+    );
+    assert!(!response.contains("alice"), "principal name leaked");
+    assert!(!response.contains(PASSWORD), "password leaked");
+    let profile = Profile::load(&conf).expect("profile");
+    let cfg = RealmConfig::from_profiles(&profile, None, REALM).expect("realm config");
+    let master =
+        master_key_from_password(REALM, "master", cfg.master_key_type).expect("master key");
+    let store = FileStore::open(&cfg.database_name, &master).expect("store");
+    let key = store
+        .lookup(&PrincipalName::new_principal("alice"), REALM)
+        .await
+        .expect("lookup")
+        .expect("alice")
+        .keys[0]
+        .key
+        .key_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert!(!response.contains(&key), "key material leaked");
+
+    let mut health = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("health");
+    health
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("request");
+    let mut response = Vec::new();
+    health.read_to_end(&mut response).await.expect("response");
+    assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+
+    let mut ready = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("ready");
+    ready
+        .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("request");
+    let mut response = Vec::new();
+    ready.read_to_end(&mut response).await.expect("response");
+    assert!(response.starts_with(b"HTTP/1.1 200 OK"));
 }
 
 #[tokio::test]

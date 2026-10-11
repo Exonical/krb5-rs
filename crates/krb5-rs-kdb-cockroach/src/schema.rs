@@ -134,7 +134,6 @@ pub(crate) fn multi_region_sql(db: &str, mr: &MultiRegion) -> String {
         }
     }
     for t in [
-        "realms",
         "principals",
         "principal_keys",
         "policies",
