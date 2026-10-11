@@ -60,8 +60,8 @@ pub use db::{
 pub use store::{
     AdminStore, AlwaysAllow, AuthState, AuthStateStore, AuthStateUpdate, AuthoritativeState,
     ConsistencyGate, GateDecision, HealthCheck, LockoutReport, LockoutReporter, MemoryAuthState,
-    NoPolicies, NoopLockoutReporter, Policy, PolicyStore, PrincipalStore, SecurityState,
-    StoreError, StoreErrorKind,
+    NoPolicies, NoopLockoutReporter, Policy, PolicyStore, PrincipalRecord, PrincipalStore,
+    SecurityState, StoreError, StoreErrorKind,
 };
 
 use std::sync::Arc;

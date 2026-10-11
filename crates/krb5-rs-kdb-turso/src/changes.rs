@@ -6,57 +6,14 @@ use krb5_rs::kdc::replication::{
     StoredPrincipal,
 };
 use krb5_rs::kdc::StoreError;
-use rasn::types::GeneralString;
 use turso::{Connection, Row, Value};
 
 use crate::db::{blob, exec, int, now_unix, opt_blob, opt_int, opt_text, query, text, TxError};
 use krb5_rs::types::PrincipalName;
 
-/// Encode a principal name as one key string: components joined by `/`, with
-/// `\` and `/` inside a component escaped (as in MIT's unparse). The name
-/// type is stored separately and ignored by lookups.
-pub(crate) fn encode_name(name: &PrincipalName) -> Result<String, StoreError> {
-    let mut out = String::new();
-    for (i, comp) in name.name_string.iter().enumerate() {
-        if i > 0 {
-            out.push('/');
-        }
-        let s = std::str::from_utf8(comp.as_bytes())
-            .map_err(|_| StoreError::conflict("principal name component is not UTF-8"))?;
-        for c in s.chars() {
-            if c == '\\' || c == '/' {
-                out.push('\\');
-            }
-            out.push(c);
-        }
-    }
-    Ok(out)
-}
-
-/// Inverse of [`encode_name`].
-pub(crate) fn decode_name(key: &str, name_type: i32) -> Result<PrincipalName, StoreError> {
-    let mut parts: Vec<String> = vec![String::new()];
-    let mut chars = key.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => parts.last_mut().expect("one part exists").push(
-                chars
-                    .next()
-                    .ok_or_else(|| StoreError::corrupt("dangling escape"))?,
-            ),
-            '/' => parts.push(String::new()),
-            c => parts.last_mut().expect("one part exists").push(c),
-        }
-    }
-    let name_string = parts
-        .iter()
-        .map(|p| GeneralString::try_from(p.clone()).map_err(|_| StoreError::corrupt("bad name")))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(PrincipalName {
-        name_type,
-        name_string,
-    })
-}
+pub(crate) use krb5_rs::kdc::replication::{
+    decode_principal_key as decode_name, encode_principal_key as encode_name,
+};
 
 fn u(n: u64) -> Result<Value, StoreError> {
     i64::try_from(n)

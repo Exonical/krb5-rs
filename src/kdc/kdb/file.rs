@@ -21,7 +21,8 @@ use crate::kdc::db::{
 };
 use crate::kdc::policy::kerberos_time;
 use crate::kdc::store::{
-    AdminStore, HealthCheck, Policy, PolicyStore, PrincipalStore, StoreError, StoreErrorKind,
+    AdminStore, HealthCheck, Policy, PolicyStore, PrincipalRecord, PrincipalStore, StoreError,
+    StoreErrorKind,
 };
 use crate::types::{EncryptionKey, KerberosTime, PrincipalName};
 
@@ -89,17 +90,6 @@ fn string_list(l: &Option<Vec<GeneralString>>) -> Vec<String> {
         .flatten()
         .map(|g| String::from_utf8_lossy(g.as_bytes()).to_string())
         .collect()
-}
-
-/// A database record: the principal plus bookkeeping the KDC does not use.
-#[derive(Debug, Clone)]
-pub struct PrincipalRecord {
-    /// The principal as the KDC sees it (keys decrypted).
-    pub entry: PrincipalEntry,
-    /// Last password change.
-    pub last_pwd_change: Option<KerberosTime>,
-    /// Last modification.
-    pub mod_time: Option<KerberosTime>,
 }
 
 type Stamp = (SystemTime, u64);
@@ -572,6 +562,109 @@ impl FileStore {
         Ok(all)
     }
 
+    /// Every principal's record.
+    pub(crate) fn list_records(&self) -> Result<Vec<PrincipalRecord>, StoreError> {
+        self.refresh(false)?;
+        let raws: Vec<KdbPrincipal> = self.read_cache().records.values().cloned().collect();
+        raws.iter().map(|r| self.decrypt_record(r)).collect()
+    }
+
+    /// Insert a new principal under the write lock; `Conflict` if it exists.
+    pub(crate) fn create_record(
+        &self,
+        entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
+    ) -> Result<(), StoreError> {
+        let record = self.to_record(
+            &entry,
+            last_pwd_change,
+            Some(kerberos_time(Utc::now().timestamp())),
+        )?;
+        let key = store_key(&entry.name, &entry.realm);
+        self.modify(|list| {
+            let exists = list.iter().any(|p| {
+                let realm = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
+                store_key(&p.name, &realm) == key
+            });
+            if exists {
+                return Err(StoreError::conflict(format!(
+                    "Principal or policy already exists: {}@{}",
+                    entry.name, entry.realm
+                )));
+            }
+            list.push(record);
+            Ok(())
+        })
+    }
+
+    /// Read-modify-write a principal under the write lock.
+    pub(crate) fn update_record(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        mut f: impl FnMut(&mut PrincipalRecord) -> Result<(), StoreError>,
+    ) -> Result<PrincipalRecord, StoreError> {
+        let key = store_key(name, realm);
+        self.modify(|list| {
+            let pos = list
+                .iter()
+                .position(|p| {
+                    let r = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
+                    store_key(&p.name, &r) == key
+                })
+                .ok_or_else(|| {
+                    StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
+                })?;
+            let mut rec = self.decrypt_record(&list[pos])?;
+            f(&mut rec)?;
+            rec.mod_time = Some(kerberos_time(Utc::now().timestamp()));
+            list[pos] = self.to_record(&rec.entry, rec.last_pwd_change, rec.mod_time)?;
+            Ok(rec)
+        })
+    }
+
+    /// Insert a new policy under the write lock; `Conflict` if it exists.
+    pub(crate) fn create_policy_record(&self, policy: Policy) -> Result<(), StoreError> {
+        let record = policy_to_record(&policy)?;
+        self.modify_file(|file| {
+            let list = file.policies.get_or_insert_with(Vec::new);
+            if list
+                .iter()
+                .any(|p| p.name.as_bytes() == record.name.as_bytes())
+            {
+                return Err(StoreError::conflict(format!(
+                    "Principal or policy already exists: policy {}",
+                    policy.name
+                )));
+            }
+            list.push(record);
+            Ok(())
+        })
+    }
+
+    /// Read-modify-write a policy under the write lock.
+    pub(crate) fn update_policy_record(
+        &self,
+        name: &str,
+        mut f: impl FnMut(&mut Policy) -> Result<(), StoreError>,
+    ) -> Result<Policy, StoreError> {
+        self.modify_file(|file| {
+            let pos = file
+                .policies
+                .iter()
+                .flatten()
+                .position(|p| p.name.as_bytes() == name.as_bytes())
+                .ok_or_else(|| {
+                    StoreError::not_found(format!("Policy \"{name}\" does not exist"))
+                })?;
+            let list = file.policies.as_mut().expect("found above");
+            let mut policy = policy_from_record(&list[pos]);
+            f(&mut policy)?;
+            list[pos] = policy_to_record(&policy)?;
+            Ok(policy)
+        })
+    }
+
     /// Every principal with decrypted keys.
     pub fn list(&self) -> Result<Vec<PrincipalEntry>, StoreError> {
         self.refresh(false)?;
@@ -613,19 +706,32 @@ impl HealthCheck for FileStore {
 /// The file backend applies each operation under its write lock; the futures
 /// complete immediately.
 impl AdminStore for FileStore {
-    fn get_principal(
+    fn get_record(
         &self,
         name: &PrincipalName,
         realm: &str,
-    ) -> impl std::future::Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
-        std::future::ready(self.get_record(name, realm).map(|r| r.map(|r| r.entry)))
+    ) -> impl std::future::Future<Output = Result<Option<PrincipalRecord>, StoreError>> + Send {
+        std::future::ready(FileStore::get_record(self, name, realm))
     }
 
-    fn put_principal(
+    fn create_principal(
         &self,
         entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
     ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
-        std::future::ready(self.put(entry))
+        std::future::ready(self.create_record(entry, last_pwd_change))
+    }
+
+    fn update_principal<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<PrincipalRecord, StoreError>> + Send
+    where
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send,
+    {
+        std::future::ready(self.update_record(name, realm, f))
     }
 
     fn delete_principal(
@@ -638,8 +744,8 @@ impl AdminStore for FileStore {
 
     fn list_principals(
         &self,
-    ) -> impl std::future::Future<Output = Result<Vec<PrincipalEntry>, StoreError>> + Send {
-        std::future::ready(self.list())
+    ) -> impl std::future::Future<Output = Result<Vec<PrincipalRecord>, StoreError>> + Send {
+        std::future::ready(self.list_records())
     }
 
     fn get_policy(
@@ -649,11 +755,22 @@ impl AdminStore for FileStore {
         std::future::ready(FileStore::get_policy(self, name))
     }
 
-    fn put_policy(
+    fn create_policy(
         &self,
         policy: Policy,
     ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
-        std::future::ready(FileStore::put_policy(self, policy))
+        std::future::ready(self.create_policy_record(policy))
+    }
+
+    fn update_policy<F>(
+        &self,
+        name: &str,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<Policy, StoreError>> + Send
+    where
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send,
+    {
+        std::future::ready(self.update_policy_record(name, f))
     }
 
     fn delete_policy(

@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use super::file::{FileStore, PrincipalRecord};
+use super::file::FileStore;
 use crate::crypto::{enctype_name, SaltType};
 use crate::kdc::db::{keys_from_password, random_keys, PrincipalAttributes, PrincipalEntry};
 use crate::kdc::policy::kerberos_time;
-use crate::kdc::store::{Policy, StoreError};
+use crate::kdc::store::{AdminStore, Policy, PrincipalRecord, StoreError};
 use crate::keytab::{FileKeytab, Keytab, KeytabEntry};
 use crate::types::{KerberosTime, PrincipalName};
 
@@ -218,22 +218,46 @@ fn update_list(list: &mut Vec<String>, clear: bool, add: &[String], realm: &str)
     }
 }
 
-/// Administration operations over a [`FileStore`].
-pub struct Admin<'a> {
-    store: &'a FileStore,
+/// Run a future that is expected to complete without waiting (a store whose
+/// futures are ready immediately, like [`FileStore`]). It polls with a no-op
+/// waker and yields the thread between polls, so a store that does wait still
+/// works, only without a reactor of its own.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, Waker};
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// kadmin-style administration over any [`AdminStore`]: the semantics (epoch
+/// bumps, policy validation, kadm5 rules) live here once, for the file
+/// database and for CockroachDB alike. Every mutation is one atomic store
+/// operation.
+pub struct AdminOps<S: AdminStore> {
+    store: S,
     keysalts: Vec<(i32, SaltType)>,
 }
 
-impl<'a> Admin<'a> {
+impl<S: AdminStore> AdminOps<S> {
     /// Administer `store`, generating keys for `keysalts`
     /// (`supported_enctypes`).
-    pub fn new(store: &'a FileStore, keysalts: Vec<(i32, SaltType)>) -> Self {
+    pub fn new(store: S, keysalts: Vec<(i32, SaltType)>) -> Self {
         Self { store, keysalts }
     }
 
-    fn require(&self, name: &PrincipalName, realm: &str) -> Result<PrincipalRecord, StoreError> {
+    async fn require(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<PrincipalRecord, StoreError> {
         self.store
-            .get_record(name, realm)?
+            .get_record(name, realm)
+            .await?
             .ok_or_else(|| missing(format!("Principal {name}@{realm}")))
     }
 
@@ -298,9 +322,9 @@ impl<'a> Admin<'a> {
 
     /// `KADM5_UNK_POLICY` for a `-policy` naming a policy that does not exist
     /// (svr_principal.c:117).
-    fn check_policy(&self, opts: &PrincipalOptions) -> Result<(), StoreError> {
+    async fn check_policy(&self, opts: &PrincipalOptions) -> Result<(), StoreError> {
         if let Some(Some(name)) = &opts.policy {
-            if self.store.get_policy(name)?.is_none() {
+            if self.store.get_policy(name).await?.is_none() {
                 return Err(missing(format!("Policy \"{name}\"")));
             }
         }
@@ -309,17 +333,17 @@ impl<'a> Admin<'a> {
 
     /// `addprinc` (`kadm5_create_principal`): kvno 1, keys from `password`
     /// or random (`-randkey`). Fails if the principal exists.
-    pub fn add_principal(
+    pub async fn add_principal(
         &self,
         name: &PrincipalName,
         realm: &str,
         password: Option<&str>,
         opts: &PrincipalOptions,
     ) -> Result<(), StoreError> {
-        if self.store.get_record(name, realm)?.is_some() {
+        if self.store.get_record(name, realm).await?.is_some() {
             return Err(duplicate(format!("{name}@{realm}")));
         }
-        self.check_policy(opts)?;
+        self.check_policy(opts).await?;
         let keys = match password {
             Some(pw) => keys_from_password(name, realm, pw, 1, &self.keysalts),
             None => random_keys(1, &self.etypes()),
@@ -342,7 +366,9 @@ impl<'a> Admin<'a> {
         };
         Self::apply_options(&mut entry, opts);
         entry.security_epoch = 1;
-        self.store.put(entry)
+        self.store
+            .create_principal(entry, Some(kerberos_time(Utc::now().timestamp())))
+            .await
     }
 
     fn etypes(&self) -> Vec<i32> {
@@ -356,8 +382,12 @@ impl<'a> Admin<'a> {
     }
 
     /// `delprinc`.
-    pub fn delete_principal(&self, name: &PrincipalName, realm: &str) -> Result<(), StoreError> {
-        if self.store.delete(name, realm)? {
+    pub async fn delete_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<(), StoreError> {
+        if self.store.delete_principal(name, realm).await? {
             Ok(())
         } else {
             Err(missing(format!("Principal {name}@{realm}")))
@@ -367,82 +397,96 @@ impl<'a> Admin<'a> {
     /// `cpw` (`kadm5_chpass_principal` / `kadm5_randkey_principal`): the new
     /// keys get kvno = highest + 1; older keys are dropped unless
     /// `keep_old`. Clears REQUIRES_PWCHANGE and records the password change.
-    pub fn change_password(
+    pub async fn change_password(
         &self,
         name: &PrincipalName,
         realm: &str,
         password: Option<&str>,
         keep_old: bool,
     ) -> Result<u32, StoreError> {
-        let rec = self.require(name, realm)?;
-        let mut entry = rec.entry;
-        let kvno = entry.current_kvno().unwrap_or(0) + 1;
-        let mut keys = match password {
-            Some(pw) => keys_from_password(name, realm, pw, kvno, &self.keysalts),
-            None => random_keys(kvno, &self.etypes()),
-        }
-        .map_err(|e| err(e.to_string()))?;
-        if keep_old {
-            keys.extend(entry.keys);
-        }
-        entry.keys = keys;
-        entry
-            .attributes
-            .remove(PrincipalAttributes::REQUIRES_PWCHANGE);
-        // A new key is a key rotation or password reset: bump the epoch. MIT
-        // also zeroes `fail_auth_count` (svr_principal.c:1343, 1473); the
-        // counter lives in the KDC process here, so record an unlock time.
-        entry.security_epoch += 1;
-        entry.last_admin_unlock = Some(kerberos_time(Utc::now().timestamp()));
+        let mut new_kvno = 0u32;
+        let keysalts = &self.keysalts;
+        let etypes = self.etypes();
         self.store
-            .put_record(entry, Some(kerberos_time(Utc::now().timestamp())))?;
-        Ok(kvno)
+            .update_principal(name, realm, |rec| {
+                let kvno = rec.entry.current_kvno().unwrap_or(0) + 1;
+                let mut keys = match password {
+                    Some(pw) => keys_from_password(name, realm, pw, kvno, keysalts),
+                    None => random_keys(kvno, &etypes),
+                }
+                .map_err(|e| err(e.to_string()))?;
+                if keep_old {
+                    keys.extend(rec.entry.keys.iter().cloned());
+                }
+                rec.entry.keys = keys;
+                rec.entry
+                    .attributes
+                    .remove(PrincipalAttributes::REQUIRES_PWCHANGE);
+                // A new key is a key rotation or password reset: bump the
+                // epoch. MIT also zeroes `fail_auth_count`
+                // (svr_principal.c:1343, 1473); the counter lives in the KDC
+                // process here, so record an unlock time.
+                rec.entry.security_epoch += 1;
+                let now = kerberos_time(Utc::now().timestamp());
+                rec.entry.last_admin_unlock = Some(now);
+                rec.last_pwd_change = Some(now);
+                new_kvno = kvno;
+                Ok(())
+            })
+            .await?;
+        Ok(new_kvno)
     }
 
     /// `modprinc`.
-    pub fn modify_principal(
+    pub async fn modify_principal(
         &self,
         name: &PrincipalName,
         realm: &str,
         opts: &PrincipalOptions,
     ) -> Result<(), StoreError> {
-        self.check_policy(opts)?;
-        let rec = self.require(name, realm)?;
-        let mut entry = rec.entry;
-        Self::apply_options(&mut entry, opts);
-        self.store.put_record(entry, rec.last_pwd_change)
+        self.check_policy(opts).await?;
+        self.store
+            .update_principal(name, realm, |rec| {
+                Self::apply_options(&mut rec.entry, opts);
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     /// `add_policy` (`kadm5_create_policy`, svr_policy.c:59-180).
-    pub fn add_policy(&self, policy: Policy) -> Result<(), StoreError> {
+    pub async fn add_policy(&self, policy: Policy) -> Result<(), StoreError> {
         validate_policy(&policy)?;
-        if self.store.get_policy(&policy.name)?.is_some() {
+        if self.store.get_policy(&policy.name).await?.is_some() {
             return Err(duplicate(format!("policy {}", policy.name)));
         }
-        self.store.put_policy(Policy {
-            security_epoch: 1,
-            ..policy
-        })
+        self.store
+            .create_policy(Policy {
+                security_epoch: 1,
+                ..policy
+            })
+            .await
     }
 
     /// `modify_policy` (`kadm5_modify_policy`, svr_policy.c:254-380): the
     /// changed policy gets a higher `security_epoch`.
-    pub fn modify_policy(&self, name: &str, change: &PolicyChange) -> Result<(), StoreError> {
-        let mut policy = self
-            .store
-            .get_policy(name)?
-            .ok_or_else(|| missing(format!("Policy \"{name}\"")))?;
-        change.apply(&mut policy);
-        validate_policy(&policy)?;
-        policy.security_epoch += 1;
-        self.store.put_policy(policy)
+    pub async fn modify_policy(&self, name: &str, change: &PolicyChange) -> Result<(), StoreError> {
+        self.store
+            .update_policy(name, |policy| {
+                change.apply(policy);
+                validate_policy(policy)?;
+                policy.security_epoch += 1;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     /// `delete_policy` (`kadm5_delete_policy`, svr_policy.c:183-208). Like
     /// MIT's db2 module it does not refuse a policy that principals still
     /// name; such a name then counts as no policy.
-    pub fn delete_policy(&self, name: &str) -> Result<(), StoreError> {
-        if self.store.delete_policy(name)? {
+    pub async fn delete_policy(&self, name: &str) -> Result<(), StoreError> {
+        if self.store.delete_policy(name).await? {
             Ok(())
         } else {
             Err(missing(format!("Policy \"{name}\"")))
@@ -450,38 +494,41 @@ impl<'a> Admin<'a> {
     }
 
     /// `get_policy`.
-    pub fn get_policy(&self, name: &str) -> Result<Policy, StoreError> {
+    pub async fn get_policy(&self, name: &str) -> Result<Policy, StoreError> {
         self.store
-            .get_policy(name)?
+            .get_policy(name)
+            .await?
             .ok_or_else(|| missing(format!("Policy \"{name}\"")))
     }
 
     /// `list_policies`, sorted by name.
-    pub fn list_policies(&self) -> Result<Vec<String>, StoreError> {
+    pub async fn list_policies(&self) -> Result<Vec<String>, StoreError> {
         Ok(self
             .store
-            .list_policies()?
+            .list_policies()
+            .await?
             .into_iter()
             .map(|p| p.name)
             .collect())
     }
 
     /// `getprinc` data.
-    pub fn get_principal(
+    pub async fn get_principal(
         &self,
         name: &PrincipalName,
         realm: &str,
     ) -> Result<PrincipalRecord, StoreError> {
-        self.require(name, realm)
+        self.require(name, realm).await
     }
 
     /// `listprincs`: `name@REALM`, sorted.
-    pub fn list_principals(&self) -> Result<Vec<String>, StoreError> {
+    pub async fn list_principals(&self) -> Result<Vec<String>, StoreError> {
         let mut out: Vec<String> = self
             .store
-            .list()?
+            .list_principals()
+            .await?
             .iter()
-            .map(|e| format!("{}@{}", e.name, e.realm))
+            .map(|r| format!("{}@{}", r.entry.name, r.entry.realm))
             .collect();
         out.sort();
         Ok(out)
@@ -490,7 +537,7 @@ impl<'a> Admin<'a> {
     /// `ktadd` (keytab.c:120-330): by default new random keys (kvno + 1,
     /// old keys dropped, `keepold` FALSE) are generated and written; with
     /// `norandkey` the current-kvno keys are written unchanged.
-    pub fn ktadd(
+    pub async fn ktadd(
         &self,
         name: &PrincipalName,
         realm: &str,
@@ -498,9 +545,9 @@ impl<'a> Admin<'a> {
         randomize: bool,
     ) -> Result<u32, StoreError> {
         if randomize {
-            self.change_password(name, realm, None, false)?;
+            self.change_password(name, realm, None, false).await?;
         }
-        let entry = self.require(name, realm)?.entry;
+        let entry = self.require(name, realm).await?.entry;
         let kvno = entry
             .current_kvno()
             .ok_or_else(|| err("principal has no keys"))?;
@@ -517,6 +564,109 @@ impl<'a> Admin<'a> {
             .map_err(|e| err(format!("writing keytab: {e}")))?;
         }
         Ok(kvno)
+    }
+}
+
+/// Administration operations over a [`FileStore`]: the synchronous face of
+/// [`AdminOps`], for the standalone database.
+pub struct Admin<'a> {
+    ops: AdminOps<&'a FileStore>,
+}
+
+impl<'a> Admin<'a> {
+    /// Administer `store`, generating keys for `keysalts`
+    /// (`supported_enctypes`).
+    pub fn new(store: &'a FileStore, keysalts: Vec<(i32, SaltType)>) -> Self {
+        Self {
+            ops: AdminOps::new(store, keysalts),
+        }
+    }
+
+    /// See [`AdminOps::add_principal`].
+    pub fn add_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        password: Option<&str>,
+        opts: &PrincipalOptions,
+    ) -> Result<(), StoreError> {
+        block_on(self.ops.add_principal(name, realm, password, opts))
+    }
+
+    /// See [`AdminOps::delete_principal`].
+    pub fn delete_principal(&self, name: &PrincipalName, realm: &str) -> Result<(), StoreError> {
+        block_on(self.ops.delete_principal(name, realm))
+    }
+
+    /// See [`AdminOps::change_password`].
+    pub fn change_password(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        password: Option<&str>,
+        keep_old: bool,
+    ) -> Result<u32, StoreError> {
+        block_on(self.ops.change_password(name, realm, password, keep_old))
+    }
+
+    /// See [`AdminOps::modify_principal`].
+    pub fn modify_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        opts: &PrincipalOptions,
+    ) -> Result<(), StoreError> {
+        block_on(self.ops.modify_principal(name, realm, opts))
+    }
+
+    /// See [`AdminOps::add_policy`].
+    pub fn add_policy(&self, policy: Policy) -> Result<(), StoreError> {
+        block_on(self.ops.add_policy(policy))
+    }
+
+    /// See [`AdminOps::modify_policy`].
+    pub fn modify_policy(&self, name: &str, change: &PolicyChange) -> Result<(), StoreError> {
+        block_on(self.ops.modify_policy(name, change))
+    }
+
+    /// See [`AdminOps::delete_policy`].
+    pub fn delete_policy(&self, name: &str) -> Result<(), StoreError> {
+        block_on(self.ops.delete_policy(name))
+    }
+
+    /// See [`AdminOps::get_policy`].
+    pub fn get_policy(&self, name: &str) -> Result<Policy, StoreError> {
+        block_on(self.ops.get_policy(name))
+    }
+
+    /// See [`AdminOps::list_policies`].
+    pub fn list_policies(&self) -> Result<Vec<String>, StoreError> {
+        block_on(self.ops.list_policies())
+    }
+
+    /// See [`AdminOps::get_principal`].
+    pub fn get_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<PrincipalRecord, StoreError> {
+        block_on(self.ops.get_principal(name, realm))
+    }
+
+    /// See [`AdminOps::list_principals`].
+    pub fn list_principals(&self) -> Result<Vec<String>, StoreError> {
+        block_on(self.ops.list_principals())
+    }
+
+    /// See [`AdminOps::ktadd`].
+    pub fn ktadd(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        keytab: &Path,
+        randomize: bool,
+    ) -> Result<u32, StoreError> {
+        block_on(self.ops.ktadd(name, realm, keytab, randomize))
     }
 }
 

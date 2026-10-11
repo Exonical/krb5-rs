@@ -115,10 +115,17 @@ jobs:
           # test listens) through their network's gateway address.
           gw=$(docker network inspect krb5-rs_default -f '{{(index .IPAM.Config 0).Gateway}}')
           echo "KDC_LIVE_HOST=$gw" >> "$GITHUB_ENV"
+      - name: Start the CockroachDB test cluster
+        env:
+          CONTAINER_CLI: docker
+          CRDB_HOST: 127.0.0.1
+        run: bash tests/crdb/cluster.sh up
       - name: Live interop tests
         env:
           CONTAINER_CLI: docker
         run: cargo test --workspace --all-features -- --ignored --test-threads=1
       - name: Container logs
         if: failure()
-        run: docker compose -p krb5-rs -f docker-compose.test.yml logs
+        run: |
+          docker compose -p krb5-rs -f docker-compose.test.yml logs
+          docker logs crdb1 2>&1 | tail -200 || true

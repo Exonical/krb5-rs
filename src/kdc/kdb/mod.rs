@@ -13,5 +13,6 @@ pub mod master;
 #[cfg(feature = "tokio")]
 pub mod propagation;
 
-pub use file::{FileStore, PrincipalRecord};
+pub use crate::kdc::store::PrincipalRecord;
+pub use file::FileStore;
 pub use master::{master_key_from_password, read_stash, write_stash};

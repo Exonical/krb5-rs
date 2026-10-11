@@ -349,6 +349,101 @@ pub struct ApplyOutcome {
     pub skipped_stale: usize,
 }
 
+/// Encode a principal name as one key string: components joined by `/`, with
+/// `\` and `/` inside a component escaped (as in MIT's unparse). Replication
+/// keys entities by this string; the name type travels separately and is
+/// ignored when comparing, as in MIT.
+pub fn encode_principal_key(name: &PrincipalName) -> Result<String, StoreError> {
+    let mut out = String::new();
+    for (i, comp) in name.name_string.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        let s = std::str::from_utf8(comp.as_bytes())
+            .map_err(|_| StoreError::conflict("principal name component is not UTF-8"))?;
+        for c in s.chars() {
+            if c == '\\' || c == '/' {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// Inverse of [`encode_principal_key`].
+pub fn decode_principal_key(key: &str, name_type: i32) -> Result<PrincipalName, StoreError> {
+    let mut parts: Vec<String> = vec![String::new()];
+    let mut chars = key.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => parts.last_mut().expect("one part exists").push(
+                chars
+                    .next()
+                    .ok_or_else(|| StoreError::corrupt("dangling escape in a principal key"))?,
+            ),
+            '/' => parts.push(String::new()),
+            c => parts.last_mut().expect("one part exists").push(c),
+        }
+    }
+    let name_string = parts
+        .into_iter()
+        .map(|p| {
+            rasn::types::GeneralString::try_from(p)
+                .map_err(|_| StoreError::corrupt("principal key is not a GeneralString"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PrincipalName {
+        name_type,
+        name_string,
+    })
+}
+
+/// A consistent snapshot of the authoritative data at [`Snapshot::ts`], read
+/// page by page so the engine can feed a [`RebuildWriter`] without holding
+/// everything in memory.
+pub trait Snapshot: Send {
+    /// The timestamp the snapshot is read at: the checkpoint after loading it.
+    fn ts(&self) -> ReplicationTs;
+
+    /// The next page of `Change` upserts, or `None` when the snapshot is
+    /// exhausted. The versions are those of the stored rows.
+    fn next_page(&mut self)
+        -> impl Future<Output = Result<Option<Vec<Change>>, StoreError>> + Send;
+}
+
+/// The authoritative side of replication (docs §5): complete, ordered change
+/// batches and a snapshot for bootstrap.
+///
+/// Correctness rests on reading at a fixed timestamp `T`: CockroachDB's
+/// timestamp cache guarantees no write into a span read at `T` can later
+/// commit at or below `T`, so the log rows in `(since, T]` are final once read.
+pub trait ReplicationSource: Send + Sync {
+    /// The snapshot type.
+    type Snapshot: Snapshot;
+
+    /// Start a snapshot at a fresh read timestamp.
+    fn snapshot(&self) -> impl Future<Output = Result<Self::Snapshot, StoreError>> + Send;
+
+    /// The changes with commit timestamp in `(since, upto]`, in commit order,
+    /// as the current state of each changed entity read at `upto` (absent
+    /// means deleted: the change is a `Delete` carrying the log row's
+    /// version). `upto` is the read timestamp, or, when more than `limit` log
+    /// rows qualify, the last commit timestamp included. One commit timestamp
+    /// is never split across batches, so a batch can exceed `limit`.
+    fn changes_since(
+        &self,
+        since: ReplicationTs,
+        limit: usize,
+    ) -> impl Future<Output = Result<ChangeBatch, StoreError>> + Send;
+
+    /// The low watermark of retained log rows: a replica whose checkpoint is
+    /// below it must rebuild from a snapshot. `None` if nothing was pruned.
+    fn pruned_before(
+        &self,
+    ) -> impl Future<Output = Result<Option<ReplicationTs>, StoreError>> + Send;
+}
+
 /// A replica database that applies replicated changes (docs §5).
 pub trait ReplicaSink: Send + Sync {
     /// The writer returned by [`ReplicaSink::begin_rebuild`].

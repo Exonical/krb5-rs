@@ -166,7 +166,7 @@ The log wins on operational simplicity, recoverability and correctness that
 can be reasoned about. It needs no extra infrastructure. The cost is a few
 seconds of propagation latency, which the consistency policy (§7) accounts for.
 
-### Correctness argument **(to verify)**
+### Correctness argument (verified against CockroachDB v26.3.2, PR 6)
 
 1. Every admin transaction writes its entity rows and one `replication_log`
    row per changed entity, with `commit_ts = cluster_logical_timestamp()`.
@@ -189,6 +189,21 @@ seconds of propagation latency, which the consistency policy (§7) accounts for.
 5. A checkpoint advances only in the same Turso transaction that commits the
    data, so a crash never moves it ahead of durable state.
 
+**Verified facts (PR 6, `crates/krb5-rs-kdb-cockroach/tests/facts.rs`, v26.3.2, 3 nodes):**
+
+- `cluster_logical_timestamp()` returns `wall_nanos.logical` with a 10-digit logical part.
+- Inside `BEGIN READ ONLY AS OF SYSTEM TIME t` it returns the AOST timestamp, not the present: the replication read gets its `T` from inside the read-only transaction (`follower_read_timestamp()` or the present). An explicit decimal `T` is accepted by AOST and returned unchanged.
+- In a write transaction the value read is the commit timestamp: the row's `crdb_internal_mvcc_timestamp` equals it. A transaction that pinned it and is then pushed (a newer committed value on a key it writes) fails with SQLSTATE 40001 instead of committing at the stale value.
+- The timestamp cache: a writer into a span another transaction already read commits above that reader's timestamp.
+- GLOBAL (non-blocking) write transactions: the pinned timestamp still equals the commit timestamp (difference 0 ms in four runs), and commit-wait on the local test cluster was 2 to 23 ms.
+- Licensing: without a license key a cluster has a 7-day grace period from initialisation, then is throttled (5 concurrent open transactions) unless an Enterprise Free/Trial license is installed (docs.cockroachlabs.com/docs/stable/licensing-faqs; `pkg/server/license/enforcer.go`). Multi-region features worked on the unlicensed cluster inside the grace period.
+
+**Caveats found while building it:**
+
+- A follower read is about 4.2 s in the past, so right after a database, its tables or its grants are created they do not exist at the read timestamp (SQLSTATE 3D000, 42P01, 42501). `changes_since` and `snapshot` then read once at the present; a real error repeats there and is returned. A batch whose read timestamp is not above the caller's checkpoint is empty, so the checkpoint never goes backwards after such a fallback.
+- When `changes_since` truncates at `limit`, the entities are still read at the full read timestamp `T`, so an entity may arrive with a version newer than the batch's `upto`; it appears again in a later batch and the replica's version check makes that idempotent.
+- `replication_log` rows are inserted with `ON CONFLICT DO NOTHING`, which a KDC's `kdc_replica` user may do with INSERT alone (no UPDATE on the log).
+
 ### Bootstrap and rebuild
 
 - **Bootstrap** (no local checkpoint): read every table `AS OF SYSTEM TIME T0`
@@ -205,7 +220,7 @@ seconds of propagation latency, which the consistency policy (§7) accounts for.
 
 Every KDC upserts `replica_status(kdc_id, region, applied_ts, seen_at)` every
 few seconds. Lag is `now - applied_ts`, exported as a metric (§9). The admin CLI
-can wait on these heartbeats (`krb5-rs-kdb wait-applied --since <ts>`) to report
+can wait on these heartbeats (`krb5-rs-kdb replication wait-applied --since <ts>`) to report
 how many KDCs have applied a change. A committed transaction is **not** treated
 as applied anywhere until the heartbeats show it.
 
@@ -285,8 +300,11 @@ accordingly.
 `pw_lockout_duration`). They live in Turso `auth_state` and are never
 replicated. When a KDC trips the threshold, it locks locally at once and
 reports the lockout to CockroachDB `lockouts` asynchronously, with retries and
-a bounded queue. The report replicates to every KDC and bumps the principal's
-`security_epoch`.
+a bounded queue. The report replicates to every KDC. The KDC does not touch
+`principals` (least privilege), so the report does not bump the principal's
+`security_epoch`; `AuthoritativeState` reports the lockout from the `lockouts`
+table (an active row means locked), and an administrative unlock deletes the
+row in the same transaction that bumps the epoch.
 
 Global guarantee: an attacker gets at most about `pw_max_fail × N_kdc`
 attempts, plus whatever fits in the replication delay, before every KDC

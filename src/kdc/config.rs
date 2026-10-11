@@ -198,6 +198,15 @@ const DBMODULE_OPTION_KEYS: &[&str] = &[
     "turso_checkpoint_threshold",
     "turso_passive_checkpoint",
     "turso_max_retries",
+    "cockroach_url",
+    "cockroach_ca",
+    "cockroach_cert",
+    "cockroach_key",
+    "cockroach_pool_size",
+    "cockroach_connect_timeout",
+    "cockroach_statement_timeout",
+    "cockroach_insecure",
+    "replication_read",
 ];
 
 /// Everything the KDC needs to know about one realm.

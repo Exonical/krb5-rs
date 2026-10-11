@@ -13,11 +13,11 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use krb5_rs::kdc::kdb::admin::{
-    format_policy, format_principal, parse_lifetime, parse_principal, parse_time, Admin,
+    format_policy, format_principal, parse_lifetime, parse_principal, parse_time, Admin, AdminOps,
     AttrChange, PolicyChange, PrincipalOptions,
 };
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, write_stash, FileStore};
-use krb5_rs::kdc::{default_realm, RealmConfig};
+use krb5_rs::kdc::{default_realm, AdminStore, RealmConfig, StoreError};
 use krb5_rs::profile::Profile;
 
 fn usage() -> ! {
@@ -29,6 +29,8 @@ fn usage() -> ! {
          modprinc [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] [-allow_delegate_to P]... [-allow_delegate_from P]... [-clear_delegate_to] [-clear_delegate_from] [-policy P | -clearpolicy] [-unlock] NAME\n  \
          addpol|modpol [-maxlife T] [-minlife T] [-minlength N] [-minclasses N] [-history N] [-maxfailure N] [-failurecountinterval T] [-lockoutduration T] [-allowedkeysalts K] POLICY\n  \
          delpol POLICY\n  getpol [-terse] POLICY\n  listpols\n  \
+         database migrate [--create-roles] [--multi-region --primary-region R --regions R1,R2,...]   (CockroachDB)\n  \
+         replication status | prune --older-than D | wait-applied --since TS [--timeout D]   (CockroachDB)\n  \
          getprinc NAME\n  listprincs\n  ktadd -k PATH [-norandkey] NAME..."
     );
     std::process::exit(2);
@@ -253,6 +255,18 @@ fn main() {
         ));
     }
 
+    match cfg.db_module.library.as_deref() {
+        None => {}
+        Some("krb5-rs-cockroach") => {
+            cockroach_command(&cmd, args, &cfg, &realm);
+            return;
+        }
+        Some(other) => fail(format!("unknown db_library {other:?}")),
+    }
+    if matches!(cmd.as_str(), "database" | "replication") {
+        fail(format!("`{cmd}` needs db_library = krb5-rs-cockroach"));
+    }
+
     match cmd.as_str() {
         "init" => {
             init(args, &cfg, &realm);
@@ -294,10 +308,123 @@ fn main() {
 
     let master = ok(read_stash(&cfg.key_stash_file, &realm));
     let store = ok(FileStore::open(&cfg.database_name, &master));
-    let admin = Admin::new(&store, cfg.supported_keysalts.clone());
-    let principal = |s: &str| ok(parse_principal(s, &realm));
+    let admin = Blocking::new(runtime(), &store, cfg.supported_keysalts.clone());
+    run_admin(&admin, &cmd, args, &realm);
+}
 
-    match cmd.as_str() {
+/// The admin operations, synchronously, over any store: the commands are the
+/// same for the file database and for CockroachDB.
+struct Blocking<S: AdminStore> {
+    rt: tokio::runtime::Runtime,
+    ops: AdminOps<S>,
+}
+
+impl<S: AdminStore> Blocking<S> {
+    /// `rt` must be the runtime the store was opened on: a database
+    /// connection's driver task runs on it and only makes progress while it
+    /// is being driven.
+    fn new(
+        rt: tokio::runtime::Runtime,
+        store: S,
+        keysalts: Vec<(i32, krb5_rs::crypto::SaltType)>,
+    ) -> Self {
+        Self {
+            rt,
+            ops: AdminOps::new(store, keysalts),
+        }
+    }
+
+    fn add_principal(
+        &self,
+        n: &krb5_rs::types::PrincipalName,
+        r: &str,
+        pw: Option<&str>,
+        o: &PrincipalOptions,
+    ) -> Result<(), StoreError> {
+        self.rt.block_on(self.ops.add_principal(n, r, pw, o))
+    }
+
+    fn delete_principal(
+        &self,
+        n: &krb5_rs::types::PrincipalName,
+        r: &str,
+    ) -> Result<(), StoreError> {
+        self.rt.block_on(self.ops.delete_principal(n, r))
+    }
+
+    fn change_password(
+        &self,
+        n: &krb5_rs::types::PrincipalName,
+        r: &str,
+        pw: Option<&str>,
+        keep: bool,
+    ) -> Result<u32, StoreError> {
+        self.rt.block_on(self.ops.change_password(n, r, pw, keep))
+    }
+
+    fn modify_principal(
+        &self,
+        n: &krb5_rs::types::PrincipalName,
+        r: &str,
+        o: &PrincipalOptions,
+    ) -> Result<(), StoreError> {
+        self.rt.block_on(self.ops.modify_principal(n, r, o))
+    }
+
+    fn add_policy(&self, p: krb5_rs::kdc::Policy) -> Result<(), StoreError> {
+        self.rt.block_on(self.ops.add_policy(p))
+    }
+
+    fn modify_policy(&self, n: &str, c: &PolicyChange) -> Result<(), StoreError> {
+        self.rt.block_on(self.ops.modify_policy(n, c))
+    }
+
+    fn delete_policy(&self, n: &str) -> Result<(), StoreError> {
+        self.rt.block_on(self.ops.delete_policy(n))
+    }
+
+    fn get_policy(&self, n: &str) -> Result<krb5_rs::kdc::Policy, StoreError> {
+        self.rt.block_on(self.ops.get_policy(n))
+    }
+
+    fn list_policies(&self) -> Result<Vec<String>, StoreError> {
+        self.rt.block_on(self.ops.list_policies())
+    }
+
+    fn get_principal(
+        &self,
+        n: &krb5_rs::types::PrincipalName,
+        r: &str,
+    ) -> Result<krb5_rs::kdc::PrincipalRecord, StoreError> {
+        self.rt.block_on(self.ops.get_principal(n, r))
+    }
+
+    fn list_principals(&self) -> Result<Vec<String>, StoreError> {
+        self.rt.block_on(self.ops.list_principals())
+    }
+
+    fn ktadd(
+        &self,
+        n: &krb5_rs::types::PrincipalName,
+        r: &str,
+        keytab: &Path,
+        randomize: bool,
+    ) -> Result<u32, StoreError> {
+        self.rt.block_on(self.ops.ktadd(n, r, keytab, randomize))
+    }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| fail(format!("starting the runtime: {e}")))
+}
+
+fn run_admin<S: AdminStore>(admin: &Blocking<S>, cmd: &str, args: Vec<String>, realm: &str) {
+    let principal = |s: &str| ok(parse_principal(s, realm));
+
+    match cmd {
         "addprinc" => {
             let mut randkey = false;
             let (opts, rest) = principal_options(args, &mut randkey);
@@ -413,4 +540,166 @@ fn main() {
         }
         _ => usage(),
     }
+}
+
+/// Commands against CockroachDB (`db_library = krb5-rs-cockroach`): the
+/// kadmin commands, plus `create`, `stash`, `database migrate` and
+/// `replication status|prune|wait-applied`.
+#[cfg(feature = "cockroach")]
+fn cockroach_command(cmd: &str, mut args: Vec<String>, cfg: &RealmConfig, realm: &str) {
+    use krb5_rs::kdc::replication::ReplicationTs;
+    use krb5_rs_kdb_cockroach::{CockroachConfig, CockroachStore, MigrateOptions, MultiRegion};
+
+    let config = ok(CockroachConfig::from_db_module(&cfg.db_module));
+    let rt = runtime();
+    let flag = |args: &mut Vec<String>, name: &str| -> Option<String> {
+        let at = args.iter().position(|a| a == name)?;
+        args.remove(at);
+        (at < args.len()).then(|| args.remove(at))
+    };
+    let switch = |args: &mut Vec<String>, name: &str| -> bool {
+        match args.iter().position(|a| a == name) {
+            Some(at) => {
+                args.remove(at);
+                true
+            }
+            None => false,
+        }
+    };
+    match cmd {
+        "database" => {
+            if args.first().map(String::as_str) != Some("migrate") {
+                usage();
+            }
+            args.remove(0);
+            let create_roles = switch(&mut args, "--create-roles");
+            let multi = switch(&mut args, "--multi-region");
+            let primary = flag(&mut args, "--primary-region");
+            let regions = flag(&mut args, "--regions");
+            if !args.is_empty() {
+                usage();
+            }
+            let multi_region = multi.then(|| MultiRegion {
+                primary_region: primary
+                    .clone()
+                    .unwrap_or_else(|| fail("--multi-region needs --primary-region")),
+                regions: regions
+                    .as_deref()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            });
+            let report = ok(rt.block_on(CockroachStore::migrate(
+                config,
+                &MigrateOptions {
+                    create_roles,
+                    multi_region,
+                },
+            )));
+            println!(
+                "Schema version {} -> {}{}{}.",
+                report.from,
+                report.to,
+                if report.roles { ", roles created" } else { "" },
+                if report.multi_region {
+                    ", multi-region applied"
+                } else {
+                    ""
+                },
+            );
+        }
+        "create" => {
+            let stash = args.iter().any(|a| a == "-s");
+            let password = read_line(&format!("Enter KDC database master key for {realm}: "));
+            let key = ok(master_key_from_password(
+                realm,
+                &password,
+                cfg.master_key_type,
+            ));
+            let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
+            let store = ok(rt.block_on(CockroachStore::connect(config, key.clone(), realm)));
+            ok(rt.block_on(store.create_realm(&etypes)));
+            if stash {
+                ok(write_stash(&cfg.key_stash_file, realm, &key));
+            }
+        }
+        "stash" => {
+            let password = read_line(&format!("Enter KDC database master key for {realm}: "));
+            let key = ok(master_key_from_password(
+                realm,
+                &password,
+                cfg.master_key_type,
+            ));
+            ok(rt.block_on(CockroachStore::open(config, key.clone(), realm)));
+            ok(write_stash(&cfg.key_stash_file, realm, &key));
+        }
+        "replication" => {
+            let master = ok(read_stash(&cfg.key_stash_file, realm));
+            let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
+            let sub = if args.is_empty() {
+                usage()
+            } else {
+                args.remove(0)
+            };
+            match sub.as_str() {
+                "status" => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+                    println!(
+                        "{:<24} {:<16} {:<32} {:>8} {:>8}",
+                        "KDC", "REGION", "APPLIED", "LAG(s)", "SEEN(s)"
+                    );
+                    for s in ok(rt.block_on(store.replica_statuses())) {
+                        println!(
+                            "{:<24} {:<16} {:<32} {:>8} {:>8}",
+                            s.kdc_id,
+                            s.region,
+                            s.applied_ts,
+                            (now - s.applied_ts.wall_time().timestamp()).max(0),
+                            (now - s.seen_at).max(0)
+                        );
+                    }
+                }
+                "prune" => {
+                    let older = flag(&mut args, "--older-than").unwrap_or_else(|| usage());
+                    let d = ok(parse_lifetime(&older)).unwrap_or_default();
+                    let (cutoff, deleted) = ok(rt.block_on(store.prune(d)));
+                    println!("Pruned {deleted} log rows; pruned_before is now {cutoff}.");
+                }
+                "wait-applied" => {
+                    let since: ReplicationTs = flag(&mut args, "--since")
+                        .unwrap_or_else(|| usage())
+                        .parse()
+                        .unwrap_or_else(|e| fail(e));
+                    let timeout = flag(&mut args, "--timeout")
+                        .map_or(std::time::Duration::from_secs(30), |t| {
+                            ok(parse_lifetime(&t)).unwrap_or_default()
+                        });
+                    let out = ok(rt.block_on(store.wait_applied(since, timeout)));
+                    println!(
+                        "{} of {} KDCs are at or past {since}.",
+                        out.applied, out.total
+                    );
+                    if !out.complete() {
+                        std::process::exit(1);
+                    }
+                }
+                _ => usage(),
+            }
+        }
+        _ => {
+            let master = ok(read_stash(&cfg.key_stash_file, realm));
+            let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
+            let admin = Blocking::new(rt, store, cfg.supported_keysalts.clone());
+            run_admin(&admin, cmd, args, realm);
+        }
+    }
+}
+
+#[cfg(not(feature = "cockroach"))]
+fn cockroach_command(_cmd: &str, _args: Vec<String>, _cfg: &RealmConfig, _realm: &str) {
+    fail("db_library krb5-rs-cockroach needs a krb5-rs-kdb built with the `cockroach` feature");
 }

@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use super::db::{store_key, PrincipalEntry, StoreKey};
-use crate::types::PrincipalName;
+use crate::types::{KerberosTime, PrincipalName};
 
 /// Why a store operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,21 +279,48 @@ pub trait AuthStateStore: Send + Sync {
     ) -> impl Future<Output = Result<AuthState, StoreError>> + Send;
 }
 
+/// A database record: the principal plus bookkeeping the KDC does not use.
+#[derive(Debug, Clone)]
+pub struct PrincipalRecord {
+    /// The principal as the KDC sees it (keys decrypted).
+    pub entry: PrincipalEntry,
+    /// Last password change.
+    pub last_pwd_change: Option<KerberosTime>,
+    /// Last modification (set by the store on every write).
+    pub mod_time: Option<KerberosTime>,
+}
+
 /// Administrative access to the authoritative store (docs/architecture §3).
-/// Principal and policy mutations are applied transactionally by the backend.
+///
+/// Every mutation is atomic. The `update_*` operations are a transactional
+/// read-modify-write: the closure sees the current state and edits it, and the
+/// store commits the result, re-running the closure if the transaction has to
+/// be retried (so it must be repeatable). The store sets `mod_time` itself.
 pub trait AdminStore: Send + Sync {
-    /// The principal, if it exists.
-    fn get_principal(
+    /// The principal's record, if it exists.
+    fn get_record(
         &self,
         name: &PrincipalName,
         realm: &str,
-    ) -> impl Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<Option<PrincipalRecord>, StoreError>> + Send;
 
-    /// Insert or replace a principal.
-    fn put_principal(
+    /// Insert a new principal; [`StoreErrorKind::Conflict`] if it exists.
+    fn create_principal(
         &self,
         entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Read-modify-write one principal; [`StoreErrorKind::NotFound`] if it
+    /// does not exist. Returns the stored record.
+    fn update_principal<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> impl Future<Output = Result<PrincipalRecord, StoreError>> + Send
+    where
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send;
 
     /// Delete a principal; returns whether it existed.
     fn delete_principal(
@@ -302,10 +329,10 @@ pub trait AdminStore: Send + Sync {
         realm: &str,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
-    /// Every principal.
+    /// Every principal's record.
     fn list_principals(
         &self,
-    ) -> impl Future<Output = Result<Vec<PrincipalEntry>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<Vec<PrincipalRecord>, StoreError>> + Send;
 
     /// The policy, if it exists.
     fn get_policy(
@@ -313,13 +340,22 @@ pub trait AdminStore: Send + Sync {
         name: &str,
     ) -> impl Future<Output = Result<Option<Policy>, StoreError>> + Send;
 
-    /// Insert or replace a policy.
-    fn put_policy(&self, policy: Policy) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// Insert a new policy; [`StoreErrorKind::Conflict`] if it exists.
+    fn create_policy(&self, policy: Policy) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Read-modify-write one policy; [`StoreErrorKind::NotFound`] if missing.
+    fn update_policy<F>(
+        &self,
+        name: &str,
+        f: F,
+    ) -> impl Future<Output = Result<Policy, StoreError>> + Send
+    where
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send;
 
     /// Delete a policy; returns whether it existed.
     fn delete_policy(&self, name: &str) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
-    /// Every policy.
+    /// Every policy, sorted by name.
     fn list_policies(&self) -> impl Future<Output = Result<Vec<Policy>, StoreError>> + Send;
 }
 
@@ -394,19 +430,32 @@ impl<T: AuthStateStore + ?Sized> AuthStateStore for Arc<T> {
 }
 
 impl<T: AdminStore + ?Sized> AdminStore for Arc<T> {
-    fn get_principal(
+    fn get_record(
         &self,
         name: &PrincipalName,
         realm: &str,
-    ) -> impl Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
-        (**self).get_principal(name, realm)
+    ) -> impl Future<Output = Result<Option<PrincipalRecord>, StoreError>> + Send {
+        (**self).get_record(name, realm)
     }
 
-    fn put_principal(
+    fn create_principal(
         &self,
         entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
     ) -> impl Future<Output = Result<(), StoreError>> + Send {
-        (**self).put_principal(entry)
+        (**self).create_principal(entry, last_pwd_change)
+    }
+
+    fn update_principal<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> impl Future<Output = Result<PrincipalRecord, StoreError>> + Send
+    where
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send,
+    {
+        (**self).update_principal(name, realm, f)
     }
 
     fn delete_principal(
@@ -419,7 +468,7 @@ impl<T: AdminStore + ?Sized> AdminStore for Arc<T> {
 
     fn list_principals(
         &self,
-    ) -> impl Future<Output = Result<Vec<PrincipalEntry>, StoreError>> + Send {
+    ) -> impl Future<Output = Result<Vec<PrincipalRecord>, StoreError>> + Send {
         (**self).list_principals()
     }
 
@@ -430,8 +479,93 @@ impl<T: AdminStore + ?Sized> AdminStore for Arc<T> {
         (**self).get_policy(name)
     }
 
-    fn put_policy(&self, policy: Policy) -> impl Future<Output = Result<(), StoreError>> + Send {
-        (**self).put_policy(policy)
+    fn create_policy(&self, policy: Policy) -> impl Future<Output = Result<(), StoreError>> + Send {
+        (**self).create_policy(policy)
+    }
+
+    fn update_policy<F>(
+        &self,
+        name: &str,
+        f: F,
+    ) -> impl Future<Output = Result<Policy, StoreError>> + Send
+    where
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send,
+    {
+        (**self).update_policy(name, f)
+    }
+
+    fn delete_policy(&self, name: &str) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        (**self).delete_policy(name)
+    }
+
+    fn list_policies(&self) -> impl Future<Output = Result<Vec<Policy>, StoreError>> + Send {
+        (**self).list_policies()
+    }
+}
+
+impl<T: AdminStore + ?Sized> AdminStore for &T {
+    fn get_record(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl Future<Output = Result<Option<PrincipalRecord>, StoreError>> + Send {
+        (**self).get_record(name, realm)
+    }
+
+    fn create_principal(
+        &self,
+        entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        (**self).create_principal(entry, last_pwd_change)
+    }
+
+    fn update_principal<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> impl Future<Output = Result<PrincipalRecord, StoreError>> + Send
+    where
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send,
+    {
+        (**self).update_principal(name, realm, f)
+    }
+
+    fn delete_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        (**self).delete_principal(name, realm)
+    }
+
+    fn list_principals(
+        &self,
+    ) -> impl Future<Output = Result<Vec<PrincipalRecord>, StoreError>> + Send {
+        (**self).list_principals()
+    }
+
+    fn get_policy(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<Policy>, StoreError>> + Send {
+        (**self).get_policy(name)
+    }
+
+    fn create_policy(&self, policy: Policy) -> impl Future<Output = Result<(), StoreError>> + Send {
+        (**self).create_policy(policy)
+    }
+
+    fn update_policy<F>(
+        &self,
+        name: &str,
+        f: F,
+    ) -> impl Future<Output = Result<Policy, StoreError>> + Send
+    where
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send,
+    {
+        (**self).update_policy(name, f)
     }
 
     fn delete_policy(&self, name: &str) -> impl Future<Output = Result<bool, StoreError>> + Send {

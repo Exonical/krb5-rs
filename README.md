@@ -90,6 +90,42 @@ CockroachDB) arrives in a later change. Turso 0.8.1 pulls C code through its
 `simsimd` dependency (compiled with `cc`); the module is the only place that
 does, and it is off by default.
 
+### CockroachDB authoritative module (optional)
+
+`crates/krb5-rs-kdb-cockroach` stores the realm (principals, keys encrypted under the master key, policies, lockouts) in CockroachDB and is the authority a fleet of replicas follows. It is an optional plug-in: `krb5-rs-kdb` includes it only when built with `--features cockroach` (it brings rustls with the aws-lc-rs provider, which is C code; the `fips` feature of rustls can later select the FIPS-validated aws-lc build).
+
+```
+[realms]
+    EXAMPLE.COM = { database_module = crdb }
+[dbmodules]
+    crdb = {
+        db_library = krb5-rs-cockroach
+        cockroach_url = postgresql://kdc_admin@crdb-public:26257/krb5?sslmode=verify-full
+        cockroach_ca = /etc/krb5-rs/crdb/ca.crt
+        cockroach_cert = /etc/krb5-rs/crdb/client.kdc_admin.crt
+        cockroach_key = /etc/krb5-rs/crdb/client.kdc_admin.key
+        cockroach_pool_size = 8
+        cockroach_connect_timeout = 5s
+        cockroach_statement_timeout = 10s
+        replication_read = follower     # or present
+    }
+```
+
+Connections are TLS only and verify the server (`sslmode=verify-full`); password authentication over TLS works too (put the password in the URL). `sslmode=disable` is refused unless `cockroach_insecure = true`, for tests only.
+
+`krb5-rs-kdb` runs the usual commands against it, plus:
+
+```
+krb5-rs-kdb database migrate [--create-roles] [--multi-region --primary-region R --regions R1,R2,...]
+krb5-rs-kdb replication status
+krb5-rs-kdb replication prune --older-than 7d
+krb5-rs-kdb replication wait-applied --since TS [--timeout 30s]
+```
+
+`database migrate` applies the embedded, versioned schema (idempotent); `--create-roles` creates the `kdc_admin` and `kdc_replica` users with their grants (a KDC's `kdc_replica` can read the replicated data, report lockouts and heartbeat, and nothing else); `--multi-region` is the opt-in step that sets the database regions, GLOBAL locality on the replicated tables and REGIONAL BY ROW on `replica_status`. Every administrative change is one SERIALIZABLE transaction with the CockroachDB retry protocol and writes its `replication_log` rows stamped with the transaction's `cluster_logical_timestamp()`.
+
+The integration tests need a cluster: `tests/crdb/cluster.sh up` starts a secure 3-node one (localities california, ohio, washington-dc); see `tests/crdb/README.md`.
+
 ### Replicas (database propagation)
 
 For HA, one primary keeps the writable database and any number of stateless replicas pull it. This is MIT kprop/kpropd's idea reversed into a pull model (protocol `KRB5RS-PROP-1`, documented in `src/kdc/kdb/propagation.rs`): a replica authenticates to the primary's `kprop/primary` service with a Kerberos ticket (AP-REQ with mutual authentication), asks for the database naming the serial it already has, and receives the raw database file in KRB-PRIV blocks protected by the negotiated subkeys, unless it is current. The replica verifies size, SHA-256, format, realm and its master key, and only then renames the file over its database.
