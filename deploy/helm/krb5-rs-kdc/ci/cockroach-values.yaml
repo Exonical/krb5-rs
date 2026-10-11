@@ -22,3 +22,13 @@ cockroach:
 
 kdcs:
   replicaCount: 2
+
+networkPolicy:
+  enabled: true
+
+metrics:
+  networkPolicy:
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring

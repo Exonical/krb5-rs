@@ -22,6 +22,7 @@ ADMIN_TLS_SECRET="${REL}-admin-tls"
 MIGRATE_TLS_SECRET="${REL}-migrate-tls"
 CERT_DIR="$(mktemp -d)"
 CERTS_VOLUME="${REL}-certs"
+CERTS_CONTAINER=""
 MANIFEST="$HERE/cockroach-e2e.yaml"
 
 host_path() {
@@ -32,6 +33,8 @@ host_path() {
   fi
 }
 
+export MSYS_NO_PATHCONV=1
+
 if command -v "${HELM%% *}" >/dev/null 2>&1; then
   CHART="${CHART:-$ROOT/deploy/helm/krb5-rs-kdc}"
   HELM_IN_CONTAINER=0
@@ -39,10 +42,6 @@ else
   CHART="${CHART:-/workspace/deploy/helm/krb5-rs-kdc}"
   HELM_IN_CONTAINER=1
 fi
-
-KUBECONFIG="$(host_path "$KUBECONFIG")"
-MANIFEST_HOST_PATH="$(host_path "$MANIFEST")"
-export KUBECONFIG MSYS_NO_PATHCONV=1
 
 run_helm() {
   if [ "$HELM_IN_CONTAINER" -eq 1 ]; then
@@ -55,6 +54,47 @@ run_helm() {
     $HELM "$@"
   fi
 }
+
+cleanup_cert_artifacts() {
+  if [ -n "$CERTS_CONTAINER" ]; then
+    "$CLI" rm -f "$CERTS_CONTAINER" >/dev/null 2>&1 || true
+    CERTS_CONTAINER=""
+  fi
+  "$CLI" volume rm "$CERTS_VOLUME" >/dev/null 2>&1 || true
+  rm -rf "$CERT_DIR"
+}
+
+generate_certificates() {
+  "$CLI" pull "$CRDB_PINNED_IMAGE"
+  "$CLI" volume create "$CERTS_VOLUME" >/dev/null
+  "$CLI" run --rm -e "NS=$NS" -v "$CERTS_VOLUME:/certs" \
+    --entrypoint /bin/sh "$CRDB_PINNED_IMAGE" -c '
+      set -e
+      umask 077
+      /cockroach/cockroach cert create-ca --certs-dir=/certs --ca-key=/certs/ca.key
+      /cockroach/cockroach cert create-node \
+        crdb-0.crdb crdb crdb-public \
+        crdb-0.crdb.${NS}.svc.cluster.local \
+        crdb.${NS}.svc.cluster.local \
+        crdb-public.${NS}.svc.cluster.local \
+        localhost 127.0.0.1 \
+        --certs-dir=/certs --ca-key=/certs/ca.key
+      for user in root kdc_admin kdc_replica; do
+        /cockroach/cockroach cert create-client "$user" \
+          --certs-dir=/certs --ca-key=/certs/ca.key
+      done
+      chmod 0644 /certs/*.crt
+      chmod 0600 /certs/*.key
+    '
+  CERTS_CONTAINER=$("$CLI" create -v "$CERTS_VOLUME:/certs:ro" "$CRDB_PINNED_IMAGE")
+  "$CLI" cp "$CERTS_CONTAINER:/certs/." "$(host_path "$CERT_DIR")"
+  "$CLI" rm "$CERTS_CONTAINER" >/dev/null
+  CERTS_CONTAINER=""
+  chmod 0700 "$CERT_DIR"
+  chmod 0600 "$CERT_DIR"/*.key
+}
+
+step() { printf '\n=== %s\n' "$*"; }
 
 diagnostics() {
   echo "--- CockroachDB E2E diagnostics"
@@ -79,8 +119,7 @@ cleanup() {
   "$KUBECTL" delete secret -n "$NS" \
     cockroach-node-certs "$MASTER_SECRET" "$REPLICA_TLS_SECRET" \
     "$ADMIN_TLS_SECRET" "$MIGRATE_TLS_SECRET" --ignore-not-found >/dev/null 2>&1 || true
-  "$CLI" volume rm "$CERTS_VOLUME" >/dev/null 2>&1 || true
-  rm -rf "$CERT_DIR"
+  cleanup_cert_artifacts
 }
 
 on_exit() {
@@ -91,38 +130,29 @@ on_exit() {
   cleanup
   exit "$result"
 }
-trap on_exit EXIT
 
+if [ "${E2E_ONLY_CERTS:-0}" = "1" ]; then
+  trap cleanup_cert_artifacts EXIT
+  cleanup_cert_artifacts
+  mkdir -p "$CERT_DIR"
+  chmod 0700 "$CERT_DIR"
+  generate_certificates
+  for key in "$CERT_DIR"/*.key; do
+    [ -r "$key" ] || { echo "extracted private key is not readable: $key"; exit 1; }
+  done
+  echo "all extracted private keys are readable as uid $(id -u)"
+  stat -c '%u:%g %a %n' "$CERT_DIR"/*.key
+  exit 0
+fi
+
+KUBECONFIG="$(host_path "$KUBECONFIG")"
+MANIFEST_HOST_PATH="$(host_path "$MANIFEST")"
+export KUBECONFIG
+trap on_exit EXIT
 cleanup
 mkdir -p "$CERT_DIR"
-
-step() { printf '\n=== %s\n' "$*"; }
-
-step "generate CockroachDB certificates"
-"$CLI" pull "$CRDB_PINNED_IMAGE"
-"$CLI" volume create "$CERTS_VOLUME" >/dev/null
-"$CLI" run --rm -v "$CERTS_VOLUME:/certs" \
-  --entrypoint /bin/sh "$CRDB_PINNED_IMAGE" -c '
-    set -e
-    umask 077
-    /cockroach/cockroach cert create-ca --certs-dir=/certs --ca-key=/certs/ca.key
-    /cockroach/cockroach cert create-node \
-      crdb-0.crdb crdb crdb-public \
-      crdb-0.crdb.default.svc.cluster.local \
-      crdb.default.svc.cluster.local \
-      crdb-public.default.svc.cluster.local \
-      localhost 127.0.0.1 \
-      --certs-dir=/certs --ca-key=/certs/ca.key
-    for user in root kdc_admin kdc_replica; do
-      /cockroach/cockroach cert create-client "$user" \
-        --certs-dir=/certs --ca-key=/certs/ca.key
-    done
-    chmod 0644 /certs/*.crt
-    chmod 0600 /certs/*.key
-  '
-"$CLI" run --rm -v "$CERTS_VOLUME:/certs:ro" \
-  -v "$(host_path "$CERT_DIR"):/out" \
-  --entrypoint /bin/sh "$CRDB_PINNED_IMAGE" -c 'cp /certs/* /out/'
+chmod 0700 "$CERT_DIR"
+generate_certificates
 
 step "create CockroachDB and client TLS Secrets"
 "$KUBECTL" delete secret -n "$NS" cockroach-node-certs "$MASTER_SECRET" \
@@ -201,7 +231,13 @@ run_helm upgrade --install "$REL" "$CHART" --namespace "$NS" \
   --set-string cockroach.maxStaleness=10s \
   --set-string cockroach.replication.pollInterval=1s \
   --wait --timeout=15m
-"$KUBECTL" wait --for=condition=complete "job/${FULL}-bootstrap" -n "$NS" --timeout=900s
+for resource in "job/${FULL}-bootstrap" "configmap/${FULL}-bootstrap"; do
+  remaining=$("$KUBECTL" get "$resource" -n "$NS" --ignore-not-found -o name)
+  [ -z "$remaining" ] || {
+    echo "$resource remains after the successful bootstrap hook"
+    exit 1
+  }
+done
 "$KUBECTL" rollout status "statefulset/${FULL}-kdc" -n "$NS" --timeout=900s
 for ordinal in 0 1; do
   "$KUBECTL" wait --for=condition=Ready "pod/${FULL}-kdc-${ordinal}" -n "$NS" --timeout=900s
@@ -247,7 +283,6 @@ EOF
 }
 
 step "bootstrap, administer, and authenticate"
-"$KUBECTL" wait --for=condition=complete "job/${FULL}-bootstrap" -n "$NS" --timeout=900s
 printf 'alice-password\n' | admin_run addprinc alice
 write_krb5_conf "${FULL}-kdc.${NS}.svc:88"
 service_seen=0

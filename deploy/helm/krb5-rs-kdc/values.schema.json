@@ -108,7 +108,13 @@
       "type": "object",
       "properties": {
         "port": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "enabled": {"type": "boolean"}
+        "enabled": {"type": "boolean"},
+        "networkPolicy": {
+          "type": "object",
+          "properties": {
+            "from": {"type": "array", "items": {"type": "object"}}
+          }
+        }
       }
     },
     "image": {

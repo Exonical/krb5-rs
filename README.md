@@ -194,7 +194,8 @@ CockroachDB mode for bounded staleness.
   primary is down; CockroachDB replicas fail closed when stale. The KDC
   StatefulSet uses a PVC per pod for its local Turso replica. Enable the prune
   CronJob in exactly one release, and give administration a separate
-  `kdc_admin` URL and TLS Secret. See
+  `kdc_admin` URL and TLS Secret. When NetworkPolicy is enabled, set
+  `metrics.networkPolicy.from` to admit Prometheus scrapes. See
   [`deploy/helm/krb5-rs-kdc/examples/multi-region`](deploy/helm/krb5-rs-kdc/examples/multi-region)
   for three regional values files.
 - **Podman** (`deploy/podman`): a single pod via `podman kube play` or a Quadlet unit (no replicas). See `deploy/podman/README.md`.

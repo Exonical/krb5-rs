@@ -1700,6 +1700,7 @@ dependencies = [
  "krb5-rs-kdb-cockroach",
  "krb5-rs-kdb-turso",
  "prometheus-client",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

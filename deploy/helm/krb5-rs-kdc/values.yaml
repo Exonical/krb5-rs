@@ -36,6 +36,7 @@ cockroach:
     tlsSecret: ""
   bootstrap:
     enabled: false          # enable in exactly one release per database
+    # A failed bootstrap Job stays for inspection until the next hook run.
     migrateUrl: ""          # a user with the admin role (e.g. root)
     migrateTlsSecret: ""
     multiRegion:
@@ -69,6 +70,10 @@ kdcs:
 metrics:
   port: 9100        # /metrics, /healthz, /readyz; always on in cockroach mode
   enabled: false    # also serve them in file mode
+  networkPolicy:
+    # Peers allowed to scrape metrics. Kubelet probes still work because
+    # NetworkPolicy cannot block access from a pod's resident node.
+    from: []
 
 image:
   repository: ghcr.io/exonical/krb5-rs-kdc

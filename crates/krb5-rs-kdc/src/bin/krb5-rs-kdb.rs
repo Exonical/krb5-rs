@@ -17,9 +17,7 @@ use krb5_rs::kdc::kdb::admin::{
     AttrChange, PolicyChange, PrincipalOptions,
 };
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, write_stash, FileStore};
-#[cfg(feature = "cockroach")]
-use krb5_rs::kdc::StoreErrorKind;
-use krb5_rs::kdc::{default_realm, AdminStore, RealmConfig, StoreError};
+use krb5_rs::kdc::{default_realm, AdminStore, RealmConfig, StoreError, StoreErrorKind};
 use krb5_rs::profile::Profile;
 
 fn usage() -> ! {
@@ -453,8 +451,17 @@ fn ensure_init_principals<S: AdminStore>(
             continue;
         }
         let password = password_file.map(read_secret_file);
-        ok(admin.add_principal(&name, &realm, password.as_deref(), &opts));
-        println!("Principal \"{name}@{realm}\" created.");
+        match admin.add_principal(&name, &realm, password.as_deref(), &opts) {
+            Ok(()) => println!("Principal \"{name}@{realm}\" created."),
+            Err(error) if error.kind() == StoreErrorKind::Conflict => {
+                if matches!(admin.principal_exists(&name, &realm), Ok(true)) {
+                    println!("Principal \"{name}@{realm}\" already exists.");
+                } else {
+                    fail(error);
+                }
+            }
+            Err(error) => fail(error),
+        }
     }
 }
 

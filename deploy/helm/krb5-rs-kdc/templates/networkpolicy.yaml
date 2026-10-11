@@ -18,8 +18,11 @@ spec:
           protocol: UDP
         - port: {{ .Values.kdc.containerPort }}
           protocol: TCP
-{{- if or (eq .Values.database.mode "cockroach") .Values.metrics.enabled }}
-    - ports:
+{{- if .Values.metrics.networkPolicy.from }}
+    # Kubelet probes still work: NetworkPolicy cannot block access from a pod's resident node.
+    - from:
+        {{- toYaml .Values.metrics.networkPolicy.from | nindent 8 }}
+      ports:
         - port: {{ .Values.metrics.port }}
           protocol: TCP
 {{- end }}

@@ -11,6 +11,7 @@ const REALM: &str = "KDB.TEST";
 struct Env {
     dir: PathBuf,
     conf: PathBuf,
+    remove_dir_on_drop: bool,
 }
 
 impl Env {
@@ -18,6 +19,15 @@ impl Env {
         let dir = std::env::temp_dir().join(format!("krb5rs_kdb_{}_{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
+        Self::in_directory(&dir, true)
+    }
+
+    fn from_tempdir(dir: &Path) -> Env {
+        Self::in_directory(dir, false)
+    }
+
+    fn in_directory(dir: &Path, remove_dir_on_drop: bool) -> Env {
+        let dir = dir.to_path_buf();
         let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
         let conf = dir.join("kdc.conf");
         std::fs::write(
@@ -30,7 +40,11 @@ impl Env {
             ),
         )
         .expect("kdc.conf");
-        Env { dir, conf }
+        Env {
+            dir,
+            conf,
+            remove_dir_on_drop,
+        }
     }
 
     fn run(&self, args: &[&str], stdin: &str) -> Output {
@@ -65,7 +79,9 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if self.remove_dir_on_drop {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -198,7 +214,8 @@ fn init_is_idempotent_and_reads_secrets_only_from_files() {
 
 #[test]
 fn global_master_password_file_opens_file_database_without_a_stash() {
-    let env = Env::new("global-master");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let env = Env::from_tempdir(temp.path());
     let master = env.dir.join("master");
     let wrong = env.dir.join("wrong-master");
     std::fs::write(&master, "master-secret\n").expect("master file");
@@ -227,7 +244,8 @@ fn global_master_password_file_opens_file_database_without_a_stash() {
 
 #[test]
 fn init_falls_back_to_the_global_master_password_file() {
-    let env = Env::new("global-init");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let env = Env::from_tempdir(temp.path());
     let master = env.dir.join("master");
     std::fs::write(&master, "master-secret\n").expect("master file");
     let master_path = master.to_string_lossy().into_owned();
