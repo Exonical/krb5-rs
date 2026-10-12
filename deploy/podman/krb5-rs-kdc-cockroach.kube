@@ -1,0 +1,19 @@
+# Quadlet unit for the external-CockroachDB Podman deployment.
+[Unit]
+Description=krb5-rs CockroachDB-backed Kerberos KDC
+After=network-online.target
+Wants=network-online.target
+
+[Kube]
+Yaml=krb5-rs-kdc-cockroach.yaml
+Network=krb5rs-crdb
+PublishPort=88:8888/udp
+PublishPort=88:8888/tcp
+PublishPort=9100:9100/tcp
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

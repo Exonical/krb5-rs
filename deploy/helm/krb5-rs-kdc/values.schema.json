@@ -17,6 +17,7 @@
         "tlsSecret": {"type": "string"},
         "region": {"type": "string"},
         "poolSize": {"type": "integer", "minimum": 1},
+        "poolIdleTimeout": {"type": "string"},
         "connectTimeout": {"type": "string"},
         "statementTimeout": {"type": "string"},
         "transactionTimeout": {"type": "string"},

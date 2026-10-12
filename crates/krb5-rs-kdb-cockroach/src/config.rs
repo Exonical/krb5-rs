@@ -9,6 +9,7 @@
 //!         cockroach_cert = /etc/krb5-rs/crdb/client.kdc_replica.crt
 //!         cockroach_key = /etc/krb5-rs/crdb/client.kdc_replica.key
 //!         cockroach_pool_size = 8
+//!         cockroach_pool_idle_timeout = 5m
 //!         cockroach_connect_timeout = 5s
 //!         cockroach_statement_timeout = 10s
 //!         replication_read = follower
@@ -48,6 +49,9 @@ pub struct CockroachConfig {
     pub key: Option<PathBuf>,
     /// Pooled connections.
     pub pool_size: usize,
+    /// Retire idle pooled connections after this duration. `None` or zero
+    /// disables idle eviction.
+    pub pool_idle_timeout: Option<Duration>,
     /// Time to connect or to wait for a pooled connection.
     pub connect_timeout: Duration,
     /// Server-side statement timeout, also bounding point reads.
@@ -69,6 +73,7 @@ impl std::fmt::Debug for CockroachConfig {
             .field("cert", &self.cert)
             .field("key", &self.key)
             .field("pool_size", &self.pool_size)
+            .field("pool_idle_timeout", &self.pool_idle_timeout)
             .field("replication_read", &self.replication_read)
             .field("transaction_timeout", &self.transaction_timeout)
             .field("insecure", &self.insecure)
@@ -99,6 +104,7 @@ impl CockroachConfig {
             cert: None,
             key: None,
             pool_size: 8,
+            pool_idle_timeout: None,
             connect_timeout: Duration::from_secs(5),
             statement_timeout: Duration::from_secs(10),
             transaction_timeout: Duration::from_secs(30),
@@ -133,6 +139,7 @@ impl CockroachConfig {
                 .parse()
                 .map_err(|_| StoreError::backend("cockroach_pool_size: not a number"))?;
         }
+        c.pool_idle_timeout = duration("cockroach_pool_idle_timeout")?;
         if let Some(d) = duration("cockroach_connect_timeout")? {
             c.connect_timeout = d;
         }
@@ -255,11 +262,13 @@ mod tests {
         let m = module(
             "  db_library = krb5-rs-cockroach\n  cockroach_url = postgresql://kdc@crdb:26257/krb5?sslmode=verify-full\n  \
              cockroach_ca = /ca.crt\n  cockroach_pool_size = 3\n  cockroach_connect_timeout = 2s\n  \
-             cockroach_statement_timeout = 1m\n  cockroach_transaction_timeout = 30s\n  \
+             cockroach_pool_idle_timeout = 1s\n  cockroach_statement_timeout = 1m\n  \
+             cockroach_transaction_timeout = 30s\n  \
              replication_read = present",
         );
         let c = CockroachConfig::from_db_module(&m).expect("config");
         assert_eq!(c.pool_size, 3);
+        assert_eq!(c.pool_idle_timeout, Some(Duration::from_secs(1)));
         assert_eq!(c.connect_timeout, Duration::from_secs(2));
         assert_eq!(c.statement_timeout, Duration::from_secs(60));
         assert_eq!(c.transaction_timeout, Duration::from_secs(30));
