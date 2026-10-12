@@ -1,4 +1,4 @@
-{{- if and .Values.replicas.pdb.enabled (gt (int .Values.replicas.replicaCount) 0) }}
+{{- if and (eq .Values.database.mode "file") .Values.replicas.pdb.enabled (gt (int .Values.replicas.replicaCount) 0) }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -11,4 +11,19 @@ spec:
     matchLabels:
       {{- include "krb5-rs-kdc.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: replica
+{{- end }}
+{{- if and (eq .Values.database.mode "cockroach") .Values.kdcs.pdb.enabled (gt (int .Values.kdcs.replicaCount) 0) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-kdc
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kdc
+spec:
+  maxUnavailable: {{ .Values.kdcs.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kdc
 {{- end }}

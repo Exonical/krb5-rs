@@ -31,10 +31,11 @@ standalone backend. Nothing in this design removes it.
 | `crates/krb5-rs-kdc` | Daemon and admin CLI. Cargo features `turso` and `cockroach` select modules; metrics/health HTTP | modules off by default |
 
 The database modules are **pluggable and optional**: they are not compiled
-into the KDC unless their feature is enabled, so the core stays pure Rust. The
-CockroachDB module uses `tokio-postgres` (pgwire) with `rustls`. Its crypto
-provider is `aws-lc-rs`, chosen for the FIPS 140-3 path. That is the only C
-dependency, and only in that module.
+into the KDC unless their feature is enabled, so the default KDC stays pure
+Rust. The CockroachDB module uses `tokio-postgres` (pgwire) with `rustls`. Its
+crypto provider is `aws-lc-rs`, chosen for the FIPS 140-3 path. The CockroachDB
+and Turso modules both contain C dependencies: aws-lc-rs and `turso_core`'s
+`simsimd`, respectively.
 
 Module selection mirrors MIT's `[dbmodules]` / `database_module`:
 
@@ -44,16 +45,29 @@ Module selection mirrors MIT's `[dbmodules]` / `database_module`:
 [dbmodules]
     crdb = {
         db_library = krb5-rs-cockroach
-        # authoritative store + replication source
-        cockroach_url = postgresql://kdc@crdb-public:26257/krb5?sslmode=verify-full
+        # authoritative store, replication source and KDC heartbeat
+        cockroach_url = postgresql://kdc_replica@crdb-public:26257/krb5?sslmode=verify-full
         cockroach_ca = /etc/krb5-rs/crdb/ca.crt
-        cockroach_cert = /etc/krb5-rs/crdb/client.kdc.crt
-        cockroach_key = /etc/krb5-rs/crdb/client.kdc.key
-        # local replica
-        # local replica (PR 5 reads the replica from its own dbmodules section:
-        # db_library = krb5-rs-turso, replica_path = a directory)
-        replica_library = krb5-rs-turso
+        cockroach_cert = /etc/krb5-rs/crdb/tls.crt
+        cockroach_key = /etc/krb5-rs/crdb/tls.key
+        cockroach_pool_size = 8
+        cockroach_connect_timeout = 5s
+        cockroach_statement_timeout = 10s
+        cockroach_transaction_timeout = 30s
+        replication_read = follower
+        # local replica owned by this KDC
         replica_path = /var/lib/krb5-rs/replica
+        turso_pool_size = 8
+        region = california
+        consistency_mode = bounded
+        max_staleness = 30s
+        authoritative_timeout = 500ms
+        replication_poll_interval = 1s
+        replication_batch_limit = 1000
+        replication_retry_min = 100ms
+        replication_retry_max = 30s
+        replication_rebuild = auto
+        replication_heartbeat_interval = 5s
     }
 ```
 
@@ -406,8 +420,8 @@ epoch.
   `max_staleness`, `authoritative_timeout`; heartbeat interval.
 - **Health and readiness** (HTTP, unprivileged port):
   - `/healthz`: the process is alive;
-  - `/readyz`: listeners are bound, the replica is bootstrapped, and freshness
-    is within bounds;
+  - `/readyz`: the replica is bootstrapped, not rebuilding or marked for
+    rebuild, and freshness is within bounds;
   - `/metrics`: Prometheus.
 - **Metrics:**
   - lookup latency;
@@ -422,8 +436,14 @@ epoch.
 - **Shutdown.** Stop the listeners, finish the in-flight apply transaction,
   then exit. The checkpoint is durable with the data, so a restart resumes
   exactly.
-- **Kubernetes.** KDCs run as a StatefulSet per region, each pod with its own
-  PVC for Turso. No two pods share a database file.
+- **Kubernetes.** The Helm chart supports file/kprop mode (one primary plus
+  replicas) and CockroachDB mode. In CockroachDB mode, each region runs a KDC
+  StatefulSet with a PVC per pod, an idempotent bootstrap Job as a
+  pre-install/pre-upgrade hook, and an optional prune CronJob; startup,
+  readiness and liveness use the HTTP probes. Use the `-cockroach` image
+  variant. See
+  [`deploy/helm/krb5-rs-kdc/examples/multi-region`](../../deploy/helm/krb5-rs-kdc/examples/multi-region)
+  for regional values.
 
 ## 10. Testing
 

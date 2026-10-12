@@ -5,6 +5,76 @@
 # Kerberos realm served (required, e.g. EXAMPLE.COM). No default.
 realm: ""
 
+database:
+  # file: one primary + replicas that pull the file database (default).
+  # cockroach: every KDC pod replicates CockroachDB into its own Turso replica.
+  mode: file
+
+cockroach:
+  url: ""              # KDC connection as kdc_replica, sslmode=verify-full (required in cockroach mode)
+  tlsSecret: ""        # Secret with ca.crt, tls.crt, tls.key for kdc_replica (required)
+  region: ""           # this release's region, e.g. california (required)
+  poolSize: 8
+  connectTimeout: 5s
+  statementTimeout: 10s
+  transactionTimeout: 30s   # must be identical everywhere: migrate stores it, KDCs refuse to start on mismatch
+  replicationRead: follower # follower | present
+  consistencyMode: bounded  # bounded | strict
+  maxStaleness: 30s
+  authoritativeTimeout: 500ms
+  replication:
+    pollInterval: 1s
+    batchLimit: 1000
+    retryMin: 100ms
+    retryMax: 30s
+    rebuild: auto           # auto | manual
+    heartbeatInterval: 5s
+  turso:
+    poolSize: 8
+  admin:
+    url: ""                 # as kdc_admin: bootstrap Job, prune CronJob and the admin command in NOTES
+    tlsSecret: ""
+  bootstrap:
+    enabled: false          # enable in exactly one release per database
+    # A failed bootstrap Job stays for inspection until the next hook run.
+    migrateUrl: ""          # a user with the admin role (e.g. root)
+    migrateTlsSecret: ""
+    multiRegion:
+      enabled: false
+      primaryRegion: ""
+      regions: []
+    backoffLimit: 6
+    activeDeadlineSeconds: 900
+  prune:
+    enabled: false          # enable in exactly one release per database
+    schedule: "17 3 * * *"
+    olderThan: 7d
+
+kdcs:
+  replicaCount: 3
+  persistence:
+    enabled: true           # false = emptyDir (each restart takes a fresh snapshot)
+    size: 1Gi
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  startupFailureThreshold: 180   # x 5 s: time allowed for the first snapshot
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+metrics:
+  port: 9100        # /metrics, /healthz, /readyz; always on in cockroach mode
+  enabled: false    # also serve them in file mode
+  networkPolicy:
+    # Peers allowed to scrape metrics. Kubelet probes still work because
+    # NetworkPolicy cannot block access from a pod's resident node.
+    from: []
+
 image:
   repository: ghcr.io/exonical/krb5-rs-kdc
   # Defaults to the chart appVersion.

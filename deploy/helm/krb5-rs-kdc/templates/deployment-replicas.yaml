@@ -1,3 +1,4 @@
+{{- if eq .Values.database.mode "file" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,7 +23,7 @@ spec:
         {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: replica
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include "krb5-rs-kdc.fileConfigChecksum" . }}
         {{- with .Values.replicas.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -43,6 +44,9 @@ spec:
             - --krb5-config=/etc/krb5-rs/krb5.conf
             - --realm={{ .Values.realm }}
             - --master-password-file=/secrets/master-password
+            {{- if .Values.metrics.enabled }}
+            - --metrics-listen=0.0.0.0:{{ .Values.metrics.port }}
+            {{- end }}
           ports:
             - name: kdc-udp
               containerPort: {{ .Values.kdc.containerPort }}
@@ -50,6 +54,11 @@ spec:
             - name: kdc-tcp
               containerPort: {{ .Values.kdc.containerPort }}
               protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
           # The daemon binds its ports only after the first database pull, so
           # these probes pass only once the replica has data.
           startupProbe:
@@ -96,3 +105,4 @@ spec:
           secret:
             secretName: {{ include "krb5-rs-kdc.secretName" . }}
             defaultMode: 0440
+{{- end }}

@@ -1,0 +1,137 @@
+{{- if eq .Values.database.mode "cockroach" }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-kdc
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kdc
+spec:
+  replicas: {{ .Values.kdcs.replicaCount }}
+  serviceName: {{ include "krb5-rs-kdc.fullname" . }}-kdc-pods
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kdc
+  template:
+    metadata:
+      labels:
+        {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kdc
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.kdcs.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "krb5-rs-kdc.scheduling" (dict "ctx" . "cfg" .Values.kdcs) | nindent 6 }}
+      containers:
+        - name: kdc
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config=/etc/krb5-rs/kdc.conf
+            - --krb5-config=/etc/krb5-rs/krb5.conf
+            - --realm={{ .Values.realm }}
+            - --master-password-file=/secrets/master-password
+            - --metrics-listen=0.0.0.0:{{ .Values.metrics.port }}
+          env:
+            - name: K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAME
+              value: "{{ .Values.cockroach.region }}-$(K8S_POD_NAME)"
+          ports:
+            - name: kdc-udp
+              containerPort: {{ .Values.kdc.containerPort }}
+              protocol: UDP
+            - name: kdc-tcp
+              containerPort: {{ .Values.kdc.containerPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 5
+            failureThreshold: {{ .Values.kdcs.startupFailureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.kdcs.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/krb5-rs
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+            - name: cockroach-tls
+              mountPath: /crdb
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        {{- if not .Values.kdcs.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "krb5-rs-kdc.fullname" . }}
+            items:
+              - key: kdc.conf
+                path: kdc.conf
+              - key: krb5.conf
+                path: krb5.conf
+        - name: secrets
+          secret:
+            secretName: {{ include "krb5-rs-kdc.secretName" . }}
+            defaultMode: 0440
+        - name: cockroach-tls
+          secret:
+            secretName: {{ required "cockroach.tlsSecret is required in CockroachDB mode" .Values.cockroach.tlsSecret }}
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}
+  {{- if .Values.kdcs.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.kdcs.persistence.accessModes | nindent 10 }}
+        {{- with .Values.kdcs.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.kdcs.persistence.size }}
+  {{- end }}
+{{- end }}

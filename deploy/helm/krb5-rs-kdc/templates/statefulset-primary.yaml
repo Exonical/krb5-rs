@@ -1,3 +1,4 @@
+{{- if eq .Values.database.mode "file" -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -19,7 +20,7 @@ spec:
         {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: primary
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include "krb5-rs-kdc.fileConfigChecksum" . }}
         {{- with .Values.primary.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -70,6 +71,9 @@ spec:
             - --config=/etc/krb5-rs/kdc.conf
             - --krb5-config=/etc/krb5-rs/krb5.conf
             - --realm={{ .Values.realm }}
+            {{- if .Values.metrics.enabled }}
+            - --metrics-listen=0.0.0.0:{{ .Values.metrics.port }}
+            {{- end }}
           ports:
             - name: kdc-udp
               containerPort: {{ .Values.kdc.containerPort }}
@@ -80,6 +84,11 @@ spec:
             - name: kprop
               containerPort: {{ .Values.propagation.port }}
               protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
           startupProbe:
             tcpSocket:
               port: kdc-tcp
@@ -140,3 +149,4 @@ spec:
           requests:
             storage: {{ .Values.primary.persistence.size }}
   {{- end }}
+{{- end }}

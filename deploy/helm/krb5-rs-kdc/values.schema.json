@@ -4,6 +4,119 @@
   "required": ["realm"],
   "properties": {
     "realm": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9._-]+$", "description": "Kerberos realm, e.g. EXAMPLE.COM"},
+    "database": {
+      "type": "object",
+      "properties": {
+        "mode": {"type": "string", "enum": ["file", "cockroach"]}
+      }
+    },
+    "cockroach": {
+      "type": "object",
+      "properties": {
+        "url": {"type": "string"},
+        "tlsSecret": {"type": "string"},
+        "region": {"type": "string"},
+        "poolSize": {"type": "integer", "minimum": 1},
+        "connectTimeout": {"type": "string"},
+        "statementTimeout": {"type": "string"},
+        "transactionTimeout": {"type": "string"},
+        "replicationRead": {"type": "string", "enum": ["follower", "present"]},
+        "consistencyMode": {"type": "string", "enum": ["bounded", "strict"]},
+        "maxStaleness": {"type": "string"},
+        "authoritativeTimeout": {"type": "string"},
+        "replication": {
+          "type": "object",
+          "properties": {
+            "pollInterval": {"type": "string"},
+            "batchLimit": {"type": "integer", "minimum": 1},
+            "retryMin": {"type": "string"},
+            "retryMax": {"type": "string"},
+            "rebuild": {"type": "string", "enum": ["auto", "manual"]},
+            "heartbeatInterval": {"type": "string"}
+          }
+        },
+        "turso": {
+          "type": "object",
+          "properties": {
+            "poolSize": {"type": "integer", "minimum": 1}
+          }
+        },
+        "admin": {
+          "type": "object",
+          "properties": {
+            "url": {"type": "string"},
+            "tlsSecret": {"type": "string"}
+          }
+        },
+        "bootstrap": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "migrateUrl": {"type": "string"},
+            "migrateTlsSecret": {"type": "string"},
+            "multiRegion": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "primaryRegion": {"type": "string"},
+                "regions": {"type": "array", "items": {"type": "string"}}
+              }
+            },
+            "backoffLimit": {"type": "integer", "minimum": 0},
+            "activeDeadlineSeconds": {"type": "integer", "minimum": 1}
+          }
+        },
+        "prune": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string"},
+            "olderThan": {"type": "string"}
+          }
+        }
+      }
+    },
+    "kdcs": {
+      "type": "object",
+      "properties": {
+        "replicaCount": {"type": "integer", "minimum": 0},
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "size": {"type": "string"},
+            "storageClass": {"type": "string"},
+            "accessModes": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "pdb": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "maxUnavailable": {"type": ["integer", "string"]}
+          }
+        },
+        "startupFailureThreshold": {"type": "integer", "minimum": 1},
+        "resources": {"type": "object"},
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"},
+        "affinity": {"type": "object"},
+        "podAnnotations": {"type": "object"}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "enabled": {"type": "boolean"},
+        "networkPolicy": {
+          "type": "object",
+          "properties": {
+            "from": {"type": "array", "items": {"type": "object"}}
+          }
+        }
+      }
+    },
     "image": {
       "type": "object",
       "properties": {
@@ -106,5 +219,122 @@
     "securityContext": {"type": "object"},
     "nameOverride": {"type": "string"},
     "fullnameOverride": {"type": "string"}
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"database": {"properties": {"mode": {"const": "cockroach"}}, "required": ["mode"]}},
+        "required": ["database"]
+      },
+      "then": {
+        "required": ["secrets", "cockroach"],
+        "properties": {
+          "secrets": {
+            "required": ["existingSecret"],
+            "properties": {"existingSecret": {"type": "string", "minLength": 1}}
+          },
+          "cockroach": {
+            "required": ["url", "tlsSecret", "region"],
+            "properties": {
+              "url": {"type": "string", "minLength": 1},
+              "tlsSecret": {"type": "string", "minLength": 1},
+              "region": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "cockroach": {"properties": {"bootstrap": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}}
+            },
+            "required": ["cockroach"]
+          },
+          {
+            "properties": {
+              "cockroach": {"properties": {"prune": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}}
+            },
+            "required": ["cockroach"]
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "cockroach": {
+            "required": ["admin"],
+            "properties": {
+              "admin": {
+                "required": ["url", "tlsSecret"],
+                "properties": {
+                  "url": {"type": "string", "minLength": 1},
+                  "tlsSecret": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "cockroach": {"properties": {"bootstrap": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}}
+        },
+        "required": ["cockroach"]
+      },
+      "then": {
+        "properties": {
+          "cockroach": {
+            "properties": {
+              "bootstrap": {
+                "required": ["migrateUrl", "migrateTlsSecret"],
+                "properties": {
+                  "migrateUrl": {"type": "string", "minLength": 1},
+                  "migrateTlsSecret": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "cockroach": {
+            "properties": {
+              "bootstrap": {
+                "properties": {
+                  "multiRegion": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}
+                }
+              }
+            }
+          }
+        },
+        "required": ["cockroach"]
+      },
+      "then": {
+        "properties": {
+          "cockroach": {
+            "properties": {
+              "bootstrap": {
+                "properties": {
+                  "multiRegion": {
+                    "required": ["primaryRegion", "regions"],
+                    "properties": {
+                      "primaryRegion": {"type": "string", "minLength": 1},
+                      "regions": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

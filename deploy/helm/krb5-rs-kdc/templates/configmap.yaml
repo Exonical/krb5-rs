@@ -1,3 +1,4 @@
+{{- if eq .Values.database.mode "file" -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -25,3 +26,20 @@ data:
 
     {{- . | nindent 4 }}
     {{- end }}
+{{- else }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+data:
+  kdc.conf: |
+    {{- include "krb5-rs-kdc.cockroachKdcConf" . | nindent 4 }}
+  krb5.conf: |
+    {{- include "krb5-rs-kdc.krb5Conf" . | nindent 4 }}
+{{- if .Values.cockroach.admin.url }}
+  admin-kdc.conf: |
+    {{- include "krb5-rs-kdc.cockroachClientConf" (dict "ctx" . "url" .Values.cockroach.admin.url "certDir" "/crdb-admin") | nindent 4 }}
+{{- end }}
+{{- end }}

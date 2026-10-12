@@ -263,3 +263,156 @@ async fn kdb_administers_a_cockroachdb_realm_and_reports_replication() {
     .await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn init_and_global_master_password_file_work_without_a_stash() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path();
+    let db = format!("krb5t_cli_init_{}", std::process::id());
+    run_sql(
+        &crdb_config("root", "defaultdb"),
+        &format!("CREATE DATABASE \"{db}\""),
+    )
+    .await
+    .expect("create database");
+    let root = write_conf(dir, "root.conf", "root", &db);
+    let admin = write_conf(dir, "admin.conf", "kdc_admin", &db);
+    ok(&root, &["database", "migrate", "--create-roles"], "");
+
+    let master = dir.join("master");
+    let wrong_master = dir.join("wrong-master");
+    std::fs::write(&master, "master-password\n").expect("master password");
+    std::fs::write(&wrong_master, "wrong-password\n").expect("wrong password");
+    let master_path = master.to_string_lossy().into_owned();
+    let wrong_master_path = wrong_master.to_string_lossy().into_owned();
+
+    let first = ok(
+        &admin,
+        &["--master-password-file", &master_path, "init"],
+        "",
+    );
+    assert!(
+        first.contains(&format!("Realm {REALM} created.")),
+        "{first}"
+    );
+    let second = ok(
+        &admin,
+        &["--master-password-file", &master_path, "init"],
+        "",
+    );
+    assert!(
+        second.contains(&format!("Realm {REALM} already exists.")),
+        "{second}"
+    );
+    assert!(!dir.join("stash").exists());
+
+    let wrong = kdb(
+        &admin,
+        &["--master-password-file", &wrong_master_path, "init"],
+        "",
+    );
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("master key"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+
+    let added = ok(
+        &admin,
+        &[
+            "--master-password-file",
+            &master_path,
+            "addprinc",
+            "-randkey",
+            "alice",
+        ],
+        "",
+    );
+    assert!(
+        added.contains("Principal \"alice@CLI.CRDB\" created."),
+        "{added}"
+    );
+    let listed = ok(
+        &admin,
+        &["--master-password-file", &master_path, "listprincs"],
+        "",
+    );
+    assert!(listed.contains("alice@CLI.CRDB"), "{listed}");
+
+    let _ = run_sql(
+        &crdb_config("root", "defaultdb"),
+        &format!("DROP DATABASE \"{db}\" CASCADE"),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn concurrent_init_runs_create_a_shared_principal_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path();
+    let db = format!("krb5t_cli_race_{}", std::process::id());
+    run_sql(
+        &crdb_config("root", "defaultdb"),
+        &format!("CREATE DATABASE \"{db}\""),
+    )
+    .await
+    .expect("create database");
+
+    let root = write_conf(dir, "root.conf", "root", &db);
+    let admin = write_conf(dir, "admin.conf", "kdc_admin", &db);
+    ok(&root, &["database", "migrate", "--create-roles"], "");
+    ok(&admin, &["create", "-s"], "master-password\n");
+    let master = dir.join("master");
+    std::fs::write(&master, "master-password\n").expect("master password");
+    let config_path = admin.to_string_lossy().into_owned();
+    let master_path = master.to_string_lossy().into_owned();
+
+    let mut children = Vec::new();
+    for _ in 0..4 {
+        children.push(
+            Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdb"))
+                .args([
+                    "--config",
+                    &config_path,
+                    "--realm",
+                    REALM,
+                    "--master-password-file",
+                    &master_path,
+                    "init",
+                    "--randkey",
+                    "HTTP/race.cli.crdb",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn concurrent init"),
+        );
+    }
+    let outputs = children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("wait for init"))
+        .collect::<Vec<_>>();
+    for output in outputs {
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let principal = ok(&admin, &["getprinc", "HTTP/race.cli.crdb"], "");
+    assert!(
+        principal.contains("HTTP/race.cli.crdb@CLI.CRDB"),
+        "{principal}"
+    );
+
+    let _ = run_sql(
+        &crdb_config("root", "defaultdb"),
+        &format!("DROP DATABASE \"{db}\" CASCADE"),
+    )
+    .await;
+}

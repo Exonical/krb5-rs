@@ -1,0 +1,23 @@
+{{- if eq .Values.database.mode "cockroach" -}}
+{{- $_ := required "secrets.existingSecret is required in CockroachDB mode" .Values.secrets.existingSecret -}}
+{{- $_ := required "cockroach.url is required in CockroachDB mode" .Values.cockroach.url -}}
+{{- $_ := required "cockroach.tlsSecret is required in CockroachDB mode" .Values.cockroach.tlsSecret -}}
+{{- $_ := required "cockroach.region is required in CockroachDB mode" .Values.cockroach.region -}}
+{{- if or .Values.cockroach.bootstrap.enabled .Values.cockroach.prune.enabled -}}
+{{- $_ := required "cockroach.admin.url is required for bootstrap or prune" .Values.cockroach.admin.url -}}
+{{- $_ := required "cockroach.admin.tlsSecret is required for bootstrap or prune" .Values.cockroach.admin.tlsSecret -}}
+{{- end -}}
+{{- if .Values.cockroach.bootstrap.enabled -}}
+{{- $_ := required "cockroach.bootstrap.migrateUrl is required when bootstrap is enabled" .Values.cockroach.bootstrap.migrateUrl -}}
+{{- $_ := required "cockroach.bootstrap.migrateTlsSecret is required when bootstrap is enabled" .Values.cockroach.bootstrap.migrateTlsSecret -}}
+{{- end -}}
+{{- if .Values.cockroach.bootstrap.multiRegion.enabled -}}
+{{- $_ := required "cockroach.bootstrap.multiRegion.primaryRegion is required" .Values.cockroach.bootstrap.multiRegion.primaryRegion -}}
+{{- if not .Values.cockroach.bootstrap.multiRegion.regions -}}
+{{- fail "cockroach.bootstrap.multiRegion.regions must be non-empty" -}}
+{{- end -}}
+{{- if not (has .Values.cockroach.bootstrap.multiRegion.primaryRegion .Values.cockroach.bootstrap.multiRegion.regions) -}}
+{{- fail "cockroach.bootstrap.multiRegion.regions must contain primaryRegion" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

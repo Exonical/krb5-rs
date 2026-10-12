@@ -1,0 +1,34 @@
+realm: EXAMPLE.COM
+
+database:
+  mode: cockroach
+
+secrets:
+  existingSecret: krb5-master
+
+cockroach:
+  url: postgresql://kdc_replica@cockroach.example.com:26257/krb5?sslmode=verify-full
+  tlsSecret: krb5-kdc-replica-tls
+  region: california
+  admin:
+    url: postgresql://kdc_admin@cockroach.example.com:26257/krb5?sslmode=verify-full
+    tlsSecret: krb5-kdc-admin-tls
+  bootstrap:
+    enabled: false
+    migrateUrl: postgresql://root@cockroach.example.com:26257/krb5?sslmode=verify-full
+    migrateTlsSecret: krb5-crdb-root-tls
+  prune:
+    enabled: false
+
+kdcs:
+  replicaCount: 2
+
+networkPolicy:
+  enabled: true
+
+metrics:
+  networkPolicy:
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring

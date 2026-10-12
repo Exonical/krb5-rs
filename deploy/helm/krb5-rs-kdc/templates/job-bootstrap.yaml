@@ -1,0 +1,109 @@
+{{- if and (eq .Values.database.mode "cockroach") .Values.cockroach.bootstrap.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-bootstrap
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.cockroach.bootstrap.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.cockroach.bootstrap.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "krb5-rs-kdc.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        - name: migrate
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kdb"]
+          args:
+            - --config
+            - /etc/krb5-rs/migrate-kdc.conf
+            - --krb5-config
+            - /etc/krb5-rs/krb5.conf
+            - --realm
+            - {{ .Values.realm | quote }}
+            - database
+            - migrate
+            - --create-roles
+            {{- if .Values.cockroach.bootstrap.multiRegion.enabled }}
+            - --multi-region
+            - --primary-region
+            - {{ .Values.cockroach.bootstrap.multiRegion.primaryRegion | quote }}
+            - --regions
+            - {{ join "," .Values.cockroach.bootstrap.multiRegion.regions | quote }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: cockroach-migrate
+              mountPath: /crdb-migrate
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: init
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kdb"]
+          args:
+            - --config
+            - /etc/krb5-rs/admin-kdc.conf
+            - --krb5-config
+            - /etc/krb5-rs/krb5.conf
+            - --realm
+            - {{ .Values.realm | quote }}
+            - --master-password-file
+            - /secrets/master-password
+            - init
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+            - name: cockroach-admin
+              mountPath: /crdb-admin
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "krb5-rs-kdc.fullname" . }}-bootstrap
+        - name: secrets
+          secret:
+            secretName: {{ include "krb5-rs-kdc.secretName" . }}
+            defaultMode: 0440
+        - name: cockroach-migrate
+          secret:
+            secretName: {{ .Values.cockroach.bootstrap.migrateTlsSecret }}
+            defaultMode: 0440
+        - name: cockroach-admin
+          secret:
+            secretName: {{ .Values.cockroach.admin.tlsSecret }}
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}
+{{- end }}
