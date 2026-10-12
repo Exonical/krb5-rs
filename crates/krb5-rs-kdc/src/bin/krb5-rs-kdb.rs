@@ -454,11 +454,22 @@ fn ensure_init_principals<S: AdminStore>(
         match admin.add_principal(&name, &realm, password.as_deref(), &opts) {
             Ok(()) => println!("Principal \"{name}@{realm}\" created."),
             Err(error) if error.kind() == StoreErrorKind::Conflict => {
-                if matches!(admin.principal_exists(&name, &realm), Ok(true)) {
-                    println!("Principal \"{name}@{realm}\" already exists.");
-                } else {
-                    fail(error);
+                // A concurrent init created it. Under contention the re-read can
+                // briefly fail, so retry before reporting what it returned.
+                let mut last = admin.principal_exists(&name, &realm);
+                for attempt in 1..20u64 {
+                    if matches!(last, Ok(true)) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis((100 * attempt).min(500)));
+                    last = admin.principal_exists(&name, &realm);
                 }
+                if !matches!(last, Ok(true)) {
+                    fail(format!(
+                        "{error}; re-check after the conflict returned {last:?}"
+                    ));
+                }
+                println!("Principal \"{name}@{realm}\" already exists.");
             }
             Err(error) => fail(error),
         }
