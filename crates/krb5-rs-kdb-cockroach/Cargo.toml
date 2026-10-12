@@ -22,4 +22,5 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 krb5-rs-kdb-turso = { path = "../krb5-rs-kdb-turso" }
+tempfile = "3.27"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time"] }

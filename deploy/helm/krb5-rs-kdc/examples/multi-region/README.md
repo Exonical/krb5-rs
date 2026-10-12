@@ -89,5 +89,11 @@ cluster-local and do not resolve from clients or the other clusters.
 - Tickets already issued remain valid until they expire (see
   [kdb.md §7.4](../../../../../docs/architecture/kdb.md#74-tickets-already-issued)).
 
-These values files are render-validated examples. They have not been run on
-real multi-region infrastructure.
+These values files are exercised locally and in CI with three region-tagged
+nodes in one CockroachDB cluster. That validates the regional schema and KDC
+failover flow, but does not model geographic latency or use separate
+CockroachDB clusters in real regions.
+
+The partition test sets `cockroach.poolIdleTimeout=1s` so idle SQL connections
+are retired and Ohio must reconnect after its egress NetworkPolicy is applied.
+The default `0s` disables pool idle eviction.

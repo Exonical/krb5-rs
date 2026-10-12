@@ -24,14 +24,7 @@ CERT_DIR="$(mktemp -d)"
 CERTS_VOLUME="${REL}-certs"
 CERTS_CONTAINER=""
 MANIFEST="$HERE/cockroach-e2e.yaml"
-
-host_path() {
-  if command -v cygpath >/dev/null 2>&1; then
-    cygpath -m "$1"
-  else
-    realpath "$1"
-  fi
-}
+MULTI_REGION_CERTS=0
 
 export MSYS_NO_PATHCONV=1
 
@@ -43,56 +36,7 @@ else
   HELM_IN_CONTAINER=1
 fi
 
-run_helm() {
-  if [ "$HELM_IN_CONTAINER" -eq 1 ]; then
-    "$CLI" run --rm --network host \
-      -v "$(host_path "$KUBECONFIG"):/root/.kube/config:ro" \
-      -v "$(host_path "$ROOT"):/workspace:ro" \
-      --workdir /workspace \
-      "$HELM_IMAGE" "$@"
-  else
-    $HELM "$@"
-  fi
-}
-
-cleanup_cert_artifacts() {
-  if [ -n "$CERTS_CONTAINER" ]; then
-    "$CLI" rm -f "$CERTS_CONTAINER" >/dev/null 2>&1 || true
-    CERTS_CONTAINER=""
-  fi
-  "$CLI" volume rm "$CERTS_VOLUME" >/dev/null 2>&1 || true
-  rm -rf "$CERT_DIR"
-}
-
-generate_certificates() {
-  "$CLI" pull "$CRDB_PINNED_IMAGE"
-  "$CLI" volume create "$CERTS_VOLUME" >/dev/null
-  "$CLI" run --rm -e "NS=$NS" -v "$CERTS_VOLUME:/certs" \
-    --entrypoint /bin/sh "$CRDB_PINNED_IMAGE" -c '
-      set -e
-      umask 077
-      /cockroach/cockroach cert create-ca --certs-dir=/certs --ca-key=/certs/ca.key
-      /cockroach/cockroach cert create-node \
-        crdb-0.crdb crdb crdb-public \
-        crdb-0.crdb.${NS}.svc.cluster.local \
-        crdb.${NS}.svc.cluster.local \
-        crdb-public.${NS}.svc.cluster.local \
-        localhost 127.0.0.1 \
-        --certs-dir=/certs --ca-key=/certs/ca.key
-      for user in root kdc_admin kdc_replica; do
-        /cockroach/cockroach cert create-client "$user" \
-          --certs-dir=/certs --ca-key=/certs/ca.key
-      done
-      chmod 0644 /certs/*.crt
-      chmod 0600 /certs/*.key
-    '
-  CERTS_CONTAINER=$("$CLI" create -v "$CERTS_VOLUME:/certs:ro" "$CRDB_PINNED_IMAGE")
-  "$CLI" cp "$CERTS_CONTAINER:/certs/." "$(host_path "$CERT_DIR")"
-  "$CLI" rm "$CERTS_CONTAINER" >/dev/null
-  CERTS_CONTAINER=""
-  chmod 0700 "$CERT_DIR"
-  chmod 0600 "$CERT_DIR"/*.key
-}
+source "$HERE/e2e-lib.sh"
 
 step() { printf '\n=== %s\n' "$*"; }
 
@@ -164,14 +108,6 @@ step "create CockroachDB and client TLS Secrets"
   --from-file=node.key="$(host_path "$CERT_DIR/node.key")" \
   --from-file=client.root.crt="$(host_path "$CERT_DIR/client.root.crt")" \
   --from-file=client.root.key="$(host_path "$CERT_DIR/client.root.key")"
-make_client_secret() {
-  secret=$1
-  user=$2
-  "$KUBECTL" create secret generic "$secret" -n "$NS" \
-    --from-file=ca.crt="$(host_path "$CERT_DIR/ca.crt")" \
-    --from-file=tls.crt="$(host_path "$CERT_DIR/client.${user}.crt")" \
-    --from-file=tls.key="$(host_path "$CERT_DIR/client.${user}.key")"
-}
 make_client_secret "$REPLICA_TLS_SECRET" kdc_replica
 make_client_secret "$ADMIN_TLS_SECRET" kdc_admin
 make_client_secret "$MIGRATE_TLS_SECRET" root
@@ -180,17 +116,6 @@ head -c 32 /dev/urandom | base64 | tr -d '\n' > "$CERT_DIR/master-password"
   --from-file=master-password="$(host_path "$CERT_DIR/master-password")"
 
 if [ -n "${K3S_PODMAN_CONTAINER:-}" ]; then
-  import_image() {
-    local image=$1
-    local archive="$CERT_DIR/image.tar"
-    local archive_host
-    archive_host="$(host_path "$archive")"
-    "$CLI" save -o "$archive_host" "$image"
-    "$CLI" cp "$archive_host" "$K3S_PODMAN_CONTAINER:/tmp/krb5-e2e-image.tar"
-    "$CLI" exec "$K3S_PODMAN_CONTAINER" ctr images import /tmp/krb5-e2e-image.tar
-    "$CLI" exec "$K3S_PODMAN_CONTAINER" rm -f /tmp/krb5-e2e-image.tar
-    rm -f "$archive"
-  }
   import_image "$KDC_IMAGE"
   import_image "$MIT_IMAGE"
   import_image "$CRDB_PINNED_IMAGE"
@@ -242,45 +167,6 @@ done
 for ordinal in 0 1; do
   "$KUBECTL" wait --for=condition=Ready "pod/${FULL}-kdc-${ordinal}" -n "$NS" --timeout=900s
 done
-
-mit() {
-  "$KUBECTL" exec -n "$NS" mit-client -- bash -c "$1"
-}
-
-write_krb5_conf() {
-  kdc=$1
-  mit "cat > /tmp/krb5.conf <<'EOF'
-[libdefaults]
- default_realm = ${REALM}
- dns_lookup_kdc = false
- dns_lookup_realm = false
-[realms]
- ${REALM} = {
-  kdc = ${kdc}
- }
-EOF"
-}
-
-kinit_alice() {
-  printf 'alice-password\n' | "$KUBECTL" exec -i -n "$NS" mit-client -- \
-    bash -c 'KRB5_CONFIG=/tmp/krb5.conf KRB5CCNAME=FILE:/tmp/cc_$RANDOM timeout 20 kinit alice@E2E.TEST'
-}
-
-admin_run() {
-  local pod="${FULL}-kdb"
-  local overrides
-  overrides=$(cat <<EOF
-{"apiVersion":"v1","spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"${pod}","image":"${KDC_IMAGE}","imagePullPolicy":"Never","securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":[{"name":"config","mountPath":"/etc/krb5-rs","readOnly":true},{"name":"secrets","mountPath":"/secrets","readOnly":true},{"name":"cockroach-admin","mountPath":"/crdb-admin","readOnly":true},{"name":"tmp","mountPath":"/tmp"}]}],"volumes":[{"name":"config","configMap":{"name":"${FULL}"}},{"name":"secrets","secret":{"secretName":"${MASTER_SECRET}","defaultMode":288}},{"name":"cockroach-admin","secret":{"secretName":"${ADMIN_TLS_SECRET}","defaultMode":288}},{"name":"tmp","emptyDir":{}}]}}
-EOF
-  )
-  "$KUBECTL" run "$pod" -n "$NS" --rm -i --attach --restart=Never \
-    --image="$KDC_IMAGE" --image-pull-policy=Never --overrides="$overrides" \
-    --override-type=strategic \
-    --command -- krb5-rs-kdb \
-    --config /etc/krb5-rs/admin-kdc.conf \
-    --krb5-config /etc/krb5-rs/krb5.conf \
-    --realm "$REALM" --master-password-file /secrets/master-password "$@"
-}
 
 step "bootstrap, administer, and authenticate"
 printf 'alice-password\n' | admin_run addprinc alice

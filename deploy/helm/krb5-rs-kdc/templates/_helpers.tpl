@@ -80,6 +80,7 @@ Set "kdc" to include the KDC replication and local-replica options.
   cockroach_cert = {{ .certDir }}/tls.crt
   cockroach_key = {{ .certDir }}/tls.key
   cockroach_pool_size = {{ $v.cockroach.poolSize }}
+  cockroach_pool_idle_timeout = {{ $v.cockroach.poolIdleTimeout }}
   cockroach_connect_timeout = {{ $v.cockroach.connectTimeout }}
   cockroach_statement_timeout = {{ $v.cockroach.statementTimeout }}
   cockroach_transaction_timeout = {{ $v.cockroach.transactionTimeout }}

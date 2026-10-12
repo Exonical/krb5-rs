@@ -80,6 +80,141 @@ Test with an MIT client (`/etc/krb5.conf` with `default_realm = MY.REALM` and
 kinit alice@MY.REALM && klist
 ```
 
+## External CockroachDB
+
+`krb5-rs-kdc-cockroach.yaml` runs the CockroachDB-enabled image and gives this
+KDC its own persistent Turso replica. It does not run CockroachDB. Before
+playing the Pod, create the database and schema with a CockroachDB SQL
+administrator, then initialize the realm with `kdc_admin`. Use a database
+name and realm consistently in the client profiles and URLs:
+
+```sh
+IMAGE=ghcr.io/exonical/krb5-rs-kdc:<version>-cockroach
+NETWORK=krb5rs-crdb
+DB=krb5
+REALM=MY.REALM
+CERTS="$PWD/tests/crdb/certs"
+umask 077
+openssl rand -hex 24 > master-password
+```
+
+The profile passed to the one-off `database migrate` command should use
+`kdc_replica`'s CockroachDB module and the `root` client certificate for the
+migrator:
+
+```ini
+[realms]
+    MY.REALM = {
+        database_module = crdb
+        key_stash_file = /tmp/stash
+        supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal
+    }
+[dbmodules]
+    crdb = {
+        db_library = krb5-rs-cockroach
+        cockroach_url = postgresql://root@crdb1:26257/krb5?sslmode=verify-full
+        cockroach_ca = /crdb/ca.crt
+        cockroach_cert = /crdb/client.root.crt
+        cockroach_key = /crdb/client.root.key
+        cockroach_pool_size = 8
+        cockroach_pool_idle_timeout = 0s
+        cockroach_connect_timeout = 5s
+        cockroach_statement_timeout = 10s
+        cockroach_transaction_timeout = 30s
+    }
+```
+
+Run migration with the CockroachDB-enabled image. For a multi-region database,
+append `--multi-region --primary-region california --regions
+california,ohio,washington-dc`:
+
+```sh
+podman run --rm --network "$NETWORK" --user 0 \
+  -v "$PWD/migrator.conf:/config/kdc.conf:ro" \
+  -v "$PWD/krb5.conf:/config/krb5.conf:ro" \
+  -v "$CERTS:/crdb:ro" \
+  --entrypoint /usr/local/bin/krb5-rs-kdb "$IMAGE" \
+  --config /config/kdc.conf --krb5-config /config/krb5.conf \
+  --realm "$REALM" database migrate --create-roles
+```
+
+Use the same profile shape for `init` and day-to-day administration, but set
+the URL and certificate paths to `kdc_admin`:
+
+```ini
+cockroach_url = postgresql://kdc_admin@crdb1:26257/krb5?sslmode=verify-full
+cockroach_cert = /crdb/client.kdc_admin.crt
+cockroach_key = /crdb/client.kdc_admin.key
+```
+
+Mount the master-password file; do not put its contents in command arguments:
+
+```sh
+podman run --rm --network "$NETWORK" --user 0 \
+  -v "$PWD/admin.conf:/config/kdc.conf:ro" \
+  -v "$PWD/krb5.conf:/config/krb5.conf:ro" \
+  -v "$CERTS:/crdb:ro" \
+  -v "$PWD/master-password:/secrets/master-password:ro" \
+  --entrypoint /usr/local/bin/krb5-rs-kdb "$IMAGE" \
+  --config /config/kdc.conf --krb5-config /config/krb5.conf \
+  --realm "$REALM" --master-password-file /secrets/master-password init
+
+printf 'alice-password\n' | podman run --rm -i --network "$NETWORK" --user 0 \
+  -v "$PWD/admin.conf:/config/kdc.conf:ro" \
+  -v "$PWD/krb5.conf:/config/krb5.conf:ro" \
+  -v "$CERTS:/crdb:ro" \
+  -v "$PWD/master-password:/secrets/master-password:ro" \
+  --entrypoint /usr/local/bin/krb5-rs-kdb "$IMAGE" \
+  --config /config/kdc.conf --krb5-config /config/krb5.conf \
+  --realm "$REALM" --master-password-file /secrets/master-password addprinc alice
+```
+
+`replication status` uses the same admin profile and master-password file:
+
+```sh
+podman run --rm --network "$NETWORK" --user 0 \
+  -v "$PWD/admin.conf:/config/kdc.conf:ro" \
+  -v "$PWD/krb5.conf:/config/krb5.conf:ro" \
+  -v "$CERTS:/crdb:ro" \
+  -v "$PWD/master-password:/secrets/master-password:ro" \
+  --entrypoint /usr/local/bin/krb5-rs-kdb "$IMAGE" \
+  --config /config/kdc.conf --krb5-config /config/krb5.conf \
+  --realm "$REALM" --master-password-file /secrets/master-password replication status
+```
+
+Before use, edit the clearly marked realm, region, CockroachDB URL, image tag
+and `POD_NAME` in `krb5-rs-kdc-cockroach.yaml`. Replace the sample base64 Secret
+data with the master password and `kdc_replica`'s `ca.crt`, client certificate
+and key. Set `POD_NAME` to a unique `<region>-<host>` value, for example
+`california-podman-1`, so each KDC heartbeat has a unique identity. Then run:
+
+```sh
+podman kube play --network krb5rs-crdb krb5-rs-kdc-cockroach.yaml
+```
+
+`krb5-rs-kdc-cockroach.kube` is the matching Quadlet unit. Install it beside
+the edited YAML under `~/.config/containers/systemd/` (or
+`/etc/containers/systemd/` for a system service); ensure its `Network=` names
+the Podman network that can resolve the CockroachDB host.
+
+The Pod exposes `/healthz` for liveness and `/readyz` for readiness. Readiness
+waits for the local replica to bootstrap and remain within `max_staleness`;
+when CockroachDB is unavailable or the replica becomes stale, the KDC fails
+closed with `KDC_ERR_SVC_UNAVAILABLE`. Each KDC Pod must have its **own**
+`/var/lib/krb5-rs` volume; never share a Turso replica volume between Pods.
+`test-cockroach.sh` runs the local end-to-end flow against the scratch
+`krb5_podman_e2e` database on the existing `krb5rs-crdb` network. The daemon
+listens for metrics and health checks on container port 9100; the sample maps
+it to host port 19100.
+
+`PODMAN_TEST_FAIL_AFTER_READY=1 bash deploy/podman/test-cockroach.sh` is an
+intentional cleanup smoke test: it exits nonzero after `/readyz` succeeds and
+still removes the test Pod, Secrets, volumes and scratch database.
+
+The sample publishes host port 88. Rootless Podman cannot bind ports below
+1024 by default; either raise `net.ipv4.ip_unprivileged_port_start` as shown
+above or publish a higher port and set that port in the clients' `krb5.conf`.
+
 ## Stop and remove
 
 ```sh
