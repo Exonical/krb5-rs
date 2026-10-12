@@ -147,28 +147,13 @@ pub fn parse_lifetime(s: &str) -> Result<Option<Duration>, StoreError> {
         .map(Duration::from_secs))
 }
 
-/// Parse `name[@REALM]`; the realm defaults to `default_realm`.
+/// Parse `name[@REALM]` with MIT escaping/type inference
+/// (`lib/krb5/krb/parse.c:40-172`); the realm defaults to `default_realm`.
 pub fn parse_principal(
     s: &str,
     default_realm: &str,
 ) -> Result<(PrincipalName, String), StoreError> {
-    let (name, realm) = match s.split_once('@') {
-        Some((n, r)) => (n, r.to_string()),
-        None => (s, default_realm.to_string()),
-    };
-    let parsed: PrincipalName = name.parse().map_err(|e| err(format!("{e}")))?;
-    let name_type = if name.starts_with("krbtgt/") {
-        2
-    } else {
-        parsed.name_type
-    };
-    Ok((
-        PrincipalName {
-            name_type,
-            ..parsed
-        },
-        realm,
-    ))
+    crate::kdc::kdb::mit::parse_name_with_default(s, default_realm)
 }
 
 /// Options for [`Admin::add_principal`] and [`Admin::modify_principal`].
@@ -404,14 +389,18 @@ impl<S: AdminStore> AdminOps<S> {
         password: Option<&str>,
         keep_old: bool,
     ) -> Result<u32, StoreError> {
-        let mut new_kvno = 0u32;
-        let keysalts = &self.keysalts;
+        let keysalts = self.keysalts.clone();
         let etypes = self.etypes();
+        let callback_name = name.clone();
+        let callback_realm = realm.to_owned();
+        let password = password.map(str::to_owned);
         self.store
-            .update_principal(name, realm, |rec| {
+            .update_principal(name, realm, move |rec| {
                 let kvno = rec.entry.current_kvno().unwrap_or(0) + 1;
-                let mut keys = match password {
-                    Some(pw) => keys_from_password(name, realm, pw, kvno, keysalts),
+                let mut keys = match password.as_deref() {
+                    Some(pw) => {
+                        keys_from_password(&callback_name, &callback_realm, pw, kvno, &keysalts)
+                    }
                     None => random_keys(kvno, &etypes),
                 }
                 .map_err(|e| err(e.to_string()))?;
@@ -430,11 +419,10 @@ impl<S: AdminStore> AdminOps<S> {
                 let now = kerberos_time(Utc::now().timestamp());
                 rec.entry.last_admin_unlock = Some(now);
                 rec.last_pwd_change = Some(now);
-                new_kvno = kvno;
                 Ok(())
             })
-            .await?;
-        Ok(new_kvno)
+            .await
+            .map(|updated| updated.entry.current_kvno().unwrap_or(0))
     }
 
     /// `modprinc`.
@@ -445,9 +433,10 @@ impl<S: AdminStore> AdminOps<S> {
         opts: &PrincipalOptions,
     ) -> Result<(), StoreError> {
         self.check_policy(opts).await?;
+        let opts = opts.clone();
         self.store
-            .update_principal(name, realm, |rec| {
-                Self::apply_options(&mut rec.entry, opts);
+            .update_principal(name, realm, move |rec| {
+                Self::apply_options(&mut rec.entry, &opts);
                 Ok(())
             })
             .await?;
@@ -471,8 +460,9 @@ impl<S: AdminStore> AdminOps<S> {
     /// `modify_policy` (`kadm5_modify_policy`, svr_policy.c:254-380): the
     /// changed policy gets a higher `security_epoch`.
     pub async fn modify_policy(&self, name: &str, change: &PolicyChange) -> Result<(), StoreError> {
+        let change = change.clone();
         self.store
-            .update_policy(name, |policy| {
+            .update_policy(name, move |policy| {
                 change.apply(policy);
                 validate_policy(policy)?;
                 policy.security_epoch += 1;

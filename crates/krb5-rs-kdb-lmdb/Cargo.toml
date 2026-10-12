@@ -1,0 +1,17 @@
+[package]
+name = "krb5-rs-kdb-lmdb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+heed = { version = "=0.22.1", default-features = false }
+fs2 = "0.4.3"
+krb5-rs = { path = "../..", features = ["kdc", "tokio"] }
+tokio = { version = "1.53.2", features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }

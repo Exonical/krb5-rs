@@ -288,6 +288,9 @@ pub struct PrincipalRecord {
     pub last_pwd_change: Option<KerberosTime>,
     /// Last modification (set by the store on every write).
     pub mod_time: Option<KerberosTime>,
+    /// MIT unparsed modifier principal bytes from `KRB5_TL_MOD_PRINC`, when
+    /// the backend represents it.
+    pub mod_by: Option<Vec<u8>>,
 }
 
 /// Administrative access to the authoritative store (docs/architecture §3).
@@ -295,7 +298,9 @@ pub struct PrincipalRecord {
 /// Every mutation is atomic. The `update_*` operations are a transactional
 /// read-modify-write: the closure sees the current state and edits it, and the
 /// store commits the result, re-running the closure if the transaction has to
-/// be retried (so it must be repeatable). The store sets `mod_time` itself.
+/// be retried (so it must be repeatable). The closure is `Send + 'static` so
+/// LMDB can execute the write transaction in `spawn_blocking`. The store sets
+/// `mod_time` itself.
 pub trait AdminStore: Send + Sync {
     /// The principal's record, if it exists.
     fn get_record(
@@ -320,7 +325,7 @@ pub trait AdminStore: Send + Sync {
         f: F,
     ) -> impl Future<Output = Result<PrincipalRecord, StoreError>> + Send
     where
-        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send;
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send + 'static;
 
     /// Delete a principal; returns whether it existed.
     fn delete_principal(
@@ -350,7 +355,7 @@ pub trait AdminStore: Send + Sync {
         f: F,
     ) -> impl Future<Output = Result<Policy, StoreError>> + Send
     where
-        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send;
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send + 'static;
 
     /// Delete a policy; returns whether it existed.
     fn delete_policy(&self, name: &str) -> impl Future<Output = Result<bool, StoreError>> + Send;
@@ -453,7 +458,7 @@ impl<T: AdminStore + ?Sized> AdminStore for Arc<T> {
         f: F,
     ) -> impl Future<Output = Result<PrincipalRecord, StoreError>> + Send
     where
-        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send,
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send + 'static,
     {
         (**self).update_principal(name, realm, f)
     }
@@ -489,7 +494,7 @@ impl<T: AdminStore + ?Sized> AdminStore for Arc<T> {
         f: F,
     ) -> impl Future<Output = Result<Policy, StoreError>> + Send
     where
-        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send,
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send + 'static,
     {
         (**self).update_policy(name, f)
     }
@@ -527,7 +532,7 @@ impl<T: AdminStore + ?Sized> AdminStore for &T {
         f: F,
     ) -> impl Future<Output = Result<PrincipalRecord, StoreError>> + Send
     where
-        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send,
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send + 'static,
     {
         (**self).update_principal(name, realm, f)
     }
@@ -563,7 +568,7 @@ impl<T: AdminStore + ?Sized> AdminStore for &T {
         f: F,
     ) -> impl Future<Output = Result<Policy, StoreError>> + Send
     where
-        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send,
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send + 'static,
     {
         (**self).update_policy(name, f)
     }
