@@ -8,6 +8,18 @@ use krb5_rs::keytab::{FileKeytab, Keytab};
 
 const REALM: &str = "KDB.TEST";
 
+#[test]
+fn help_does_not_require_a_database_configuration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdb"))
+        .arg("--help")
+        .output()
+        .expect("run help");
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stderr);
+    assert!(help.contains("commands:"));
+    assert!(help.contains("klmdb") || help.contains("database"));
+}
+
 struct Env {
     dir: PathBuf,
     conf: PathBuf,

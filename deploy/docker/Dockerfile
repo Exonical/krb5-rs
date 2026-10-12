@@ -19,11 +19,12 @@ FROM docker.io/library/rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69
 ARG TARGET=x86_64-unknown-linux-musl
 ARG FEATURES
 RUN rustup target add "$TARGET"
-RUN if [ -n "$FEATURES" ]; then \
-      apt-get update \
-      && apt-get install -y --no-install-recommends cmake musl-tools \
-      && rm -rf /var/lib/apt/lists/*; \
-    fi
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends musl-tools \
+ && if [ -n "$FEATURES" ]; then \
+      apt-get install -y --no-install-recommends cmake; \
+    fi \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock README.md LICENSE ./
@@ -31,11 +32,11 @@ COPY src ./src
 COPY examples ./examples
 COPY crates ./crates
 
-# The default build is pure Rust. FEATURES=cockroach enables the CockroachDB
-# module (rustls with aws-lc-rs) and the Turso module (turso_core's simsimd).
-# Both contain C, so cmake and musl-tools are needed at build time only.
+# The default build includes the klmdb module (LMDB C library).
+# FEATURES=cockroach additionally enables rustls/aws-lc-rs and Turso's
+# simsimd; all variants are built statically for musl.
 ENV RUSTFLAGS="-C target-feature=+crt-static -C strip=symbols"
-RUN if [ -n "$FEATURES" ]; then export CC_x86_64_unknown_linux_musl=musl-gcc; fi \
+RUN export CC_x86_64_unknown_linux_musl=musl-gcc \
  && cargo build --locked --release -p krb5-rs-kdc --target "$TARGET" ${FEATURES:+--features "$FEATURES"} \
  && mkdir -p /out/data \
  && cp "target/$TARGET/release/krb5-rs-kdc" "target/$TARGET/release/krb5-rs-kdb" /out/

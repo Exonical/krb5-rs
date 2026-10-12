@@ -62,6 +62,7 @@ pub use db::{
     keys_from_password, random_keys, salt_bytes, KeyEntry, MemoryStore, PrincipalAttributes,
     PrincipalEntry,
 };
+pub use policy::kerberos_time;
 pub use store::{
     AdminStore, AlwaysAllow, AuthState, AuthStateStore, AuthStateUpdate, AuthoritativeState,
     ConsistencyGate, GateDecision, HealthCheck, LockoutReport, LockoutReporter, MemoryAuthState,
@@ -305,11 +306,13 @@ impl<S: PrincipalStore> Kdc<S> {
             Transport::Udp => self.handle_udp(request).await,
             Transport::Tcp => self.handle(request).await,
         };
-        let mut summary = RequestSummary::new(request, &reply, transport);
+        let summary = RequestSummary::new(request, &reply, transport);
         #[cfg(feature = "tokio")]
-        {
+        let summary = {
+            let mut summary = summary;
             summary.store_time = Duration::from_nanos(timer.load(Ordering::Relaxed));
-        }
+            summary
+        };
         (reply, summary)
     }
 

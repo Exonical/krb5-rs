@@ -2,7 +2,9 @@
 
 Pure Rust Kerberos V5 implementation. GSSAPI, SPNEGO, PKINIT.
 
-**No C FFI. No system krb5. No libgssapi. Just `cargo add krb5-rs`.**
+**The core library has no C FFI, system krb5 or libgssapi.** The deployable
+daemon and admin tool include LMDB (C); the CockroachDB-enabled image also
+builds aws-lc and simsimd.
 
 ## Features
 
@@ -17,7 +19,8 @@ Pure Rust Kerberos V5 implementation. GSSAPI, SPNEGO, PKINIT.
 
 MIT Kerberos and Heimdal are massive C codebases (~450K and ~620K SLOC respectively) with decades of CVEs. Every Rust project needing Kerberos auth depends on FFI bindings to these C libraries, inheriting their build complexity and security risks.
 
-`krb5-rs` is a ground-up Rust implementation using `rasn` (ASN.1) + RustCrypto. Pure Rust, single binary, cross-compiles to musl.
+`krb5-rs` is a ground-up Rust implementation using `rasn` (ASN.1) + RustCrypto.
+The core library is pure Rust and cross-compiles to musl.
 
 ## Status
 
@@ -62,7 +65,57 @@ krb5-rs-kdc --config kdc.conf
 
 The KDC reads its data through async store traits in `krb5_rs::kdc::store` (`PrincipalStore`, `PolicyStore`, `AuthStateStore`, `AdminStore`, `AuthoritativeState`, `LockoutReporter`, `HealthCheck`, `ConsistencyGate`; design in `docs/architecture/kdb.md`). `Kdc::handle*` are therefore `async`. `Kdc::new(config, store)` keeps its old behaviour; `Kdc::builder(config, store)` injects policies, authentication state, a consistency gate and a lockout reporter.
 
-`krb5-rs-kdb` has MIT kadmin policy commands (`addpol`, `modpol`, `delpol`, `getpol [-terse]`, `listpols`; `-maxfailure`, `-failurecountinterval`, `-lockoutduration`, ...) and `addprinc`/`modprinc` `-policy NAME`, `-clearpolicy`, `-unlock`. A principal under a policy with `pw_max_fail` set is locked out after that many failed pre-authentications, following MIT's db2 lockout (`KDC_ERR_CLIENT_REVOKED`, status `LOCKED_OUT`). Failure counters are per KDC process and in memory for the File and Memory backends (not persisted); policies and administrative unlocks are persisted. `disable_lockout` / `disable_last_success` in `[dbmodules]` work as in MIT. Not in MIT: the KDC re-checks a local client at TGS time (disabled, expired, locked out), controllable with `KdcConfig::tgs_recheck_client`.
+`krb5-rs-kdb` has MIT kadmin policy commands (`addpol`, `modpol`, `delpol`, `getpol [-terse]`, `listpols`; `-maxfailure`, `-failurecountinterval`, `-lockoutduration`, ...) and `addprinc`/`modprinc` `-policy NAME`, `-clearpolicy`, `-unlock`. A principal under a policy with `pw_max_fail` set is locked out after that many failed pre-authentications, following MIT's db2 lockout (`KDC_ERR_CLIENT_REVOKED`, status `LOCKED_OUT`). File and Memory lockout counters are in-memory; klmdb keeps them in its separate lockout environment. Policies and administrative unlocks are persisted. `disable_lockout` / `disable_last_success` in `[dbmodules]` work as in MIT. Not in MIT: the KDC re-checks a local client at TGS time (disabled, expired, locked out), controllable with `KdcConfig::tgs_recheck_client`.
+
+### MIT-compatible klmdb module
+
+The deployable `krb5-rs-kdc`/`krb5-rs-kdb` binaries compile the pure-Rust
+KDB codecs and the `krb5-rs-kdb-lmdb` backend by default. The backend is opt-in:
+an unset `db_library` continues to use the existing krb5-rs file store, while
+`db_library = klmdb` uses the same LMDB files as MIT krb5 1.17+:
+
+```ini
+[realms]
+    EXAMPLE.COM = {
+        database_name = /var/lib/krb5kdc/principal
+        database_module = lmdb
+        default_principal_expiration = never
+    }
+[dbmodules]
+    lmdb = {
+        db_library = klmdb
+        # database_name may also be set here, overriding the realm value.
+        mapsize = 128
+        max_readers = 0
+        nosync = false
+        disable_lockout = false
+        disable_last_success = false
+    }
+```
+
+The principal/policy environment is `<database_name>.mdb`; lockout records
+live separately in `<database_name>.lockout.mdb` and are always unsynced. A
+krb5-rs file database is automatically converted when klmdb is selected and
+the `.mdb` file is absent; the original is retained as
+`<database_name>.krb5rs-file.bak`.
+The optional realm `default_principal_expiration` value is applied to the
+initial `K/M` and `krbtgt` records; it defaults to `never`.
+Bootstrap records use MIT's `db_creation@REALM` modifier; later mutations
+through `krb5-rs-kdb` use `krb5-rs-kdb@REALM` because the admin-store API does
+not carry an authenticated modifier identity.
+
+MIT's klmdb files use `MDB_DATA_VERSION` 1, the same as bundled LMDB 0.9.x.
+The bundled LMDB lock-file version is 2, versus version 1 in some distro
+0.9.x builds. Do not run an MIT and a krb5-rs process on the same environment
+at the same time; sequential use is supported. MIT extensions in tl-data, string attributes,
+password history, and unmodeled attribute bits are preserved on updates.
+`security_epoch` and key `s2kparams` are krb5-rs-only and are not persisted by
+MIT klmdb; reads return epoch zero and no s2kparams.
+KRB5RS-PROP-1 `kprop_*` settings are rejected with klmdb in this change;
+MIT-compatible kprop is a later step.
+Master-key rotation through `kdb5_util add_mkey` / `use_mkey` is not
+supported; opening a database whose `K/M` has multiple key-data entries fails
+with an explicit error.
 
 ### Turso replica module (optional)
 

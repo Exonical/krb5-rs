@@ -66,7 +66,8 @@ pub(crate) fn ts(t: &KerberosTime) -> i64 {
 }
 
 /// Kerberos time from epoch seconds (epoch on out-of-range input).
-pub(crate) fn kerberos_time(ts: i64) -> KerberosTime {
+/// Convert unix seconds to the KDC's Kerberos time representation.
+pub fn kerberos_time(ts: i64) -> KerberosTime {
     DateTime::<Utc>::from_timestamp(ts, 0)
         .unwrap_or_default()
         .fixed_offset()

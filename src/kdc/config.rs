@@ -8,6 +8,7 @@ use std::time::Duration;
 use super::KdcConfig;
 use crate::crypto::{enctype_from_name, parse_enctype_list, parse_keysalt_list, SaltType};
 use crate::profile::{Profile, ProfileError};
+use crate::types::KerberosTime;
 
 /// MIT `KRB5_DEFAULT_SUPPORTED_ENCTYPES` (osconf.hin:109-111).
 const DEFAULT_SUPPORTED_ENCTYPES: &str =
@@ -49,6 +50,8 @@ const DEFAULT_KPROP_POLL_INTERVAL: i32 = 60;
 /// `kprop_keytab` and `kprop_password_file`. Both together is an error.
 #[derive(Debug, Clone, Default)]
 pub struct PropagationSettings {
+    /// Whether any `kprop_*` option was explicitly configured.
+    pub configured: bool,
     /// `kprop_listen`: where the primary serves replicas (empty = off).
     pub listen: Vec<SocketAddr>,
     /// `kprop_primary` (`host:port`): set on replicas.
@@ -77,6 +80,11 @@ impl PropagationSettings {
     /// Whether this KDC is a replica (`kprop_primary` set).
     pub fn is_replica(&self) -> bool {
         self.primary.is_some()
+    }
+
+    /// Whether KRB5RS-PROP-1 settings are present, including partial settings.
+    pub fn is_configured(&self) -> bool {
+        self.configured
     }
 }
 
@@ -110,6 +118,21 @@ fn propagation_settings(
     let r = |key: &str| kdc_conf.get_string(&["realms", realm, key]);
     let invalid = |m: &str| ConfigError::Invalid(m.to_string());
 
+    let configured = [
+        "kprop_listen",
+        "kprop_primary",
+        "kprop_primary_kdc",
+        "kprop_service",
+        "kprop_client",
+        "kprop_keytab",
+        "kprop_password_file",
+        "kprop_poll_interval",
+    ]
+    .iter()
+    .any(|key| r(key).is_some())
+        || !kdc_conf
+            .get_values(&["realms", realm, "kprop_acl"])
+            .is_empty();
     let listen = match r("kprop_listen") {
         Some(spec) => parse_listen_addresses(&spec, DEFAULT_KPROP_PORT)?,
         None => Vec::new(),
@@ -156,6 +179,7 @@ fn propagation_settings(
         return Err(invalid("kprop_poll_interval must be positive"));
     }
     Ok(PropagationSettings {
+        configured,
         listen,
         primary,
         primary_kdc,
@@ -176,8 +200,8 @@ fn propagation_settings(
 /// Without `db_library` the built-in file database is used.
 #[derive(Debug, Clone, Default)]
 pub struct DbModuleConfig {
-    /// `db_library`: the plug-in serving the data (for example
-    /// `krb5-rs-turso`).
+    /// `db_library`: the plug-in serving the data (for example `klmdb` or
+    /// `krb5-rs-turso`). With no `db_library`, the file store is used.
     pub library: Option<String>,
     /// Every other key of the section, for the plug-in to interpret
     /// (`replica_path`, `turso_pool_size`, ...).
@@ -193,6 +217,10 @@ impl DbModuleConfig {
 
 /// Keys of a `[dbmodules]` section that plug-ins may read.
 const DBMODULE_OPTION_KEYS: &[&str] = &[
+    "database_name",
+    "mapsize",
+    "max_readers",
+    "nosync",
     "replica_path",
     "turso_pool_size",
     "turso_checkpoint_threshold",
@@ -225,8 +253,7 @@ const DBMODULE_OPTION_KEYS: &[&str] = &[
 
 /// Everything the KDC needs to know about one realm.
 ///
-/// `database_name` points at this crate's own database file format
-/// ([`crate::kdc::kdb::FileStore`]), not an MIT db2/LMDB database.
+/// `database_name` is the base path used by the selected database module.
 #[derive(Debug, Clone)]
 pub struct RealmConfig {
     /// KDC behaviour settings.
@@ -239,6 +266,9 @@ pub struct RealmConfig {
     pub master_key_type: i32,
     /// Key/salt combinations generated for new keys (`supported_enctypes`).
     pub supported_keysalts: Vec<(i32, SaltType)>,
+    /// `default_principal_expiration` from the realm section
+    /// (`lib/kadm5/alt_prof.c:580-594`, `include/k5-int.h:199`).
+    pub default_principal_expiration: Option<KerberosTime>,
     /// UDP listen addresses (`kdc_listen` / `kdc_ports`).
     pub udp_listen: Vec<SocketAddr>,
     /// TCP listen addresses (`kdc_tcp_listen` / `kdc_tcp_ports`, defaulting
@@ -343,6 +373,13 @@ impl RealmConfig {
             &["realms", realm, "max_renewable_life"],
             DEFAULT_MAX_RENEWABLE_LIFE,
         )?;
+        let default_principal_expiration = r("default_principal_expiration")
+            .map(|value| {
+                super::kdb::admin::parse_time(&value)
+                    .map_err(|error| ConfigError::Invalid(error.to_string()))
+            })
+            .transpose()?
+            .flatten();
         let clockskew = deltat(
             libdefaults,
             &["libdefaults", "clockskew"],
@@ -434,7 +471,8 @@ impl RealmConfig {
 
         Ok(Self {
             kdc,
-            database_name: r("database_name")
+            database_name: module_value("database_name")
+                .or_else(|| r("database_name"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(format!("{KDC_DIR}/principal"))),
             key_stash_file: r("key_stash_file")
@@ -444,6 +482,7 @@ impl RealmConfig {
                 .and_then(|s| enctype_from_name(&s))
                 .unwrap_or(18),
             supported_keysalts,
+            default_principal_expiration,
             udp_listen: parse_listen_addresses(&udp_str, DEFAULT_PORT)?,
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
             propagation: propagation_settings(kdc_conf, realm)?,
@@ -815,11 +854,19 @@ mod db_module_tests {
         let kdc = Profile::parse(
             "[realms]\n R = {\n  database_module = replica\n }\n[dbmodules]\n replica = {\n  \
              db_library = krb5-rs-turso\n  replica_path = /var/lib/krb5-rs/replica\n  \
-             turso_pool_size = 16\n  unrelated = x\n }\n",
+             database_name = /var/lib/krb5-rs/principal.mdb\n  mapsize = 256\n  \
+             max_readers = 80\n  nosync = true\n  turso_pool_size = 16\n  unrelated = x\n }\n",
         )
         .expect("kdc.conf");
         let c = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
         assert_eq!(c.db_module.library.as_deref(), Some("krb5-rs-turso"));
+        assert_eq!(
+            c.database_name,
+            PathBuf::from("/var/lib/krb5-rs/principal.mdb")
+        );
+        assert_eq!(c.db_module.get("mapsize"), Some("256"));
+        assert_eq!(c.db_module.get("max_readers"), Some("80"));
+        assert_eq!(c.db_module.get("nosync"), Some("true"));
         assert_eq!(
             c.db_module.get("replica_path"),
             Some("/var/lib/krb5-rs/replica")
@@ -833,5 +880,43 @@ mod db_module_tests {
         )
         .expect("config");
         assert!(none.db_module.library.is_none());
+    }
+
+    #[test]
+    fn klmdb_database_name_in_dbmodules_overrides_realm_value() {
+        let kdc = Profile::parse(
+            "[realms]\n R = {\n  database_name = /realm/principal\n  \
+             database_module = lmdb\n  default_principal_expiration = 123\n }\n[dbmodules]\n lmdb = {\n  \
+             db_library = klmdb\n  database_name = /module/principal\n }\n",
+        )
+        .expect("kdc.conf");
+        let config = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
+        assert_eq!(config.db_module.library.as_deref(), Some("klmdb"));
+        assert_eq!(config.database_name, PathBuf::from("/module/principal"));
+        assert_eq!(
+            config
+                .default_principal_expiration
+                .map(|time| time.timestamp()),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn propagation_records_partial_kprop_configuration() {
+        let no_kprop = RealmConfig::from_profiles(
+            &Profile::parse("[realms]\n R = {\n }\n").expect("kdc.conf"),
+            None,
+            "R",
+        )
+        .expect("config");
+        assert!(!no_kprop.propagation.is_configured());
+        let partial = RealmConfig::from_profiles(
+            &Profile::parse("[realms]\n R = {\n  kprop_client = kprop/replica\n }\n")
+                .expect("kdc.conf"),
+            None,
+            "R",
+        )
+        .expect("config");
+        assert!(partial.propagation.is_configured());
     }
 }

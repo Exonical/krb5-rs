@@ -625,6 +625,7 @@ impl CockroachStore {
             entry: sp.into_entry(&self.master)?,
             last_pwd_change: last_pwd_change.map(kt),
             mod_time: mod_time.map(kt),
+            mod_by: None,
         })
     }
 
@@ -918,7 +919,7 @@ impl AdminStore for CockroachStore {
         f: F,
     ) -> Result<PrincipalRecord, StoreError>
     where
-        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send,
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send + 'static,
     {
         let key = encode_principal_key(name)?;
         let f = Arc::new(Mutex::new(f));
@@ -951,6 +952,7 @@ impl AdminStore for CockroachStore {
                         entry: sp.into_entry(master)?,
                         last_pwd_change: last_pwd.map(kt),
                         mod_time: mod_time.map(kt),
+                        mod_by: None,
                     };
                     let unlock_before = rec.entry.last_admin_unlock.map(|t| t.timestamp());
                     {
@@ -1082,7 +1084,7 @@ impl AdminStore for CockroachStore {
 
     async fn update_policy<F>(&self, name: &str, f: F) -> Result<Policy, StoreError>
     where
-        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send,
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send + 'static,
     {
         let f = Arc::new(Mutex::new(f));
         let name = name.to_string();
