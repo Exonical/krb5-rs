@@ -8,7 +8,7 @@ use chrono::{DateTime, Timelike, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use krb5_rs::crypto::{find_etype, key_usage};
 use krb5_rs::kdc::{
-    ConsistencyGate, GateDecision, Kdc, KdcConfig, MemoryStore, PrincipalAttributes,
+    ConsistencyGate, GateDecision, GateSubject, Kdc, KdcConfig, MemoryStore, PrincipalAttributes,
 };
 use krb5_rs::pac::{ticket_pac, verify_ticket_pac, DelegationInfo, PAC_DELEGATION_INFO};
 use krb5_rs::protocol::ap::{decrypt_ticket, encrypt_ticket_part};
@@ -85,7 +85,7 @@ async fn fixture(cfg: Cfg) -> Fix {
 struct AllowGate;
 
 impl ConsistencyGate for AllowGate {
-    async fn check(&self, _principals: &[&PrincipalEntry]) -> GateDecision {
+    async fn check(&self, _subjects: &[GateSubject<'_>]) -> GateDecision {
         GateDecision::Allow
     }
 }
@@ -93,11 +93,11 @@ impl ConsistencyGate for AllowGate {
 struct RecordingGate(Arc<Mutex<Vec<PrincipalName>>>);
 
 impl ConsistencyGate for RecordingGate {
-    async fn check(&self, principals: &[&PrincipalEntry]) -> GateDecision {
+    async fn check(&self, subjects: &[GateSubject<'_>]) -> GateDecision {
         self.0
             .lock()
             .expect("gate record lock")
-            .extend(principals.iter().map(|principal| principal.name.clone()));
+            .extend(subjects.iter().map(|subject| subject.entry.name.clone()));
         GateDecision::Allow
     }
 }

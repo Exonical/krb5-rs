@@ -2634,7 +2634,7 @@ async fn strict_mode_rejects_authoritative_security_changes_the_replica_has_not_
     use krb5_rs::kdc::replication::{
         FreshnessGate, RebuildPolicy, ReplicationConfig, ReplicationEngine, StrictGate,
     };
-    use krb5_rs::kdc::{ConsistencyGate, GateDecision, Kdc, KdcConfig};
+    use krb5_rs::kdc::{ConsistencyGate, GateDecision, GateSubject, Kdc, KdcConfig, PrincipalRole};
     use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
 
     let (db, admin_store) = TestDb::with_realm("strict").await;
@@ -2700,8 +2700,8 @@ async fn strict_mode_rejects_authoritative_security_changes_the_replica_has_not_
         .await
         .expect("disable at authority");
     assert!(
-        matches!(as_login(&strict, &name("hot"), "pw").await, Err(29)),
-        "strict mode checks the authoritative disable immediately"
+        matches!(as_login(&strict, &name("hot"), "pw").await, Err(18)),
+        "strict mode returns MIT's client-revoked code for an authoritative disable"
     );
     // Bounded mode keeps serving within the documented replication window.
     assert!(
@@ -2757,7 +2757,12 @@ async fn strict_mode_rejects_authoritative_security_changes_the_replica_has_not_
         .expect("local hot");
     proxy.set_cut(true);
     assert_eq!(
-        unavailable_gate.check(&[&local_hot]).await,
+        unavailable_gate
+            .check(&[GateSubject {
+                entry: &local_hot,
+                role: PrincipalRole::Client,
+            }])
+            .await,
         GateDecision::Reject {
             reason: "AUTHORITY_UNAVAILABLE".into()
         }
@@ -2809,8 +2814,8 @@ async fn strict_mode_rejects_authoritative_security_changes_the_replica_has_not_
         "the bounded KDC returns MIT KDC_ERR_CLIENT_REVOKED once the disable is local"
     );
     assert!(
-        matches!(as_login(&strict, &name("hot"), "new-pw").await, Err(29)),
-        "strict mode fails closed on the authoritative disabled state"
+        matches!(as_login(&strict, &name("hot"), "new-pw").await, Err(18)),
+        "strict allows the gate and the local MIT check returns client-revoked"
     );
 
     drop((unavailable_kdc, strict, bounded, engine, replica, source));

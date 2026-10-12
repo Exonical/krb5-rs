@@ -4,11 +4,15 @@
 //! Our own AsExchange / TgsExchange / AuthContext drive `Kdc::handle`
 //! directly; hand-built requests cover options the client cannot send.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Timelike, Utc};
 use krb5_rs::crypto::{find_etype, key_usage};
-use krb5_rs::kdc::{Kdc, KdcConfig, MemoryStore, PrincipalAttributes, PrincipalStore};
+use krb5_rs::kdc::{
+    AlwaysAllow, AuthoritativeDenial, ConsistencyGate, GateDecision, GateSubject, Kdc, KdcConfig,
+    MemoryStore, PrincipalAttributes, PrincipalStore,
+};
 use krb5_rs::protocol::ap::{decrypt_ticket, encrypt_ticket_part};
 use krb5_rs::protocol::{
     AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
@@ -80,6 +84,41 @@ async fn first_key(store: &MemoryStore, name: &PrincipalName, etype: i32) -> Enc
 }
 
 async fn fixture_with(opts: FixtureOptions) -> Fixture {
+    fixture_with_gate(opts, AlwaysAllow).await
+}
+
+struct DenyGate {
+    allow_checks: usize,
+    checks: AtomicUsize,
+    index: usize,
+    denial: AuthoritativeDenial,
+}
+
+impl DenyGate {
+    fn new(allow_checks: usize, index: usize, denial: AuthoritativeDenial) -> Self {
+        Self {
+            allow_checks,
+            checks: AtomicUsize::new(0),
+            index,
+            denial,
+        }
+    }
+}
+
+impl ConsistencyGate for DenyGate {
+    async fn check(&self, _subjects: &[GateSubject<'_>]) -> GateDecision {
+        if self.checks.fetch_add(1, Ordering::SeqCst) < self.allow_checks {
+            GateDecision::Allow
+        } else {
+            GateDecision::Deny {
+                index: self.index,
+                denial: self.denial,
+            }
+        }
+    }
+}
+
+async fn fixture_with_gate(opts: FixtureOptions, gate: impl ConsistencyGate + 'static) -> Fixture {
     let mut store = MemoryStore::new();
     let tgt_etypes = opts.krbtgt_etypes.unwrap_or_else(|| vec![18, 17]);
     store
@@ -152,7 +191,7 @@ async fn fixture_with(opts: FixtureOptions) -> Fixture {
         config.max_life = l;
     }
     Fixture {
-        kdc: Kdc::new(config, store),
+        kdc: Kdc::builder(config, store).consistency(gate).build(),
         tgs_key,
         service_key,
     }

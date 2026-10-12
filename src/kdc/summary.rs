@@ -68,9 +68,8 @@ pub struct RequestSummary {
     pub reply_etype: Option<i32>,
     /// Enctype of the issued ticket (`tkt=`).
     pub ticket_etype: Option<i32>,
-    /// The consistency gate refused the request (`KDC_ERR_SVC_UNAVAILABLE`,
-    /// the only source of that code here): the hook for a
-    /// rejected-for-staleness metric.
+    /// The consistency gate refused the request (`KDC_ERR_SVC_UNAVAILABLE` or
+    /// an `AUTHORITATIVE_` denial status): the hook for gate-rejection metrics.
     pub gate_rejected: bool,
     /// Time spent awaiting KDC stores during request processing.
     pub store_time: Duration,
@@ -149,10 +148,15 @@ impl RequestSummary {
             },
         };
 
-        let gate_rejected = matches!(
-            outcome,
-            Outcome::Error { code, .. } if code == crate::types::error_codes::KDC_ERR_SVC_UNAVAILABLE
-        );
+        let gate_rejected = match &outcome {
+            Outcome::Error { code, status } => {
+                *code == crate::types::error_codes::KDC_ERR_SVC_UNAVAILABLE
+                    || status
+                        .as_deref()
+                        .is_some_and(|status| status.starts_with("AUTHORITATIVE_"))
+            }
+            Outcome::Issued => false,
+        };
         Self {
             kind,
             transport,
@@ -217,7 +221,10 @@ impl fmt::Display for Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kdc::{Kdc, KdcConfig, MemoryStore, PrincipalAttributes};
+    use crate::kdc::{
+        AuthoritativeDenial, ConsistencyGate, GateDecision, GateSubject, Kdc, KdcConfig,
+        MemoryStore, PrincipalAttributes,
+    };
     use crate::protocol::{
         AsExchange, AsExchangeConfig, StepResult, TgsExchange, TgsOptions, TgsStepResult,
     };
@@ -225,7 +232,7 @@ mod tests {
 
     const REALM: &str = "R";
 
-    fn kdc() -> Kdc<MemoryStore> {
+    fn store() -> MemoryStore {
         let mut store = MemoryStore::new();
         store
             .add_random_key(
@@ -255,7 +262,22 @@ mod tests {
                 PrincipalAttributes::empty(),
             )
             .expect("service");
-        Kdc::new(KdcConfig::new(REALM), store)
+        store
+    }
+
+    fn kdc() -> Kdc<MemoryStore> {
+        Kdc::new(KdcConfig::new(REALM), store())
+    }
+
+    struct DenyClient;
+
+    impl ConsistencyGate for DenyClient {
+        async fn check(&self, _subjects: &[GateSubject<'_>]) -> GateDecision {
+            GateDecision::Deny {
+                index: 0,
+                denial: AuthoritativeDenial::Disabled,
+            }
+        }
     }
 
     fn peer() -> SocketAddr {
@@ -289,6 +311,36 @@ mod tests {
             "AS_REQ (4 etypes {18 17 20 19}) 192.0.2.7:4000: NEEDED_PREAUTH: \
              alice@R for krbtgt/R@R, error 25"
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_client_denial_is_summarized_as_a_gate_rejection() {
+        let kdc = Kdc::builder(KdcConfig::new(REALM), store())
+            .consistency(DenyClient)
+            .build();
+        let mut exchange = AsExchange::new(
+            AsExchangeConfig::new(PrincipalName::new_principal("alice"), REALM),
+            "pw",
+        );
+        let mut input = Vec::new();
+        loop {
+            match exchange.step(&input).expect("AS step") {
+                StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } => {
+                    let (reply, summary) = kdc.handle_summarized(&data, Transport::Tcp).await;
+                    if let Outcome::Error {
+                        code: crate::types::error_codes::KDC_ERR_CLIENT_REVOKED,
+                        status: Some(status),
+                    } = &summary.outcome
+                    {
+                        assert_eq!(status, "AUTHORITATIVE_CLIENT_DISABLED");
+                        assert!(summary.gate_rejected);
+                        return;
+                    }
+                    input = reply;
+                }
+                StepResult::Complete => panic!("authoritative denial issued a ticket"),
+            }
+        }
     }
 
     #[tokio::test]

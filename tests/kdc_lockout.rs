@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use krb5_rs::kdc::{
-    AuthState, AuthStateStore, AuthStateUpdate, ConsistencyGate, GateDecision, Kdc, KdcConfig,
-    LockoutReport, LockoutReporter, MemoryAuthState, MemoryStore, Policy, PrincipalAttributes,
-    PrincipalEntry,
+    AuthState, AuthStateStore, AuthStateUpdate, ConsistencyGate, GateDecision, GateSubject, Kdc,
+    KdcConfig, LockoutReport, LockoutReporter, MemoryAuthState, MemoryStore, Policy,
+    PrincipalAttributes, PrincipalEntry,
 };
 use krb5_rs::protocol::{
     AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
@@ -514,7 +514,7 @@ async fn a_tripped_lockout_is_reported_once() {
 struct Reject(&'static str);
 
 impl ConsistencyGate for Reject {
-    async fn check(&self, _principals: &[&PrincipalEntry]) -> GateDecision {
+    async fn check(&self, _subjects: &[GateSubject<'_>]) -> GateDecision {
         GateDecision::Reject {
             reason: self.0.to_string(),
         }
@@ -524,11 +524,13 @@ impl ConsistencyGate for Reject {
 struct Record(Arc<Mutex<Vec<Vec<String>>>>);
 
 impl ConsistencyGate for Record {
-    async fn check(&self, principals: &[&PrincipalEntry]) -> GateDecision {
-        self.0
-            .lock()
-            .expect("lock")
-            .push(principals.iter().map(|p| p.name.to_string()).collect());
+    async fn check(&self, subjects: &[GateSubject<'_>]) -> GateDecision {
+        self.0.lock().expect("lock").push(
+            subjects
+                .iter()
+                .map(|subject| subject.entry.name.to_string())
+                .collect(),
+        );
         GateDecision::Allow
     }
 }
