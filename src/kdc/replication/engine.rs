@@ -9,7 +9,8 @@ use super::{
     RebuildWriter, ReplicaRegistry, ReplicaSink, ReplicationSource, ReplicationTs, Snapshot,
 };
 use crate::kdc::{
-    AuthoritativeState, ConsistencyGate, GateDecision, PrincipalEntry, StoreErrorKind,
+    AuthoritativeDenial, AuthoritativeState, ConsistencyGate, GateDecision, GateSubject,
+    PrincipalAttributes, PrincipalRole, StoreErrorKind,
 };
 
 /// What to do if the source pruned past this replica's checkpoint.
@@ -449,7 +450,7 @@ impl FreshnessGate {
 }
 
 impl ConsistencyGate for FreshnessGate {
-    async fn check(&self, _principals: &[&PrincipalEntry]) -> GateDecision {
+    async fn check(&self, _subjects: &[GateSubject<'_>]) -> GateDecision {
         let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         if !status.bootstrapped || status.needs_rebuild || status.rebuilding {
             return GateDecision::Reject {
@@ -496,12 +497,13 @@ impl<A: AuthoritativeState> StrictGate<A> {
 }
 
 impl<A: AuthoritativeState> ConsistencyGate for StrictGate<A> {
-    async fn check(&self, principals: &[&PrincipalEntry]) -> GateDecision {
-        match self.freshness.check(principals).await {
+    async fn check(&self, subjects: &[GateSubject<'_>]) -> GateDecision {
+        match self.freshness.check(subjects).await {
             GateDecision::Allow => {}
             rejected => return rejected,
         }
-        for principal in principals {
+        for (index, subject) in subjects.iter().enumerate() {
+            let principal = subject.entry;
             let authoritative = tokio::time::timeout(
                 self.authoritative_timeout,
                 self.authority
@@ -511,8 +513,9 @@ impl<A: AuthoritativeState> ConsistencyGate for StrictGate<A> {
             let authoritative = match authoritative {
                 Ok(Ok(state)) => state,
                 Ok(Err(error)) if error.kind() == StoreErrorKind::NotFound => {
-                    return GateDecision::Reject {
-                        reason: "AUTHORITATIVE_MISMATCH".to_string(),
+                    return GateDecision::Deny {
+                        index,
+                        denial: AuthoritativeDenial::Deleted,
                     }
                 }
                 Ok(Err(_)) | Err(_) => {
@@ -521,10 +524,23 @@ impl<A: AuthoritativeState> ConsistencyGate for StrictGate<A> {
                     }
                 }
             };
-            if authoritative.epoch > principal.security_epoch
-                || authoritative.disabled
-                || authoritative.locked
+            if authoritative.disabled
+                && !principal
+                    .attributes
+                    .contains(PrincipalAttributes::DISALLOW_ALL_TIX)
             {
+                return GateDecision::Deny {
+                    index,
+                    denial: AuthoritativeDenial::Disabled,
+                };
+            }
+            if authoritative.locked && subject.role == PrincipalRole::Client {
+                return GateDecision::Deny {
+                    index,
+                    denial: AuthoritativeDenial::LockedOut,
+                };
+            }
+            if authoritative.epoch > principal.security_epoch {
                 return GateDecision::Reject {
                     reason: "AUTHORITATIVE_MISMATCH".to_string(),
                 };
@@ -553,7 +569,7 @@ fn jitter(d: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kdc::{GateDecision, PrincipalAttributes, SecurityState};
+    use crate::kdc::{PrincipalEntry, SecurityState};
     use crate::types::PrincipalName;
 
     #[test]
@@ -658,29 +674,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_gate_checks_epoch_disabled_locked_and_authority_timeout() {
+    async fn strict_gate_denies_a_client_disabled_only_at_the_authority() {
         let entry = principal();
-        let status = fresh_status();
         let gate = StrictGate::new(
-            Arc::clone(&status),
-            Duration::from_secs(30),
-            Arc::new(Authority {
-                state: Ok(SecurityState {
-                    epoch: entry.security_epoch + 1,
-                    ..SecurityState::default()
-                }),
-            }),
-            Duration::from_millis(100),
-        );
-        assert_eq!(
-            gate.check(&[&entry]).await,
-            GateDecision::Reject {
-                reason: "AUTHORITATIVE_MISMATCH".into()
-            }
-        );
-
-        let gate = StrictGate::new(
-            Arc::clone(&status),
+            fresh_status(),
             Duration::from_secs(30),
             Arc::new(Authority {
                 state: Ok(SecurityState {
@@ -690,28 +687,104 @@ mod tests {
             }),
             Duration::from_millis(100),
         );
+
         assert_eq!(
-            gate.check(&[&entry]).await,
-            GateDecision::Reject {
-                reason: "AUTHORITATIVE_MISMATCH".into()
+            gate.check(&[GateSubject {
+                entry: &entry,
+                role: PrincipalRole::Client,
+            }])
+            .await,
+            GateDecision::Deny {
+                index: 0,
+                denial: AuthoritativeDenial::Disabled,
             }
         );
+    }
 
+    #[tokio::test]
+    async fn strict_gate_allows_a_client_disabled_both_locally_and_authoritatively() {
+        let mut entry = principal();
+        entry
+            .attributes
+            .insert(PrincipalAttributes::DISALLOW_ALL_TIX);
         let gate = StrictGate::new(
-            status,
+            fresh_status(),
             Duration::from_secs(30),
             Arc::new(Authority {
-                state: Err(crate::kdc::StoreError::unavailable("down")),
+                state: Ok(SecurityState {
+                    disabled: true,
+                    ..SecurityState::default()
+                }),
             }),
             Duration::from_millis(100),
         );
+
         assert_eq!(
-            gate.check(&[&entry]).await,
-            GateDecision::Reject {
-                reason: "AUTHORITY_UNAVAILABLE".into()
-            }
+            gate.check(&[GateSubject {
+                entry: &entry,
+                role: PrincipalRole::Client,
+            }])
+            .await,
+            GateDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_gate_denies_a_locked_client() {
+        let entry = principal();
+        let gate = StrictGate::new(
+            fresh_status(),
+            Duration::from_secs(30),
+            Arc::new(Authority {
+                state: Ok(SecurityState {
+                    locked: true,
+                    ..SecurityState::default()
+                }),
+            }),
+            Duration::from_millis(100),
         );
 
+        assert_eq!(
+            gate.check(&[GateSubject {
+                entry: &entry,
+                role: PrincipalRole::Client,
+            }])
+            .await,
+            GateDecision::Deny {
+                index: 0,
+                denial: AuthoritativeDenial::LockedOut,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_gate_ignores_server_lockout() {
+        let entry = principal();
+        let gate = StrictGate::new(
+            fresh_status(),
+            Duration::from_secs(30),
+            Arc::new(Authority {
+                state: Ok(SecurityState {
+                    locked: true,
+                    ..SecurityState::default()
+                }),
+            }),
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(
+            gate.check(&[GateSubject {
+                entry: &entry,
+                role: PrincipalRole::Server,
+            }])
+            .await,
+            GateDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_gate_denies_an_authoritatively_deleted_principal() {
+        let entry = principal();
         let gate = StrictGate::new(
             fresh_status(),
             Duration::from_secs(30),
@@ -720,10 +793,66 @@ mod tests {
             }),
             Duration::from_millis(100),
         );
+
         assert_eq!(
-            gate.check(&[&entry]).await,
+            gate.check(&[GateSubject {
+                entry: &entry,
+                role: PrincipalRole::Client,
+            }])
+            .await,
+            GateDecision::Deny {
+                index: 0,
+                denial: AuthoritativeDenial::Deleted,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_gate_rejects_a_greater_authoritative_epoch() {
+        let entry = principal();
+        let gate = StrictGate::new(
+            fresh_status(),
+            Duration::from_secs(30),
+            Arc::new(Authority {
+                state: Ok(SecurityState {
+                    epoch: entry.security_epoch + 1,
+                    ..SecurityState::default()
+                }),
+            }),
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(
+            gate.check(&[GateSubject {
+                entry: &entry,
+                role: PrincipalRole::Client,
+            }])
+            .await,
             GateDecision::Reject {
-                reason: "AUTHORITATIVE_MISMATCH".into()
+                reason: "AUTHORITATIVE_MISMATCH".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_gate_rejects_an_unavailable_or_timed_out_authority() {
+        let entry = principal();
+        let gate = StrictGate::new(
+            fresh_status(),
+            Duration::from_secs(30),
+            Arc::new(Authority {
+                state: Err(crate::kdc::StoreError::unavailable("down")),
+            }),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            gate.check(&[GateSubject {
+                entry: &entry,
+                role: PrincipalRole::Client,
+            }])
+            .await,
+            GateDecision::Reject {
+                reason: "AUTHORITY_UNAVAILABLE".into(),
             }
         );
 
@@ -734,9 +863,13 @@ mod tests {
             Duration::from_millis(1),
         );
         assert_eq!(
-            gate.check(&[&entry]).await,
+            gate.check(&[GateSubject {
+                entry: &entry,
+                role: PrincipalRole::Client,
+            }])
+            .await,
             GateDecision::Reject {
-                reason: "AUTHORITY_UNAVAILABLE".into()
+                reason: "AUTHORITY_UNAVAILABLE".into(),
             }
         );
     }

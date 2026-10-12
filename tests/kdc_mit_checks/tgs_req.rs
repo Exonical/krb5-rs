@@ -1,6 +1,7 @@
 //! TGS exchange against the KDC (do_tgs_req.c, kdc_util.c, tgs_policy.c).
 
 use super::*;
+use krb5_rs::kdc::PrincipalRole;
 use krb5_rs::kdc::StoreError;
 use krb5_rs::keytab::{KeytabEntry, MemoryKeytab};
 use krb5_rs::protocol::ap::{ApReqOptions, AuthContext};
@@ -666,5 +667,38 @@ async fn unavailable_local_tgt_client_lookup_returns_service_unavailable() {
     assert_eq!(
         error.e_text.as_ref().map(|text| text.as_bytes()),
         Some(b"LOOKING_UP_CLIENT".as_slice())
+    );
+}
+
+struct DenyTgsHeaderClient;
+
+impl ConsistencyGate for DenyTgsHeaderClient {
+    async fn check(&self, subjects: &[GateSubject<'_>]) -> GateDecision {
+        if subjects
+            .iter()
+            .any(|subject| subject.role == PrincipalRole::Server && subject.entry.name == service())
+        {
+            GateDecision::Deny {
+                index: 0,
+                denial: AuthoritativeDenial::Disabled,
+            }
+        } else {
+            GateDecision::Allow
+        }
+    }
+}
+
+#[tokio::test]
+async fn authoritative_tgs_header_client_disable_returns_client_revoked() {
+    let f = fixture_with_gate(FixtureOptions::default(), DenyTgsHeaderClient).await;
+    let tgt = get_tgt(&f).await;
+
+    let run = run_tgs(&f.kdc, &tgt, service(), TgsOptions::default()).await;
+    assert!(run.result.is_err(), "TGS unexpectedly succeeded");
+    let error = krb_error(run.replies.last().expect("KRB-ERROR reply"));
+    assert_eq!(error.error_code, 18);
+    assert_eq!(
+        error.e_text.as_ref().map(|text| text.as_bytes()),
+        Some(b"AUTHORITATIVE_CLIENT_DISABLED".as_slice())
     );
 }

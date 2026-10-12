@@ -31,9 +31,9 @@ use krb5_rs::kdc::kdb::propagation::{
 };
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, FileStore};
 use krb5_rs::kdc::{
-    default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
-    MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig, RequestLogger,
-    ServeOptions, StoreError, StoreErrorKind,
+    default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, GateSubject, Kdc,
+    KdcConfig, MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig,
+    RequestLogger, ServeOptions, StoreError, StoreErrorKind,
 };
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
@@ -243,10 +243,10 @@ enum RuntimeGate {
 
 #[cfg(feature = "cockroach")]
 impl krb5_rs::kdc::ConsistencyGate for RuntimeGate {
-    async fn check(&self, principals: &[&PrincipalEntry]) -> krb5_rs::kdc::GateDecision {
+    async fn check(&self, subjects: &[GateSubject<'_>]) -> krb5_rs::kdc::GateDecision {
         match self {
-            RuntimeGate::Bounded(gate) => gate.check(principals).await,
-            RuntimeGate::Strict(gate) => gate.check(principals).await,
+            RuntimeGate::Bounded(gate) => gate.check(subjects).await,
+            RuntimeGate::Strict(gate) => gate.check(subjects).await,
         }
     }
 }

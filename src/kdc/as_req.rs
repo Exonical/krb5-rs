@@ -18,7 +18,7 @@ use super::preauth::{
     select_client_key, verify_enc_timestamp, verify_encrypted_challenge,
 };
 use super::reqbody::raw_req_body;
-use super::{is_tgs_principal, random_key, Kdc, PrincipalStore};
+use super::{is_tgs_principal, random_key, GateSubject, Kdc, PrincipalRole, PrincipalStore};
 use crate::crypto::{find_etype, key_usage};
 use crate::protocol::ap::encrypt_ticket_part;
 use crate::types::error_codes::*;
@@ -127,7 +127,17 @@ impl<S: PrincipalStore> Kdc<S> {
             .await?
             .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "SERVER_NOT_FOUND"))?;
         let local_tgt = self.require_local_tgt().await?;
-        self.consistency_gate(&[&client, &server]).await?;
+        self.consistency_gate(&[
+            GateSubject {
+                entry: &client,
+                role: PrincipalRole::Client,
+            },
+            GateSubject {
+                entry: &server,
+                role: PrincipalRole::Server,
+            },
+        ])
+        .await?;
 
         validate_as_request(opts, &client, &server, kdc_time)?;
         // krb5_db_check_policy_as, the last step of validate_as_request

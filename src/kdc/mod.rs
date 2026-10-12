@@ -63,10 +63,10 @@ pub use db::{
     PrincipalEntry,
 };
 pub use store::{
-    AdminStore, AlwaysAllow, AuthState, AuthStateStore, AuthStateUpdate, AuthoritativeState,
-    ConsistencyGate, GateDecision, HealthCheck, LockoutReport, LockoutReporter, MemoryAuthState,
-    NoPolicies, NoopLockoutReporter, Policy, PolicyStore, PrincipalRecord, PrincipalStore,
-    SecurityState, StoreError, StoreErrorKind,
+    AdminStore, AlwaysAllow, AuthState, AuthStateStore, AuthStateUpdate, AuthoritativeDenial,
+    AuthoritativeState, ConsistencyGate, GateDecision, GateSubject, HealthCheck, LockoutReport,
+    LockoutReporter, MemoryAuthState, NoPolicies, NoopLockoutReporter, Policy, PolicyStore,
+    PrincipalRecord, PrincipalRole, PrincipalStore, SecurityState, StoreError, StoreErrorKind,
 };
 
 use std::sync::Arc;
@@ -305,11 +305,13 @@ impl<S: PrincipalStore> Kdc<S> {
             Transport::Udp => self.handle_udp(request).await,
             Transport::Tcp => self.handle(request).await,
         };
-        let mut summary = RequestSummary::new(request, &reply, transport);
+        let summary = RequestSummary::new(request, &reply, transport);
         #[cfg(feature = "tokio")]
-        {
+        let summary = {
+            let mut summary = summary;
             summary.store_time = Duration::from_nanos(timer.load(Ordering::Relaxed));
-        }
+            summary
+        };
         (reply, summary)
     }
 
@@ -455,14 +457,45 @@ impl<S: PrincipalStore> Kdc<S> {
         result
     }
 
-    /// Ask the consistency gate whether tickets involving `principals` may
-    /// be issued (docs/architecture/kdb.md §7); a rejection is
-    /// `KDC_ERR_SVC_UNAVAILABLE` with the gate's reason as status, which lets
-    /// clients fail over to another KDC.
-    async fn consistency_gate(&self, principals: &[&PrincipalEntry]) -> Result<(), KdcError> {
-        match self.gate.check(principals).await {
+    /// Ask the consistency gate whether tickets involving `subjects` may be
+    /// issued (docs/architecture/kdb.md §7).
+    async fn consistency_gate(&self, subjects: &[GateSubject<'_>]) -> Result<(), KdcError> {
+        match self.gate.check(subjects).await {
             GateDecision::Allow => Ok(()),
             GateDecision::Reject { reason } => Err(KdcError::new(KDC_ERR_SVC_UNAVAILABLE, &reason)),
+            GateDecision::Deny { index, denial } => {
+                let Some(subject) = subjects.get(index) else {
+                    return Err(KdcError::new(
+                        KDC_ERR_SVC_UNAVAILABLE,
+                        "AUTHORITATIVE_MISMATCH",
+                    ));
+                };
+                // MIT kdc_util.c:777-787 maps a locked client to
+                // KDC_ERR_CLIENT_REVOKED and a locked service to
+                // KDC_ERR_S_PRINCIPAL_UNKNOWN; check_lockout uses the same
+                // client code (lockout.rs:131; MIT kdc_db2.c:1546-1549).
+                let (code, status) = match (subject.role, denial) {
+                    (PrincipalRole::Client, AuthoritativeDenial::Disabled) => {
+                        (KDC_ERR_CLIENT_REVOKED, "AUTHORITATIVE_CLIENT_DISABLED")
+                    }
+                    (PrincipalRole::Client, AuthoritativeDenial::LockedOut) => {
+                        (KDC_ERR_CLIENT_REVOKED, "AUTHORITATIVE_CLIENT_LOCKED_OUT")
+                    }
+                    (PrincipalRole::Client, AuthoritativeDenial::Deleted) => {
+                        (KDC_ERR_C_PRINCIPAL_UNKNOWN, "AUTHORITATIVE_CLIENT_DELETED")
+                    }
+                    (PrincipalRole::Server, AuthoritativeDenial::Disabled) => {
+                        (KDC_ERR_S_PRINCIPAL_UNKNOWN, "AUTHORITATIVE_SERVER_DISABLED")
+                    }
+                    (PrincipalRole::Server, AuthoritativeDenial::Deleted) => {
+                        (KDC_ERR_S_PRINCIPAL_UNKNOWN, "AUTHORITATIVE_SERVER_DELETED")
+                    }
+                    (PrincipalRole::Server, AuthoritativeDenial::LockedOut) => {
+                        (KDC_ERR_SVC_UNAVAILABLE, "AUTHORITATIVE_MISMATCH")
+                    }
+                };
+                Err(KdcError::new(code, status))
+            }
         }
     }
 
