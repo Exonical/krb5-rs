@@ -30,10 +30,12 @@ use krb5_rs::kdc::kdb::propagation::{
     PropSecret, PropServerConfig,
 };
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, FileStore};
+#[cfg(feature = "cockroach")]
+use krb5_rs::kdc::GateSubject;
 use krb5_rs::kdc::{
-    default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, GateSubject, Kdc,
-    KdcConfig, MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig,
-    RequestLogger, ServeOptions, StoreError, StoreErrorKind,
+    default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
+    MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig, RequestLogger,
+    ServeOptions, StoreError, StoreErrorKind,
 };
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
