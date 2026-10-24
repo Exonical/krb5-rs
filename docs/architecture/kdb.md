@@ -233,8 +233,8 @@ log, as in MIT.
   serial and time from the header (`ulog_set_last`).
 - `krb5-rs-kproplog [-h] [-v] [-v] [-e num]` and `-R` print or reset the log
   like MIT `kproplog`; the two print identical output for the same log.
-- Without `iprop_enable`, `-i`, `-c` and `load -i` fail with "Iprop not
-  enabled" as in MIT, and no log is written.
+- Without `iprop_enable`, `dump -i` and `load -i` fail with "Iprop not
+  enabled" and no log is written; `-c` without `-i` is refused, as in MIT.
 
 Deviations: `load -update` with iprop enabled reinitializes the log instead
 of logging each loaded principal; the file store and CockroachDB never write
