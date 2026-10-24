@@ -145,7 +145,7 @@ jobs:
       - name: Create the cluster and load the images
         run: |
           k3d cluster create e2e --image "$K3S_IMAGE" --wait --timeout 180s
-          k3d image import localhost/krb5-rs-kdc:e2e krb5-rs-mit-test:1.22.2 -c e2e
+          bash deploy/helm/krb5-rs-kdc/ci/k3d-import.sh e2e localhost/krb5-rs-kdc:e2e krb5-rs-mit-test:1.22.2
       - name: Chart end-to-end
         run: bash deploy/helm/krb5-rs-kdc/ci/e2e.sh
 
@@ -177,8 +177,8 @@ jobs:
       - name: Create the cluster and load images
         run: |
           k3d cluster create e2e-cockroach --image "$K3S_IMAGE" --wait --timeout 180s
-          k3d image import localhost/krb5-rs-kdc:e2e-cockroach \
-            krb5-rs-mit-test:1.22.2 "$CRDB_PINNED_IMAGE" -c e2e-cockroach
+          bash deploy/helm/krb5-rs-kdc/ci/k3d-import.sh e2e-cockroach localhost/krb5-rs-kdc:e2e-cockroach \
+            krb5-rs-mit-test:1.22.2 "$CRDB_PINNED_IMAGE"
       - name: CockroachDB chart end-to-end
         run: bash deploy/helm/krb5-rs-kdc/ci/e2e-cockroach.sh
       - name: Multi-region CockroachDB chart end-to-end
