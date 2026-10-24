@@ -40,6 +40,9 @@ pub mod types;
 #[cfg(feature = "tokio")]
 pub mod transport;
 
+#[cfg(feature = "tokio")]
+pub mod rpc;
+
 #[cfg(feature = "client")]
 pub mod client;
 
