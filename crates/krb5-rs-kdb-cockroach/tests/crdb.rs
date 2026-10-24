@@ -21,6 +21,7 @@ use krb5_rs::kdc::{
     PrincipalStore, StoreErrorKind,
 };
 use krb5_rs::types::PrincipalName;
+use krb5_rs_kdb_cockroach::run_sql;
 use krb5_rs_kdb_cockroach::{
     CockroachConfig, CockroachLockoutReporter, CockroachStore, FailPoint, MigrateOptions,
     MultiRegion,
@@ -373,7 +374,36 @@ async fn concurrent_migrations_of_a_fresh_database_all_succeed() {
         }
         assert_eq!(count(&db, "schema_migrations").await, 1);
         assert_eq!(count(&db, "replication_meta").await, 1);
+        db.drop_db().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn migrate_refuses_an_existing_table_with_another_definition() {
+    let db = TestDb::new("migrate_clash").await;
+    run_sql(
+        &db.root(),
+        "CREATE TABLE principals (realm STRING PRIMARY KEY)",
+    )
+    .await
+    .expect("create clashing table");
+    let opts = MigrateOptions {
+        create_roles: false,
+        multi_region: None,
+    };
+    let err = CockroachStore::migrate(db.root(), &opts)
+        .await
+        .expect_err("migrate accepted a foreign principals table");
+    assert!(
+        err.to_string().contains("does not match schema version 1"),
+        "{err}"
+    );
+    let marked = db
+        .text("SELECT count(*)::STRING FROM schema_migrations")
+        .await;
+    assert_eq!(marked[0], "0");
+    db.drop_db().await;
 }
 
 #[tokio::test]
