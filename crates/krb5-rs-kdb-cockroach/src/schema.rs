@@ -2,7 +2,7 @@
 
 use krb5_rs::kdc::StoreError;
 
-use crate::db::Db;
+use crate::db::{is_retryable, Db, TxError};
 
 /// Newest schema version this build understands.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -94,10 +94,7 @@ pub(crate) async fn migrate(db: &Db, opts: &MigrateOptions) -> Result<MigrateRep
         )));
     }
     for (version, name, sql) in MIGRATIONS.iter().filter(|(v, _, _)| *v > from) {
-        let script = format!(
-            "{sql}\nINSERT INTO schema_migrations (version, name) VALUES ({version}, '{name}');"
-        );
-        db.simple(&script).await?;
+        apply(db, *version, name, sql).await?;
     }
     let dbname = database_name(db).await?;
     if opts.create_roles {
@@ -113,6 +110,34 @@ pub(crate) async fn migrate(db: &Db, opts: &MigrateOptions) -> Result<MigrateRep
         multi_region: opts.multi_region.is_some(),
         roles: opts.create_roles,
     })
+}
+
+/// Apply one migration. CockroachDB commits each DDL statement on its own
+/// (`autocommit_before_ddl`, even inside BEGIN), so a script retried after a
+/// serialization failure, or racing another migrate, finds tables an earlier
+/// attempt already created: every statement is idempotent (`IF NOT EXISTS`,
+/// `ON CONFLICT DO NOTHING`). After a failure the version is read again, as a
+/// concurrent migrate or an ambiguous commit may have applied it.
+async fn apply(db: &Db, version: i64, name: &str, sql: &str) -> Result<(), StoreError> {
+    let script = format!(
+        "{sql}\nINSERT INTO schema_migrations (version, name) VALUES ({version}, '{name}') \
+         ON CONFLICT DO NOTHING;"
+    );
+    let mut attempt = 0;
+    loop {
+        let Err(error) = db.simple_once(&script).await else {
+            return Ok(());
+        };
+        if current_version(db).await? >= version {
+            return Ok(());
+        }
+        match error {
+            TxError::Pg(e) if is_retryable(&e) => {
+                db.again(&mut attempt).await.map_err(TxError::into_store)?;
+            }
+            e => return Err(e.into_store()),
+        }
+    }
 }
 
 /// SQL of the multi-region step: the database regions, GLOBAL locality for

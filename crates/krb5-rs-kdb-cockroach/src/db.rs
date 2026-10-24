@@ -75,6 +75,13 @@ fn is_retry(e: &tokio_postgres::Error) -> bool {
     e.code().is_some_and(|c| c.code() == RETRY)
 }
 
+/// A serialization failure (40001) or an ambiguous commit (40003): the
+/// statement may be retried once the caller has checked what committed.
+pub(crate) fn is_retryable(e: &tokio_postgres::Error) -> bool {
+    e.code()
+        .is_some_and(|c| c.code() == RETRY || c.code() == AMBIGUOUS)
+}
+
 /// A pooled connection that is discarded, not recycled, unless a transaction
 /// ended cleanly (a dropped future must not leave one open in the pool).
 struct Guarded {
@@ -233,6 +240,15 @@ impl Db {
                 Err(error) => return Err(map_err(&error)),
             }
         }
+    }
+
+    /// Run `sql` once, without retrying: for scripts that must not run again
+    /// before the caller has checked what an earlier attempt committed.
+    pub(crate) async fn simple_once(&self, sql: &str) -> Result<(), TxError> {
+        let mut g = self.get().await?;
+        g.client().batch_execute(sql).await?;
+        g.clean = true;
+        Ok(())
     }
 
     /// Run `sql` and return its rows outside a transaction.
@@ -487,7 +503,7 @@ impl Db {
 
     /// Count a retry, back off with jitter, or give up. A give-up is a
     /// failure; a `Restart` outcome is returned by the caller.
-    async fn again(&self, attempt: &mut u32) -> Result<(), TxError> {
+    pub(crate) async fn again(&self, attempt: &mut u32) -> Result<(), TxError> {
         *attempt += 1;
         self.metrics.tx_retries.fetch_add(1, Ordering::Relaxed);
         if *attempt > self.max_retries {
