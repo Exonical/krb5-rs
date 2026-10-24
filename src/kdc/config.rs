@@ -21,6 +21,9 @@ const DEFAULT_KDC_PORTLIST: &str = "88";
 const DEFAULT_PORT: u16 = 88;
 /// MIT `MAX_DGRAM_SIZE` (osconf.hin:113).
 const MAX_DGRAM_SIZE: usize = 65536;
+
+/// `DEF_ULOGENTRIES` (`include/kdb_log.h:42`).
+const DEF_ULOGENTRIES: u32 = 1000;
 /// MIT `KRB5_KDB_MAX_LIFE` / `KRB5_KDB_MAX_RLIFE` (k5-int.h:132-133), seconds.
 const DEFAULT_MAX_LIFE: i32 = 24 * 3600;
 const DEFAULT_MAX_RENEWABLE_LIFE: i32 = 7 * 24 * 3600;
@@ -152,6 +155,19 @@ pub struct RealmConfig {
     pub tcp_listen: Vec<SocketAddr>,
     /// The database module (`[dbmodules]`).
     pub db_module: DbModuleConfig,
+    /// Incremental propagation settings.
+    pub iprop: IpropConfig,
+}
+
+/// The `iprop_*` realm settings (`lib/kadm5/alt_prof.c`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpropConfig {
+    /// `iprop_enable`, default false.
+    pub enabled: bool,
+    /// `iprop_logfile`, default `<database_name>.ulog`.
+    pub logfile: PathBuf,
+    /// `iprop_ulogsize`, default 1000 entries.
+    pub ulogsize: u32,
 }
 
 /// The realm to serve when none is given: the only `[realms]` subsection of
@@ -344,12 +360,29 @@ impl RealmConfig {
             kdc.pkinit = pkinit_settings(kdc_conf, realm)?;
         }
 
+        let database_name = module_value("database_name")
+            .or_else(|| r("database_name"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("{KDC_DIR}/principal")));
+        let ulogsize = ["iprop_ulogsize", "iprop_master_ulogsize"]
+            .iter()
+            .filter_map(|k| r(k).and_then(|v| v.trim().parse::<i32>().ok()))
+            .find(|&v| v > 0)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(DEF_ULOGENTRIES);
+        let iprop = IpropConfig {
+            enabled: kdc_conf.get_boolean(&["realms", realm, "iprop_enable"], false)?,
+            logfile: r("iprop_logfile").map(PathBuf::from).unwrap_or_else(|| {
+                let mut name = database_name.clone().into_os_string();
+                name.push(".ulog");
+                PathBuf::from(name)
+            }),
+            ulogsize,
+        };
+
         Ok(Self {
             kdc,
-            database_name: module_value("database_name")
-                .or_else(|| r("database_name"))
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(format!("{KDC_DIR}/principal"))),
+            database_name,
             key_stash_file: r("key_stash_file")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(format!("{KDC_DIR}/.k5.{realm}"))),
@@ -361,6 +394,7 @@ impl RealmConfig {
             udp_listen: parse_listen_addresses(&udp_str, DEFAULT_PORT)?,
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
             db_module,
+            iprop,
         })
     }
 }

@@ -6,6 +6,7 @@ use std::time::Duration;
 use fs2::FileExt;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, WithTls, WithoutTls};
+use krb5_rs::kdc::kdb::mit::ulog::{update_from_entry, Ulog, Update};
 use krb5_rs::kdc::kdb::mit::{
     decode_lockout, encode_lockout, merge_policy, merge_record, new_entry, policy_from_entry,
     record_from_entry, unparse_name, MitEntry, MitPolicy, TlData, ACTKVNO, MKVNO,
@@ -93,6 +94,7 @@ struct Inner {
     master: EncryptionKey,
     realm: String,
     options: LmdbOptions,
+    ulog: Option<Ulog>,
     #[cfg(test)]
     fail_lockout_write: std::sync::atomic::AtomicBool,
 }
@@ -411,9 +413,34 @@ impl LmdbStore {
             )));
         }
         publish_environments(&temp_base, database_name, faults.publish_stop)?;
-        let store = Self::open_environments(database_name, realm, master, options, false)?;
+        let mut store = Self::open_environments(database_name, realm, master, options, false)?;
         store.verify_master()?;
+        if config.iprop.enabled {
+            let ulog = Ulog::map(&config.iprop.logfile, config.iprop.ulogsize)?;
+            if let Some(inner) = Arc::get_mut(&mut store.inner) {
+                inner.ulog = Some(ulog);
+            }
+        }
         Ok(store)
+    }
+
+    /// The update log, when `iprop_enable` is set.
+    pub fn ulog(&self) -> Option<&Ulog> {
+        self.inner.ulog.as_ref()
+    }
+
+    /// `ulog_add_update` after a logged change (`lib/kdb/kdb5.c:981-1051`).
+    fn log(&self, mut update: Update) -> Result<(), StoreError> {
+        self.inner
+            .ulog
+            .as_ref()
+            .map_or(Ok(()), |ulog| ulog.add_update(&mut update))
+    }
+
+    /// Policy changes reinitialize the ulog so replicas resync fully
+    /// (`lib/kdb/kdb5.c:2441-2525`).
+    fn reset_ulog(&self) -> Result<(), StoreError> {
+        self.inner.ulog.as_ref().map_or(Ok(()), Ulog::init_header)
     }
 
     fn sync_all(&self) -> Result<(), StoreError> {
@@ -516,6 +543,7 @@ impl LmdbStore {
                 master: master.clone(),
                 realm: realm.to_owned(),
                 options,
+                ulog: None,
                 #[cfg(test)]
                 fail_lockout_write: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -767,7 +795,7 @@ impl LmdbStore {
         }
         txn.commit()
             .map_err(|e| backend("committing principal", e))?;
-        Ok(())
+        self.log(update_from_entry(None, &raw))
     }
 
     #[cfg(test)]
@@ -812,6 +840,7 @@ impl LmdbStore {
             })?
             .to_vec();
         let mut raw = MitEntry::decode(&key, &value)?;
+        let current = self.inner.ulog.as_ref().map(|_| raw.clone());
         let mut record = record_from_entry(&raw, &self.inner.master)?;
         f(&mut record)?;
         record.mod_time = Some(now_time());
@@ -825,6 +854,9 @@ impl LmdbStore {
             .map_err(|e| backend("writing updated principal", e))?;
         txn.commit()
             .map_err(|e| backend("committing updated principal", e))?;
+        if let Some(current) = current {
+            self.log(update_from_entry(Some(&current), &raw))?;
+        }
         Ok(record)
     }
 
@@ -856,10 +888,35 @@ impl LmdbStore {
                     .map_err(|e| backend("committing lockout deletion", e))
             });
         }
+        if deleted {
+            self.log(Update::deletion(key))?;
+        }
         Ok(deleted)
     }
 
     fn create_policy_sync(&self, policy: Policy) -> Result<(), StoreError> {
+        self.create_policy_unlogged(policy)?;
+        self.reset_ulog()
+    }
+
+    fn update_policy_sync<F>(&self, name: &str, f: F) -> Result<Policy, StoreError>
+    where
+        F: FnMut(&mut Policy) -> Result<(), StoreError>,
+    {
+        let policy = self.update_policy_unlogged(name, f)?;
+        self.reset_ulog()?;
+        Ok(policy)
+    }
+
+    fn delete_policy_sync(&self, name: &str) -> Result<bool, StoreError> {
+        let deleted = self.delete_policy_unlogged(name)?;
+        if deleted {
+            self.reset_ulog()?;
+        }
+        Ok(deleted)
+    }
+
+    fn create_policy_unlogged(&self, policy: Policy) -> Result<(), StoreError> {
         let key = policy.name.as_bytes().to_vec();
         let value = MitPolicy {
             name: policy.name.clone(),
@@ -902,7 +959,7 @@ impl LmdbStore {
         txn.commit().map_err(|e| backend("committing policy", e))
     }
 
-    fn update_policy_sync<F>(&self, name: &str, mut f: F) -> Result<Policy, StoreError>
+    fn update_policy_unlogged<F>(&self, name: &str, mut f: F) -> Result<Policy, StoreError>
     where
         F: FnMut(&mut Policy) -> Result<(), StoreError>,
     {
@@ -933,7 +990,7 @@ impl LmdbStore {
         Ok(policy)
     }
 
-    fn delete_policy_sync(&self, name: &str) -> Result<bool, StoreError> {
+    fn delete_policy_unlogged(&self, name: &str) -> Result<bool, StoreError> {
         let mut txn = self
             .inner
             .main_env
@@ -993,12 +1050,14 @@ impl LmdbStore {
     /// right after the main one, so a load that fails before the main commit
     /// changes nothing. Only a failing lockout commit can leave the new
     /// principals with their old lockout rows. Like MIT, the lockout database
-    /// is not emptied.
+    /// is not emptied. `merge_nra` keeps existing lockout records, as MIT's
+    /// klmdb does for iprop loads (`plugins/kdb/lmdb/kdb_lmdb.c:72-76,795-799`).
     pub fn load_dump(
         config: &krb5_rs::kdc::RealmConfig,
         entries: &[MitEntry],
         policies: &[MitPolicy],
         update: bool,
+        merge_nra: bool,
     ) -> Result<(), StoreError> {
         let options = LmdbOptions::from_db_module(
             &config.db_module,
@@ -1052,14 +1111,19 @@ impl LmdbStore {
             .map_err(|e| backend("opening lockout database", e))?;
         if !options.disable_lockout || !options.disable_last_success {
             for entry in entries {
+                let key = unparse_name(&entry.principal, &entry.realm);
+                if merge_nra
+                    && lockout_db
+                        .get(&lockout_txn, &key)
+                        .map_err(|e| backend("reading lockout record", e))?
+                        .is_some()
+                {
+                    continue;
+                }
                 let value =
                     encode_lockout(entry.last_success, entry.last_failed, entry.fail_auth_count);
                 lockout_db
-                    .put(
-                        &mut lockout_txn,
-                        &unparse_name(&entry.principal, &entry.realm),
-                        &value,
-                    )
+                    .put(&mut lockout_txn, &key, &value)
                     .map_err(|e| backend("loading lockout state", e))?;
             }
         }
@@ -1567,8 +1631,8 @@ mod tests {
         config.database_name = directory.path().join("principal");
         let master = master_key_from_password("DUMP.TEST", "master-password-for-dump-fixtures", 18)
             .expect("master key");
-        assert!(LmdbStore::load_dump(&config, &entries, &policies, true).is_err());
-        LmdbStore::load_dump(&config, &entries, &policies, false).expect("load");
+        assert!(LmdbStore::load_dump(&config, &entries, &policies, true, false).is_err());
+        LmdbStore::load_dump(&config, &entries, &policies, false, false).expect("load");
         let dumped = {
             let store = LmdbStore::open(&config, &master).expect("open loaded database");
             let (entries, policies) = store.dump_entries().expect("dump");
@@ -1579,14 +1643,15 @@ mod tests {
             String::from_utf8_lossy(&data)
         );
 
-        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], true).expect("update");
+        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], true, false).expect("update");
         let count = |config| {
             let store = LmdbStore::open(config, &master).expect("open");
             let (entries, policies) = store.dump_entries().expect("dump");
             (entries.len(), policies.len())
         };
         assert_eq!(count(&config), (entries.len(), policies.len()));
-        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], false).expect("replace");
+        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], false, false)
+            .expect("replace");
         assert_eq!(count(&config), (1, 1));
     }
 
