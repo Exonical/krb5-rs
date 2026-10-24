@@ -256,3 +256,9 @@ applies; edit `PublishPort=` to use another host port.
 test image succeeds against it, `podman pod restart` keeps the principals, and
 `podman kube down` / `--force` behave as above. Quadlet itself needs systemd and
 was not run here.
+
+`test-replication.sh` (CI job `podman-e2e`, podman 4.9) plays the replica and
+the primary on one Podman network with the placeholder hostnames, and checks
+that the first push loads the replica, that a new principal reaches it through
+`--watch` before the 60 s interval, and that MIT `kinit` succeeds against the
+replica KDC. Host ports are not published in that test.

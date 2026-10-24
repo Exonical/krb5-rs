@@ -184,6 +184,19 @@ jobs:
       - name: Multi-region CockroachDB chart end-to-end
         run: bash deploy/helm/krb5-rs-kdc/ci/e2e-multiregion.sh
 
+  podman-e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the KDC image
+        run: docker build -f deploy/docker/Dockerfile -t localhost/krb5-rs-kdc:e2e .
+      - name: Build the MIT client image
+        run: docker build -t krb5-rs-mit-test:1.22.2 tests/kdc
+      - name: Load the images into Podman
+        run: docker save localhost/krb5-rs-kdc:e2e krb5-rs-mit-test:1.22.2 | sudo podman load
+      - name: Podman primary and replica end-to-end
+        run: sudo bash deploy/podman/test-replication.sh
+
   live:
     runs-on: ubuntu-latest
     steps:
