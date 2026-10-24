@@ -1778,6 +1778,7 @@ dependencies = [
  "krb5-rs-kdb-lmdb",
  "krb5-rs-kdb-turso",
  "prometheus-client",
+ "regex",
  "tempfile",
  "tokio",
  "tracing",

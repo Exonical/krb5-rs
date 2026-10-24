@@ -5,6 +5,7 @@
 //! updates can merge krb5-rs-owned fields without discarding MIT extensions.
 
 mod codec;
+pub mod dump;
 mod name;
 mod tl;
 mod xdr;

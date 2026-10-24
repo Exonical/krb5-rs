@@ -950,6 +950,123 @@ impl LmdbStore {
     }
 }
 
+impl LmdbStore {
+    /// Raw entries in key order with their lockout state, as `kdb5_util dump`
+    /// sees them through `klmdb_iterate` (`plugins/kdb/lmdb/kdb_lmdb.c:841-880`).
+    pub fn dump_entries(&self) -> Result<(Vec<MitEntry>, Vec<MitPolicy>), StoreError> {
+        let txn = self
+            .inner
+            .main_env
+            .read_txn()
+            .map_err(|e| backend("opening dump transaction", e))?;
+        let mut entries = Vec::new();
+        for item in self
+            .inner
+            .principal_db
+            .iter(&txn)
+            .map_err(|e| backend("iterating principals", e))?
+        {
+            let (key, value) = item.map_err(|e| backend("reading principal iteration", e))?;
+            let mut entry = MitEntry::decode(key, value)?;
+            entry.set_auth_state(self.auth_state_sync(key)?)?;
+            entries.push(entry);
+        }
+        let mut policies = Vec::new();
+        for item in self
+            .inner
+            .policy_db
+            .iter(&txn)
+            .map_err(|e| backend("iterating policies", e))?
+        {
+            let (key, value) = item.map_err(|e| backend("reading policy iteration", e))?;
+            policies.push(MitPolicy::decode(key, value)?);
+        }
+        Ok((entries, policies))
+    }
+
+    /// Load dump records. Without `update` this mirrors klmdb's `temporary`
+    /// load: the principal and policy databases are emptied and refilled in
+    /// one write transaction that is only committed once everything is
+    /// written (`plugins/kdb/lmdb/kdb_lmdb.c:62-76,635-647,1004-1020`).
+    /// Deviation: MIT writes lockout records outside that transaction while
+    /// loading; they are written here in one transaction after the commit,
+    /// so an aborted load changes nothing. Like MIT, the lockout database is
+    /// not emptied.
+    pub fn load_dump(
+        config: &krb5_rs::kdc::RealmConfig,
+        entries: &[MitEntry],
+        policies: &[MitPolicy],
+        update: bool,
+    ) -> Result<(), StoreError> {
+        let options = LmdbOptions::from_db_module(
+            &config.db_module,
+            config.kdc.disable_lockout,
+            config.kdc.disable_last_success,
+        )?;
+        let database_name = &config.database_name;
+        let main = main_path(database_name);
+        if update && !main.exists() {
+            return Err(StoreError::not_found(format!(
+                "klmdb environment {} does not exist",
+                main.display()
+            )));
+        }
+        create_parent(database_name)?;
+        let env = open_main_env(&main, &options)?;
+        let mut txn = env
+            .write_txn()
+            .map_err(|e| backend("opening load transaction", e))?;
+        let principal_db = env
+            .create_database::<Bytes, Bytes>(&mut txn, Some("principal"))
+            .map_err(|e| backend("opening principal database", e))?;
+        let policy_db = env
+            .create_database::<Bytes, Bytes>(&mut txn, Some("policy"))
+            .map_err(|e| backend("opening policy database", e))?;
+        if !update {
+            principal_db
+                .clear(&mut txn)
+                .map_err(|e| backend("emptying principal database", e))?;
+            policy_db
+                .clear(&mut txn)
+                .map_err(|e| backend("emptying policy database", e))?;
+        }
+        for entry in entries {
+            let (key, value) = entry.encode()?;
+            principal_db
+                .put(&mut txn, &key, &value)
+                .map_err(|e| backend("loading principal", e))?;
+        }
+        for policy in policies {
+            policy_db
+                .put(&mut txn, policy.name.as_bytes(), &policy.encode()?)
+                .map_err(|e| backend("loading policy", e))?;
+        }
+        txn.commit().map_err(|e| backend("committing load", e))?;
+        let lockout_env = open_lockout_env(&lockout_path(database_name), &options)?;
+        let mut txn = lockout_env
+            .write_txn()
+            .map_err(|e| backend("opening lockout load transaction", e))?;
+        let lockout_db = lockout_env
+            .create_database::<Bytes, Bytes>(&mut txn, Some("lockout"))
+            .map_err(|e| backend("opening lockout database", e))?;
+        if !options.disable_lockout || !options.disable_last_success {
+            for entry in entries {
+                let value =
+                    encode_lockout(entry.last_success, entry.last_failed, entry.fail_auth_count);
+                lockout_db
+                    .put(
+                        &mut txn,
+                        &unparse_name(&entry.principal, &entry.realm),
+                        &value,
+                    )
+                    .map_err(|e| backend("loading lockout state", e))?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| backend("committing lockout load", e))
+    }
+}
+
 fn creator_name(realm: &str) -> Vec<u8> {
     let principal = PrincipalName::new_principal("db_creation");
     unparse_name(&principal, realm)
@@ -1418,6 +1535,56 @@ mod tests {
             security_epoch: 0,
             last_admin_unlock: None,
         }
+    }
+
+    #[test]
+    fn mit_dump_loads_and_dumps_back_byte_for_byte() {
+        use krb5_rs::kdc::kdb::mit::dump::{read_dump, write_dump, DumpVersion, Record};
+        let data = fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/mit-dump/v7.dump"
+        ))
+        .expect("MIT fixture");
+        let (_, records, _) = read_dump(&data, "v7", None).expect("parse");
+        let (mut entries, mut policies) = (Vec::new(), Vec::new());
+        for record in records {
+            match record {
+                Record::Principal(entry) => entries.push(entry),
+                Record::Policy(policy) => policies.push(policy),
+            }
+        }
+        let directory = tempfile::tempdir().expect("tempdir");
+        let profile = Profile::parse(
+            "[realms]\n DUMP.TEST = {\n  database_module = lmdb\n }\n\
+             [dbmodules]\n lmdb = {\n  db_library = klmdb\n }\n",
+        )
+        .expect("profile");
+        let mut config = krb5_rs::kdc::RealmConfig::from_profiles(&profile, None, "DUMP.TEST")
+            .expect("realm config");
+        config.database_name = directory.path().join("principal");
+        let master = master_key_from_password("DUMP.TEST", "master-password-for-dump-fixtures", 18)
+            .expect("master key");
+        assert!(LmdbStore::load_dump(&config, &entries, &policies, true).is_err());
+        LmdbStore::load_dump(&config, &entries, &policies, false).expect("load");
+        let dumped = {
+            let store = LmdbStore::open(&config, &master).expect("open loaded database");
+            let (entries, policies) = store.dump_entries().expect("dump");
+            write_dump(DumpVersion::R111, &entries, &policies)
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&dumped),
+            String::from_utf8_lossy(&data)
+        );
+
+        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], true).expect("update");
+        let count = |config| {
+            let store = LmdbStore::open(config, &master).expect("open");
+            let (entries, policies) = store.dump_entries().expect("dump");
+            (entries.len(), policies.len())
+        };
+        assert_eq!(count(&config), (entries.len(), policies.len()));
+        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], false).expect("replace");
+        assert_eq!(count(&config), (1, 1));
     }
 
     fn test_store(path: &Path) -> (LmdbStore, EncryptionKey) {
