@@ -185,6 +185,124 @@ test ! -e "$B/rsrep/from_master"
 test ! -e "$B/mitrep/from_master"
 echo "bad versions rejected by both"
 
+cat > "$B/badsize.c" <<'BADSIZE'
+#include <krb5.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static void check(krb5_context ctx, krb5_error_code ret, const char *what)
+{
+    if (ret) {
+        const char *m = krb5_get_error_message(ctx, ret);
+        fprintf(stderr, "%s: %s\n", what, m);
+        exit(1);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    krb5_context ctx;
+    krb5_principal me, server;
+    krb5_keytab kt;
+    krb5_creds creds;
+    krb5_auth_context ac = NULL;
+    krb5_error *err = NULL;
+    krb5_ap_rep_enc_part *rep = NULL;
+    krb5_get_init_creds_opt *opt;
+    struct sockaddr_in sin, local;
+    socklen_t len = sizeof(local);
+    krb5_address addr, *addrs[2];
+    unsigned char zeros[12] = { 0 }, nonzero[12] = { 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };
+    krb5_data in, out;
+    char *sname;
+    int fd;
+
+    if (argc != 6) {
+        fprintf(stderr, "usage: badsize port client server keytab short|nonzero12|unsafe\n");
+        return 2;
+    }
+    check(ctx, krb5_init_context(&ctx), "init");
+    check(ctx, krb5_parse_name(ctx, argv[2], &me), "parse client");
+    check(ctx, krb5_parse_name(ctx, argv[3], &server), "parse server");
+    check(ctx, krb5_kt_resolve(ctx, argv[4], &kt), "keytab");
+    check(ctx, krb5_unparse_name(ctx, server, &sname), "unparse");
+    check(ctx, krb5_get_init_creds_opt_alloc(ctx, &opt), "opt");
+    check(ctx, krb5_get_init_creds_keytab(ctx, &creds, me, kt, 0, sname, opt), "get creds");
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(atoi(argv[1]));
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&sin, sizeof(sin)) < 0 ||
+        getsockname(fd, (struct sockaddr *)&local, &len) < 0) {
+        perror("connect");
+        return 1;
+    }
+    addr.magic = KV5M_ADDRESS;
+    addr.addrtype = ADDRTYPE_INET;
+    addr.length = 4;
+    addr.contents = (krb5_octet *)&local.sin_addr;
+    addrs[0] = &addr;
+    addrs[1] = NULL;
+
+    check(ctx, krb5_auth_con_init(ctx, &ac), "auth_con_init");
+    krb5_auth_con_setflags(ctx, ac, KRB5_AUTH_CONTEXT_DO_SEQUENCE);
+    check(ctx, krb5_auth_con_setaddrs(ctx, ac, &addr, NULL), "setaddrs");
+    check(ctx, krb5_sendauth(ctx, &ac, &fd, "kprop5_01", me, server,
+                             AP_OPTS_MUTUAL_REQUIRED, NULL, &creds, NULL,
+                             &err, &rep, NULL), "sendauth");
+
+    if (strcmp(argv[5], "unsafe") == 0) {
+        out.data = "not a KRB-SAFE message";
+        out.length = strlen(out.data);
+    } else {
+        in.data = (char *)(strcmp(argv[5], "short") == 0 ? zeros : nonzero);
+        in.length = strcmp(argv[5], "short") == 0 ? 5 : 12;
+        check(ctx, krb5_mk_safe(ctx, ac, &in, &out, NULL), "mk_safe");
+    }
+    check(ctx, krb5_write_message(ctx, &fd, &out), "write");
+    check(ctx, krb5_read_message(ctx, &fd, &in), "read reply");
+    check(ctx, krb5_rd_error(ctx, &in, &err), "rd_error");
+    printf("error=%d text=%.*s\n", (int)err->error, (int)err->text.length, err->text.data);
+    (void)addrs;
+    return 0;
+}
+BADSIZE
+gcc -o "$B/badsize" "$B/badsize.c" -lkrb5 -lcom_err
+badsize() { # port mit|rs mode
+  if [ "$2" = mit ]; then
+    mit mitrep kpropd -D -t -P $1 -r $R -s "$B/host.keytab" -a "$B/ok.acl" \
+      -f "$B/mitrep/from_master" -p "$(command -v kdb5_util)" > "$B/badsize$1.log" 2>&1 &
+  else
+    KRB5_KDC_PROFILE=$B/rsrep.conf $BIN/krb5-rs-kpropd -D -t -P $1 -r $R -s "$B/host.keytab" \
+      -a "$B/ok.acl" -f "$B/rsrep/from_master" -p $BIN/krb5-rs-kdb > "$B/badsize$1.log" 2>&1 &
+  fi
+  local p=$!
+  wait_listen $1
+  "$B/badsize" $1 "host/$H@$R" "host/$H@$R" "$B/host.keytab" $3
+  wait $p || true
+}
+port=17554
+for mode in short nonzero12 unsafe; do
+  rs=$(badsize $port rs $mode)
+  ref=$(badsize $((port + 1)) mit $mode)
+  port=$((port + 2))
+  echo "$mode: krb5-rs [$rs] MIT [$ref]"
+  test "$rs" = "$ref"
+  if [ $mode != unsafe ]; then
+    test "$rs" = "error=60 text=malformed database size message"
+  fi
+done
+test ! -e "$B/rsrep/from_master"
+test ! -e "$B/mitrep/from_master"
+echo "malformed database sizes rejected by both"
+
 cat > "$B/cut.py" <<'CUT'
 import socket, sys, threading
 lport, dhost, dport, cap = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
