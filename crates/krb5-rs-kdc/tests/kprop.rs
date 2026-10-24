@@ -116,8 +116,6 @@ struct Realm {
 
 fn realm(tag: &str) -> Realm {
     let dir = TempDir::new(tag);
-    // kprop/kpropd canonicalize the host name like krb5_sname_to_principal;
-    // krb5.conf below turns DNS canonicalization off, so this is the name.
     let canon = HostCanon::from_profile(&Profile::parse(LIBDEFAULTS).expect("profile"));
     let host = canon.candidates(&local_hostname().expect("hostname"))[0].clone();
     let primary = write_conf(&dir, "primary");
@@ -271,7 +269,6 @@ fn kprop_pushes_the_dump_and_kpropd_loads_it() {
 #[test]
 fn kpropd_rejects_a_principal_missing_from_the_acl() {
     let r = realm("acl");
-    // The enctype column must name the ticket enctype.
     let acl = format!(
         "host/{host}@{REALM}x\nhost/{host}@{REALM} des3-cbc-sha1\n",
         host = r.host

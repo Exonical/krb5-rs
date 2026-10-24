@@ -33,13 +33,14 @@ struct Args {
     /// Seconds one push may take in interval mode before it is killed.
     timeout: u64,
     kdb: Option<PathBuf>,
+    watch: Vec<PathBuf>,
     replica_hosts: Vec<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "\nUsage: kprop [-r realm] [-f file] [-d] [-P port] [-s keytab] replica_host\n       \
-         kprop --interval SECS [--timeout SECS] [--kdb PROGRAM] [options] replica_host...\n"
+         kprop --interval SECS [--timeout SECS] [--watch PATH] [--kdb PROGRAM] [options] replica_host...\n"
     );
     std::process::exit(1);
 }
@@ -60,6 +61,7 @@ fn parse_args() -> Args {
         interval: None,
         timeout: 300,
         kdb: None,
+        watch: Vec::new(),
         replica_hosts: Vec::new(),
     };
     let mut positional = Vec::new();
@@ -74,6 +76,11 @@ fn parse_args() -> Args {
             "--timeout" => {
                 let secs = it.next().and_then(|v| v.parse().ok()).filter(|&v| v > 0);
                 args.timeout = secs.unwrap_or_else(|| usage());
+                continue;
+            }
+            "--watch" => {
+                args.watch
+                    .push(PathBuf::from(it.next().unwrap_or_else(|| usage())));
                 continue;
             }
             "--kdb" => {
@@ -144,6 +151,7 @@ fn propagate_forever(args: &Args, secs: u64) -> ! {
         common.push("-d".into());
     }
     loop {
+        let seen = stamps(&args.watch);
         let dumped = std::process::Command::new(&kdb)
             .args(args.realm.iter().flat_map(|r| ["-r", r.as_str()]))
             .arg("dump")
@@ -175,8 +183,18 @@ fn propagate_forever(args: &Args, secs: u64) -> ! {
             Ok(status) => eprintln!("kprop: {} dump failed ({status})", kdb.display()),
             Err(e) => eprintln!("kprop: {e} while running {}", kdb.display()),
         }
-        std::thread::sleep(Duration::from_secs(secs));
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline && stamps(&args.watch) == seen {
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
+}
+
+fn stamps(paths: &[PathBuf]) -> Vec<Option<std::time::SystemTime>> {
+    paths
+        .iter()
+        .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .collect()
 }
 
 /// `port` is a number or the `krb5_prop` service name.

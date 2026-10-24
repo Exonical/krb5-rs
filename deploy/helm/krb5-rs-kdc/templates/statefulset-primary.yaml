@@ -150,6 +150,8 @@ spec:
           args:
             - --interval
             - {{ .Values.propagation.interval | quote }}
+            - --watch
+            - /var/lib/krb5-rs/principal.mdb
             - --kdb
             - /usr/local/bin/krb5-rs-kdb
             - -r

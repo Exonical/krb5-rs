@@ -1,8 +1,11 @@
 # krb5-rs KDC on Podman
 
-A single pod running one KDC (the "primary"): the database lives in a named
-volume, so it survives restarts. Podman has no replicas; high availability is
-Kubernetes-only (see `deploy/helm`).
+A primary pod (`krb5-rs-kdc.yaml`, host `kdc1.example.com`) and an optional
+replica pod (`krb5-rs-kdc-replica.yaml`, host `kdc2.example.com`). Each
+database lives in a named volume, so it survives restarts. The primary's
+`kprop` container pushes the database with MIT kprop to the replica's
+`krb5-rs-kpropd` (TCP 7540) after every admin change and every 60s; the
+replica's KDC starts once the first push is loaded.
 
 `krb5-rs-kdc.yaml` is a self-contained `podman kube play` file with a Secret
 (master and kprop passwords), a ConfigMap (`kdc.conf`, `krb5.conf`), a
@@ -22,9 +25,11 @@ sed -e 's/EXAMPLE\.COM/MY.REALM/g' \
     krb5-rs-kdc.yaml > my-kdc.yaml
 ```
 
-(`kprop-password` is the password of the `host/` principals the Helm chart
-uses for MIT kprop to its `krb5-rs-kpropd` replicas; it is unused in the
-single-pod setup.) Keep `my-kdc.yaml`
+Write `my-kdc-replica.yaml` from `krb5-rs-kdc-replica.yaml` with the same
+realm and the same two passwords; also replace `kdc1.example.com` and
+`kdc2.example.com` in both files with the hosts' DNS names. `kprop-password`
+is the password of the two `host/` principals kprop authenticates with. Without
+a replica, drop the `kprop` container from `my-kdc.yaml`. Keep `my-kdc.yaml`
 private: it contains the master password. Pin the image tag or digest in the
 file if you do not want `:latest`; to test a local build
 (`podman build -f deploy/docker/Dockerfile -t krb5-rs-kdc .`) replace
@@ -36,6 +41,7 @@ Changing the master password later does not re-key an existing database.
 
 ```sh
 podman kube play my-kdc.yaml        # creates secret, volume, pod; starts it
+podman kube play my-kdc-replica.yaml  # on the replica host
 podman pod ps
 podman logs krb5-rs-kdc-kdc         # one log line per request
 ```

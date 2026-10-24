@@ -10,7 +10,6 @@ data:
     {{- include "krb5-rs-kdc.kdcConf" (dict "ctx" . "role" "primary") | nindent 4 }}
   replica-kdc.conf: |
     {{- include "krb5-rs-kdc.kdcConf" (dict "ctx" . "role" "replica") | nindent 4 }}
-  # Throwaway database a replica derives its host/ key in.
   keytab-kdc.conf: |
     [realms]
      {{ .Values.realm }} = {
@@ -20,7 +19,6 @@ data:
      }
   kpropd.acl: |
     host/{{ include "krb5-rs-kdc.primaryHost" . }}@{{ .Values.realm }}
-  # The primary's kprop sidecar gets its ticket from the KDC in its own pod.
   kprop-krb5.conf: |
     [libdefaults]
      default_realm = {{ .Values.realm }}

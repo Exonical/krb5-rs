@@ -1,8 +1,10 @@
-# Single-pod krb5-rs KDC for `podman kube play` (primary only, restart Always).
-# High availability (replicas) is Kubernetes-only: see deploy/helm.
+# Primary krb5-rs KDC for `podman kube play`. Its kprop container pushes the
+# database (MIT kprop) to the kpropd of krb5-rs-kdc-replica.yaml on
+# kdc2.example.com after each admin change and every 60s.
 #
-# Before use replace EXAMPLE.COM and both CHANGE-ME passwords (README.md shows
-# how) and set the image if you do not use the published one.
+# Before use replace EXAMPLE.COM, kdc1/kdc2.example.com and both CHANGE-ME
+# passwords (README.md shows how) and set the image if you do not use the
+# published one.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -35,6 +37,16 @@ data:
      default_realm = EXAMPLE.COM
      dns_lookup_kdc = false
      dns_lookup_realm = false
+  kprop-krb5.conf: |
+    [libdefaults]
+     default_realm = EXAMPLE.COM
+     dns_lookup_kdc = false
+     dns_lookup_realm = false
+     udp_preference_limit = 1
+    [realms]
+     EXAMPLE.COM = {
+      kdc = 127.0.0.1:8888
+     }
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -54,6 +66,7 @@ metadata:
   labels:
     app: krb5-rs-kdc
 spec:
+  hostname: kdc1.example.com
   restartPolicy: Always
   securityContext:
     runAsNonRoot: true
@@ -74,6 +87,10 @@ spec:
         - --master-password-file
         - /secrets/master-password
         - --stash
+        - --password
+        - host/kdc1.example.com=/secrets/kprop-password
+        - --password
+        - host/kdc2.example.com=/secrets/kprop-password
       volumeMounts:
         - name: data
           mountPath: /var/lib/krb5-rs
@@ -83,7 +100,62 @@ spec:
         - name: secrets
           mountPath: /secrets
           readOnly: true
+    - name: init-keytab
+      image: ghcr.io/exonical/krb5-rs-kdc:latest
+      command: ["/usr/local/bin/krb5-rs-kdb"]
+      args:
+        - --config
+        - /etc/krb5-rs/kdc.conf
+        - --realm
+        - EXAMPLE.COM
+        - ktadd
+        - -k
+        - /var/lib/krb5-rs/krb5.keytab
+        - -norandkey
+        - host/kdc1.example.com
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/krb5-rs
+        - name: config
+          mountPath: /etc/krb5-rs
+          readOnly: true
   containers:
+    - name: kprop
+      image: ghcr.io/exonical/krb5-rs-kdc:latest
+      command: ["/usr/local/bin/krb5-rs-kprop"]
+      args:
+        - --interval
+        - "60"
+        - --watch
+        - /var/lib/krb5-rs/principal.mdb
+        - --kdb
+        - /usr/local/bin/krb5-rs-kdb
+        - -r
+        - EXAMPLE.COM
+        - -P
+        - "7540"
+        - -s
+        - /var/lib/krb5-rs/krb5.keytab
+        - -f
+        - /var/lib/krb5-rs/replica_datatrans
+        - kdc2.example.com
+      env:
+        - name: KRB5_KDC_PROFILE
+          value: /etc/krb5-rs/kdc.conf
+        - name: KRB5_CONFIG
+          value: /etc/krb5-rs/kprop-krb5.conf
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/krb5-rs
+        - name: config
+          mountPath: /etc/krb5-rs
+          readOnly: true
     - name: kdc
       image: ghcr.io/exonical/krb5-rs-kdc:latest
       args:

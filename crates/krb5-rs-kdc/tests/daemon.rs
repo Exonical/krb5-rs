@@ -574,7 +574,6 @@ async fn lockout_policy_from_the_database_applies_in_the_daemon() {
     assert_eq!(attempt(daemon.tcp, "carol", "wrong").await, Err(24));
     // Locked out now, even with the right password.
     assert_eq!(attempt(daemon.tcp, "carol", "carol-pw").await, Err(18));
-    // The log is read on another thread; the line may trail the reply.
     daemon.wait_for_line("LOCKED_OUT: carol@");
 
     // An administrator unlocks; the daemon sees it on its next request.
