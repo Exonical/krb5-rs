@@ -186,10 +186,15 @@ Deviations:
   `~`-rename: principal and policy databases are cleared and refilled in one
   write transaction that commits only after every record is stored
   (`plugins/kdb/lmdb/kdb_lmdb.c:62-76, 635-647, 1004-1020`). Lockout rows are
-  written in a second transaction after that commit (MIT writes them per
-  record without a transaction); stale lockout rows of principals that were
+  staged in a second transaction that commits right after it (MIT writes
+  them per record without a transaction), so a load that fails before the
+  main commit changes nothing; stale lockout rows of principals that were
   not reloaded stay, as in MIT. The file store uses `<db>~` plus rename like
   db2 (`plugins/kdb/db2/kdb_db2.c:298, 1419`).
+- Input that ends inside a record (after `princ`/`policy` or within its
+  fields) is rejected; MIT treats it as the end of the dump and drops the
+  record (`dump.c:616, 898, 907, 917`). A complete policy missing only its
+  final newline is kept.
 - `-hash` is accepted and ignored; `-c`, `-rev` and `-recurse` are accepted
   and ignored on dump; iprop (`-i`) and `-mkey_convert` are rejected.
 - `e_data` is always written empty, as klmdb never stores it

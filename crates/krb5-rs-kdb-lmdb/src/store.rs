@@ -989,9 +989,11 @@ impl LmdbStore {
     /// one write transaction that is only committed once everything is
     /// written (`plugins/kdb/lmdb/kdb_lmdb.c:62-76,635-647,1004-1020`).
     /// Deviation: MIT writes lockout records outside that transaction while
-    /// loading; they are written here in one transaction after the commit,
-    /// so an aborted load changes nothing. Like MIT, the lockout database is
-    /// not emptied.
+    /// loading; here they are staged in one lockout transaction committed
+    /// right after the main one, so a load that fails before the main commit
+    /// changes nothing. Only a failing lockout commit can leave the new
+    /// principals with their old lockout rows. Like MIT, the lockout database
+    /// is not emptied.
     pub fn load_dump(
         config: &krb5_rs::kdc::RealmConfig,
         entries: &[MitEntry],
@@ -1041,13 +1043,12 @@ impl LmdbStore {
                 .put(&mut txn, policy.name.as_bytes(), &policy.encode()?)
                 .map_err(|e| backend("loading policy", e))?;
         }
-        txn.commit().map_err(|e| backend("committing load", e))?;
         let lockout_env = open_lockout_env(&lockout_path(database_name), &options)?;
-        let mut txn = lockout_env
+        let mut lockout_txn = lockout_env
             .write_txn()
             .map_err(|e| backend("opening lockout load transaction", e))?;
         let lockout_db = lockout_env
-            .create_database::<Bytes, Bytes>(&mut txn, Some("lockout"))
+            .create_database::<Bytes, Bytes>(&mut lockout_txn, Some("lockout"))
             .map_err(|e| backend("opening lockout database", e))?;
         if !options.disable_lockout || !options.disable_last_success {
             for entry in entries {
@@ -1055,14 +1056,16 @@ impl LmdbStore {
                     encode_lockout(entry.last_success, entry.last_failed, entry.fail_auth_count);
                 lockout_db
                     .put(
-                        &mut txn,
+                        &mut lockout_txn,
                         &unparse_name(&entry.principal, &entry.realm),
                         &value,
                     )
                     .map_err(|e| backend("loading lockout state", e))?;
             }
         }
-        txn.commit()
+        txn.commit().map_err(|e| backend("committing load", e))?;
+        lockout_txn
+            .commit()
             .map_err(|e| backend("committing lockout load", e))
     }
 }

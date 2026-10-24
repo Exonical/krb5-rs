@@ -198,11 +198,6 @@ pub struct Loader<'a> {
     pub warnings: Vec<String>,
 }
 
-enum Step<T> {
-    Eof,
-    Ok(T),
-}
-
 impl<'a> Loader<'a> {
     /// `data` is the input after the header line.
     pub fn new(data: &'a [u8], fname: &str, version: DumpVersion) -> Self {
@@ -307,6 +302,10 @@ impl<'a> Loader<'a> {
 
     /// The next record, `None` at end of input (`process_tagged`,
     /// `dump.c:958-980`).
+    /// Deviation: MIT ends the load without error when the input stops right
+    /// after a record tag or a policy's numeric fields (`dump.c:616, 898, 907,
+    /// 917`), silently dropping that record; that is an error here, except
+    /// that a complete policy missing only its final newline is kept.
     pub fn next_record(&mut self) -> Result<Option<Record>, LoadError> {
         if self.at_eof() {
             return Ok(None);
@@ -315,14 +314,8 @@ impl<'a> Loader<'a> {
             return Err(self.fail(""));
         };
         match tag {
-            b"princ" => match self.principal()? {
-                Step::Ok(entry) => Ok(Some(Record::Principal(entry))),
-                _ => Ok(None),
-            },
-            b"policy" => match self.policy()? {
-                Step::Ok(policy) => Ok(Some(Record::Policy(policy))),
-                _ => Ok(None),
-            },
+            b"princ" => self.principal().map(|e| Some(Record::Principal(e))),
+            b"policy" => self.policy().map(|p| Some(Record::Policy(p))),
             b"End" => Ok(None),
             other => Err(self.fail(format!(
                 "unknown record type \"{}\"",
@@ -353,11 +346,8 @@ impl<'a> Loader<'a> {
     }
 
     /// `process_k5beta7_princ` (`dump.c:598-794`).
-    fn principal(&mut self) -> Result<Step<MitEntry>, LoadError> {
+    fn principal(&mut self) -> Result<MitEntry, LoadError> {
         self.line += 1;
-        if self.at_eof() {
-            return Ok(Step::Eof);
-        }
         let mut sizes = [0u32; 5];
         for size in &mut sizes {
             *size = self
@@ -432,7 +422,7 @@ impl<'a> Loader<'a> {
         self.record_end();
         let [attributes, max_life, max_renewable_life, expiration, pw_expiration, last_success, last_failed, fail_auth_count] =
             fixed;
-        Ok(Step::Ok(MitEntry {
+        Ok(MitEntry {
             principal,
             realm,
             attributes,
@@ -445,7 +435,7 @@ impl<'a> Loader<'a> {
             fail_auth_count,
             tl_data,
             key_data,
-        }))
+        })
     }
 
     /// `read_record_end` (`dump.c:508-523`): trash is reported, not fatal.
@@ -470,12 +460,9 @@ impl<'a> Loader<'a> {
 
     /// `process_k5beta7_policy`, `process_r1_8_policy` and
     /// `process_r1_11_policy` (`dump.c:796-956`).
-    fn policy(&mut self) -> Result<Step<MitPolicy>, LoadError> {
+    fn policy(&mut self) -> Result<MitPolicy, LoadError> {
         self.line += 1;
         let Some(name) = self.token(1023) else {
-            if self.at_eof() {
-                return Ok(Step::Eof);
-            }
             return Err(self.fail("cannot parse policy (0 read)"));
         };
         let name = String::from_utf8_lossy(name).into_owned();
@@ -509,14 +496,14 @@ impl<'a> Loader<'a> {
             tl_data: Vec::new(),
         };
         if self.version != DumpVersion::R111 {
-            return Ok(Step::Ok(policy));
+            return Ok(policy);
         }
         let Some(&next) = self.data.get(self.pos) else {
-            return Ok(Step::Eof);
+            return Ok(policy);
         };
         self.pos += 1;
         if next == b'\n' {
-            return Ok(Step::Ok(policy));
+            return Ok(policy);
         }
         let mut extra = [0u32; 3];
         for (read, field) in extra.iter_mut().enumerate() {
@@ -540,7 +527,7 @@ impl<'a> Loader<'a> {
             .and_then(|n| i16::try_from(n).ok())
             .ok_or_else(|| self.fail("cannot parse policy (4 read)"))?;
         policy.tl_data = self.tl_data(usize::try_from(count).unwrap_or(0))?;
-        Ok(Step::Ok(policy))
+        Ok(policy)
     }
 }
 
@@ -613,6 +600,23 @@ pub enum LoadFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_ending_inside_a_record_is_rejected() {
+        for body in ["princ\t", "princ\t38\t", "policy\t", "policy\tp\t0\t0"] {
+            let data = format!("kdb5_util load_dump version 7\n{body}");
+            assert!(
+                matches!(
+                    read_dump(data.as_bytes(), "d", None),
+                    Err(LoadFailure::Record { .. })
+                ),
+                "{body:?}"
+            );
+        }
+        let data = b"kdb5_util load_dump version 7\npolicy\tp\t0\t0\t0\t1\t0\t0\t0\t0\t0";
+        let (_, records, _) = read_dump(data, "d", None).expect("complete policy");
+        assert_eq!(records.len(), 1);
+    }
 
     fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(format!(

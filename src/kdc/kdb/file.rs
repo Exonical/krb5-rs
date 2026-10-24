@@ -609,7 +609,24 @@ impl FileStore {
     /// Snapshot all principals and policies for migration to another
     /// authoritative backend.
     pub fn export_records(&self) -> Result<(Vec<PrincipalRecord>, Vec<Policy>), StoreError> {
-        Ok((self.list_records()?, self.list_policies()?))
+        self.refresh(false)?;
+        let (raws, mut policies) = {
+            let cache = self.read_cache();
+            (
+                cache
+                    .records
+                    .values()
+                    .cloned()
+                    .collect::<Vec<KdbPrincipal>>(),
+                cache.policies.values().cloned().collect::<Vec<Policy>>(),
+            )
+        };
+        policies.sort_by(|a, b| a.name.cmp(&b.name));
+        let records = raws
+            .iter()
+            .map(|r| self.decrypt_record(r))
+            .collect::<Result<_, _>>()?;
+        Ok((records, policies))
     }
 
     /// Principals and policies as MIT dump entries in klmdb key order.
