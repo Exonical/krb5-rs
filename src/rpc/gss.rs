@@ -298,8 +298,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> GssClient<S> {
             gc_proc = proc_::CONTINUE_INIT;
             if res.major == 0 {
                 if !complete {
-                    if let InitStep::Continue(_) = initiator.step(Some(&res.token)).map_err(gss)? {
-                        return Err(RpcError::Gss("context not complete".into()));
+                    match initiator.step(Some(&res.token)).map_err(gss)? {
+                        InitStep::Complete(None) => {}
+                        InitStep::Complete(Some(t)) if t.is_empty() => {}
+                        _ => return Err(RpcError::Gss("context not complete".into())),
                     }
                 }
                 let mut ctx = initiator.context().map_err(gss)?;
