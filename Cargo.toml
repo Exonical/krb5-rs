@@ -54,6 +54,10 @@ p521 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"], optional = true 
 crypto-bigint = { version = "0.7", optional = true }
 rasn-pkix = { version = "0.28", optional = true }
 
+# getaddrinfo(AI_CANONNAME) host-name canonicalization (kprop).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 rasn-cms = "0.28"
 tokio = { version = "1.50", features = ["full"] }

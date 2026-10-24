@@ -161,6 +161,15 @@ impl AuthContext {
             decrypt_ticket(&key, &req.ticket)?
         };
 
+        // After the key lookup (an unknown server is NoKey, rd_req_dec.c:131),
+        // a ticket for another principal is refused even when it decrypts
+        // with a shared key (KRB5KRB_AP_WRONG_PRINC, rd_req_dec.c:382).
+        if let Some(server) = server {
+            if server.name_string != req.ticket.sname.name_string {
+                return Err(ApError::WrongPrinc.into());
+            }
+        }
+
         let session = enc_part.key.clone();
         let session_profile =
             find_etype(session.keytype).map_err(|e| Krb5Error::Crypto(e.to_string()))?;

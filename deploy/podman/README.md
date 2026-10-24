@@ -22,7 +22,9 @@ sed -e 's/EXAMPLE\.COM/MY.REALM/g' \
     krb5-rs-kdc.yaml > my-kdc.yaml
 ```
 
-(`kprop-password` is unused in the single-pod setup.) Keep `my-kdc.yaml`
+(`kprop-password` is the password of the `host/` principals the Helm chart
+uses for MIT kprop to its `krb5-rs-kpropd` replicas; it is unused in the
+single-pod setup.) Keep `my-kdc.yaml`
 private: it contains the master password. Pin the image tag or digest in the
 file if you do not want `:latest`; to test a local build
 (`podman build -f deploy/docker/Dockerfile -t krb5-rs-kdc .`) replace

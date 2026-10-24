@@ -48,10 +48,12 @@ spec:
             - --master-password-file
             - /secrets/master-password
             - --stash
-            - --randkey
-            - {{ .Values.propagation.servicePrincipal }}
             - --password
-            - {{ .Values.propagation.clientPrincipal }}=/secrets/kprop-password
+            - host/{{ include "krb5-rs-kdc.primaryHost" . }}=/secrets/kprop-password
+            {{- range $i := until (int .Values.replicas.replicaCount) }}
+            - --password
+            - host/{{ include "krb5-rs-kdc.replicaHost" (dict "ctx" $ "i" $i) }}=/secrets/kprop-password
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           volumeMounts:
@@ -63,6 +65,30 @@ spec:
             - name: secrets
               mountPath: /secrets
               readOnly: true
+        - name: init-keytab
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kdb"]
+          args:
+            - --config
+            - /etc/krb5-rs/kdc.conf
+            - --realm
+            - {{ .Values.realm }}
+            - ktadd
+            - -k
+            - /keytab/krb5.keytab
+            - -norandkey
+            - host/{{ include "krb5-rs-kdc.primaryHost" . }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/krb5-rs
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: keytab
+              mountPath: /keytab
       containers:
         - name: kdc
           image: {{ include "krb5-rs-kdc.image" . | quote }}
@@ -80,9 +106,6 @@ spec:
               protocol: UDP
             - name: kdc-tcp
               containerPort: {{ .Values.kdc.containerPort }}
-              protocol: TCP
-            - name: kprop
-              containerPort: {{ .Values.propagation.port }}
               protocol: TCP
             {{- if .Values.metrics.enabled }}
             - name: metrics
@@ -118,6 +141,45 @@ spec:
             - name: secrets
               mountPath: /secrets
               readOnly: true
+        {{- if gt (int .Values.replicas.replicaCount) 0 }}
+        # Push the database to every replica's kpropd (MIT kprop).
+        - name: kprop
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kprop"]
+          args:
+            - --interval
+            - {{ .Values.propagation.interval | quote }}
+            - --kdb
+            - /usr/local/bin/krb5-rs-kdb
+            - -r
+            - {{ .Values.realm }}
+            - -P
+            - {{ .Values.propagation.port | quote }}
+            - -s
+            - /keytab/krb5.keytab
+            - -f
+            - /var/lib/krb5-rs/replica_datatrans
+            {{- range $i := until (int .Values.replicas.replicaCount) }}
+            - {{ include "krb5-rs-kdc.replicaHost" (dict "ctx" $ "i" $i) }}
+            {{- end }}
+          env:
+            - name: KRB5_KDC_PROFILE
+              value: /etc/krb5-rs/kdc.conf
+            - name: KRB5_CONFIG
+              value: /etc/krb5-rs/kprop-krb5.conf
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/krb5-rs
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: keytab
+              mountPath: /keytab
+              readOnly: true
+        {{- end }}
       volumes:
         - name: config
           configMap:
@@ -127,10 +189,14 @@ spec:
                 path: kdc.conf
               - key: krb5.conf
                 path: krb5.conf
+              - key: kprop-krb5.conf
+                path: kprop-krb5.conf
         - name: secrets
           secret:
             secretName: {{ include "krb5-rs-kdc.secretName" . }}
             defaultMode: 0440
+        - name: keytab
+          emptyDir: {}
         {{- if not .Values.primary.persistence.enabled }}
         - name: data
           emptyDir: {}

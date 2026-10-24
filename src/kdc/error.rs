@@ -102,9 +102,10 @@ pub(crate) fn ap_error_code(e: ApError) -> i32 {
         ApError::InappCksum => KRB_AP_ERR_INAPP_CKSUM,
         ApError::SumTypeNoSupp => KDC_ERR_SUMTYPE_NOSUPP,
         ApError::IllCrTkt => KRB_AP_ERR_ILL_CR_TKT,
-        ApError::NoPermEtype | ApError::LocalAddrRequired | ApError::NoTktSupplied => {
-            KRB_ERR_GENERIC
-        }
+        ApError::NoPermEtype
+        | ApError::LocalAddrRequired
+        | ApError::NoTktSupplied
+        | ApError::WrongPrinc => KRB_ERR_GENERIC,
     }
 }
 

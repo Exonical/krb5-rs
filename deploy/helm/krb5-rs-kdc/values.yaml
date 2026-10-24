@@ -134,15 +134,18 @@ service:
   externalTrafficPolicy: ""
 
 propagation:
-  # Primary -> replica database propagation (protocol KRB5RS-PROP-1).
+  # The primary's krb5-rs-kprop sidecar dumps the database and pushes it to
+  # every replica's krb5-rs-kpropd (MIT kprop protocol) every `interval`
+  # seconds. `port` is the kpropd port (MIT's 754 needs root).
   port: 7540
-  servicePrincipal: kprop/primary
-  clientPrincipal: kprop/replica
-  pollInterval: 60s
+  interval: 60
+
+# Cluster DNS domain, part of the pods' host/<FQDN> kprop principals.
+clusterDomain: cluster.local
 
 secrets:
   # Name of an existing Secret with keys "master-password" and
-  # "kprop-password". When empty a Secret with random values is created on
+  # "kprop-password" (password of the host/ kprop principals). When empty a Secret with random values is created on
   # install and kept across upgrades and uninstall.
   existingSecret: ""
 

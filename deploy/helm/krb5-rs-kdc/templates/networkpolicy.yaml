@@ -27,12 +27,12 @@ spec:
           protocol: TCP
 {{- end }}
 {{- if eq .Values.database.mode "file" }}
-    # Database propagation only from the replicas.
+    # Database propagation (kprop to the replicas' kpropd) only from the primary.
     - from:
         - podSelector:
             matchLabels:
               {{- include "krb5-rs-kdc.selectorLabels" . | nindent 14 }}
-              app.kubernetes.io/component: replica
+              app.kubernetes.io/component: primary
       ports:
         - port: {{ .Values.propagation.port }}
           protocol: TCP

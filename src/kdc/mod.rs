@@ -54,10 +54,7 @@ pub use server::{
 
 pub use summary::{Outcome, RequestKind, RequestSummary, Transport};
 
-pub use config::{
-    default_realm, parse_listen_addresses, ConfigError, DbModuleConfig, PropagationSettings,
-    RealmConfig,
-};
+pub use config::{default_realm, parse_listen_addresses, ConfigError, DbModuleConfig, RealmConfig};
 pub use db::{
     keys_from_password, random_keys, salt_bytes, KeyEntry, MemoryStore, PrincipalAttributes,
     PrincipalEntry,

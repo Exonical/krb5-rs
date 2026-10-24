@@ -11,7 +11,7 @@ use sha2::{Sha256, Sha384};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use super::aes_cts::{aes_cts_decrypt, aes_cts_encrypt};
+use super::aes_cts::{aes_cts_decrypt_iv, aes_cts_encrypt_iv};
 use super::util::generate_random;
 use super::{CryptoError, EtypeProfile, KeyPurpose};
 
@@ -113,6 +113,7 @@ fn sha2_encrypt<H: Sha2Hash>(
     plaintext: &[u8],
     key_len: usize,
     hash_len: usize,
+    state: &mut [u8; AES_BLOCK],
 ) -> Result<Vec<u8>, CryptoError> {
     let ke = sha2_derive::<H>(key, usage, KeyPurpose::Encryption, key_len, hash_len)?;
     let ki = sha2_derive::<H>(key, usage, KeyPurpose::Integrity, key_len, hash_len)?;
@@ -122,12 +123,13 @@ fn sha2_encrypt<H: Sha2Hash>(
     data.extend_from_slice(&confounder);
     data.extend_from_slice(plaintext);
 
-    let ct = aes_cts_encrypt(&ke, &data)?;
+    let input_state = *state;
+    let ct = aes_cts_encrypt_iv(&ke, state, &data)?;
 
-    // MIT enc_etm.c: HMAC over IV || C, IV = 16 zero bytes, truncated to
+    // MIT enc_etm.c: HMAC over IV || C, IV = cipher state (zeroes unless chained), truncated to
     // hash_len/2.
     let mut mac_input = Vec::with_capacity(AES_BLOCK + ct.len());
-    mac_input.extend_from_slice(&[0u8; AES_BLOCK]);
+    mac_input.extend_from_slice(&input_state);
     mac_input.extend_from_slice(&ct);
     let tag = H::hmac(&ki, &mac_input);
 
@@ -142,6 +144,7 @@ fn sha2_decrypt<H: Sha2Hash>(
     ciphertext: &[u8],
     key_len: usize,
     hash_len: usize,
+    state: &mut [u8; AES_BLOCK],
 ) -> Result<Vec<u8>, CryptoError> {
     let ct_len = ciphertext
         .len()
@@ -154,7 +157,7 @@ fn sha2_decrypt<H: Sha2Hash>(
     let ki = sha2_derive::<H>(key, usage, KeyPurpose::Integrity, key_len, hash_len)?;
     let (ct, tag) = ciphertext.split_at(ct_len);
     let mut mac_input = Vec::with_capacity(AES_BLOCK + ct.len());
-    mac_input.extend_from_slice(&[0u8; AES_BLOCK]);
+    mac_input.extend_from_slice(state.as_slice());
     mac_input.extend_from_slice(ct);
     let computed = H::hmac(&ki, &mac_input);
     if !bool::from(computed[..hash_len / 2].ct_eq(tag)) {
@@ -162,7 +165,7 @@ fn sha2_decrypt<H: Sha2Hash>(
     }
 
     let ke = sha2_derive::<H>(key, usage, KeyPurpose::Encryption, key_len, hash_len)?;
-    let plain = Zeroizing::new(aes_cts_decrypt(&ke, ct)?);
+    let plain = Zeroizing::new(aes_cts_decrypt_iv(&ke, state, ct)?);
     Ok(plain[AES_BLOCK..].to_vec())
 }
 
@@ -273,7 +276,14 @@ impl EtypeProfile for Aes128CtsHmacSha256128 {
         key_usage: i32,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        sha2_encrypt::<Sha256Hash>(key, key_usage, plaintext, self.key_length(), 32)
+        sha2_encrypt::<Sha256Hash>(
+            key,
+            key_usage,
+            plaintext,
+            self.key_length(),
+            32,
+            &mut [0u8; AES_BLOCK],
+        )
     }
 
     fn decrypt(
@@ -282,7 +292,34 @@ impl EtypeProfile for Aes128CtsHmacSha256128 {
         key_usage: i32,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        sha2_decrypt::<Sha256Hash>(key, key_usage, ciphertext, self.key_length(), 32)
+        sha2_decrypt::<Sha256Hash>(
+            key,
+            key_usage,
+            ciphertext,
+            self.key_length(),
+            32,
+            &mut [0u8; AES_BLOCK],
+        )
+    }
+
+    fn encrypt_with_state(
+        &self,
+        key: &[u8],
+        key_usage: i32,
+        plaintext: &[u8],
+        state: &mut [u8; 16],
+    ) -> Result<Vec<u8>, CryptoError> {
+        sha2_encrypt::<Sha256Hash>(key, key_usage, plaintext, self.key_length(), 32, state)
+    }
+
+    fn decrypt_with_state(
+        &self,
+        key: &[u8],
+        key_usage: i32,
+        ciphertext: &[u8],
+        state: &mut [u8; 16],
+    ) -> Result<Vec<u8>, CryptoError> {
+        sha2_decrypt::<Sha256Hash>(key, key_usage, ciphertext, self.key_length(), 32, state)
     }
 
     fn string_to_key(
@@ -354,7 +391,14 @@ impl EtypeProfile for Aes256CtsHmacSha384192 {
         key_usage: i32,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        sha2_encrypt::<Sha384Hash>(key, key_usage, plaintext, self.key_length(), 48)
+        sha2_encrypt::<Sha384Hash>(
+            key,
+            key_usage,
+            plaintext,
+            self.key_length(),
+            48,
+            &mut [0u8; AES_BLOCK],
+        )
     }
 
     fn decrypt(
@@ -363,7 +407,34 @@ impl EtypeProfile for Aes256CtsHmacSha384192 {
         key_usage: i32,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        sha2_decrypt::<Sha384Hash>(key, key_usage, ciphertext, self.key_length(), 48)
+        sha2_decrypt::<Sha384Hash>(
+            key,
+            key_usage,
+            ciphertext,
+            self.key_length(),
+            48,
+            &mut [0u8; AES_BLOCK],
+        )
+    }
+
+    fn encrypt_with_state(
+        &self,
+        key: &[u8],
+        key_usage: i32,
+        plaintext: &[u8],
+        state: &mut [u8; 16],
+    ) -> Result<Vec<u8>, CryptoError> {
+        sha2_encrypt::<Sha384Hash>(key, key_usage, plaintext, self.key_length(), 48, state)
+    }
+
+    fn decrypt_with_state(
+        &self,
+        key: &[u8],
+        key_usage: i32,
+        ciphertext: &[u8],
+        state: &mut [u8; 16],
+    ) -> Result<Vec<u8>, CryptoError> {
+        sha2_decrypt::<Sha384Hash>(key, key_usage, ciphertext, self.key_length(), 48, state)
     }
 
     fn string_to_key(

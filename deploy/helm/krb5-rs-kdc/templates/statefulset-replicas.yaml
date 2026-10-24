@@ -1,0 +1,222 @@
+{{- if eq .Values.database.mode "file" -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "krb5-rs-kdc.replicaService" . }}
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: replica
+spec:
+  replicas: {{ .Values.replicas.replicaCount }}
+  serviceName: {{ include "krb5-rs-kdc.replicaService" . }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "krb5-rs-kdc.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: replica
+  template:
+    metadata:
+      labels:
+        {{- include "krb5-rs-kdc.kdcSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: replica
+      annotations:
+        checksum/config: {{ include "krb5-rs-kdc.fileConfigChecksum" . }}
+        {{- with .Values.replicas.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "krb5-rs-kdc.scheduling" (dict "ctx" . "cfg" .Values.replicas) | nindent 6 }}
+      initContainers:
+        # The replica's host/ key, derived from the kprop password in a
+        # throwaway database (the image has no shell or ktutil).
+        - name: init-keytab-db
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kdb"]
+          args:
+            - --config
+            - /etc/krb5-rs/keytab-kdc.conf
+            - --realm
+            - {{ .Values.realm }}
+            - --master-password-file
+            - /secrets/master-password
+            - init
+            - --password
+            - host/$(POD_FQDN)=/secrets/kprop-password
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_FQDN
+              value: "$(POD_NAME).{{ include "krb5-rs-kdc.replicaService" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}"
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+            - name: keytab
+              mountPath: /keytab
+        - name: init-keytab
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kdb"]
+          args:
+            - --config
+            - /etc/krb5-rs/keytab-kdc.conf
+            - --realm
+            - {{ .Values.realm }}
+            - --master-password-file
+            - /secrets/master-password
+            - ktadd
+            - -k
+            - /keytab/krb5.keytab
+            - -norandkey
+            - host/$(POD_FQDN)
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_FQDN
+              value: "$(POD_NAME).{{ include "krb5-rs-kdc.replicaService" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}"
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+            - name: keytab
+              mountPath: /keytab
+      containers:
+        # MIT kpropd: receives the primary's pushes and loads them.
+        - name: kpropd
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kpropd"]
+          args:
+            - -D
+            - -P
+            - {{ .Values.propagation.port | quote }}
+            - -r
+            - {{ .Values.realm }}
+            - -s
+            - /keytab/krb5.keytab
+            - -a
+            - /etc/krb5-rs/kpropd.acl
+            - -f
+            - /var/lib/krb5-rs/from_master
+            - -p
+            - /usr/local/bin/krb5-rs-kdb
+          env:
+            - name: KRB5_KDC_PROFILE
+              value: /etc/krb5-rs/kdc.conf
+            - name: KRB5_CONFIG
+              value: /etc/krb5-rs/krb5.conf
+          ports:
+            - name: kprop
+              containerPort: {{ .Values.propagation.port }}
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/krb5-rs
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: keytab
+              mountPath: /keytab
+              readOnly: true
+        - name: kdc
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config=/etc/krb5-rs/kdc.conf
+            - --krb5-config=/etc/krb5-rs/krb5.conf
+            - --realm={{ .Values.realm }}
+            - --master-password-file=/secrets/master-password
+            - --wait-for-database
+            {{- if .Values.metrics.enabled }}
+            - --metrics-listen=0.0.0.0:{{ .Values.metrics.port }}
+            {{- end }}
+          ports:
+            - name: kdc-udp
+              containerPort: {{ .Values.kdc.containerPort }}
+              protocol: UDP
+            - name: kdc-tcp
+              containerPort: {{ .Values.kdc.containerPort }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          # The daemon binds its ports only once kpropd loaded the first
+          # push, so these probes pass only once the replica has data.
+          startupProbe:
+            tcpSocket:
+              port: kdc-tcp
+            periodSeconds: 2
+            failureThreshold: 90
+          readinessProbe:
+            tcpSocket:
+              port: kdc-tcp
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: kdc-tcp
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.replicas.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/krb5-rs
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: {{ include "krb5-rs-kdc.fullname" . }}
+            items:
+              - key: replica-kdc.conf
+                path: kdc.conf
+              - key: krb5.conf
+                path: krb5.conf
+              - key: keytab-kdc.conf
+                path: keytab-kdc.conf
+              - key: kpropd.acl
+                path: kpropd.acl
+        - name: secrets
+          secret:
+            secretName: {{ include "krb5-rs-kdc.secretName" . }}
+            defaultMode: 0440
+        - name: keytab
+          emptyDir: {}
+{{- end }}

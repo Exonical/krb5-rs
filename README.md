@@ -70,9 +70,10 @@ The KDC reads its data through async store traits in `krb5_rs::kdc::store` (`Pri
 ### MIT-compatible klmdb module
 
 The deployable `krb5-rs-kdc`/`krb5-rs-kdb` binaries compile the pure-Rust
-KDB codecs and the `krb5-rs-kdb-lmdb` backend by default. The backend is opt-in:
-an unset `db_library` continues to use the existing krb5-rs file store, while
-`db_library = klmdb` uses the same LMDB files as MIT krb5 1.17+:
+KDB codecs and the `krb5-rs-kdb-lmdb` backend by default. klmdb is the default
+backend: an unset `db_library` (or `db_library = klmdb`) uses the same LMDB
+files as MIT krb5 1.17+, and `db_library = krb5-rs-file` selects the krb5-rs
+file store:
 
 ```ini
 [realms]
@@ -119,8 +120,6 @@ at the same time; sequential use is supported. MIT extensions in tl-data, string
 password history, and unmodeled attribute bits are preserved on updates.
 `security_epoch` and key `s2kparams` are krb5-rs-only and are not persisted by
 MIT klmdb; reads return epoch zero and no s2kparams.
-KRB5RS-PROP-1 `kprop_*` settings are rejected with klmdb in this change;
-MIT-compatible kprop is a later step.
 Master-key rotation through `kdb5_util add_mkey` / `use_mkey` is not
 supported; opening a database whose `K/M` has multiple key-data entries fails
 with an explicit error.
@@ -223,22 +222,39 @@ The integration tests need a cluster: `tests/crdb/cluster.sh up` starts a secure
 
 ### Replicas (database propagation)
 
-For HA, one primary keeps the writable database and any number of stateless replicas pull it. This is MIT kprop/kpropd's idea reversed into a pull model (protocol `KRB5RS-PROP-1`, documented in `src/kdc/kdb/propagation.rs`): a replica authenticates to the primary's `kprop/primary` service with a Kerberos ticket (AP-REQ with mutual authentication), asks for the database naming the serial it already has, and receives the raw database file in KRB-PRIV blocks protected by the negotiated subkeys, unless it is current. The replica verifies size, SHA-256, format, realm and its master key, and only then renames the file over its database.
+`krb5-rs-kprop` and `krb5-rs-kpropd` implement MIT krb5 1.22.2's full
+propagation (`src/kprop/kprop.c`, `kpropd.c`, `kprop_util.c`) and interoperate
+with MIT `kprop`/`kpropd` in both directions. The primary pushes: after
+administrative changes (and on a schedule) it runs
 
-The settings below go in the kdc.conf realm section. They are krb5-rs extensions with no MIT counterpart.
+```sh
+krb5-rs-kdb dump /usr/local/var/krb5kdc/replica_datatrans
+krb5-rs-kprop -f /usr/local/var/krb5kdc/replica_datatrans replica.example.com
+```
 
-| Option | Role | Meaning |
-| --- | --- | --- |
-| `kprop_listen` | primary | Listen address(es) of the propagation server (default port 754); unset = off |
-| `kprop_service` | both | Service principal (default `kprop/primary`); needs a key in the primary's database |
-| `kprop_acl` | primary | Principals allowed to pull (default: `kprop_client`) |
-| `kprop_primary` | replica | `host:port` of the primary's propagation server; setting it makes this KDC a replica |
-| `kprop_primary_kdc` | replica | `host:port` of the primary's KDC, used for the ticket (default: the `kprop_primary` host, port 88) |
-| `kprop_client` | replica | The replica's principal (default `kprop/replica`) |
-| `kprop_keytab` / `kprop_password_file` | replica | Exactly one: where the replica's key comes from |
-| `kprop_poll_interval` | replica | Time between pulls (deltat, default 60s, ±10% jitter; failures back off from 1s up to this value) |
+`krb5-rs-kprop [-r realm] [-f file] [-d] [-P port] [-s keytab] replica_host`
+gets a ticket for `host/replica_host` with the local `host/` key from the
+keytab, refuses a dump newer than its `.dump_ok` stamp, and sends it on TCP 754
+(`krb5_prop`): `kprop5_01` sendauth with mutual authentication, the size in
+KRB-SAFE, the dump in 32 KiB KRB-PRIV blocks with MIT's chained cipher state,
+then waits for the replica's KRB-SAFE acknowledgement and writes
+`<file>.<host>.last_prop`.
 
-`kprop_listen` and `kprop_primary` together are a configuration error. A replica needs the same master key stash as the primary. With no local database, or a damaged one, it pulls before binding its KDC listeners, retrying with backoff; with a valid one it serves immediately and syncs in the background. `krb5-rs-kdb` refuses to modify a replica's database unless given `--force`.
+Each replica runs `krb5-rs-kpropd` (options `-r -s -a -f -F -p -P -d -D -S -t`
+and `--pid-file`, as in MIT; inetd mode when stdin is a socket). It
+authenticates `host/<its hostname>` from the keytab, checks the client against
+`kpropd.acl` (one principal per line, optionally followed by the required
+ticket enctype), receives into `<file>.temp` under a lock, renames it to
+`<file>` (default `/usr/local/var/krb5kdc/from_master`), runs
+`krb5-rs-kdb -r REALM load [-d DB] <file>` (`-p` selects the program), and only
+then acknowledges. The replica needs the same master key stash as the primary.
+
+Deliberate deviations: iprop (incremental propagation, `kadmind -p`/`kpropd`
+`-A`/`-x`) is not implemented, and `-A`/`-x` are accepted and ignored;
+`krb5-rs-kpropd` never forks into the background (use `-D` or a supervisor).
+The `kprop_*` kdc.conf keys of the earlier krb5-rs pull protocol
+(`KRB5RS-PROP-1`) were removed; configurations that still set them fail with
+an error pointing at `krb5-rs-kprop`/`krb5-rs-kpropd`.
 
 File-mode replicas have no freshness bound, as with MIT kpropd. Use
 CockroachDB mode for bounded staleness.

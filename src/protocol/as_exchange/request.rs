@@ -16,7 +16,11 @@ impl AsExchange {
             .map_err(|_| Krb5Error::ReplyValidation("invalid realm string"))?;
 
         // Build server principal: krbtgt/REALM
-        let sname = PrincipalName::new_srv_inst("krbtgt", &self.config.realm);
+        let sname = self
+            .config
+            .server
+            .clone()
+            .unwrap_or_else(|| PrincipalName::new_srv_inst("krbtgt", &self.config.realm));
 
         // Compute till and rtime using checked arithmetic to avoid panic on overflow
         let now = now_kerberos();
