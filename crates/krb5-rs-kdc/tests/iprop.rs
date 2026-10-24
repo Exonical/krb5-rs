@@ -240,4 +240,20 @@ fn database_override_logs_to_its_own_ulog() {
     kdb_ok(&conf, &["-d", &alt_s, "addprinc", "-randkey", "dave"], "");
     assert!(alt.join("principal.ulog").exists());
     assert!(!dir.path("primary").join("principal.ulog").exists());
+
+    let explicit = dir.path("primary").join("principal.ulog");
+    let text = std::fs::read_to_string(&conf).expect("conf");
+    std::fs::write(
+        &conf,
+        text.replace(
+            "  iprop_enable = true\n",
+            &format!(
+                "  iprop_enable = true\n  iprop_logfile = {}\n",
+                slash(&explicit)
+            ),
+        ),
+    )
+    .expect("conf");
+    kdb_ok(&conf, &["-d", &alt_s, "addprinc", "-randkey", "eve"], "");
+    assert!(explicit.exists());
 }

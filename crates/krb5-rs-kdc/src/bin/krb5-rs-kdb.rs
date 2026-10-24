@@ -287,9 +287,10 @@ fn main() {
         .unwrap_or_else(|| fail("no realm given and no default realm found"));
     let mut cfg = ok(RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm));
     if let Some(database) = database {
-        let mut default_log = cfg.database_name.clone().into_os_string();
-        default_log.push(".ulog");
-        if cfg.iprop.logfile.as_os_str() == default_log {
+        if kdc_conf
+            .get_string(&["realms", &realm, "iprop_logfile"])
+            .is_none()
+        {
             let mut log = database.clone().into_os_string();
             log.push(".ulog");
             cfg.iprop.logfile = PathBuf::from(log);
