@@ -574,10 +574,8 @@ async fn lockout_policy_from_the_database_applies_in_the_daemon() {
     assert_eq!(attempt(daemon.tcp, "carol", "wrong").await, Err(24));
     // Locked out now, even with the right password.
     assert_eq!(attempt(daemon.tcp, "carol", "carol-pw").await, Err(18));
-    assert!(daemon
-        .snapshot()
-        .iter()
-        .any(|l| l.contains("LOCKED_OUT: carol@")));
+    // The log is read on another thread; the line may trail the reply.
+    daemon.wait_for_line("LOCKED_OUT: carol@");
 
     // An administrator unlocks; the daemon sees it on its next request.
     kdb_run(&conf, &["modprinc", "-unlock", "carol"], "");
