@@ -225,6 +225,11 @@ impl Metrics {
                             | "REPLICA_NOT_READY"
                             | "AUTHORITATIVE_MISMATCH"
                             | "AUTHORITY_UNAVAILABLE"
+                            | "AUTHORITATIVE_CLIENT_DISABLED"
+                            | "AUTHORITATIVE_CLIENT_LOCKED_OUT"
+                            | "AUTHORITATIVE_CLIENT_DELETED"
+                            | "AUTHORITATIVE_SERVER_DISABLED"
+                            | "AUTHORITATIVE_SERVER_DELETED"
                     )
                 })
                 .unwrap_or("OTHER");
@@ -562,6 +567,37 @@ mod tests {
             metrics.local_db_errors.get(),
             1,
             "not found is not a DB error"
+        );
+    }
+
+    #[test]
+    fn authoritative_client_denial_counts_as_a_gate_rejection() {
+        let metrics = Metrics::new();
+        metrics.record_request(&RequestSummary {
+            kind: RequestKind::As,
+            transport: Transport::Tcp,
+            client: Some("alice@R".into()),
+            server: Some("krbtgt/R@R".into()),
+            etypes: vec![18],
+            outcome: Outcome::Error {
+                code: 18,
+                status: Some("AUTHORITATIVE_CLIENT_DISABLED".into()),
+            },
+            reply_etype: None,
+            ticket_etype: None,
+            gate_rejected: true,
+            store_time: Duration::ZERO,
+        });
+
+        assert_eq!(
+            metrics
+                .gate_rejections
+                .get_or_create(&vec![(
+                    "reason".to_string(),
+                    "AUTHORITATIVE_CLIENT_DISABLED".to_string(),
+                )])
+                .get(),
+            1
         );
     }
 }

@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: crdb
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: sql
+      port: 26257
+      targetPort: sql
+    - name: http
+      port: 8080
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: crdb
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crdb-california
+spec:
+  ports:
+    - name: sql
+      port: 26257
+      targetPort: sql
+  selector:
+    app.kubernetes.io/name: crdb
+    statefulset.kubernetes.io/pod-name: crdb-0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crdb-ohio
+spec:
+  ports:
+    - name: sql
+      port: 26257
+      targetPort: sql
+  selector:
+    app.kubernetes.io/name: crdb
+    statefulset.kubernetes.io/pod-name: crdb-1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crdb-washington-dc
+spec:
+  ports:
+    - name: sql
+      port: 26257
+      targetPort: sql
+  selector:
+    app.kubernetes.io/name: crdb
+    statefulset.kubernetes.io/pod-name: crdb-2
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: crdb
+spec:
+  serviceName: crdb
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: crdb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: crdb
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cockroach
+          image: docker.io/cockroachdb/cockroach:v26.3.2@sha256:84f0c929fdd4284b40a0c4afb1f284573fb281abc0323f8329e4e5f1650a3e00
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              case "${HOSTNAME}" in
+                crdb-0) region=california ;;
+                crdb-1) region=ohio ;;
+                crdb-2) region=washington-dc ;;
+                *) echo "unexpected CockroachDB pod: ${HOSTNAME}" >&2; exit 1 ;;
+              esac
+              exec /cockroach/cockroach start \
+                --certs-dir=/cockroach/certs \
+                --join=crdb-0.crdb:26257,crdb-1.crdb:26257,crdb-2.crdb:26257 \
+                --listen-addr=0.0.0.0:26257 \
+                --advertise-addr="${HOSTNAME}.crdb:26257" \
+                --http-addr=0.0.0.0:8080 \
+                --locality="region=${region},zone=${region}-a" \
+                --cache=128MiB \
+                --max-sql-memory=128MiB
+          ports:
+            - name: sql
+              containerPort: 26257
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            exec:
+              command:
+                - /cockroach/cockroach
+                - sql
+                - --certs-dir=/cockroach/certs
+                - --host=localhost:26257
+                - -e
+                - SELECT 1
+            periodSeconds: 3
+            timeoutSeconds: 5
+            failureThreshold: 30
+          volumeMounts:
+            - name: certs
+              mountPath: /cockroach/certs
+              readOnly: true
+            - name: data
+              mountPath: /cockroach/cockroach-data
+      volumes:
+        - name: certs
+          secret:
+            secretName: cockroach-node-certs
+            defaultMode: 0440
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          krb5-rs-e2e: cockroach-multi
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 512Mi

@@ -15,6 +15,7 @@ cockroach:
   tlsSecret: ""        # Secret with ca.crt, tls.crt, tls.key for kdc_replica (required)
   region: ""           # this release's region, e.g. california (required)
   poolSize: 8
+  poolIdleTimeout: 0s  # 0s keeps pooled connections indefinitely; set to retire idle connections sooner
   connectTimeout: 5s
   statementTimeout: 10s
   transactionTimeout: 30s   # must be identical everywhere: migrate stores it, KDCs refuse to start on mismatch

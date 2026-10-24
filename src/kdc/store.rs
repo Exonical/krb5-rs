@@ -238,6 +238,35 @@ pub struct LockoutReport {
     pub lockout_duration: u32,
 }
 
+/// The role a principal plays in the request being gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrincipalRole {
+    /// The request's client or impersonated subject.
+    Client,
+    /// The requested service.
+    Server,
+}
+
+/// A principal the consistency gate must check, together with its role.
+#[derive(Debug, Clone, Copy)]
+pub struct GateSubject<'a> {
+    /// The local principal entry.
+    pub entry: &'a PrincipalEntry,
+    /// The principal's role in the request.
+    pub role: PrincipalRole,
+}
+
+/// Why the authority refuses a principal outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthoritativeDenial {
+    /// The principal is disabled at the authority.
+    Disabled,
+    /// The client is locked out at the authority.
+    LockedOut,
+    /// The principal was deleted at the authority.
+    Deleted,
+}
+
 /// The consistency gate's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateDecision {
@@ -248,6 +277,13 @@ pub enum GateDecision {
     Reject {
         /// Status text.
         reason: String,
+    },
+    /// The authority's state for `subjects[index]` is final.
+    Deny {
+        /// The refused subject's index in the checked slice.
+        index: usize,
+        /// Why the authority refuses the subject.
+        denial: AuthoritativeDenial,
     },
 }
 
@@ -411,11 +447,11 @@ pub trait HealthCheck: Send + Sync {
     fn health(&self) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
-/// Decides whether the KDC may issue tickets involving `principals` right
+/// Decides whether the KDC may issue tickets involving `subjects` right
 /// now (docs/architecture §7): replica freshness, authoritative epochs.
 pub trait ConsistencyGate: Send + Sync {
-    /// Check the principals a request involves.
-    fn check(&self, principals: &[&PrincipalEntry]) -> impl Future<Output = GateDecision> + Send;
+    /// Check the principals and their roles in a request.
+    fn check(&self, subjects: &[GateSubject<'_>]) -> impl Future<Output = GateDecision> + Send;
 }
 
 // ----------------------------------------------------------- Arc forwarding
@@ -629,8 +665,8 @@ impl<T: HealthCheck + ?Sized> HealthCheck for Arc<T> {
 }
 
 impl<T: ConsistencyGate + ?Sized> ConsistencyGate for Arc<T> {
-    fn check(&self, principals: &[&PrincipalEntry]) -> impl Future<Output = GateDecision> + Send {
-        (**self).check(principals)
+    fn check(&self, subjects: &[GateSubject<'_>]) -> impl Future<Output = GateDecision> + Send {
+        (**self).check(subjects)
     }
 }
 
@@ -655,7 +691,7 @@ impl PolicyStore for NoPolicies {
 pub struct AlwaysAllow;
 
 impl ConsistencyGate for AlwaysAllow {
-    fn check(&self, _principals: &[&PrincipalEntry]) -> impl Future<Output = GateDecision> + Send {
+    fn check(&self, _subjects: &[GateSubject<'_>]) -> impl Future<Output = GateDecision> + Send {
         std::future::ready(GateDecision::Allow)
     }
 }
@@ -765,12 +801,12 @@ impl<T: AuthStateStore> DynAuthState for T {
 
 /// Object-safe adapter over [`ConsistencyGate`].
 pub(crate) trait DynGate: Send + Sync {
-    fn check<'a>(&'a self, principals: &'a [&'a PrincipalEntry]) -> BoxFuture<'a, GateDecision>;
+    fn check<'a>(&'a self, subjects: &'a [GateSubject<'a>]) -> BoxFuture<'a, GateDecision>;
 }
 
 impl<T: ConsistencyGate> DynGate for T {
-    fn check<'a>(&'a self, principals: &'a [&'a PrincipalEntry]) -> BoxFuture<'a, GateDecision> {
-        Box::pin(ConsistencyGate::check(self, principals))
+    fn check<'a>(&'a self, subjects: &'a [GateSubject<'a>]) -> BoxFuture<'a, GateDecision> {
+        Box::pin(ConsistencyGate::check(self, subjects))
     }
 }
 

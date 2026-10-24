@@ -181,6 +181,8 @@ jobs:
             krb5-rs-mit-test:1.22.2 "$CRDB_PINNED_IMAGE" -c e2e-cockroach
       - name: CockroachDB chart end-to-end
         run: bash deploy/helm/krb5-rs-kdc/ci/e2e-cockroach.sh
+      - name: Multi-region CockroachDB chart end-to-end
+        run: bash deploy/helm/krb5-rs-kdc/ci/e2e-multiregion.sh
 
   live:
     runs-on: ubuntu-latest

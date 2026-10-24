@@ -2,6 +2,16 @@
 
 use super::*;
 
+fn assert_authoritative_error(run: Run<Credential>, code: i32, status: &str) {
+    assert!(run.result.is_err(), "request unexpectedly succeeded");
+    let error = krb_error(run.replies.last().expect("KRB-ERROR reply"));
+    assert_eq!(error.error_code, code);
+    assert_eq!(
+        error.e_text.as_ref().map(|text| text.as_bytes()),
+        Some(status.as_bytes())
+    );
+}
+
 fn flags_of(c: &Credential) -> TicketFlags {
     *c.flags
 }
@@ -96,6 +106,51 @@ async fn as_req_timestamp_outside_clockskew_returns_skew_error() {
     );
     let err = krb_error(&f.kdc.handle(&req).await);
     assert_eq!(err.error_code, 37);
+}
+
+#[tokio::test]
+async fn authoritative_client_disable_returns_client_revoked() {
+    let f = fixture_with_gate(
+        FixtureOptions::default(),
+        DenyGate::new(0, 0, AuthoritativeDenial::Disabled),
+    )
+    .await;
+
+    assert_authoritative_error(
+        run_as(&f.kdc, as_config(USER), PASSWORD).await,
+        18,
+        "AUTHORITATIVE_CLIENT_DISABLED",
+    );
+}
+
+#[tokio::test]
+async fn authoritative_server_disable_returns_server_unknown() {
+    let f = fixture_with_gate(
+        FixtureOptions::default(),
+        DenyGate::new(0, 1, AuthoritativeDenial::Disabled),
+    )
+    .await;
+
+    assert_authoritative_error(
+        run_as(&f.kdc, as_config(USER), PASSWORD).await,
+        7,
+        "AUTHORITATIVE_SERVER_DISABLED",
+    );
+}
+
+#[tokio::test]
+async fn authoritative_client_deletion_returns_client_unknown() {
+    let f = fixture_with_gate(
+        FixtureOptions::default(),
+        DenyGate::new(0, 0, AuthoritativeDenial::Deleted),
+    )
+    .await;
+
+    assert_authoritative_error(
+        run_as(&f.kdc, as_config(USER), PASSWORD).await,
+        6,
+        "AUTHORITATIVE_CLIENT_DELETED",
+    );
 }
 
 #[tokio::test]

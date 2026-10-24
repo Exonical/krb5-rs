@@ -231,6 +231,7 @@ const DBMODULE_OPTION_KEYS: &[&str] = &[
     "cockroach_cert",
     "cockroach_key",
     "cockroach_pool_size",
+    "cockroach_pool_idle_timeout",
     "cockroach_connect_timeout",
     "cockroach_statement_timeout",
     "cockroach_transaction_timeout",

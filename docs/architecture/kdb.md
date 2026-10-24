@@ -458,7 +458,28 @@ checkpoint follows it.
 | Mode | Behaviour |
 |---|---|
 | `bounded` (**default**, fail closed) | Serve from Turso while `freshness ≤ max_staleness` (default 30s). Beyond that, reject with `KDC_ERR_SVC_UNAVAILABLE`, so clients fail over to another KDC, and report not-ready |
-| `strict` | Same as `bounded`, plus a per-request `AuthoritativeState` check of the client's `security_epoch` (and the server's for TGS). A local epoch below the authoritative one, or the authority being unreachable within `authoritative_timeout`, rejects the request |
+| `strict` | Same freshness bound as `bounded`, plus a per-request `AuthoritativeState` check of every client/subject and server. Authoritative denials use MIT's client/server error codes; a greater authoritative epoch or unavailable authority rejects with `KDC_ERR_SVC_UNAVAILABLE` |
+
+The strict gate checks freshness first and denies only when the authority is
+stricter than the local state. A newly disabled principal is denied only when
+the local entry is not already disabled; an authoritative client lockout or
+deletion is final. A local entry already disabled is allowed through the gate
+so the KDC's normal MIT checks return the appropriate code. Stale epochs,
+authority failures, and stale replicas remain failover errors.
+
+| Role | Authoritative denial | KDC error | Status |
+|---|---|---|---|
+| Client | Disabled | `KDC_ERR_CLIENT_REVOKED` (18) | `AUTHORITATIVE_CLIENT_DISABLED` |
+| Client | Locked out | `KDC_ERR_CLIENT_REVOKED` (18) | `AUTHORITATIVE_CLIENT_LOCKED_OUT` |
+| Client | Deleted (`NotFound`) | `KDC_ERR_C_PRINCIPAL_UNKNOWN` (6) | `AUTHORITATIVE_CLIENT_DELETED` |
+| Server | Disabled | `KDC_ERR_S_PRINCIPAL_UNKNOWN` (7) | `AUTHORITATIVE_SERVER_DISABLED` |
+| Server | Deleted (`NotFound`) | `KDC_ERR_S_PRINCIPAL_UNKNOWN` (7) | `AUTHORITATIVE_SERVER_DELETED` |
+
+Servers are not subject to lockout. An authority epoch above the local entry's
+epoch is not a final denial: the local keys may be stale, so strict mode
+rejects with `KDC_ERR_SVC_UNAVAILABLE` / `AUTHORITATIVE_MISMATCH`. Authority
+timeouts and errors other than `NotFound` use
+`KDC_ERR_SVC_UNAVAILABLE` / `AUTHORITY_UNAVAILABLE`.
 
 There is no availability-first mode. Partitions never silently weaken the
 configured guarantee.

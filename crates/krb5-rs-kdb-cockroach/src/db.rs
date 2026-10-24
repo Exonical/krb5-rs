@@ -199,6 +199,11 @@ impl Db {
     }
 
     async fn get(&self) -> Result<Guarded, StoreError> {
+        if let Some(max_idle) = self.config.pool_idle_timeout.filter(|d| !d.is_zero()) {
+            let _ = self
+                .pool
+                .retain(|_, metrics| metrics.last_used() < max_idle);
+        }
         let conn = self.pool.get().await.map_err(|e| match e {
             deadpool_postgres::PoolError::Backend(e) => map_err(&e),
             other => StoreError::unavailable(format!("connection pool: {other}")),

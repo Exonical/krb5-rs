@@ -18,7 +18,10 @@ use super::policy::{
 use super::preauth::{enc_pa_rep_padata, find_padata};
 use super::reqbody::raw_req_body;
 use super::s4u::{impersonator_string, pac_options_reply};
-use super::{is_tgs_principal, names_equal, random_key, Kdc, PrincipalEntry, PrincipalStore};
+use super::{
+    is_tgs_principal, names_equal, random_key, GateSubject, Kdc, PrincipalEntry, PrincipalRole,
+    PrincipalStore,
+};
 use crate::crypto::{find_cksumtype, find_etype, key_usage};
 use crate::locate::host_realm;
 use crate::protocol::ap::{encrypt_ticket_part, ApError, AuthContext, AuthContextFlags, KeySource};
@@ -860,11 +863,20 @@ impl<S: PrincipalStore> Kdc<S> {
         subject_client: Option<&PrincipalEntry>,
         server: &PrincipalEntry,
     ) -> Result<(), KdcError> {
-        let mut involved = Vec::new();
-        involved.extend(header_client);
-        involved.extend(subject_client);
-        involved.push(server);
-        self.consistency_gate(&involved).await
+        let mut subjects = Vec::new();
+        subjects.extend(header_client.map(|entry| GateSubject {
+            entry,
+            role: PrincipalRole::Client,
+        }));
+        subjects.extend(subject_client.map(|entry| GateSubject {
+            entry,
+            role: PrincipalRole::Client,
+        }));
+        subjects.push(GateSubject {
+            entry: server,
+            role: PrincipalRole::Server,
+        });
+        self.consistency_gate(&subjects).await
     }
 }
 
@@ -903,11 +915,11 @@ mod tests {
     struct RecordingGate(Arc<Mutex<Vec<PrincipalName>>>);
 
     impl ConsistencyGate for RecordingGate {
-        async fn check(&self, principals: &[&PrincipalEntry]) -> GateDecision {
+        async fn check(&self, subjects: &[GateSubject<'_>]) -> GateDecision {
             self.0
                 .lock()
                 .expect("gate record lock")
-                .extend(principals.iter().map(|principal| principal.name.clone()));
+                .extend(subjects.iter().map(|subject| subject.entry.name.clone()));
             GateDecision::Allow
         }
     }

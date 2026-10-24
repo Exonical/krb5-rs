@@ -1,0 +1,176 @@
+# Template: replace the marked realm, CockroachDB URL, region, image tag,
+# POD_NAME and Secret data before use. See README.md.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: krb5-rs-kdc-cockroach-master
+type: Opaque
+data:
+  master-password: Q0hBTkdFLU1FLU1BU1RFUi1QQVNTV09SRA==
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: krb5-rs-kdc-cockroach-replica-tls
+type: Opaque
+data:
+  ca.crt: Q0hBTkdFLU1FLUNBLUNFUlRJRklDQVRF
+  tls.crt: Q0hBTkdFLU1FLVJFUExJQ0EtQ0VSVElGSUNBVEU=
+  tls.key: Q0hBTkdFLU1FLVJFUExJQ0EtUFJJVkFURS1LRVk=
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: krb5-rs-kdc-cockroach-config
+data:
+  kdc.conf: |
+    [kdcdefaults]
+     kdc_ports = 8888
+     kdc_tcp_ports = 8888
+
+    [realms]
+     CHANGE-ME-REALM = {
+      database_module = crdb
+      max_life = 24h
+      max_renewable_life = 7d
+      supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal
+     }
+
+    [dbmodules]
+     crdb = {
+      db_library = krb5-rs-cockroach
+      cockroach_url = postgresql://kdc_replica@CHANGE-ME-CRDB-HOST:26257/CHANGE-ME-DATABASE?sslmode=verify-full
+      cockroach_ca = /crdb/ca.crt
+      cockroach_cert = /crdb/tls.crt
+      cockroach_key = /crdb/tls.key
+      cockroach_pool_size = 8
+      cockroach_pool_idle_timeout = 0s
+      cockroach_connect_timeout = 5s
+      cockroach_statement_timeout = 10s
+      cockroach_transaction_timeout = 30s
+      replication_read = follower
+      replica_path = /var/lib/krb5-rs/replica
+      turso_pool_size = 8
+      region = CHANGE-ME-REGION
+      consistency_mode = bounded
+      max_staleness = 30s
+      authoritative_timeout = 500ms
+      replication_poll_interval = 1s
+      replication_batch_limit = 1000
+      replication_retry_min = 100ms
+      replication_retry_max = 30s
+      replication_rebuild = auto
+      replication_heartbeat_interval = 5s
+     }
+  krb5.conf: |
+    [libdefaults]
+     default_realm = CHANGE-ME-REALM
+     dns_lookup_kdc = false
+     dns_lookup_realm = false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: krb5-rs-kdc-cockroach-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: krb5-rs-kdc-cockroach
+  labels:
+    app: krb5-rs-kdc-cockroach
+spec:
+  restartPolicy: Always
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+  containers:
+    - name: kdc
+      image: ghcr.io/exonical/krb5-rs-kdc:CHANGE-ME-tag-cockroach
+      imagePullPolicy: IfNotPresent
+      args:
+        - --config=/etc/krb5-rs/kdc.conf
+        - --krb5-config=/etc/krb5-rs/krb5.conf
+        - --realm=CHANGE-ME-REALM
+        - --master-password-file=/secrets/master-password
+        - --metrics-listen=0.0.0.0:9100
+      env:
+        - name: POD_NAME
+          value: CHANGE-ME-REGION-CHANGE-ME-HOST
+      ports:
+        - name: kdc-udp
+          containerPort: 8888
+          hostPort: 88
+          protocol: UDP
+        - name: kdc-tcp
+          containerPort: 8888
+          hostPort: 88
+          protocol: TCP
+        - name: metrics
+          containerPort: 9100
+          hostPort: 19100
+          protocol: TCP
+      startupProbe:
+        httpGet:
+          path: /healthz
+          port: metrics
+        periodSeconds: 5
+        failureThreshold: 120
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: metrics
+        periodSeconds: 5
+        failureThreshold: 2
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: metrics
+        periodSeconds: 10
+        failureThreshold: 3
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/krb5-rs
+        - name: config
+          mountPath: /etc/krb5-rs
+          readOnly: true
+        - name: master-password
+          mountPath: /secrets
+          readOnly: true
+        - name: cockroach-tls
+          mountPath: /crdb
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: krb5-rs-kdc-cockroach-data
+    - name: config
+      configMap:
+        name: krb5-rs-kdc-cockroach-config
+    - name: master-password
+      secret:
+        secretName: krb5-rs-kdc-cockroach-master
+        defaultMode: 0444
+    - name: cockroach-tls
+      secret:
+        secretName: krb5-rs-kdc-cockroach-replica-tls
+        defaultMode: 0444
+    - name: tmp
+      emptyDir:
+        medium: Memory
