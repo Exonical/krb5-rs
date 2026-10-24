@@ -427,3 +427,22 @@ fn rd_req_address_check() {
         .expect("no caddr ok");
 }
 
+
+#[test]
+fn rd_req_rejects_ticket_for_another_server_with_same_key() {
+    let skey = random_key(18);
+    let session = random_key(18);
+    let cred = good_cred(&skey, &session);
+    let mut client = AuthContext::new();
+    let req = client.mk_req(&opts(), None, &cred).expect("mk_req");
+    let other = krb5_rs::types::PrincipalName::new_srv_hst("host", "other.example.com");
+    let mut server = AuthContext::new();
+    server.set_flags(AuthContextFlags::empty());
+    let e = server
+        .rd_req(&req, Some(&other), &OneKey(skey))
+        .expect_err("wrong principal accepted");
+    assert!(
+        matches!(e, krb5_rs::Krb5Error::Ap(krb5_rs::protocol::ap::ApError::WrongPrinc)),
+        "{e:?}"
+    );
+}

@@ -8,7 +8,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use krb5_rs::kdc::kdb::kprop::local_hostname;
+use krb5_rs::kdc::kdb::kprop::{local_hostname, HostCanon};
+use krb5_rs::profile::Profile;
+
+const LIBDEFAULTS: &str = "[libdefaults]\n dns_canonicalize_hostname = false\n";
 
 const REALM: &str = "KPROP.TEST";
 const MASTER: &str = "master-password\n";
@@ -113,7 +116,10 @@ struct Realm {
 
 fn realm(tag: &str) -> Realm {
     let dir = TempDir::new(tag);
-    let host = local_hostname().expect("hostname");
+    // kprop/kpropd canonicalize the host name like krb5_sname_to_principal;
+    // krb5.conf below turns DNS canonicalization off, so this is the name.
+    let canon = HostCanon::from_profile(&Profile::parse(LIBDEFAULTS).expect("profile"));
+    let host = canon.candidates(&local_hostname().expect("hostname"))[0].clone();
     let primary = write_conf(&dir, "primary");
     let replica = write_conf(&dir, "replica");
     let keytab = dir.path("krb5.keytab");
@@ -149,7 +155,7 @@ fn realm(tag: &str) -> Realm {
     std::fs::write(
         &krb5,
         format!(
-            "[libdefaults]\n default_realm = {REALM}\n udp_preference_limit = 1\n\
+            "{LIBDEFAULTS} default_realm = {REALM}\n udp_preference_limit = 1\n\
              [realms]\n {REALM} = {{\n  kdc = 127.0.0.1:{port}\n }}\n"
         ),
     )

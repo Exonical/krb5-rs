@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use krb5_rs::kdc::kdb::kprop::{self, ErrorParties, ReplayCache, KPROP_PORT, KPROP_SERVICE};
+use krb5_rs::kdc::kdb::kprop::{self, ErrorParties, ReplayCache, KPROP_SERVICE};
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
 use krb5_rs::types::PrincipalName;
@@ -38,6 +38,8 @@ struct Server {
     args: Args,
     realm: String,
     server: PrincipalName,
+    /// Every canonical name of our host principal (`k5_sname_compare`).
+    servers: Vec<PrincipalName>,
     keytab: FileKeytab,
     replay: ReplayCache,
     temp: PathBuf,
@@ -153,11 +155,8 @@ fn keytab_path(arg: Option<&str>) -> PathBuf {
 }
 
 fn port_number(port: &str) -> u16 {
-    if port == KPROP_SERVICE {
-        return KPROP_PORT;
-    }
-    port.parse()
-        .unwrap_or_else(|_| die(format!("getaddrinfo: {port}: Servname not supported")))
+    kprop::service_port(port)
+        .unwrap_or_else(|| die(format!("getaddrinfo: {port}: Servname not supported")))
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -227,7 +226,7 @@ impl Server {
         let auth = kprop::recvauth(
             &mut stream,
             &mut ctx,
-            &self.server,
+            &self.servers,
             &self.realm,
             &self.keytab,
             Some(&self.replay),
@@ -362,7 +361,15 @@ async fn main() {
             "{e} while trying to construct host service principal"
         ))
     });
-    let server = kprop::host_service(&host);
+    let servers: Vec<PrincipalName> = kprop::HostCanon::from_profile(&profile)
+        .candidates(&host)
+        .iter()
+        .map(|h| kprop::host_service(h))
+        .collect();
+    let server = servers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| die("no host name"));
     let keytab = FileKeytab::new(keytab_path(args.keytab.as_deref()));
     let temp = with_suffix(&args.file, ".temp");
     let inetd = stdin_socket();
@@ -370,6 +377,7 @@ async fn main() {
         args,
         realm,
         server,
+        servers,
         keytab,
         replay: ReplayCache::default(),
         temp,

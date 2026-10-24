@@ -22,7 +22,8 @@ use rasn::types::{GeneralString, OctetString};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::crypto::enctype_from_name;
-use crate::protocol::ap::{ApReqOptions, AuthContext, AuthContextFlags, KeySource};
+use crate::profile::Profile;
+use crate::protocol::ap::{ApError, ApReqOptions, AuthContext, AuthContextFlags, KeySource};
 use crate::protocol::Credential;
 use crate::types::error_codes::*;
 use crate::types::{ApOptions, ApReq, HostAddress, KrbErrorMsg, PrincipalName};
@@ -205,10 +206,10 @@ pub fn host_service(host: &str) -> PrincipalName {
     PrincipalName::new_srv_hst(KPROP_SERVICE_NAME, &host.to_ascii_lowercase())
 }
 
-/// This host's fully qualified name, like `hostname -f`: the kernel host
-/// name, completed from `/etc/hosts` when it has no domain.
+/// This host's name as `gethostname` returns it, before
+/// [`HostCanon::candidates`] (`krb5_sname_to_principal(NULL, ...)`).
 pub fn local_hostname() -> io::Result<String> {
-    let short = std::fs::read_to_string("/proc/sys/kernel/hostname")
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -219,28 +220,199 @@ pub fn local_hostname() -> io::Result<String> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot determine host name"))?;
-    if short.contains('.') {
-        return Ok(short.to_ascii_lowercase());
-    }
-    let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
-    Ok(canonical_from_hosts(&hosts, &short)
-        .unwrap_or(short)
-        .to_ascii_lowercase())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cannot determine host name"))
 }
 
-fn canonical_from_hosts(hosts: &str, short: &str) -> Option<String> {
-    hosts.lines().find_map(|line| {
-        let line = line.split('#').next().unwrap_or("");
-        let names: Vec<&str> = line.split_whitespace().skip(1).collect();
-        if names.iter().any(|n| n.eq_ignore_ascii_case(short)) {
-            names
-                .iter()
-                .find(|n| n.contains('.'))
-                .map(|n| (*n).to_string())
+/// `[libdefaults] dns_canonicalize_hostname` (`init_ctx.c`, default
+/// `fallback`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanonMode {
+    /// Only the name as given, qualified with the default domain.
+    False,
+    /// Only the DNS-canonicalized name.
+    True,
+    /// The qualified name first, then the DNS-canonicalized one.
+    Fallback,
+}
+
+/// Host-name canonicalization of `krb5_sname_to_principal` and
+/// `k5_canonprinc` (`sn2princ.c`).
+#[derive(Clone, Debug)]
+pub struct HostCanon {
+    /// `dns_canonicalize_hostname`.
+    pub mode: CanonMode,
+    /// `rdns`: prefer the reverse lookup of the first address.
+    pub rdns: bool,
+    /// Domain appended to single-component names (`qualify_shortname`,
+    /// default the first resolver search domain).
+    pub qualify: Option<String>,
+}
+
+impl HostCanon {
+    /// Settings from `[libdefaults]`, as `krb5_init_context` reads them.
+    pub fn from_profile(profile: &Profile) -> Self {
+        let lib = |k: &str| profile.get_string(&["libdefaults", k]);
+        let mode = match lib("dns_canonicalize_hostname") {
+            Some(v) if v.eq_ignore_ascii_case("fallback") => CanonMode::Fallback,
+            Some(v) => match parse_bool(&v) {
+                Some(true) => CanonMode::True,
+                Some(false) => CanonMode::False,
+                None => CanonMode::Fallback,
+            },
+            None => CanonMode::Fallback,
+        };
+        let rdns = lib("rdns").and_then(|v| parse_bool(&v)).unwrap_or(true);
+        let qualify = match lib("qualify_shortname") {
+            Some(v) => Some(v).filter(|v| !v.is_empty()),
+            None => {
+                primary_domain(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default())
+            }
+        };
+        Self {
+            mode,
+            rdns,
+            qualify,
+        }
+    }
+
+    /// The names `k5_canonprinc` tries for `host`, in order, lower case.
+    pub fn candidates(&self, host: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.mode != CanonMode::True {
+            out.push(self.expand(host, false));
+        }
+        if self.mode != CanonMode::False {
+            let name = self.expand(host, true);
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// `expand_hostname` (sn2princ.c:89-153).
+    fn expand(&self, host: &str, use_dns: bool) -> String {
+        let canonical = if use_dns {
+            dns_canonical(host, self.rdns)
         } else {
             None
+        };
+        let mut name = match (canonical, &self.qualify) {
+            (Some(name), _) => name,
+            (None, Some(domain)) if !host.contains('.') => format!("{host}.{domain}"),
+            (None, _) => host.to_string(),
+        };
+        name.make_ascii_lowercase();
+        if name.len() > 1 && name.ends_with('.') {
+            name.pop();
         }
+        name
+    }
+}
+
+/// MIT profile booleans (`prof_get.c` `parse_boolean`).
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "y" | "yes" | "true" | "t" | "1" | "on" => Some(true),
+        "n" | "no" | "false" | "nil" | "0" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// The resolver's first search domain (`k5_primary_domain`): the last
+/// `search` or `domain` line of resolv.conf wins.
+fn primary_domain(resolv: &str) -> Option<String> {
+    let mut domain = None;
+    for line in resolv.lines() {
+        let mut words = line.split_whitespace();
+        if let Some("search" | "domain") = words.next() {
+            domain = words.next().map(|d| d.trim_end_matches('.').to_string());
+        }
+    }
+    domain.filter(|d| !d.is_empty())
+}
+
+/// Forward lookup with `AI_CANONNAME`, then optionally a reverse lookup of
+/// the first address, as `expand_hostname` does.
+#[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "std has no getaddrinfo(AI_CANONNAME) or getnameinfo"
+)]
+fn dns_canonical(host: &str, rdns: bool) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    let c_host = CString::new(host).ok()?;
+    // SAFETY: an all-zero addrinfo is a valid "no constraints" hints value.
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_flags = libc::AI_CANONNAME;
+    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+    // SAFETY: c_host is NUL-terminated, hints is initialized and res is a
+    // valid out-pointer; the list it receives is freed below.
+    let err = unsafe { libc::getaddrinfo(c_host.as_ptr(), std::ptr::null(), &hints, &mut res) };
+    if err != 0 || res.is_null() {
+        return None;
+    }
+    // SAFETY: getaddrinfo succeeded, so res points to a valid list that
+    // stays alive until freeaddrinfo.
+    let ai = unsafe { &*res };
+    let mut name = None;
+    if !ai.ai_canonname.is_null() {
+        // SAFETY: ai_canonname is a NUL-terminated string owned by the list.
+        let canon = unsafe { CStr::from_ptr(ai.ai_canonname) };
+        name = Some(canon.to_string_lossy().into_owned());
+    }
+    if rdns {
+        let mut buf = [0 as libc::c_char; 1025];
+        let len = libc::socklen_t::try_from(buf.len()).unwrap_or(0);
+        // SAFETY: ai_addr/ai_addrlen describe a valid socket address and
+        // buf is writable for len bytes; no service buffer is requested.
+        let err = unsafe {
+            libc::getnameinfo(
+                ai.ai_addr,
+                ai.ai_addrlen,
+                buf.as_mut_ptr(),
+                len,
+                std::ptr::null_mut(),
+                0,
+                libc::NI_NAMEREQD,
+            )
+        };
+        if err == 0 {
+            // SAFETY: getnameinfo NUL-terminates buf on success.
+            let reverse = unsafe { CStr::from_ptr(buf.as_ptr()) };
+            name = Some(reverse.to_string_lossy().into_owned());
+        }
+    }
+    // SAFETY: res came from a successful getaddrinfo and is freed once.
+    unsafe { libc::freeaddrinfo(res) };
+    name
+}
+
+#[cfg(not(unix))]
+fn dns_canonical(_host: &str, _rdns: bool) -> Option<String> {
+    None
+}
+
+/// `getservbyname("krb5_prop", "tcp")` with MIT's numeric fallback: a
+/// number, a `/etc/services` name, or 754 for the default service.
+pub fn service_port(port: &str) -> Option<u16> {
+    if let Ok(n) = port.parse() {
+        return Some(n);
+    }
+    let services = std::fs::read_to_string("/etc/services").unwrap_or_default();
+    services_port(&services, port).or((port == KPROP_SERVICE).then_some(KPROP_PORT))
+}
+
+fn services_port(services: &str, name: &str) -> Option<u16> {
+    services.lines().find_map(|line| {
+        let line = line.split('#').next()?;
+        let mut words = line.split_whitespace();
+        let service = words.next()?;
+        let (port, proto) = words.next()?.split_once('/')?;
+        let named = service == name || words.any(|alias| alias == name);
+        (named && proto == "tcp")
+            .then(|| port.parse().ok())
+            .flatten()
     })
 }
 
@@ -446,14 +618,17 @@ impl Authenticated {
 pub async fn recvauth<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     ctx: &mut AuthContext,
-    server: &PrincipalName,
+    servers: &[PrincipalName],
     realm: &str,
     keys: &(dyn KeySource + Sync),
     replay: Option<&ReplayCache>,
 ) -> Result<Authenticated, KpropError> {
+    let Some(first) = servers.first() else {
+        return Err(KpropError::Protocol("no server principal".into()));
+    };
     let parties = ErrorParties {
         realm,
-        server,
+        server: first,
         client: None,
     };
     let sendauth_version = read_message(stream).await?;
@@ -472,6 +647,23 @@ pub async fn recvauth<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(e);
     }
     let ap_req = read_message(stream).await?;
+    // The ticket must be for one of our host principal's canonical names in
+    // our realm (k5_sname_compare); an undecodable request fails in rd_req.
+    let server = match rasn::der::decode::<ApReq>(&ap_req) {
+        Ok(req) => {
+            let ours = req.ticket.realm.as_bytes() == realm.as_bytes();
+            let found = servers
+                .iter()
+                .find(|s| ours && s.name_string == req.ticket.sname.name_string);
+            let Some(found) = found else {
+                let e = Krb5Error::Ap(ApError::WrongPrinc);
+                send_error(stream, parties, error_code(&e), &e.to_string()).await;
+                return Err(e.into());
+            };
+            found
+        }
+        Err(_) => first,
+    };
     let auth = match ctx.rd_req(&ap_req, Some(server), keys) {
         Ok(a) => a,
         Err(e) => {
@@ -699,17 +891,45 @@ mod tests {
     }
 
     #[test]
-    fn hosts_file_completes_short_names() {
-        let hosts = "127.0.0.1 localhost\n10.0.0.5 kdc1.example.com kdc1 # primary\n";
+    fn host_names_canonicalize_like_sn2princ() {
+        let fixed = HostCanon {
+            mode: CanonMode::False,
+            rdns: false,
+            qualify: Some("example.com".into()),
+        };
+        assert_eq!(fixed.candidates("KDC1"), vec!["kdc1.example.com"]);
+        assert_eq!(fixed.candidates("kdc1.other.org."), vec!["kdc1.other.org"]);
+        let bare = HostCanon {
+            qualify: None,
+            ..fixed.clone()
+        };
+        assert_eq!(bare.candidates("kdc1"), vec!["kdc1"]);
+        let profile = Profile::parse(
+            "[libdefaults]\n dns_canonicalize_hostname = false\n rdns = no\n qualify_shortname = ex.org\n",
+        )
+        .expect("profile");
+        let canon = HostCanon::from_profile(&profile);
+        assert_eq!(canon.mode, CanonMode::False);
+        assert!(!canon.rdns);
+        assert_eq!(canon.candidates("kdc1"), vec!["kdc1.ex.org"]);
+        let fallback = HostCanon::from_profile(&Profile::parse("").expect("profile"));
+        assert_eq!(fallback.mode, CanonMode::Fallback);
+        assert!(fallback.rdns);
         assert_eq!(
-            canonical_from_hosts(hosts, "kdc1").as_deref(),
-            Some("kdc1.example.com")
+            primary_domain("domain a.org\nsearch b.org c.org\n").as_deref(),
+            Some("b.org")
         );
-        assert_eq!(canonical_from_hosts(hosts, "other"), None);
-        assert_eq!(
-            host_service("KDC1.Example.COM").to_string(),
-            "host/kdc1.example.com"
-        );
+        assert_eq!(primary_domain("nameserver 1.1.1.1\n"), None);
+    }
+
+    #[test]
+    fn service_port_reads_services_then_defaults() {
+        let services = "ssh 22/tcp\nkrb5_prop 17540/tcp kprop # local\nfoo 9/udp\n";
+        assert_eq!(services_port(services, "krb5_prop"), Some(17540));
+        assert_eq!(services_port(services, "kprop"), Some(17540));
+        assert_eq!(services_port(services, "foo"), None);
+        assert_eq!(service_port("7540"), Some(7540));
+        assert_eq!(service_port("no-such-service-name"), None);
     }
 
     #[tokio::test]
@@ -721,7 +941,15 @@ mod tests {
         let name = host_service("kdc.example.com");
         let srv = async {
             let mut ctx = AuthContext::new();
-            recvauth(&mut server, &mut ctx, &name, "EXAMPLE.COM", &keys, None).await
+            recvauth(
+                &mut server,
+                &mut ctx,
+                std::slice::from_ref(&name),
+                "EXAMPLE.COM",
+                &keys,
+                None,
+            )
+            .await
         };
         let cli = async {
             write_message(&mut client, &nul_terminated(SENDAUTH_VERSION))

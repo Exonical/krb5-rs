@@ -114,6 +114,9 @@ pub enum ApError {
     /// No ticket supplied to mk_req.
     #[error("no ticket supplied")]
     NoTktSupplied,
+    /// The ticket names a different server than the one requested.
+    #[error("Wrong principal in request")]
+    WrongPrinc,
 }
 
 /// Replay/timing data returned by mk_safe/mk_priv/mk_cred-style calls

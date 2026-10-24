@@ -33,9 +33,9 @@ kprop/kpropd push propagation stay. Nothing in this design removes them.
 | `crates/krb5-rs-kdc` | Daemon and admin CLI. Cargo features `klmdb`, `turso` and `cockroach` compile modules; metrics/health HTTP | klmdb on by default |
 
 The database modules are **pluggable**. The klmdb backend is compiled in by
-default for the daemon and admin binaries but selected only by
-`db_library = klmdb`; with `db_library` unset, the existing krb5-rs file store
-remains the default. Turso and CockroachDB are optional features. The core
+default for the daemon and admin binaries and is the default backend: an
+unset `db_library` selects klmdb, and `db_library = krb5-rs-file` selects the
+krb5-rs file store. Turso and CockroachDB are optional features. The core
 library remains pure Rust; the daemon/admin binaries include LMDB C code, and
 the CockroachDB build adds aws-lc-rs and `turso_core`'s `simsimd`.
 
@@ -73,7 +73,8 @@ Module selection mirrors MIT's `[dbmodules]` / `database_module`:
     }
 ```
 
-When `db_library` is unset, the existing `FileStore` remains in use.
+When `db_library` is unset, klmdb is used; `db_library = krb5-rs-file`
+selects `FileStore`.
 
 ### MIT klmdb-compatible environment
 

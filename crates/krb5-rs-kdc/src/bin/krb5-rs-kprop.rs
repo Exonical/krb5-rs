@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use krb5_rs::kdc::kdb::kprop::{self, ErrorParties, KpropError, KPROP_PORT, KPROP_SERVICE};
+use krb5_rs::kdc::kdb::kprop::{self, ErrorParties, KpropError, KPROP_SERVICE};
 use krb5_rs::keytab::{key_for_principal, FileKeytab};
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::{AsExchange, AsExchangeConfig, Credential, StepResult};
 use krb5_rs::transport::{KdcTransport, LocatedTransport};
+use krb5_rs::types::error_codes::KDC_ERR_S_PRINCIPAL_UNKNOWN;
+use krb5_rs::types::{EncryptionKey, PrincipalName};
+use krb5_rs::Krb5Error;
 use tokio::net::TcpStream;
 
 const DEFAULT_FILE: &str = "/usr/local/var/krb5kdc/replica_datatrans";
@@ -27,6 +30,8 @@ struct Args {
     /// forever (the cron job MIT's documentation suggests, for images
     /// without a shell).
     interval: Option<u64>,
+    /// Seconds one push may take in interval mode before it is killed.
+    timeout: u64,
     kdb: Option<PathBuf>,
     replica_hosts: Vec<String>,
 }
@@ -34,7 +39,7 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "\nUsage: kprop [-r realm] [-f file] [-d] [-P port] [-s keytab] replica_host\n       \
-         kprop --interval SECS [--kdb PROGRAM] [options] replica_host...\n"
+         kprop --interval SECS [--timeout SECS] [--kdb PROGRAM] [options] replica_host...\n"
     );
     std::process::exit(1);
 }
@@ -53,6 +58,7 @@ fn parse_args() -> Args {
         keytab: None,
         replica_host: String::new(),
         interval: None,
+        timeout: 300,
         kdb: None,
         replica_hosts: Vec::new(),
     };
@@ -63,6 +69,11 @@ fn parse_args() -> Args {
             "--interval" => {
                 let secs = it.next().and_then(|v| v.parse().ok()).filter(|&v| v > 0);
                 args.interval = Some(secs.unwrap_or_else(|| usage()));
+                continue;
+            }
+            "--timeout" => {
+                let secs = it.next().and_then(|v| v.parse().ok()).filter(|&v| v > 0);
+                args.timeout = secs.unwrap_or_else(|| usage());
                 continue;
             }
             "--kdb" => {
@@ -146,10 +157,17 @@ fn propagate_forever(args: &Args, secs: u64) -> ! {
                         .arg("-f")
                         .arg(&args.file)
                         .arg(host)
-                        .status();
+                        .spawn()
+                        .and_then(|child| wait_deadline(child, Duration::from_secs(args.timeout)));
                     match pushed {
-                        Ok(status) if status.success() => {}
-                        Ok(status) => eprintln!("kprop: propagation to {host} failed ({status})"),
+                        Ok(Some(status)) if status.success() => {}
+                        Ok(Some(status)) => {
+                            eprintln!("kprop: propagation to {host} failed ({status})")
+                        }
+                        Ok(None) => eprintln!(
+                            "kprop: propagation to {host} timed out after {}s",
+                            args.timeout
+                        ),
                         Err(e) => eprintln!("kprop: {e} while running {}", me.display()),
                     }
                 }
@@ -162,28 +180,29 @@ fn propagate_forever(args: &Args, secs: u64) -> ! {
 }
 
 /// `port` is a number or the `krb5_prop` service name.
-fn port_number(port: &str) -> u16 {
-    if port == KPROP_SERVICE {
-        return services_port(port).unwrap_or(KPROP_PORT);
+/// Wait for `child`, killing it once `limit` passes (`None`), so one
+/// stalled replica cannot hold up the others or the next round.
+fn wait_deadline(
+    mut child: std::process::Child,
+    limit: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    port.parse()
-        .ok()
-        .or_else(|| services_port(port))
-        .unwrap_or_else(|| die(format!("{port}: Servname not supported for ai_socktype")))
 }
 
-fn services_port(name: &str) -> Option<u16> {
-    let services = std::fs::read_to_string("/etc/services").ok()?;
-    services.lines().find_map(|line| {
-        let line = line.split('#').next()?;
-        let mut words = line.split_whitespace();
-        let service = words.next()?;
-        let (port, proto) = words.next()?.split_once('/')?;
-        let named = service == name || words.any(|alias| alias == name);
-        (named && proto == "tcp")
-            .then(|| port.parse().ok())
-            .flatten()
-    })
+fn port_number(port: &str) -> u16 {
+    kprop::service_port(port)
+        .unwrap_or_else(|| die(format!("{port}: Servname not supported for ai_socktype")))
 }
 
 fn krb5_profile() -> Profile {
@@ -217,36 +236,77 @@ fn keytab_path(arg: Option<String>) -> PathBuf {
 }
 
 /// `get_tickets`: AS exchange straight to `host/<replica>` with the local
-/// host key (`krb5_get_init_creds_keytab` with `in_tkt_service`).
+/// host key (`krb5_get_init_creds_keytab` with `in_tkt_service`). Both host
+/// names are canonicalized like `sn2princ_realm`: the client is the first
+/// candidate with a keytab entry, the server the first one the KDC knows.
 async fn get_tickets(profile: Profile, args: &Args, realm: &str) -> Credential {
+    let canon = kprop::HostCanon::from_profile(&profile);
     let local = kprop::local_hostname()
         .unwrap_or_else(|e| die(format!("{e} while setting client principal name")));
-    let client = kprop::host_service(&local);
-    let server = kprop::host_service(&args.replica_host);
     let keytab = FileKeytab::new(keytab_path(args.keytab.clone()));
-    let key = key_for_principal(&keytab, &client, realm)
-        .unwrap_or_else(|e| die(format!("{e} while getting initial credentials\n")));
+    let mut first_err = None;
+    let mut found = None;
+    for name in canon.candidates(&local) {
+        let client = kprop::host_service(&name);
+        match key_for_principal(&keytab, &client, realm) {
+            Ok(key) => {
+                found = Some((client, key));
+                break;
+            }
+            Err(e) => {
+                first_err.get_or_insert(e.to_string());
+            }
+        }
+    }
+    let Some((client, key)) = found else {
+        die(format!(
+            "{} while getting initial credentials\n",
+            first_err.unwrap_or_default()
+        ))
+    };
+    let transport = LocatedTransport::new(Arc::new(profile), None);
+    let servers = canon.candidates(&args.replica_host);
+    for (i, host) in servers.iter().enumerate() {
+        let server = kprop::host_service(host);
+        match as_exchange(&transport, client.clone(), server, realm, key.clone()).await {
+            Ok(cred) => return cred,
+            Err((unknown, _)) if unknown && i + 1 < servers.len() => {}
+            Err((_, e)) => die(format!("{e} while getting initial credentials\n")),
+        }
+    }
+    die("no replica host name")
+}
+
+/// One AS exchange; the flag marks KDC_ERR_S_PRINCIPAL_UNKNOWN.
+async fn as_exchange(
+    transport: &LocatedTransport,
+    client: PrincipalName,
+    server: PrincipalName,
+    realm: &str,
+    key: EncryptionKey,
+) -> Result<Credential, (bool, String)> {
     let mut config = AsExchangeConfig::new(client, realm);
     config.server = Some(server);
     let mut exchange = AsExchange::with_key(config, key);
-    let transport = LocatedTransport::new(Arc::new(profile), None);
     let mut reply = Vec::new();
     loop {
-        let step = exchange
-            .step(&reply)
-            .unwrap_or_else(|e| die(format!("{e} while getting initial credentials\n")));
+        let step = exchange.step(&reply).map_err(|e| {
+            let unknown = matches!(&e, Krb5Error::KdcError(m)
+                if m.error_code == KDC_ERR_S_PRINCIPAL_UNKNOWN);
+            (unknown, e.to_string())
+        })?;
         match step {
             StepResult::SendToKdc { data, realm } | StepResult::RetryTcp { data, realm } => {
                 reply = transport
                     .send_recv(&realm, &data)
                     .await
-                    .unwrap_or_else(|e| die(format!("{e} while getting initial credentials\n")));
+                    .map_err(|e| (false, e.to_string()))?;
             }
             StepResult::Complete => {
                 return exchange
                     .credential()
                     .cloned()
-                    .unwrap_or_else(|e| die(format!("{e} while getting initial credentials\n")))
+                    .map_err(|e| (false, e.to_string()));
             }
         }
     }

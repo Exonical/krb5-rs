@@ -70,9 +70,10 @@ The KDC reads its data through async store traits in `krb5_rs::kdc::store` (`Pri
 ### MIT-compatible klmdb module
 
 The deployable `krb5-rs-kdc`/`krb5-rs-kdb` binaries compile the pure-Rust
-KDB codecs and the `krb5-rs-kdb-lmdb` backend by default. The backend is opt-in:
-an unset `db_library` continues to use the existing krb5-rs file store, while
-`db_library = klmdb` uses the same LMDB files as MIT krb5 1.17+:
+KDB codecs and the `krb5-rs-kdb-lmdb` backend by default. klmdb is the default
+backend: an unset `db_library` (or `db_library = klmdb`) uses the same LMDB
+files as MIT krb5 1.17+, and `db_library = krb5-rs-file` selects the krb5-rs
+file store:
 
 ```ini
 [realms]
