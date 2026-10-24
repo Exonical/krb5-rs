@@ -312,9 +312,6 @@ impl<S: PrincipalStore> Kdc<S> {
             reply_padata.push(etype_info2_padata(&client, ck)?);
         }
 
-        if find_padata(request.padata.as_deref(), PaDataType::ReqEncPaRep).is_some() {
-            flags |= TicketFlags::ENC_PA_REP;
-        }
         let tkt_flags = KerberosFlags::new(flags);
         let mut part = EncTicketPart {
             flags: tkt_flags,

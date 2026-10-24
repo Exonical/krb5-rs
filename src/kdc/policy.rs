@@ -267,7 +267,9 @@ pub(crate) fn get_ticket_flags(
         }
     }
 
-    let mut flags = TicketFlags::empty();
+    // Every new ticket advertises encrypted-padata support (RFC 6806,
+    // kdc_util.c:822-824), whether or not the client sent PA-REQ-ENC-PA-REP.
+    let mut flags = TicketFlags::ENC_PA_REP;
     for (opt, flag) in [
         (KdcOptions::FORWARDABLE, TicketFlags::FORWARDABLE),
         (KdcOptions::FORWARDED, TicketFlags::FORWARDED),
@@ -664,6 +666,29 @@ mod tests {
         let f = get_ticket_flags(KdcOptions::FORWARDABLE, None, &entry(), Some(header));
         assert!(f.contains(TicketFlags::PRE_AUTHENT));
         assert!(!f.contains(TicketFlags::FORWARDABLE | TicketFlags::INITIAL));
+    }
+
+    #[test]
+    fn new_tickets_always_advertise_enc_pa_rep() {
+        // kdc_util.c:822-824; Windows' klist shows this bit as
+        // "name_canonicalize".
+        let as_flags = get_ticket_flags(KdcOptions::empty(), Some(&entry()), &entry(), None);
+        assert!(as_flags.contains(TicketFlags::ENC_PA_REP | TicketFlags::INITIAL));
+        let tgs_flags = get_ticket_flags(
+            KdcOptions::empty(),
+            None,
+            &entry(),
+            Some(TicketFlags::PRE_AUTHENT),
+        );
+        assert!(tgs_flags.contains(TicketFlags::ENC_PA_REP));
+        // Renewal keeps the header's flags instead (:818-820).
+        let renewed = get_ticket_flags(
+            KdcOptions::RENEW,
+            None,
+            &entry(),
+            Some(TicketFlags::RENEWABLE),
+        );
+        assert!(!renewed.contains(TicketFlags::ENC_PA_REP));
     }
 
     #[test]

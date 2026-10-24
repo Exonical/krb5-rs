@@ -72,17 +72,32 @@ fn has_fast_armor(authdata: Option<&[AuthorizationDataElement]>) -> bool {
     })
 }
 
-/// `comp_cksum` (MIT kdc_util.c:116-140): the checksum must be a keyed
-/// type matching the header session key.
+/// `comp_cksum` (MIT kdc_util.c:116-140): the authenticator checksum over
+/// the request body must be collision-proof (`krb5_c_is_coll_proof_cksum`).
+/// That admits the keyed types, which must match the header session key, and
+/// the unkeyed RSA-MD5 and SHA-1 hashes (`lib/crypto/krb/cksumtypes.c:31-53`),
+/// verified by recomputing the hash; the authenticator carrying the checksum
+/// is encrypted in the session key. Windows clients send RSA-MD5.
 ///
-/// Deviation: legacy/unkeyed checksum types (1-14) are all reported as
-/// KRB_AP_ERR_INAPP_CKSUM; MIT verifies collision-proof unkeyed types.
+/// Deviation: RSA-MD4 (2), which MIT also verifies, and the keyed types this
+/// crate does not implement are KDC_ERR_SUMTYPE_NOSUPP.
 fn comp_cksum(session: &EncryptionKey, body: &[u8], cksum: &Checksum) -> Result<(), KdcError> {
+    use md5::Digest as _;
+
     const STATUS: &str = "PROCESS_TGS";
-    match cksum.cksumtype {
-        15 | 16 | 19 | 20 => {}
-        1..=14 => return Err(KdcError::new(KRB_AP_ERR_INAPP_CKSUM, STATUS)),
+    let unkeyed = match cksum.cksumtype {
+        15 | 16 | 19 | 20 => None,
+        // CKSUMTYPE_RSA_MD5, CKSUMTYPE_NIST_SHA, CKSUMTYPE_SHA1.
+        7 => Some(md5::Md5::digest(body).to_vec()),
+        9 | 14 => Some(sha1::Sha1::digest(body).to_vec()),
         _ => return Err(KdcError::new(KDC_ERR_SUMTYPE_NOSUPP, STATUS)),
+    };
+    if let Some(digest) = unkeyed {
+        return if digest == cksum.checksum.as_ref() {
+            Ok(())
+        } else {
+            Err(KdcError::new(KRB_AP_ERR_BAD_INTEGRITY, STATUS))
+        };
     }
     let profile = find_cksumtype(cksum.cksumtype)
         .map_err(|_| KdcError::new(KDC_ERR_SUMTYPE_NOSUPP, STATUS))?;
@@ -684,9 +699,6 @@ impl<S: PrincipalStore> Kdc<S> {
         };
 
         let want_enc_pa_rep = find_padata(req.padata.as_deref(), PaDataType::ReqEncPaRep).is_some();
-        if want_enc_pa_rep {
-            flags |= TicketFlags::ENC_PA_REP;
-        }
 
         let (ticket_caddr, reply_caddr) = if !opts.contains(KdcOptions::RENEW)
             && opts.intersects(KdcOptions::FORWARDED | KdcOptions::PROXY)
@@ -862,6 +874,31 @@ mod tests {
 
     use super::*;
     use crate::kdc::{ConsistencyGate, GateDecision, KdcConfig, MemoryStore};
+
+    #[test]
+    fn comp_cksum_verifies_unkeyed_collision_proof_hashes() {
+        use md5::Digest as _;
+
+        let session = EncryptionKey::new(18, vec![7; 32]);
+        let body = b"KDC-REQ-BODY bytes";
+        let cksum = |cksumtype: i32, checksum: Vec<u8>| Checksum {
+            cksumtype,
+            checksum: OctetString::from(checksum),
+        };
+        let md5 = md5::Md5::digest(body).to_vec();
+        let sha1 = sha1::Sha1::digest(body).to_vec();
+        comp_cksum(&session, body, &cksum(7, md5.clone())).expect("RSA-MD5 (Windows)");
+        comp_cksum(&session, body, &cksum(9, sha1.clone())).expect("NIST-SHA");
+        comp_cksum(&session, body, &cksum(14, sha1)).expect("SHA-1");
+        let code = |c: Checksum| {
+            comp_cksum(&session, b"other body", &c)
+                .expect_err("bad")
+                .code
+        };
+        assert_eq!(code(cksum(7, md5)), KRB_AP_ERR_BAD_INTEGRITY);
+        assert_eq!(code(cksum(1, vec![0; 4])), KDC_ERR_SUMTYPE_NOSUPP);
+        assert_eq!(code(cksum(2, vec![0; 16])), KDC_ERR_SUMTYPE_NOSUPP);
+    }
 
     struct RecordingGate(Arc<Mutex<Vec<PrincipalName>>>);
 

@@ -31,8 +31,9 @@ pub fn kdc_addr() -> SocketAddr {
     kdc_addr_str().parse().expect("parse KDC address")
 }
 
+/// Second (OTHER.REALM) KDC address — overridable via KDC_OTHER_ADDR.
 pub fn kdc_other_addr_str() -> String {
-    format!("{}:10288", kdc_host())
+    std::env::var("KDC_OTHER_ADDR").unwrap_or_else(|_| format!("{}:10288", kdc_host()))
 }
 
 /// Python gssapi oracle address — overridable via GSS_ORACLE_ADDR.
