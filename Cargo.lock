@@ -1774,6 +1774,7 @@ dependencies = [
 name = "krb5-rs-kdc"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "krb5-rs",
  "krb5-rs-kdb-cockroach",
