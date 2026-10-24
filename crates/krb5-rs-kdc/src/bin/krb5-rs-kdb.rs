@@ -19,8 +19,10 @@ use krb5_rs::kdc::kdb::admin::{
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, write_stash, FileStore};
 use krb5_rs::kdc::{default_realm, AdminStore, RealmConfig, StoreError, StoreErrorKind};
 use krb5_rs::profile::Profile;
+#[cfg(feature = "klmdb")]
+use krb5_rs_kdb_lmdb::LmdbStore;
 
-fn usage() -> ! {
+fn print_usage() {
     eprintln!(
         "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] [--master-password-file PATH] [--force] <command>\n\
          commands:\n  init [--master-password-file F] [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash\n  \
@@ -33,7 +35,16 @@ fn usage() -> ! {
          replication status | prune --older-than D | wait-applied --since TS [--timeout D] [--live-within D]   (CockroachDB)\n  \
          getprinc NAME\n  listprincs\n  ktadd -k PATH [-norandkey] NAME..."
     );
+}
+
+fn usage() -> ! {
+    print_usage();
     std::process::exit(2);
+}
+
+fn help() -> ! {
+    print_usage();
+    std::process::exit(0);
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -129,7 +140,12 @@ fn init(
         ok(write_stash(&cfg.key_stash_file, realm, &key));
         println!("Stash {} written.", cfg.key_stash_file.display());
     }
-    let admin = Blocking::new(runtime(), store, cfg.supported_keysalts.clone());
+    let admin = Blocking::new(
+        runtime(),
+        store,
+        cfg.supported_keysalts.clone(),
+        cfg.master_key_type,
+    );
     ensure_init_principals(&admin, realm, &randkeys, &passwords);
 }
 
@@ -215,6 +231,7 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     while let Some(first) = args.first().map(String::as_str) {
         match first {
+            "--help" | "-h" => help(),
             "--force" => {
                 force = true;
                 args.remove(0);
@@ -254,11 +271,19 @@ fn main() {
         cmd.as_str(),
         "getprinc" | "listprincs" | "getpol" | "listpols" | "stash"
     );
+    if cfg.db_module.library.as_deref() == Some("klmdb") && cfg.propagation.is_configured() {
+        fail("kprop_* settings cannot be combined with db_library = klmdb");
+    }
     if cfg.propagation.is_replica() && !read_only_command && !force {
         fail(format!(
             "this is a replica of {} (kprop_primary is set), so its database is read-only; \nrun `{cmd}` on the primary, or pass --force to override",
             cfg.propagation.primary.as_deref().unwrap_or("?")
         ));
+    }
+
+    if cfg.db_module.library.as_deref() == Some("klmdb") {
+        klmdb_command(&cmd, args, &cfg, &realm, master_password_file.as_deref());
+        return;
     }
 
     match cfg.db_module.library.as_deref() {
@@ -314,8 +339,143 @@ fn main() {
 
     let master = master_key(&cfg, &realm, master_password_file.as_deref());
     let store = ok(FileStore::open(&cfg.database_name, &master));
-    let admin = Blocking::new(runtime(), &store, cfg.supported_keysalts.clone());
+    let admin = Blocking::new(
+        runtime(),
+        &store,
+        cfg.supported_keysalts.clone(),
+        cfg.master_key_type,
+    );
     run_admin(&admin, &cmd, args, &realm);
+}
+
+#[cfg(feature = "klmdb")]
+fn klmdb_command(
+    cmd: &str,
+    args: Vec<String>,
+    cfg: &RealmConfig,
+    realm: &str,
+    global_master_password_file: Option<&str>,
+) {
+    if matches!(cmd, "database" | "replication") {
+        fail("klmdb does not support KRB5RS-PROP-1; MIT kprop support is planned separately");
+    }
+    let rt = runtime();
+    match cmd {
+        "init" => {
+            let mut master_file = None;
+            let mut stash = false;
+            let mut randkeys = Vec::new();
+            let mut passwords = Vec::new();
+            let mut it = args.into_iter();
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--master-password-file" => master_file = Some(next(&mut it)),
+                    "--stash" => stash = true,
+                    "--randkey" => randkeys.push(next(&mut it)),
+                    "--password" => {
+                        let spec = next(&mut it);
+                        let Some((name, file)) = spec.split_once('=') else {
+                            fail("--password expects NAME=FILE");
+                        };
+                        passwords.push((name.to_string(), file.to_string()));
+                    }
+                    _ => usage(),
+                }
+            }
+            let master_file = master_file
+                .as_deref()
+                .or(global_master_password_file)
+                .unwrap_or_else(|| fail("init requires --master-password-file"));
+            let master = master_key(cfg, realm, Some(master_file));
+            let mdb = appended_path(&cfg.database_name, ".mdb");
+            let store = if mdb.exists() || cfg.database_name.exists() {
+                ok(LmdbStore::open(cfg, &master))
+            } else {
+                let store = ok(LmdbStore::create(cfg, &master));
+                println!("Database {}.mdb created.", cfg.database_name.display());
+                store
+            };
+            if stash && !cfg.key_stash_file.exists() {
+                ok(write_stash(&cfg.key_stash_file, realm, &master));
+                println!("Stash {} written.", cfg.key_stash_file.display());
+            }
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
+            ensure_init_principals(&admin, realm, &randkeys, &passwords);
+        }
+        "create" => {
+            let stash = match args.as_slice() {
+                [] => false,
+                [flag] if flag == "-s" => true,
+                _ => usage(),
+            };
+            let master = master_key_or_prompt(cfg, realm, global_master_password_file);
+            ok(LmdbStore::create(cfg, &master));
+            if stash {
+                ok(write_stash(&cfg.key_stash_file, realm, &master));
+            }
+        }
+        "stash" => {
+            let master = master_key_or_prompt(cfg, realm, global_master_password_file);
+            ok(LmdbStore::open(cfg, &master));
+            ok(write_stash(&cfg.key_stash_file, realm, &master));
+        }
+        _ => {
+            let master = master_key(cfg, realm, global_master_password_file);
+            let store = ok(LmdbStore::open(cfg, &master));
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
+            run_admin(&admin, cmd, args, realm);
+        }
+    }
+}
+
+#[cfg(not(feature = "klmdb"))]
+fn klmdb_command(
+    _cmd: &str,
+    _args: Vec<String>,
+    _cfg: &RealmConfig,
+    _realm: &str,
+    _global_master_password_file: Option<&str>,
+) {
+    fail("db_library klmdb needs a krb5-rs-kdb built with the `klmdb` feature");
+}
+
+#[cfg(feature = "klmdb")]
+fn appended_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+#[cfg(feature = "klmdb")]
+fn read_master_from_prompt(cfg: &RealmConfig, realm: &str) -> krb5_rs::types::EncryptionKey {
+    let password = read_line(&format!("Enter KDC database master key for {realm}: "));
+    ok(master_key_from_password(
+        realm,
+        &password,
+        cfg.master_key_type,
+    ))
+}
+
+#[cfg(feature = "klmdb")]
+fn master_key_or_prompt(
+    cfg: &RealmConfig,
+    realm: &str,
+    master_password_file: Option<&str>,
+) -> krb5_rs::types::EncryptionKey {
+    match master_password_file {
+        Some(path) => master_key(cfg, realm, Some(path)),
+        None => read_master_from_prompt(cfg, realm),
+    }
 }
 
 /// The admin operations, synchronously, over any store: the commands are the
@@ -333,10 +493,11 @@ impl<S: AdminStore> Blocking<S> {
         rt: tokio::runtime::Runtime,
         store: S,
         keysalts: Vec<(i32, krb5_rs::crypto::SaltType)>,
+        master_key_type: i32,
     ) -> Self {
         Self {
             rt,
-            ops: AdminOps::new(store, keysalts),
+            ops: AdminOps::new(store, keysalts).with_history_enctype(master_key_type),
         }
     }
 
@@ -692,7 +853,12 @@ fn cockroach_command(
                 ok(write_stash(&cfg.key_stash_file, realm, &key));
                 println!("Stash {} written.", cfg.key_stash_file.display());
             }
-            let admin = Blocking::new(rt, store, cfg.supported_keysalts.clone());
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
             ensure_init_principals(&admin, realm, &randkeys, &passwords);
         }
         "database" => {
@@ -828,7 +994,12 @@ fn cockroach_command(
         _ => {
             let master = master_key(cfg, realm, global_master_password_file);
             let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
-            let admin = Blocking::new(rt, store, cfg.supported_keysalts.clone());
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
             run_admin(&admin, cmd, args, realm);
         }
     }

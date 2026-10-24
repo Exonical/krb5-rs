@@ -174,6 +174,24 @@ fn to_time(t: &Option<KerberosTime>) -> Option<KerberosTime> {
 }
 
 impl FileStore {
+    /// Whether `path` begins with this crate's legacy file-store magic. Used
+    /// only by the opt-in klmdb migration path.
+    pub fn has_database_magic(path: &Path) -> Result<bool, StoreError> {
+        use std::io::Read;
+
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(err(format!("{}: {error}", path.display()))),
+        };
+        let mut magic = [0; 8];
+        match file.read_exact(&mut magic) {
+            Ok(()) => Ok(&magic == MAGIC),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(error) => Err(err(format!("{}: {error}", path.display()))),
+        }
+    }
+
     /// Create a new database holding `K/M@REALM` and `krbtgt/REALM@REALM`
     /// with random keys for the default key/salt list (aes256, aes128).
     pub fn create(path: &Path, realm: &str, master: &EncryptionKey) -> Result<Self, StoreError> {
@@ -395,7 +413,9 @@ impl FileStore {
                 last_admin_unlock: r.last_admin_unlock,
             },
             last_pwd_change: to_time(&r.last_pwd_change),
+            password_history: None,
             mod_time: to_time(&r.mod_time),
+            mod_by: None,
         })
     }
 
@@ -462,6 +482,12 @@ impl FileStore {
             }
         })?;
         Ok(LockGuard(path))
+    }
+
+    /// Take the write lock (`<path>.lock`) until the guard drops, so no
+    /// file-store writer changes the database meanwhile (klmdb migration).
+    pub fn write_lock(&self) -> Result<impl Drop, StoreError> {
+        self.lock()
     }
 
     /// Run `f` over the on-disk principal list under the write lock.
@@ -574,6 +600,12 @@ impl FileStore {
         self.refresh(false)?;
         let raws: Vec<KdbPrincipal> = self.read_cache().records.values().cloned().collect();
         raws.iter().map(|r| self.decrypt_record(r)).collect()
+    }
+
+    /// Snapshot all principals and policies for migration to another
+    /// authoritative backend.
+    pub fn export_records(&self) -> Result<(Vec<PrincipalRecord>, Vec<Policy>), StoreError> {
+        Ok((self.list_records()?, self.list_policies()?))
     }
 
     /// Insert a new principal under the write lock; `Conflict` if it exists.
@@ -736,7 +768,7 @@ impl AdminStore for FileStore {
         f: F,
     ) -> impl std::future::Future<Output = Result<PrincipalRecord, StoreError>> + Send
     where
-        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send,
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send + 'static,
     {
         std::future::ready(self.update_record(name, realm, f))
     }
@@ -775,7 +807,7 @@ impl AdminStore for FileStore {
         f: F,
     ) -> impl std::future::Future<Output = Result<Policy, StoreError>> + Send
     where
-        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send,
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send + 'static,
     {
         std::future::ready(self.update_policy_record(name, f))
     }

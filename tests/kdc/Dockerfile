@@ -17,7 +17,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
       build-essential bison flex ca-certificates pkg-config \
-      libssl-dev libkeyutils-dev python3 python3-dev python3-pip \
+      libssl-dev libkeyutils-dev liblmdb-dev liblmdb0 \
+      python3 python3-dev python3-pip \
  && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -30,6 +31,7 @@ RUN set -eux; \
         --without-ldap --without-tcl --without-libedit --disable-nls; \
     make -j"$(nproc)"; \
     make install; \
+    test -f /usr/local/lib/krb5/plugins/kdb/klmdb.so; \
     ldconfig; \
     rm -rf /tmp/krb5-src /tmp/krb5.tar.gz
 

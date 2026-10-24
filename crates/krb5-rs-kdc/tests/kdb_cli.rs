@@ -8,6 +8,18 @@ use krb5_rs::keytab::{FileKeytab, Keytab};
 
 const REALM: &str = "KDB.TEST";
 
+#[test]
+fn help_does_not_require_a_database_configuration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdb"))
+        .arg("--help")
+        .output()
+        .expect("run help");
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stderr);
+    assert!(help.contains("commands:"));
+    assert!(help.contains("klmdb") || help.contains("database"));
+}
+
 struct Env {
     dir: PathBuf,
     conf: PathBuf,
@@ -319,7 +331,14 @@ fn policy_commands_and_principal_policy_options() {
             .code(),
         Some(1)
     );
-    env.ok(&["addprinc", "-policy", "strict", "bob"], "pw\n");
+    // The policy's -minlength 8 applies, with MIT's message.
+    let short = env.run(&["addprinc", "-policy", "strict", "bob"], "pw\n");
+    assert_eq!(short.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&short.stderr).contains("Password is too short"));
+    env.ok(
+        &["addprinc", "-policy", "strict", "bob"],
+        "long-enough-pw\n",
+    );
     assert!(env.ok(&["getprinc", "bob"], "").contains("Policy: strict"));
     env.ok(&["modprinc", "-unlock", "bob"], "");
     env.ok(&["modprinc", "-clearpolicy", "bob"], "");

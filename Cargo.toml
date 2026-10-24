@@ -84,4 +84,10 @@ name = "gen_pkinit_pki"
 required-features = ["test-pki"]
 
 [workspace]
-members = [".", "crates/krb5-rs-kdc", "crates/krb5-rs-kdb-turso", "crates/krb5-rs-kdb-cockroach"]
+members = [
+    ".",
+    "crates/krb5-rs-kdc",
+    "crates/krb5-rs-kdb-turso",
+    "crates/krb5-rs-kdb-cockroach",
+    "crates/krb5-rs-kdb-lmdb",
+]

@@ -239,8 +239,10 @@ async fn tgs_req_untampered_hand_built_request_succeeds() {
     assert_eq!(enc.sname, service());
 }
 
+/// RSA-MD5 is collision-proof for MIT (kdc_util.c:126-128), so a wrong one
+/// fails the integrity check rather than the checksum-type check.
 #[tokio::test]
-async fn tgs_req_unkeyed_checksum_returns_inapp_cksum() {
+async fn tgs_req_wrong_rsa_md5_checksum_returns_bad_integrity() {
     let f = fixture().await;
     let tgt = get_tgt(&f).await;
     let mut spec = TgsReqSpec::new(service(), KdcOptions::empty());
@@ -249,7 +251,22 @@ async fn tgs_req_unkeyed_checksum_returns_inapp_cksum() {
         checksum: OctetString::from(vec![0u8; 16]),
     }));
     let (req, _) = build_tgs_req(&tgt, spec);
-    assert_eq!(tgs_error_code(&f, &req).await, 50);
+    assert_eq!(tgs_error_code(&f, &req).await, 31);
+}
+
+/// CRC32 is not collision-proof and no longer known to MIT
+/// (cksumtypes.c has no entry): KDC_ERR_SUMTYPE_NOSUPP.
+#[tokio::test]
+async fn tgs_req_crc32_checksum_returns_sumtype_nosupp() {
+    let f = fixture().await;
+    let tgt = get_tgt(&f).await;
+    let mut spec = TgsReqSpec::new(service(), KdcOptions::empty());
+    spec.checksum = Some(Some(Checksum {
+        cksumtype: 1,
+        checksum: OctetString::from(vec![0u8; 4]),
+    }));
+    let (req, _) = build_tgs_req(&tgt, spec);
+    assert_eq!(tgs_error_code(&f, &req).await, 15);
 }
 
 #[tokio::test]

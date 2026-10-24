@@ -30,14 +30,18 @@ use krb5_rs::kdc::kdb::propagation::{
     PropSecret, PropServerConfig,
 };
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, FileStore};
+#[cfg(feature = "cockroach")]
+use krb5_rs::kdc::GateSubject;
 use krb5_rs::kdc::{
-    default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, GateSubject, Kdc,
-    KdcConfig, MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig,
-    RequestLogger, ServeOptions, StoreError, StoreErrorKind,
+    default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
+    MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig, RequestLogger,
+    ServeOptions, StoreError, StoreErrorKind,
 };
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
 use krb5_rs::types::{EncryptionKey, PrincipalName};
+#[cfg(feature = "klmdb")]
+use krb5_rs_kdb_lmdb::LmdbStore;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -107,6 +111,8 @@ struct Listen {
 enum DaemonStore {
     Memory(Arc<MemoryStore>, Arc<metrics::Metrics>),
     File(Arc<FileStore>, Arc<metrics::Metrics>),
+    #[cfg(feature = "klmdb")]
+    Lmdb(Arc<LmdbStore>, Arc<metrics::Metrics>),
     #[cfg(feature = "turso")]
     Turso(krb5_rs_kdb_turso::TursoReplica, Arc<metrics::Metrics>),
 }
@@ -125,6 +131,13 @@ impl PrincipalStore for DaemonStore {
                 result
             }
             DaemonStore::File(s, metrics) => {
+                let start = std::time::Instant::now();
+                let result = s.lookup(name, realm).await;
+                metrics.observe_principal_lookup(start.elapsed(), result.is_ok());
+                result
+            }
+            #[cfg(feature = "klmdb")]
+            DaemonStore::Lmdb(s, metrics) => {
                 let start = std::time::Instant::now();
                 let result = s.lookup(name, realm).await;
                 metrics.observe_principal_lookup(start.elapsed(), result.is_ok());
@@ -406,6 +419,52 @@ fn module_duration(cfg: &RealmConfig, key: &str, default: Duration) -> std::io::
     Ok(Duration::from_millis(millis))
 }
 
+#[cfg(feature = "klmdb")]
+async fn klmdb_mode(
+    cli: &Cli,
+    cfg: RealmConfig,
+    master: EncryptionKey,
+    metrics: Arc<metrics::Metrics>,
+) -> std::io::Result<(DynKdc, Listen, PropParts)> {
+    let config = cfg.clone();
+    let store = tokio::task::spawn_blocking(move || LmdbStore::open(&config, &master))
+        .await
+        .map_err(io_err)?
+        .map_err(io_err)?;
+    let store = Arc::new(store);
+    let (udp, tcp) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen)
+    } else {
+        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
+        (addrs.clone(), addrs)
+    };
+    let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
+    let kdc = Kdc::builder(cfg.kdc, DaemonStore::Lmdb(Arc::clone(&store), metrics))
+        .policies(Arc::clone(&store))
+        .auth_state(store)
+        .build();
+    Ok((
+        kdc,
+        Listen { udp, tcp },
+        PropParts {
+            metrics_listen,
+            ..PropParts::default()
+        },
+    ))
+}
+
+#[cfg(not(feature = "klmdb"))]
+async fn klmdb_mode(
+    _cli: &Cli,
+    _cfg: RealmConfig,
+    _master: EncryptionKey,
+    _metrics: Arc<metrics::Metrics>,
+) -> std::io::Result<(DynKdc, Listen, PropParts)> {
+    Err(io_err(
+        "db_library klmdb needs a krb5-rs-kdc built with the `klmdb` feature",
+    ))
+}
+
 #[cfg(feature = "cockroach")]
 async fn cockroach_mode(
     cli: &Cli,
@@ -630,6 +689,11 @@ async fn config_mode(
         .or_else(|| default_realm(&kdc_conf, krb5.as_ref()))
         .ok_or_else(|| io_err("no realm given and no default realm found"))?;
     let cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm).map_err(io_err)?;
+    if cfg.db_module.library.as_deref() == Some("klmdb") && cfg.propagation.is_configured() {
+        return Err(io_err(
+            "kprop_* settings cannot be combined with db_library = klmdb",
+        ));
+    }
     let master = match &cli.master_password_file {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -647,6 +711,9 @@ async fn config_mode(
         None => {}
         Some("krb5-rs-turso") => {
             return turso_mode(cli, cfg, master, metrics).await.map(Some);
+        }
+        Some("klmdb") => {
+            return klmdb_mode(cli, cfg, master, metrics).await.map(Some);
         }
         Some("krb5-rs-cockroach") => {
             return cockroach_mode(cli, cfg, master, shutdown_rx, metrics).await;

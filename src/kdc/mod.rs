@@ -62,6 +62,7 @@ pub use db::{
     keys_from_password, random_keys, salt_bytes, KeyEntry, MemoryStore, PrincipalAttributes,
     PrincipalEntry,
 };
+pub use policy::kerberos_time;
 pub use store::{
     AdminStore, AlwaysAllow, AuthState, AuthStateStore, AuthStateUpdate, AuthoritativeDenial,
     AuthoritativeState, ConsistencyGate, GateDecision, GateSubject, HealthCheck, LockoutReport,

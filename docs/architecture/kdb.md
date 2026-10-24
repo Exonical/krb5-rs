@@ -1,6 +1,7 @@
 # Pluggable KDC database architecture
 
-Status: design accepted. It is implemented incrementally in PRs 4 to 8. Sections marked
+Status: design accepted. It is implemented incrementally in PRs 4 to 8 and the
+MIT-compatible klmdb follow-up. Sections marked
 **(to verify)** are assumptions that the implementing PR must confirm against
 real CockroachDB and Turso before relying on them.
 
@@ -26,16 +27,17 @@ standalone backend. Nothing in this design removes it.
 | Crate | Contents | Default build |
 |---|---|---|
 | `krb5-rs` (library) | Store traits and domain models (`kdc::store`), lockout policy logic, replication engine (`kdc::replication`), consistency gate | yes |
+| `crates/krb5-rs-kdb-lmdb` | MIT klmdb-compatible principal, policy and lockout store | default module in daemon/admin binaries |
 | `crates/krb5-rs-kdb-turso` | Turso replica: `PrincipalStore`, `PolicyStore`, `AuthStateStore`, `ReplicaSink`, migrations | optional module |
 | `crates/krb5-rs-kdb-cockroach` | CockroachDB: `AdminStore`, `ReplicationSource`, `AuthoritativeState`, lockout reporter, replica status registry, migrations, TLS | optional module |
-| `crates/krb5-rs-kdc` | Daemon and admin CLI. Cargo features `turso` and `cockroach` select modules; metrics/health HTTP | modules off by default |
+| `crates/krb5-rs-kdc` | Daemon and admin CLI. Cargo features `klmdb`, `turso` and `cockroach` compile modules; metrics/health HTTP | klmdb on by default |
 
-The database modules are **pluggable and optional**: they are not compiled
-into the KDC unless their feature is enabled, so the default KDC stays pure
-Rust. The CockroachDB module uses `tokio-postgres` (pgwire) with `rustls`. Its
-crypto provider is `aws-lc-rs`, chosen for the FIPS 140-3 path. The CockroachDB
-and Turso modules both contain C dependencies: aws-lc-rs and `turso_core`'s
-`simsimd`, respectively.
+The database modules are **pluggable**. The klmdb backend is compiled in by
+default for the daemon and admin binaries but selected only by
+`db_library = klmdb`; with `db_library` unset, the existing krb5-rs file store
+remains the default. Turso and CockroachDB are optional features. The core
+library remains pure Rust; the daemon/admin binaries include LMDB C code, and
+the CockroachDB build adds aws-lc-rs and `turso_core`'s `simsimd`.
 
 Module selection mirrors MIT's `[dbmodules]` / `database_module`:
 
@@ -71,21 +73,112 @@ Module selection mirrors MIT's `[dbmodules]` / `database_module`:
     }
 ```
 
-`db_library = db2` (the default) keeps the existing `FileStore`.
+When `db_library` is unset, the existing `FileStore` remains in use.
+
+### MIT klmdb-compatible environment
+
+`db_library = klmdb` selects `krb5-rs-kdb-lmdb`. It mirrors MIT 1.17+
+`plugins/kdb/lmdb/kdb_lmdb.c:366-398, 492-547, 554-619`:
+
+- `<database_name>.mdb` has named databases `principal` and `policy`,
+  `MDB_NOSUBDIR`, `MDB_NOTLS`, `maxdbs = 2`, and sync enabled unless `nosync`.
+- `<database_name>.lockout.mdb` has named database `lockout`, `maxdbs = 1`,
+  and `MDB_NOSYNC` unconditionally. It is created but not opened when both
+  `disable_lockout` and `disable_last_success` are enabled.
+- Both environments use the `mapsize` value in MiB (128 by default), file
+  permissions 0600, and LMDB's default reader count when `max_readers = 0`.
+- `krb5-rs-kdb create` / `init` seed `K/M` and `krbtgt` with the realm's
+  `max_life`, `max_renewable_life`, and optional
+  `default_principal_expiration` values. The entries are built in memory,
+  written to `<database_name>.create.tmp.*` environments, verified, and only
+  then renamed into place (main `.mdb` last), so a failed `create` leaves
+  nothing behind and can simply be rerun.
+- Creating a principal commits its zeroed lockout record before the
+  principal itself. MIT's `klmdb_put_principal` commits the principal first
+  and then reports a lockout failure (`plugins/kdb/lmdb/kdb_lmdb.c:747-816`),
+  leaving a principal a retried create refuses; here a lockout failure aborts
+  the create. Deleting a principal ignores lockout errors, as MIT does
+  (`kdb_lmdb.c:833-834`).
+- Initial records use MIT's `db_creation` modifier. Later krb5-rs admin
+  mutations use `krb5-rs-kdb@REALM`; the `AdminStore` API has no authenticated
+  modifier identity.
+- The daemon and admin tool read/write synchronously memory-mapped records;
+  backend mutations run through `spawn_blocking`. Reads are kept inline
+  because each is a short memory-mapped read transaction.
+
+Principal, lockout and policy value formats are the little-endian layouts in
+`plugins/kdb/lmdb/marshal.c:48-138, 165-321`. Principal keys are the exact
+unparsed names from `lib/krb5/krb/unparse.c:61-134`; parsing and inferred name
+types follow `lib/krb5/krb/parse.c:40-172` and `bld_princ.c:31-43`. TL-data
+uses the MIT encodings in `lib/kdb/kdb5.c`, `lib/kdb/kdb_default.c`, and
+`lib/kadm5/srv/adb_xdr.c`. Updates merge krb5-rs fields into the existing
+record; unknown tl-data and string attributes, password history, ACTKVNO,
+MKEY_AUX, and unmodeled attribute bits survive.
+
+MIT klmdb and the bundled LMDB 0.9.x use `MDB_DATA_VERSION` 1. The bundled
+LMDB lock-file version is 2, versus version 1 in some distro 0.9.x builds. Do
+not run MIT and krb5-rs processes on the same environment concurrently;
+sequential use is supported. When klmdb is
+selected and `<database_name>.mdb` is absent, a legacy krb5-rs file database
+is converted under `<database_name>.convert.lock`; the original is retained
+as `<database_name>.krb5rs-file.bak`. Conversion writes and verifies temporary
+environments before renaming them into place, the main `.mdb` last, so its
+presence marks a complete set: if a conversion stops before that rename, the
+next open converts again from scratch; if it stops between that rename and the
+backup rename, the next open finishes the backup rename (and refuses, naming
+both, if a backup already exists). Conversion also holds the file store's own
+write lock (`<database_name>.lock`) from export to backup, so it fails with
+"retry" rather than lose writes from a process still using the file backend. A
+crash leaves that lock file behind, exactly as a crashed file-store writer
+does; remove it once no file-store writer is running.
+
+### Password policy
+
+`krb5-rs-kdb` applies kadm5's password rules for every backend:
+`addprinc` with a password and `cpw` check the policy's minimum length and
+character classes (`lib/kadm5/srv/server_misc.c:73-102`); `cpw` refuses the
+current password, and `addprinc`, `cpw`, randkey and `modprinc -policy` /
+`-clearpolicy` set the password expiration from the policy's `pw_max_life` as
+MIT does (`lib/kadm5/srv/svr_principal.c:364-412, 601-634, 1219-1497`).
+Rejections use MIT's messages ("Password is too short", "Password does not
+contain enough character classes", "Cannot reuse password").
+
+Deeper history needs storage for old keys, which only klmdb has (in
+`KRB5_TL_KADM_DATA`): there `cpw` also refuses the passwords kept by
+`pw_history_num` and adds the old password to the queue exactly as MIT's
+`add_to_history` (`svr_principal.c:1091-1208`), so MIT and krb5-rs tools
+share one history. History keys are encrypted in the `kadmin/history`
+principal's key, created on first use like MIT's `create_hist`
+(`lib/kadm5/srv/server_kdb.c:141-223`), including MIT's 64-second `max_life`
+(it stores `KRB5_KDB_DISALLOW_ALL_TIX` there) and initial kvno 2;
+`kadmin/history` itself cannot be given a password. The file and CockroachDB
+stores check only the current password.
+
+`security_epoch` is a krb5-rs extension and is not persisted in MIT klmdb;
+loaded principals and policies use epoch zero. MIT key-data has no
+`s2kparams` field, so that krb5-rs key metadata is not persisted either.
+`allowed_to_delegate_from` uses the krb5-rs string attribute
+`krb5rs_allowed_to_delegate_from`; MIT db2/klmdb do not define a native field
+for resource-based delegation. KRB5RS-PROP-1 `kprop_*` settings are rejected
+with klmdb here; MIT kprop integration and making klmdb the default are
+reserved for PR-C. Master-key rotation via `kdb5_util add_mkey` /
+`use_mkey` is not supported; opening a `K/M` with multiple key-data records
+fails explicitly.
 
 ## 3. Store interfaces (library, `krb5_rs::kdc::store`)
 
 All of these are async (`fn …(&self, …) -> impl Future<Output = …> + Send`),
 `Send + Sync`, and return structured errors (`StoreError` with a kind:
-`NotFound`, `Conflict`, `Unavailable`, `Corrupt`, `Stale`, `Backend`). No
+`NotFound`, `Conflict`, `Unavailable`, `Corrupt`, `Stale`, `Rejected`,
+`Backend`). No
 backend types appear in the signatures.
 
 | Trait | Used by | Responsibility | Implementations |
 |---|---|---|---|
-| `PrincipalStore` | KDC hot path | `lookup(name, realm) -> Option<PrincipalEntry>`, including encrypted-at-rest keys decrypted with the master key | Memory, File, Turso |
-| `PolicyStore` | KDC | `policy(name) -> Option<Policy>` (lockout parameters and other KDC-relevant fields) | Memory, File, Turso |
-| `AuthStateStore` | KDC | per-principal failure counters, last success/failure, local lock (§8) | Memory, Turso |
-| `AdminStore` | admin CLI | transactional create/modify/delete/rekey/policy operations | File, Cockroach |
+| `PrincipalStore` | KDC hot path | `lookup(name, realm) -> Option<PrincipalEntry>`, including encrypted-at-rest keys decrypted with the master key | Memory, File, klmdb, Turso |
+| `PolicyStore` | KDC | `policy(name) -> Option<Policy>` (lockout parameters and other KDC-relevant fields) | Memory, File, klmdb, Turso |
+| `AuthStateStore` | KDC | per-principal failure counters, last success/failure, local lock (§8) | Memory, klmdb, Turso |
+| `AdminStore` | admin CLI | transactional create/modify/delete/rekey/policy operations | File, klmdb, Cockroach |
 | `ReplicationSource` | replication engine | `snapshot()` and `changes_since(ts, limit)` | Cockroach |
 | `ReplicaSink` | replication engine | `checkpoint()`, `apply(batch)`, `replace_all(snapshot)` (atomic with the checkpoint), replica status | Turso |
 | `AuthoritativeState` | consistency gate (strict mode) | `security_state(principal) -> SecurityState { epoch, disabled, locked }` | Cockroach |
@@ -108,6 +201,9 @@ one intentional API break.
   - `last_admin_unlock`: the time of the last administrative unlock (MIT `KRB5_TL_LAST_ADMIN_UNLOCK`). Lockout counting restarts after it, so it is replicated administrative state.
 
   `last_success`, `last_failed` and `fail_auth_count` are local auth state, not replicated (§8). They are **not** fields of `PrincipalEntry`: they live behind `AuthStateStore` as `AuthState`.
+- `PrincipalRecord` carries modification metadata (`mod_time`, plus raw MIT
+  unparsed `mod_by` bytes when a backend represents them). The file backend
+  has no `mod_by` field in its legacy DER image.
 - `Policy` covers the MIT kadm5 policy fields relevant to the KDC: `pw_max_fail`, `pw_failcnt_interval` and `pw_lockout_duration`, plus `max_life`, `max_renewable_life` and `allowed_keysalts`, which kadmin applies. A policy also has its own `security_epoch`.
 - Keys stay `KeyEntry` (kvno, enctype, salt, s2kparams). At rest, both backends
   store only the MIT `encrypt_key.c` layout under the master key. Plaintext keys
@@ -419,8 +515,10 @@ accordingly.
 
 **Chosen: local counters plus replicated lockouts.** Counters follow MIT
 `lockout.c` semantics (`pw_max_fail`, `pw_failcnt_interval`,
-`pw_lockout_duration`). They live in Turso `auth_state` and are never
-replicated. When a KDC trips the threshold, it locks locally at once and
+`pw_lockout_duration`). In CockroachDB replica mode they live in Turso
+`auth_state` and are never replicated. In standalone klmdb mode, the same
+three fields live in the per-environment `lockout` database; File/Memory
+backends keep them in memory. When a KDC trips the threshold, it locks locally at once and
 reports the lockout to CockroachDB `lockouts` asynchronously, with retries and
 a bounded queue. The report replicates to every KDC. The KDC does not touch
 `principals` (least privilege), so the report does not bump the principal's

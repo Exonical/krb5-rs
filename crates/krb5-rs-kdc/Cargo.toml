@@ -18,6 +18,9 @@ name = "krb5-rs-kdb"
 path = "src/bin/krb5-rs-kdb.rs"
 
 [features]
+# MIT-compatible LMDB backend, selected with `db_library = klmdb`.
+default = ["klmdb"]
+klmdb = ["dep:krb5-rs-kdb-lmdb"]
 # The Turso replica database module (db_library = krb5-rs-turso). Off by
 # default: it pulls Turso, whose dependencies include C code (simsimd).
 turso = ["dep:krb5-rs-kdb-turso"]
@@ -26,6 +29,7 @@ turso = ["dep:krb5-rs-kdb-turso"]
 cockroach = ["dep:krb5-rs-kdb-cockroach", "turso"]
 
 [dependencies]
+krb5-rs-kdb-lmdb = { path = "../krb5-rs-kdb-lmdb", optional = true }
 krb5-rs-kdb-turso = { path = "../krb5-rs-kdb-turso", optional = true }
 krb5-rs-kdb-cockroach = { path = "../krb5-rs-kdb-cockroach", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
