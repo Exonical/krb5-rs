@@ -383,3 +383,38 @@ fn calls_after_destroy_have_no_context() {
     let err = RpcError::Auth(AuthStat::GssCredProblem);
     assert!(err.to_string().contains("GssCredProblem"));
 }
+
+#[tokio::test]
+async fn truncated_record_marker_is_an_error_not_eof() {
+    let mut empty: &[u8] = &[];
+    assert!(matches!(
+        krb5_rs::rpc::read_record(&mut empty).await,
+        Ok(None)
+    ));
+    let mut partial: &[u8] = &[0x80, 0x00];
+    let err = krb5_rs::rpc::read_record(&mut partial)
+        .await
+        .expect_err("partial marker");
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[tokio::test]
+async fn records_over_the_limit_are_not_written() {
+    let big = vec![0u8; krb5_rs::rpc::MAX_RECORD + 1];
+    assert!(krb5_rs::rpc::write_record(&mut tokio::io::sink(), &big)
+        .await
+        .is_err());
+    let max = vec![0u8; krb5_rs::rpc::MAX_RECORD];
+    let mut buf = Vec::new();
+    krb5_rs::rpc::write_record(&mut buf, &max)
+        .await
+        .expect("max-size record");
+    let mut r: &[u8] = &buf;
+    assert_eq!(
+        krb5_rs::rpc::read_record(&mut r)
+            .await
+            .expect("read")
+            .map(|v| v.len()),
+        Some(krb5_rs::rpc::MAX_RECORD)
+    );
+}

@@ -383,12 +383,13 @@ pub async fn read_record<S: AsyncRead + Unpin>(
     let mut record = Vec::new();
     loop {
         let mut mark = [0u8; 4];
-        match stream.read_exact(&mut mark).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && record.is_empty() => {
-                return Ok(None)
+        if record.is_empty() {
+            if stream.read(&mut mark[..1]).await? == 0 {
+                return Ok(None);
             }
-            Err(e) => return Err(e),
+            stream.read_exact(&mut mark[1..]).await?;
+        } else {
+            stream.read_exact(&mut mark).await?;
         }
         let mark = u32::from_be_bytes(mark);
         let len = usize::try_from(mark & !LAST_FRAGMENT)
@@ -412,7 +413,7 @@ pub async fn write_record<S: AsyncWrite + Unpin>(
 ) -> Result<(), std::io::Error> {
     let len = u32::try_from(record.len())
         .ok()
-        .filter(|l| l & LAST_FRAGMENT == 0)
+        .filter(|l| l & LAST_FRAGMENT == 0 && record.len() <= MAX_RECORD)
         .ok_or_else(|| std::io::Error::other("RPC record too large"))?;
     let mut out = Vec::with_capacity(record.len() + 4);
     out.extend_from_slice(&(len | LAST_FRAGMENT).to_be_bytes());
