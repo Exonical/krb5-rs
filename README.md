@@ -125,6 +125,13 @@ Master-key rotation through `kdb5_util add_mkey` / `use_mkey` is not
 supported; opening a database whose `K/M` has multiple key-data entries fails
 with an explicit error.
 
+`krb5-rs-kdb dump [-b7|-r13|-r18] [-verbose] [FILE [NAME-REGEX]...]` and
+`krb5-rs-kdb load [-b7|-r13|-r18] [-verbose] [-update] [-hash] FILE` read and
+write MIT `kdb5_util` dump formats 4-7 (default 7) for klmdb and the file
+store, so databases move between MIT and krb5-rs in both directions. A klmdb
+dump is byte-identical to MIT's. Deviations are listed in
+[`docs/architecture/kdb.md`](docs/architecture/kdb.md#mit-dumpload).
+
 ### Turso replica module (optional)
 
 `crates/krb5-rs-kdb-turso` is an optional plug-in (not built into the daemon unless

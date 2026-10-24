@@ -446,6 +446,96 @@ env KRB5_KDC_PROFILE="$LOAD_DIR/kdc.conf" KRB5_CONFIG="$LOAD_DIR/krb5.conf" \
 mit_env "$LOAD_DIR" "$KADMIN" -r "$REALM" -q 'getprinc bob' > "$LOAD_DIR/getprinc.log"
 grep -q 'bob@KLMDB.LIVE' "$LOAD_DIR/getprinc.log"
 
+terse_all() {
+  local dir=$1
+  mit_admin "$dir" listprincs 2>/dev/null | grep "@$REALM\$" | sort | while read -r name; do
+    mit_admin "$dir" "getprinc -terse $name" 2>/dev/null | grep -v '^Authenticating'
+  done
+  mit_admin "$dir" listpols 2>/dev/null | grep -v '^Authenticating' | sort | while read -r name; do
+    mit_admin "$dir" "getpol -terse $name" 2>/dev/null | grep -v '^Authenticating'
+  done
+}
+
+RS_DUMP="$RS_DIR/rs.dump"
+rs_kdb "$RS_DIR" dump "$RS_DUMP"
+test "$(head -n 1 "$RS_DUMP")" = 'kdb5_util load_dump version 7'
+test -f "$RS_DUMP.dump_ok"
+cmp "$MIT_DUMP" "$RS_DUMP"
+terse_all "$RS_DIR" > "$BASE/source.terse"
+grep -q 'bob@KLMDB.LIVE' "$BASE/source.terse"
+
+MIT_LOAD="$BASE/mit-load"
+write_profile "$MIT_LOAD" "$MIT_PORT"
+mit_create "$MIT_LOAD"
+mit_env "$MIT_LOAD" "$MIT_KDB" load -r "$REALM" "$RS_DUMP" >/dev/null
+terse_all "$MIT_LOAD" > "$BASE/mit-load.terse"
+diff "$BASE/source.terse" "$BASE/mit-load.terse"
+
+RS_LOAD="$BASE/rs-load"
+write_profile "$RS_LOAD" "$RS_PORT"
+mit_create "$RS_LOAD"
+mit_addprinc "$RS_LOAD" only-before-load 'Only-Before-Load-1'
+rs_kdb "$RS_LOAD" load "$MIT_DUMP"
+terse_all "$RS_LOAD" > "$BASE/rs-load.terse"
+diff "$BASE/source.terse" "$BASE/rs-load.terse"
+rs_kdb "$RS_LOAD" dump "$RS_LOAD/again.dump"
+cmp "$MIT_DUMP" "$RS_LOAD/again.dump"
+mit_env "$RS_LOAD" "$MIT_KDB" dump -r "$REALM" "$RS_LOAD/mit-again.dump" >/dev/null
+cmp "$MIT_DUMP" "$RS_LOAD/mit-again.dump"
+rs_kdc_start "$RS_LOAD"
+authenticated=0
+for attempt in $(seq 1 12); do
+  if kinit_try "$RS_LOAD" bob 'Bob-Initial-Password' rs-load-bob; then
+    authenticated=1
+    break
+  fi
+  sleep 1
+done
+test "$authenticated" = 1
+stop_server
+
+rs_kdb "$RS_DIR" dump "$BASE/bob.dump" 'bob@KLMDB\.LIVE'
+test "$(grep -c '^princ' "$BASE/bob.dump")" = 1
+if grep -q '^policy' "$BASE/bob.dump"; then
+  echo "name-filtered dump included policies" >&2
+  exit 1
+fi
+mit_addprinc "$RS_LOAD" extra 'Extra-Password-1'
+rs_kdb "$RS_LOAD" load -update -hash -verbose "$BASE/bob.dump" 2> "$BASE/update.log"
+grep -qx 'bob@KLMDB.LIVE' "$BASE/update.log"
+mit_admin "$RS_LOAD" 'getprinc extra' | grep -q 'extra@KLMDB.LIVE'
+rs_kdb "$RS_LOAD" dump "$BASE/before-bad.dump"
+printf 'kdb5_util load_dump version 9\n' > "$BASE/bad-header.dump"
+head -c 700 "$MIT_DUMP" > "$BASE/truncated.dump"
+printf 'kdb5_util load_dump version 7\nbogus\t1\n' > "$BASE/bad-type.dump"
+for bad in bad-header truncated bad-type; do
+  if mit_env "$MIT_LOAD" "$MIT_KDB" load -r "$REALM" "$BASE/$bad.dump" 2> "$BASE/$bad.mit.err"; then
+    echo "MIT accepted $bad" >&2
+    exit 1
+  fi
+  if rs_kdb "$RS_LOAD" load "$BASE/$bad.dump" 2> "$BASE/$bad.rs.err"; then
+    echo "krb5-rs accepted $bad" >&2
+    exit 1
+  fi
+done
+grep -q "dump header bad in $BASE/bad-header.dump" "$BASE/bad-header.mit.err"
+grep -q "dump header bad in $BASE/bad-header.dump" "$BASE/bad-header.rs.err"
+grep -q 'unknown record type "bogus"' "$BASE/bad-type.mit.err"
+grep -q 'unknown record type "bogus"' "$BASE/bad-type.rs.err"
+grep -q 'restore failed' "$BASE/truncated.mit.err"
+grep -q 'restore failed' "$BASE/truncated.rs.err"
+rs_kdb "$RS_LOAD" dump "$BASE/after-bad.dump"
+cmp "$BASE/before-bad.dump" "$BASE/after-bad.dump"
+rs_kdb "$RS_DIR" dump "$BASE/two.dump" 'K/M@.*' 'bob@KLMDB\.LIVE'
+rs_kdb "$RS_LOAD" load "$BASE/two.dump"
+rs_kdb "$RS_LOAD" dump "$BASE/replaced.dump"
+cmp "$BASE/two.dump" "$BASE/replaced.dump"
+mit_admin "$RS_LOAD" 'getprinc bob' | grep -q 'bob@KLMDB.LIVE'
+if mit_admin "$RS_LOAD" 'getprinc extra' | grep -q '^Principal: extra@KLMDB.LIVE'; then
+  echo "non-update load kept a principal missing from the dump" >&2
+  exit 1
+fi
+
 echo KLMDB_LIVE_OK
 "#,
     );

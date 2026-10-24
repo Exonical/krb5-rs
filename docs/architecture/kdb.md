@@ -161,9 +161,49 @@ loaded principals and policies use epoch zero. MIT key-data has no
 `krb5rs_allowed_to_delegate_from`; MIT db2/klmdb do not define a native field
 for resource-based delegation. KRB5RS-PROP-1 `kprop_*` settings are rejected
 with klmdb here; MIT kprop integration and making klmdb the default are
-reserved for PR-C. Master-key rotation via `kdb5_util add_mkey` /
+reserved for PR-C. MIT dump/load is described below. Master-key rotation via `kdb5_util add_mkey` /
 `use_mkey` is not supported; opening a `K/M` with multiple key-data records
 fails explicitly.
+
+### MIT dump/load
+
+`krb5-rs-kdb dump` and `load` implement `kdb5_util dump`/`load`
+(`src/kadmin/dbutil/dump.c`) for klmdb and the file store. The writer emits
+format version 7 by default and versions 6, 5 and 4 with `-r18`, `-r13` and
+`-b7`; the reader accepts all four and, for version 7, both policy record
+forms (`dump.c:1001-1043`). Records are parsed byte for byte like MIT
+(lowercase hex, `-1` for empty octets, length and range checks, `unknown
+record type`), the whole file is parsed before the database is touched, and
+klmdb output is byte-identical to MIT 1.22.2 (checked-in fixtures in
+`tests/fixtures/mit-dump` and the live test). Dump output goes to a
+`<file>-<pid>` temporary that is renamed over the target, followed by the
+`<file>.dump_ok` stamp; trailing name arguments are anchored regular
+expressions as in MIT.
+
+Deviations:
+
+- klmdb non-`-update` loads follow MIT's klmdb module rather than the db2
+  `~`-rename: principal and policy databases are cleared and refilled in one
+  write transaction that commits only after every record is stored
+  (`plugins/kdb/lmdb/kdb_lmdb.c:62-76, 635-647, 1004-1020`). Lockout rows are
+  staged in a second transaction that commits right after it (MIT writes
+  them per record without a transaction), so a load that fails before the
+  main commit changes nothing; stale lockout rows of principals that were
+  not reloaded stay, as in MIT. The file store uses `<db>~` plus rename like
+  db2 (`plugins/kdb/db2/kdb_db2.c:298, 1419`).
+- Input that ends inside a record (after `princ`/`policy` or within its
+  fields) is rejected; MIT treats it as the end of the dump and drops the
+  record (`dump.c:616, 898, 907, 917`). A complete policy missing only its
+  final newline is kept.
+- `-hash` is accepted and ignored; `-c`, `-rev` and `-recurse` are accepted
+  and ignored on dump; iprop (`-i`) and `-mkey_convert` are rejected.
+- `e_data` is always written empty, as klmdb never stores it
+  (`plugins/kdb/lmdb/marshal.c`).
+- The file store keeps only what its record model has: string attributes
+  other than `krb5rs_allowed_to_delegate_from`, password history, policy
+  tl-data, MIT tl-data and the lockout fields (`last_success`,
+  `last_failed`, `fail_auth_count`; the file store keeps lockout counters in
+  memory, see section 8) are dropped on load and dumped as zero.
 
 ## 3. Store interfaces (library, `krb5_rs::kdc::store`)
 

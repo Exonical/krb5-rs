@@ -16,6 +16,10 @@ use rasn::types::{GeneralString, OctetString};
 
 use super::format::{KdbFile, KdbKey, KdbPolicy, KdbPrincipal, MAGIC, VERSION};
 use super::master::{decrypt_key, encrypt_key, master_principal};
+use super::mit::{
+    merge_policy, new_entry, policy_from_entry, record_from_entry, unparse_name, MitEntry,
+    MitPolicy,
+};
 use crate::kdc::db::{
     random_keys, store_key, KeyEntry, PrincipalAttributes, PrincipalEntry, StoreKey,
 };
@@ -605,7 +609,140 @@ impl FileStore {
     /// Snapshot all principals and policies for migration to another
     /// authoritative backend.
     pub fn export_records(&self) -> Result<(Vec<PrincipalRecord>, Vec<Policy>), StoreError> {
-        Ok((self.list_records()?, self.list_policies()?))
+        self.refresh(false)?;
+        let (raws, mut policies) = {
+            let cache = self.read_cache();
+            (
+                cache
+                    .records
+                    .values()
+                    .cloned()
+                    .collect::<Vec<KdbPrincipal>>(),
+                cache.policies.values().cloned().collect::<Vec<Policy>>(),
+            )
+        };
+        policies.sort_by(|a, b| a.name.cmp(&b.name));
+        let records = raws
+            .iter()
+            .map(|r| self.decrypt_record(r))
+            .collect::<Result<_, _>>()?;
+        Ok((records, policies))
+    }
+
+    /// Principals and policies as MIT dump entries in klmdb key order.
+    /// Deviation: the file store keeps only what [`PrincipalRecord`] and
+    /// [`Policy`] model (no lockout state, string attributes, password
+    /// history or policy tl-data), so only that is dumped.
+    pub fn dump_entries(&self) -> Result<(Vec<MitEntry>, Vec<MitPolicy>), StoreError> {
+        let (records, policies) = self.export_records()?;
+        let creator = unparse_name(&PrincipalName::new_principal("db_creation"), &self.realm);
+        let mut entries = records
+            .iter()
+            .map(|r| new_entry(r, &self.master, &creator))
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_cached_key(|e| unparse_name(&e.principal, &e.realm));
+        let policies = policies
+            .iter()
+            .map(|policy| {
+                let mut entry = MitPolicy {
+                    name: String::new(),
+                    pw_min_life: 0,
+                    pw_max_life: 0,
+                    pw_min_length: 0,
+                    pw_min_classes: 0,
+                    pw_history_num: 0,
+                    pw_max_fail: 0,
+                    pw_failcnt_interval: 0,
+                    pw_lockout_duration: 0,
+                    attributes: 0,
+                    max_life: 0,
+                    max_renewable_life: 0,
+                    allowed_keysalts: None,
+                    tl_data: Vec::new(),
+                };
+                merge_policy(&mut entry, policy).map(|()| entry)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((entries, policies))
+    }
+
+    /// Load dump records. Without `update` the new database is written to
+    /// `<path>~` and renamed over `path`, like MIT's db2 temporary database
+    /// (`plugins/kdb/db2/kdb_db2.c:298,1419-1460`). Keys must be encrypted in
+    /// `master`; fields the file store does not model are dropped.
+    pub fn load_dump(
+        path: &Path,
+        realm: &str,
+        master: &EncryptionKey,
+        entries: &[MitEntry],
+        policies: &[MitPolicy],
+        update: bool,
+    ) -> Result<(), StoreError> {
+        let store = if update {
+            Self::open(path, master)?
+        } else {
+            Self {
+                path: path.to_path_buf(),
+                realm: realm.to_string(),
+                master: master.clone(),
+                cache: RwLock::new(Cache::default()),
+            }
+        };
+        let mut principals = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let record = record_from_entry(entry, master)?;
+            principals.push((
+                store_key(&record.entry.name, &record.entry.realm),
+                store.to_record(&record.entry, record.last_pwd_change, record.mod_time)?,
+            ));
+        }
+        let policies = policies
+            .iter()
+            .map(|p| policy_to_record(&policy_from_entry(p)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let merge = |file: &mut KdbFile| {
+            let mut index: HashMap<StoreKey, usize> = HashMap::new();
+            for (i, p) in file.principals.iter().enumerate() {
+                let realm = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
+                index.insert(store_key(&p.name, &realm), i);
+            }
+            for (key, record) in principals {
+                match index.get(&key) {
+                    Some(&i) => file.principals[i] = record,
+                    None => {
+                        index.insert(key, file.principals.len());
+                        file.principals.push(record);
+                    }
+                }
+            }
+            let list = file.policies.get_or_insert_with(Vec::new);
+            for policy in policies {
+                list.retain(|p| p.name.as_bytes() != policy.name.as_bytes());
+                list.push(policy);
+            }
+        };
+        if update {
+            return store.modify_file(|file| {
+                merge(file);
+                Ok(())
+            });
+        }
+        let _guard = store.lock()?;
+        let serial = read_file(path).map_or(0, |(_, f)| f.serial.unwrap_or(0));
+        let mut file = KdbFile {
+            version: VERSION,
+            realm: general(realm)?,
+            principals: Vec::new(),
+            serial: Some(serial + 1),
+            policies: None,
+        };
+        merge(&mut file);
+        let temporary = sibling(path, "~");
+        write_atomic(&temporary, &file)?;
+        std::fs::rename(&temporary, path).map_err(|e| {
+            let _ = std::fs::remove_file(&temporary);
+            err(format!("renaming {}: {e}", temporary.display()))
+        })
     }
 
     /// Insert a new principal under the write lock; `Conflict` if it exists.
@@ -854,6 +991,70 @@ mod tests {
             security_epoch: 0,
             last_admin_unlock: None,
         }
+    }
+
+    #[test]
+    fn mit_dump_loads_into_and_dumps_from_the_file_store() {
+        use crate::kdc::kdb::mit::dump::{read_dump, write_dump, DumpVersion, Record};
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mit-dump/v7.dump"
+        ))
+        .expect("fixture");
+        let (_, records, _) = read_dump(&data, "v7", None).expect("parse");
+        let (mut entries, mut policies) = (Vec::new(), Vec::new());
+        for record in records {
+            match record {
+                Record::Principal(entry) => entries.push(entry),
+                Record::Policy(policy) => policies.push(policy),
+            }
+        }
+        let names = |entries: &[MitEntry]| {
+            entries
+                .iter()
+                .map(|e| unparse_name(&e.principal, &e.realm))
+                .collect::<Vec<_>>()
+        };
+        let realm = "DUMP.TEST";
+        let master = master_key_from_password(realm, "master-password-for-dump-fixtures", 18)
+            .expect("master");
+        let path = temp("dump");
+        assert!(FileStore::load_dump(&path, realm, &master, &entries, &policies, true).is_err());
+        FileStore::load_dump(&path, realm, &master, &entries, &policies, false).expect("load");
+        assert!(!path.with_file_name("principal~").exists());
+
+        let store = FileStore::open(&path, &master).expect("open");
+        assert!(store
+            .get_record(&PrincipalName::new_principal("alice"), realm)
+            .expect("alice")
+            .is_some());
+        let (dumped, dumped_policies) = store.dump_entries().expect("dump");
+        assert_eq!(names(&dumped), names(&entries));
+        for (ours, theirs) in dumped.iter().zip(&entries) {
+            assert_eq!(ours.key_data.len(), theirs.key_data.len());
+            assert_eq!(ours.attributes, theirs.attributes);
+        }
+        let policy_names = |p: &[MitPolicy]| p.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        assert_eq!(policy_names(&dumped_policies), policy_names(&policies));
+        let text = write_dump(DumpVersion::R111, &dumped, &dumped_policies);
+        let (_, reread, _) = read_dump(&text, "ours", None).expect("reread");
+        assert_eq!(reread.len(), entries.len() + policies.len());
+
+        drop(store);
+        FileStore::load_dump(&path, realm, &master, &entries[1..2], &[], true).expect("update");
+        let (after_update, after_update_policies) = FileStore::open(&path, &master)
+            .expect("open")
+            .dump_entries()
+            .expect("dump");
+        assert_eq!(after_update.len(), entries.len());
+        assert_eq!(after_update_policies.len(), policies.len());
+        FileStore::load_dump(&path, realm, &master, &entries[..2], &[], false).expect("replace");
+        let (replaced, replaced_policies) = FileStore::open(&path, &master)
+            .expect("open")
+            .dump_entries()
+            .expect("dump");
+        assert_eq!(names(&replaced), names(&entries[..2]));
+        assert!(replaced_policies.is_empty());
     }
 
     #[test]

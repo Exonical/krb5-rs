@@ -3,19 +3,23 @@
 //! `krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] <cmd> args`
 //!
 //! Commands: `create [-s]`, `stash`, `addprinc`, `delprinc`, `cpw`,
-//! `modprinc`, `getprinc`, `listprincs`, `ktadd`. See `usage()`.
+//! `modprinc`, `getprinc`, `listprincs`, `ktadd`, `dump`, `load`. See `usage()`.
 //!
 //! The master password and principal passwords are read from stdin, one
 //! line each, with prompts on stderr; they are never taken from the command
 //! line. Input is not hidden when stdin is a terminal.
 
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use krb5_rs::kdc::kdb::admin::{
     format_policy, format_principal, parse_lifetime, parse_principal, parse_time, AdminOps,
     AttrChange, PolicyChange, PrincipalOptions,
 };
+use krb5_rs::kdc::kdb::mit::dump::{
+    policy_record, principal_record, read_dump, DumpVersion, LoadFailure, Record,
+};
+use krb5_rs::kdc::kdb::mit::{unparse_name, MitEntry, MitPolicy};
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, write_stash, FileStore};
 use krb5_rs::kdc::{default_realm, AdminStore, RealmConfig, StoreError, StoreErrorKind};
 use krb5_rs::profile::Profile;
@@ -33,7 +37,8 @@ fn print_usage() {
          delpol POLICY\n  getpol [-terse] POLICY\n  listpols\n  \
          database migrate [--create-roles] [--multi-region --primary-region R --regions R1,R2,...]   (CockroachDB)\n  \
          replication status | prune --older-than D | wait-applied --since TS [--timeout D] [--live-within D]   (CockroachDB)\n  \
-         getprinc NAME\n  listprincs\n  ktadd -k PATH [-norandkey] NAME..."
+         getprinc NAME\n  listprincs\n  ktadd -k PATH [-norandkey] NAME...\n  \
+         dump [-b7|-r13|-r18] [-verbose] [FILE [NAME-REGEX]...]\n  load [-b7|-r13|-r18] [-verbose] [-update] [-hash] FILE"
     );
 }
 
@@ -269,7 +274,7 @@ fn main() {
 
     let read_only_command = matches!(
         cmd.as_str(),
-        "getprinc" | "listprincs" | "getpol" | "listpols" | "stash"
+        "getprinc" | "listprincs" | "getpol" | "listpols" | "stash" | "dump"
     );
     if cfg.db_module.library.as_deref() == Some("klmdb") && cfg.propagation.is_configured() {
         fail("kprop_* settings cannot be combined with db_library = klmdb");
@@ -288,6 +293,9 @@ fn main() {
 
     match cfg.db_module.library.as_deref() {
         None => {}
+        Some("krb5-rs-cockroach") if matches!(cmd.as_str(), "dump" | "load") => fail(format!(
+            "`{cmd}` needs db_library = klmdb or the file store"
+        )),
         Some("krb5-rs-cockroach") => {
             cockroach_command(&cmd, args, &cfg, &realm, master_password_file.as_deref());
             return;
@@ -334,6 +342,27 @@ fn main() {
             ok(write_stash(&cfg.key_stash_file, &realm, &key));
             return;
         }
+        "dump" => {
+            dump_command(args, || {
+                let master = master_key(&cfg, &realm, master_password_file.as_deref());
+                FileStore::open(&cfg.database_name, &master)?.dump_entries()
+            });
+            return;
+        }
+        "load" => {
+            load_command(args, |entries, policies, update| {
+                let master = master_key(&cfg, &realm, master_password_file.as_deref());
+                FileStore::load_dump(
+                    &cfg.database_name,
+                    &realm,
+                    &master,
+                    entries,
+                    policies,
+                    update,
+                )
+            });
+            return;
+        }
         _ => {}
     }
 
@@ -346,6 +375,163 @@ fn main() {
         cfg.master_key_type,
     );
     run_admin(&admin, &cmd, args, &realm);
+}
+
+type DumpEntries = (Vec<MitEntry>, Vec<MitPolicy>);
+
+/// `kdb5_util dump` (`kadmin/dbutil/dump.c:1137-1362`). Deviation: `-c`,
+/// `-rev` and `-recurse` are accepted and ignored (klmdb iterates in key
+/// order); `-mkey_convert`/`-new_mkey_file` are not supported.
+fn dump_command(args: Vec<String>, read: impl FnOnce() -> Result<DumpEntries, StoreError>) {
+    let mut version = DumpVersion::R111;
+    let mut verbose = false;
+    let mut it = args.into_iter().peekable();
+    while let Some(arg) = it.next_if(|a| a.starts_with('-') && a != "-") {
+        match arg.as_str() {
+            "-b7" => version = DumpVersion::Beta7,
+            "-r13" => version = DumpVersion::R13,
+            "-r18" => version = DumpVersion::R18,
+            "-ov" => fail("OV dump format not supported"),
+            "-c" | "-rev" | "-recurse" => {}
+            "-verbose" => verbose = true,
+            "-mkey_convert" | "-new_mkey_file" => fail("master key conversion is not supported"),
+            a if a.starts_with("-i") => fail("Iprop not enabled"),
+            _ => usage(),
+        }
+    }
+    let file = it.next().filter(|f| f != "-");
+    let names: Vec<regex::Regex> = it
+        .map(|n| {
+            regex::Regex::new(&format!("^(?:{n})$"))
+                .unwrap_or_else(|e| fail(format!("regular expression error: {e}")))
+        })
+        .collect();
+    let (entries, policies) = ok(read());
+    let mut out = version.header().as_bytes().to_vec();
+    for entry in &entries {
+        let name = unparse_name(&entry.principal, &entry.realm);
+        let name = String::from_utf8_lossy(&name);
+        if !names.is_empty() && !names.iter().any(|r| r.is_match(&name)) {
+            continue;
+        }
+        out.extend(principal_record(entry, version));
+        if verbose {
+            eprintln!("{name}");
+        }
+    }
+    if names.is_empty() {
+        for policy in &policies {
+            out.extend(policy_record(policy, version));
+        }
+    }
+    match file {
+        None => ok(std::io::stdout().write_all(&out)),
+        Some(file) => ok(write_dump_file(Path::new(&file), &out)
+            .map_err(|e| format!("{e} while opening {file} for writing"))),
+    }
+}
+
+/// `create_ofile`/`finish_ofile` and the `.dump_ok` stamp
+/// (`kadmin/dbutil/dump.c:111-210`).
+fn write_dump_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let ok_file = appended_path(path, ".dump_ok");
+    private_file(&ok_file, false)?;
+    let temp = appended_path(path, &format!("-{:06}", std::process::id() % 1_000_000));
+    let result = private_file(&temp, true).and_then(|mut f| {
+        f.write_all(data)?;
+        f.sync_all()?;
+        std::fs::rename(&temp, path)
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result?;
+    private_file(&ok_file, false)?.write_all(&[0])
+}
+
+fn private_file(path: &Path, new: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
+/// `kdb5_util load` (`kadmin/dbutil/dump.c:1384-1610`). The whole dump is
+/// parsed before the database is touched. `-hash` selects db2's hash
+/// format in MIT and is ignored here.
+fn load_command(
+    args: Vec<String>,
+    store: impl FnOnce(&[MitEntry], &[MitPolicy], bool) -> Result<(), StoreError>,
+) {
+    let (mut forced, mut verbose, mut update) = (None, false, false);
+    let mut it = args.into_iter();
+    while it.len() > 1 {
+        match it.next().as_deref() {
+            Some("-b7") => forced = Some(DumpVersion::Beta7),
+            Some("-r13") => forced = Some(DumpVersion::R13),
+            Some("-r18") => forced = Some(DumpVersion::R18),
+            Some("-ov") => fail("OV dump format not supported"),
+            Some("-i") => fail("Iprop not enabled"),
+            Some("-verbose") => verbose = true,
+            Some("-update") => update = true,
+            Some("-hash") => {}
+            _ => usage(),
+        }
+    }
+    let Some(file) = it.next() else { usage() };
+    let data = std::fs::read(&file).unwrap_or_else(|e| fail(format!("{e} while opening {file}")));
+    let (version, records, warnings) = match read_dump(&data, &file, forced) {
+        Ok(loaded) => loaded,
+        Err(LoadFailure::Header(message)) => fail(message),
+        Err(LoadFailure::Record {
+            version,
+            error,
+            warnings,
+        }) => {
+            for line in warnings
+                .iter()
+                .chain(error.messages.iter().filter(|m| !m.is_empty()))
+            {
+                eprintln!("{line}");
+            }
+            eprintln!(
+                "krb5-rs-kdb: error processing line {} of {file}",
+                error.line
+            );
+            fail(format!("{} restore failed", version.name()));
+        }
+    };
+    for line in &warnings {
+        eprintln!("{line}");
+    }
+    let (mut entries, mut policies) = (Vec::new(), Vec::new());
+    for record in records {
+        match record {
+            Record::Principal(entry) => {
+                if verbose {
+                    let name = unparse_name(&entry.principal, &entry.realm);
+                    eprintln!("{}", String::from_utf8_lossy(&name));
+                }
+                entries.push(entry);
+            }
+            Record::Policy(policy) => {
+                if verbose {
+                    eprintln!("created policy {}", policy.name);
+                }
+                policies.push(policy);
+            }
+        }
+    }
+    if let Err(e) = store(&entries, &policies, update) {
+        eprintln!("krb5-rs-kdb: {e}");
+        fail(format!("{} restore failed", version.name()));
+    }
 }
 
 #[cfg(feature = "klmdb")]
@@ -424,6 +610,13 @@ fn klmdb_command(
             ok(LmdbStore::open(cfg, &master));
             ok(write_stash(&cfg.key_stash_file, realm, &master));
         }
+        "dump" => dump_command(args, || {
+            let master = master_key(cfg, realm, global_master_password_file);
+            LmdbStore::open(cfg, &master)?.dump_entries()
+        }),
+        "load" => load_command(args, |entries, policies, update| {
+            LmdbStore::load_dump(cfg, entries, policies, update)
+        }),
         _ => {
             let master = master_key(cfg, realm, global_master_password_file);
             let store = ok(LmdbStore::open(cfg, &master));
