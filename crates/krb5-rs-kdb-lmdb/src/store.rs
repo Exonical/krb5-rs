@@ -413,15 +413,19 @@ impl LmdbStore {
             )));
         }
         publish_environments(&temp_base, database_name, faults.publish_stop)?;
-        let mut store = Self::open_environments(database_name, realm, master, options, false)?;
+        let store = Self::open_environments(database_name, realm, master, options, false)?;
         store.verify_master()?;
+        store.with_ulog(config)
+    }
+
+    fn with_ulog(mut self, config: &krb5_rs::kdc::RealmConfig) -> Result<Self, StoreError> {
         if config.iprop.enabled {
             let ulog = Ulog::map(&config.iprop.logfile, config.iprop.ulogsize)?;
-            if let Some(inner) = Arc::get_mut(&mut store.inner) {
-                inner.ulog = Some(ulog);
-            }
+            Arc::get_mut(&mut self.inner)
+                .ok_or_else(|| StoreError::backend("klmdb store is already shared"))?
+                .ulog = Some(ulog);
         }
-        Ok(store)
+        Ok(self)
     }
 
     /// The update log, when `iprop_enable` is set.
@@ -484,7 +488,7 @@ impl LmdbStore {
         }
         let store = Self::open_environments(database_name, realm, master, options, false)?;
         store.verify_master()?;
-        Ok(store)
+        store.with_ulog(config)
     }
 
     fn open_environments(
