@@ -9,10 +9,10 @@
 pub mod admin;
 mod file;
 mod format;
+#[cfg(feature = "tokio")]
+pub mod kprop;
 pub mod master;
 pub mod mit;
-#[cfg(feature = "tokio")]
-pub mod propagation;
 
 pub use crate::kdc::store::PrincipalRecord;
 pub use file::FileStore;

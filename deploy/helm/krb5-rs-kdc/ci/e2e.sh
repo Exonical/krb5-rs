@@ -57,10 +57,10 @@ $HELM upgrade --install "$REL" "$CHART" \
   --set realm="$REALM" \
   --set image.repository="$KDC_IMAGE_REPO" --set image.tag="$KDC_IMAGE_TAG" \
   --set image.pullPolicy=Never \
-  --set propagation.pollInterval=5s \
+  --set propagation.interval=5 \
   --wait --timeout 5m
 kubectl rollout status "statefulset/${PRIMARY}" --timeout=120s
-kubectl rollout status "deployment/${FULL}-replicas" --timeout=120s
+kubectl rollout status "statefulset/${FULL}-replicas" --timeout=120s
 [ "$(kubectl get pods -l app.kubernetes.io/component=replica --no-headers | grep -c Running)" -eq 2 ]
 
 step "MIT client pod"

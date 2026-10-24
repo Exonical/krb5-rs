@@ -1,0 +1,21 @@
+{{- if eq .Values.database.mode "file" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "krb5-rs-kdc.replicaService" . }}
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: replica
+spec:
+  clusterIP: None
+  # kprop must reach a replica before its first load makes it Ready.
+  publishNotReadyAddresses: true
+  ports:
+    - name: kprop
+      port: {{ .Values.propagation.port }}
+      targetPort: kprop
+      protocol: TCP
+  selector:
+    {{- include "krb5-rs-kdc.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: replica
+{{- end }}

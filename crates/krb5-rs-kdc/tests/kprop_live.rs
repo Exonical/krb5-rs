@@ -1,0 +1,163 @@
+//! MIT 1.22.2 kprop/kpropd interoperability in both directions, inside the MIT
+//! container of the Compose stack (`KPROP_LIVE_CONTAINER`, default
+//! `krb5-rs-kdc-1`; `CONTAINER_CLI`, default `podman`). The krb5-rs binaries
+//! are copied in, so they must run on the container's libc (or be static).
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+fn container_cli() -> String {
+    std::env::var("CONTAINER_CLI").unwrap_or_else(|_| "podman".into())
+}
+
+fn container() -> String {
+    std::env::var("KPROP_LIVE_CONTAINER").unwrap_or_else(|_| "krb5-rs-kdc-1".into())
+}
+
+fn container_run(args: &[&str], stdin: &str) -> std::process::Output {
+    let mut child = Command::new(container_cli())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run container CLI");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait")
+}
+
+#[test]
+#[ignore = "requires the MIT container of the Compose stack"]
+fn mit_and_krb5_rs_kprop_interoperate_both_ways() {
+    let c = container();
+    let mkdir = container_run(&["exec", &c, "mkdir", "-p", "/tmp/kprop-live/bin"], "");
+    assert!(mkdir.status.success(), "{mkdir:?}");
+    for (name, path) in [
+        ("krb5-rs-kdb", env!("CARGO_BIN_EXE_krb5-rs-kdb")),
+        ("krb5-rs-kprop", env!("CARGO_BIN_EXE_krb5-rs-kprop")),
+        ("krb5-rs-kpropd", env!("CARGO_BIN_EXE_krb5-rs-kpropd")),
+    ] {
+        let dest = format!("{c}:/tmp/kprop-live/bin/{name}");
+        let out = container_run(&["cp", path, &dest], "");
+        assert!(out.status.success(), "cp {name}: {out:?}");
+    }
+    let out = container_run(&["exec", "-i", &c, "bash", "-s"], SCRIPT);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("KPROP_LIVE_OK"),
+        "kprop interop script failed\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+const SCRIPT: &str = r#"
+set -euo pipefail
+B=/tmp/kprop-live
+BIN=$B/bin
+R=KPROP.LIVE
+pkill -f "krb5kdc -r $R" 2>/dev/null || true
+rm -rf "$B/mit" "$B/mitrep" "$B/rsrep" "$B"/*.conf "$B"/*.log "$B"/*.keytab "$B"/*.acl "$B"/dump* "$B/stash"
+mkdir -p "$B/mit" "$B/mitrep" "$B/rsrep"
+H=$(hostname | tr 'A-Z' 'a-z')
+realm_conf() { # file dbdir db_library
+  cat > "$1" <<EOF
+[kdcdefaults]
+ kdc_ports = 18888
+ kdc_tcp_ports = 18888
+[realms]
+ $R = {
+  database_name = $2/principal
+  key_stash_file = $B/stash
+  supported_enctypes = aes256-cts-hmac-sha1-96:normal
+ }
+[dbmodules]
+ $R = {
+  db_library = $3
+  database_name = $2/principal
+ }
+EOF
+}
+realm_conf "$B/mit.conf" "$B/mit" db2
+realm_conf "$B/mitrep.conf" "$B/mitrep" db2
+realm_conf "$B/rsrep.conf" "$B/rsrep" klmdb
+cat > "$B/krb5.conf" <<EOF
+[libdefaults]
+ default_realm = $R
+ dns_lookup_kdc = false
+ dns_canonicalize_hostname = false
+ rdns = false
+ udp_preference_limit = 1
+[realms]
+ $R = {
+  kdc = 127.0.0.1:18888
+ }
+EOF
+export KRB5_CONFIG=$B/krb5.conf
+mit() { KRB5_KDC_PROFILE=$B/$1.conf "${@:2}"; }
+# Without connecting: a -t kpropd treats any connection as its one transfer.
+wait_listen() { local hex; hex=$(printf '%04X' "$1"); for _ in $(seq 1 100); do grep -Eq ":$hex [0-9A-F]+:0000 0A" /proc/net/tcp /proc/net/tcp6 && return 0; sleep 0.1; done; return 1; }
+wait_port() { for _ in $(seq 1 100); do (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+mit mit kdb5_util create -r $R -s -P master-password >/dev/null
+mit mit kadmin.local -r $R -q "addprinc -pw alice-pw alice" >/dev/null
+mit mit kadmin.local -r $R -q "addprinc -randkey host/$H" >/dev/null
+mit mit kadmin.local -r $R -q "ktadd -k $B/host.keytab host/$H" >/dev/null
+mit mit kdb5_util -r $R dump "$B/dump"
+mit mit krb5kdc -r $R -n > "$B/kdc.log" 2>&1 &
+wait_port 18888
+echo "host/$H@$R" > "$B/ok.acl"
+echo "host/other@$R" > "$B/bad.acl"
+
+# 1. krb5-rs kprop -> MIT kpropd (MIT kdb5_util load).
+mit mitrep kpropd -D -t -P 17540 -r $R -s "$B/host.keytab" -a "$B/ok.acl" \
+  -f "$B/mitrep/from_master" -p "$(command -v kdb5_util)" > "$B/mitkpropd.log" 2>&1 &
+P=$!
+wait_listen 17540
+$BIN/krb5-rs-kprop -r $R -f "$B/dump" -P 17540 -s "$B/host.keytab" "$H" | grep -q "Database propagation to $H: SUCCEEDED"
+wait $P
+cmp "$B/dump" "$B/mitrep/from_master"
+mit mitrep kadmin.local -r $R -q "getprinc alice" | grep -q "Principal: alice@$R"
+test -f "$B/dump.$H.last_prop"
+echo "rs kprop -> MIT kpropd ok"
+
+# 2. MIT kprop -> krb5-rs kpropd (krb5-rs-kdb load into klmdb).
+KRB5_KDC_PROFILE=$B/rsrep.conf $BIN/krb5-rs-kpropd -D -t -P 17541 -r $R -s "$B/host.keytab" \
+  -a "$B/ok.acl" -f "$B/rsrep/from_master" -p $BIN/krb5-rs-kdb > "$B/rskpropd.log" 2>&1 &
+P=$!
+wait_listen 17541
+kprop -r $R -f "$B/dump" -P 17541 -s "$B/host.keytab" "$H" | grep -q "SUCCEEDED"
+wait $P
+cmp "$B/dump" "$B/rsrep/from_master"
+$BIN/krb5-rs-kdb --config "$B/rsrep.conf" --realm $R getprinc alice | grep -q "alice@$R"
+echo "MIT kprop -> rs kpropd ok"
+
+# 3. Unauthorized client, both directions: the sender fails, nothing loads.
+rm -rf "$B/rsrep"/* "$B/mitrep/from_master"
+KRB5_KDC_PROFILE=$B/rsrep.conf $BIN/krb5-rs-kpropd -D -t -P 17542 -r $R -s "$B/host.keytab" \
+  -a "$B/bad.acl" -f "$B/rsrep/from_master" -p $BIN/krb5-rs-kdb > "$B/rsbad.log" 2>&1 &
+P=$!
+wait_listen 17542
+if kprop -r $R -f "$B/dump" -P 17542 -s "$B/host.keytab" "$H" > "$B/mitkprop-bad.log" 2>&1; then
+  echo "MIT kprop succeeded against a denying ACL" >&2; exit 1
+fi
+wait $P || true
+grep -q "Rejected connection from unauthorized principal host/$H@$R" "$B/rsbad.log"
+test ! -e "$B/rsrep/from_master"
+mit mitrep kpropd -D -t -P 17543 -r $R -s "$B/host.keytab" -a "$B/bad.acl" \
+  -f "$B/mitrep/from_master" -p "$(command -v kdb5_util)" > "$B/mitbad.log" 2>&1 &
+P=$!
+wait_listen 17543
+if $BIN/krb5-rs-kprop -r $R -f "$B/dump" -P 17543 -s "$B/host.keytab" "$H" > "$B/rskprop-bad.log" 2>&1; then
+  echo "krb5-rs kprop succeeded against a denying MIT ACL" >&2; exit 1
+fi
+wait $P || true
+test ! -e "$B/mitrep/from_master"
+echo "unauthorized rejected both ways"
+
+pkill -f "krb5kdc -r $R" || true
+echo KPROP_LIVE_OK
+"#;

@@ -39,7 +39,8 @@ ENV RUSTFLAGS="-C target-feature=+crt-static -C strip=symbols"
 RUN export CC_x86_64_unknown_linux_musl=musl-gcc \
  && cargo build --locked --release -p krb5-rs-kdc --target "$TARGET" ${FEATURES:+--features "$FEATURES"} \
  && mkdir -p /out/data \
- && cp "target/$TARGET/release/krb5-rs-kdc" "target/$TARGET/release/krb5-rs-kdb" /out/
+ && cp "target/$TARGET/release/krb5-rs-kdc" "target/$TARGET/release/krb5-rs-kdb" \
+      "target/$TARGET/release/krb5-rs-kprop" "target/$TARGET/release/krb5-rs-kpropd" /out/
 
 # gcr.io/distroless/static-debian12:nonroot (index digest)
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
@@ -52,7 +53,7 @@ LABEL org.opencontainers.image.title="krb5-rs-kdc" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}"
 
-COPY --from=build /out/krb5-rs-kdc /out/krb5-rs-kdb /usr/local/bin/
+COPY --from=build /out/krb5-rs-kdc /out/krb5-rs-kdb /out/krb5-rs-kprop /out/krb5-rs-kpropd /usr/local/bin/
 # Pre-owned data directory: new volumes mounted here inherit uid 65532.
 COPY --from=build --chown=65532:65532 /out/data /var/lib/krb5-rs
 

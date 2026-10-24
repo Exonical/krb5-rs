@@ -19,8 +19,8 @@ real CockroachDB and Turso before relying on them.
 - Kerberos protocol code never sees SQL, CockroachDB types or Turso types.
 - Not a goal: immediate revocation of tickets that were already issued (§7.4).
 
-The existing `FileStore` + kprop-style propagation (PR 2) stays as the
-standalone backend. Nothing in this design removes it.
+The standalone backends, klmdb (the default) and `FileStore`, with MIT
+kprop/kpropd push propagation stay. Nothing in this design removes them.
 
 ## 2. Components and crates
 
@@ -159,9 +159,8 @@ loaded principals and policies use epoch zero. MIT key-data has no
 `s2kparams` field, so that krb5-rs key metadata is not persisted either.
 `allowed_to_delegate_from` uses the krb5-rs string attribute
 `krb5rs_allowed_to_delegate_from`; MIT db2/klmdb do not define a native field
-for resource-based delegation. KRB5RS-PROP-1 `kprop_*` settings are rejected
-with klmdb here; MIT kprop integration and making klmdb the default are
-reserved for PR-C. MIT dump/load is described below. Master-key rotation via `kdb5_util add_mkey` /
+for resource-based delegation. klmdb is the default `db_library`;
+`db_library = krb5-rs-file` selects `FileStore`. MIT dump/load is described below. Master-key rotation via `kdb5_util add_mkey` /
 `use_mkey` is not supported; opening a `K/M` with multiple key-data records
 fails explicitly.
 
@@ -204,6 +203,34 @@ Deviations:
   tl-data, MIT tl-data and the lockout fields (`last_success`,
   `last_failed`, `fail_auth_count`; the file store keeps lockout counters in
   memory, see section 8) are dropped on load and dumped as zero.
+
+### MIT kprop/kpropd
+
+`krb5-rs-kprop` and `krb5-rs-kpropd` follow MIT 1.22.2 `src/kprop`
+(`kprop.c`, `kpropd.c`, `kprop_util.c`); the wire code is
+`src/kdc/kdb/kprop.rs`. The primary pushes a `krb5-rs-kdb dump` file:
+sendauth (`KRB5_SENDAUTH_V1.0`, application version `kprop5_01`, AP-REQ with
+mutual authentication as `host/<primary FQDN>` to `host/<replica FQDN>`), the
+database size in KRB-SAFE (4 bytes, or 12 with a zero first word for zero and
+sizes above `u32::MAX`), the file in 32 KiB KRB-PRIV blocks whose AES cipher
+state chains across messages as in MIT's `krb5_mk_priv`, and the replica's
+KRB-SAFE echo of the size. Both sides use sequence numbers; only the local
+address is set, as in MIT, so NAT works. kpropd checks `kpropd.acl` (a line
+starting with the client principal, followed by whitespace and an optional
+enctype name that must equal the ticket's), receives into `<file>.temp` under
+an exclusive lock, renames it to `<file>`, runs
+`krb5-rs-kdb -r REALM load [-d DB] <file>` (a full load, §MIT dump/load) and
+acknowledges only after the load succeeds, so a failed load is a failed
+propagation on the primary.
+
+Deviations: no iprop (`-A`, `-x` are accepted and ignored; the `ulog` and
+`kadmind -p` side do not exist); kpropd does not daemonize (`-D` or a
+supervisor), and `--pid-file` writes the pid of the foreground process.
+krb5-rs-only additions: `krb5-rs-kprop --interval SECS [--kdb PROGRAM]
+host...` dumps and pushes forever (the cron job, for shell-less images), and
+`krb5-rs-kdc --wait-for-database` lets a replica start before its first push.
+The previous krb5-rs pull protocol (`KRB5RS-PROP-1`) and its `kprop_*`
+kdc.conf keys are gone; the keys are rejected with a migration error.
 
 ## 3. Store interfaces (library, `krb5_rs::kdc::store`)
 
@@ -595,8 +622,8 @@ epoch.
 - **Shutdown.** Stop the listeners, finish the in-flight apply transaction,
   then exit. The checkpoint is durable with the data, so a restart resumes
   exactly.
-- **Kubernetes.** The Helm chart supports file/kprop mode (one primary plus
-  replicas) and CockroachDB mode. In CockroachDB mode, each region runs a KDC
+- **Kubernetes.** The Helm chart supports file mode (one primary whose kprop
+  sidecar pushes to kpropd replicas) and CockroachDB mode. In CockroachDB mode, each region runs a KDC
   StatefulSet with a PVC per pod, an idempotent bootstrap Job as a
   pre-install/pre-upgrade hook, and an optional prune CronJob; startup,
   readiness and liveness use the HTTP probes. Use the `-cockroach` image

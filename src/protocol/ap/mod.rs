@@ -245,6 +245,8 @@ pub struct AuthContext {
     /// KDC mode (MIT `krb5_rd_req_decoded_anyflag`): TGS authenticator key
     /// usage and no INVALID-flag check (rd_req_dec.c:521-529, 813-814).
     tgs_req: bool,
+    /// KRB-PRIV cipher state (`krb5_auth_con_initivector`, auth_con.c:315).
+    cstate: Option<[u8; 16]>,
 }
 
 impl Default for AuthContext {
@@ -278,6 +280,7 @@ impl AuthContext {
             conn_sane_seq: false,
             conn_heimdal_seq: false,
             tgs_req: false,
+            cstate: None,
         }
     }
 

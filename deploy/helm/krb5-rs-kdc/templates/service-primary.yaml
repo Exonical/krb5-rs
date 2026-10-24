@@ -13,10 +13,6 @@ spec:
       port: {{ .Values.kdc.containerPort }}
       targetPort: kdc-tcp
       protocol: TCP
-    - name: kprop
-      port: {{ .Values.propagation.port }}
-      targetPort: kprop
-      protocol: TCP
   selector:
     {{- include "krb5-rs-kdc.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: primary

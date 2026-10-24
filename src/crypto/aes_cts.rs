@@ -14,6 +14,17 @@ const AES_BLOCK: usize = 16;
 /// AES-CTS encrypt (CS3 variant). Key must be 16 or 32 bytes.
 /// Plaintext must be at least one block (16 bytes).
 pub(crate) fn aes_cts_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    aes_cts_encrypt_iv(key, &mut [0u8; AES_BLOCK], plaintext)
+}
+
+/// AES-CTS encrypt chaining `iv` like MIT `krb5int_aes_encrypt`
+/// (`enc_provider/aes.c:239-298`): a single block uses a zero IV and leaves
+/// `iv` alone; otherwise `iv` becomes the last CBC output block.
+pub(crate) fn aes_cts_encrypt_iv(
+    key: &[u8],
+    iv: &mut [u8; AES_BLOCK],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     if plaintext.len() < AES_BLOCK {
         return Err(CryptoError::InputTooShort);
     }
@@ -28,10 +39,9 @@ pub(crate) fn aes_cts_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, C
     let mut padded = plaintext.to_vec();
     padded.resize(plaintext.len() + pad_len, 0);
 
-    // CBC-encrypt the entire padded plaintext with zero IV
-    let cbc_out = aes_cbc_encrypt(key, &[0u8; AES_BLOCK], &padded)?;
-
+    let cbc_out = aes_cbc_encrypt(key, iv, &padded)?;
     let nblocks = cbc_out.len() / AES_BLOCK;
+    iv.copy_from_slice(&cbc_out[(nblocks - 1) * AES_BLOCK..]);
     let mut result = Vec::with_capacity(plaintext.len());
 
     // All blocks before the last two pass through unchanged
@@ -52,7 +62,19 @@ pub(crate) fn aes_cts_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, C
 
 /// AES-CTS decrypt (CS3 variant). Key must be 16 or 32 bytes.
 /// Ciphertext must be at least one block (16 bytes).
+#[cfg(test)]
 pub(crate) fn aes_cts_decrypt(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    aes_cts_decrypt_iv(key, &mut [0u8; AES_BLOCK], ciphertext)
+}
+
+/// AES-CTS decrypt chaining `iv` like MIT `krb5int_aes_decrypt`
+/// (`enc_provider/aes.c:300-358`): `iv` becomes the second-to-last
+/// ciphertext block.
+pub(crate) fn aes_cts_decrypt_iv(
+    key: &[u8],
+    iv: &mut [u8; AES_BLOCK],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     if ciphertext.len() < AES_BLOCK {
         return Err(CryptoError::InputTooShort);
     }
@@ -67,9 +89,7 @@ pub(crate) fn aes_cts_decrypt(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, 
 
     let mut plaintext = Vec::with_capacity(ciphertext.len());
 
-    // Step 1: CBC-decrypt all blocks before the last two.
-    // For nblocks == 2, prev_iv stays zero — correct since CBC IV for the first block is zero.
-    let mut prev_iv = [0u8; AES_BLOCK];
+    let mut prev_iv = *iv;
     if nblocks > 2 {
         let prefix_end = (nblocks - 2) * AES_BLOCK;
         let prefix_plain = aes_cbc_decrypt(key, &prev_iv, &ciphertext[..prefix_end])?;
@@ -83,6 +103,7 @@ pub(crate) fn aes_cts_decrypt(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, 
     //   ciphertext[(n-1)*16..] is the partial C[n-2] (tail_len bytes)
     let cn1 = &ciphertext[(nblocks - 2) * AES_BLOCK..(nblocks - 1) * AES_BLOCK];
     let cn2_partial = &ciphertext[(nblocks - 1) * AES_BLOCK..];
+    iv.copy_from_slice(cn1);
 
     // Step 2: ECB-decrypt C[n-1] to get intermediate value
     let ecb_dec = aes_ecb_decrypt_block(key, cn1)?;
@@ -272,5 +293,33 @@ mod tests {
         assert_eq!(ct.len(), 48);
         let dec = aes_cbc_decrypt(&key, &iv, &ct).expect("cbc decrypt");
         assert_eq!(dec, plain);
+    }
+
+    #[test]
+    fn chained_state_round_trips_like_mit() {
+        let key = [7u8; 32];
+        let mut enc_state = [0u8; AES_BLOCK];
+        let mut dec_state = [0u8; AES_BLOCK];
+        for len in [16usize, 17, 32, 45, 100] {
+            let msg: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let before = enc_state;
+            let ct = aes_cts_encrypt_iv(&key, &mut enc_state, &msg).expect("encrypt");
+            if len == AES_BLOCK {
+                assert_eq!(enc_state, before, "single block leaves state alone");
+            } else {
+                assert_eq!(
+                    &enc_state[..],
+                    &ct[ct.len().div_ceil(AES_BLOCK) * AES_BLOCK - 2 * AES_BLOCK..][..AES_BLOCK]
+                );
+            }
+            let pt = aes_cts_decrypt_iv(&key, &mut dec_state, &ct).expect("decrypt");
+            assert_eq!(pt, msg);
+            assert_eq!(enc_state, dec_state);
+        }
+        let mut fresh = [0u8; AES_BLOCK];
+        let msg = [1u8; 40];
+        let chained = aes_cts_encrypt_iv(&key, &mut enc_state, &msg).expect("encrypt");
+        let unchained = aes_cts_encrypt_iv(&key, &mut fresh, &msg).expect("encrypt");
+        assert_ne!(chained, unchained);
     }
 }

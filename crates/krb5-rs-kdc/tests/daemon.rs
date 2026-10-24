@@ -60,7 +60,8 @@ fn make_realm(dir: &TempDir) -> PathBuf {
         format!(
             "[realms]\n {REALM} = {{\n  database_name = {}\n  key_stash_file = {}\n  \
              max_life = 24h\n  max_renewable_life = 7d\n  \
-             supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal\n }}\n",
+             supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal\n }}\n\
+             [dbmodules]\n {REALM} = {{\n  db_library = krb5-rs-file\n }}\n",
             slash(&dir.path("principal")),
             slash(&dir.path("stash")),
         ),
@@ -620,11 +621,15 @@ async fn the_daemon_serves_from_a_turso_replica_selected_by_db_library() {
             .expect("apply");
     }
     // Point the realm at the replica and take the file database away.
-    let mut text = std::fs::read_to_string(&conf).expect("read kdc.conf");
-    text.push_str(&format!(
-        "[dbmodules]\n {REALM} = {{\n  db_library = krb5-rs-turso\n  replica_path = {}\n }}\n",
-        slash(&replica_dir)
-    ));
+    let text = std::fs::read_to_string(&conf)
+        .expect("read kdc.conf")
+        .replace(
+            "  db_library = krb5-rs-file\n",
+            &format!(
+                "  db_library = krb5-rs-turso\n  replica_path = {}\n",
+                slash(&replica_dir)
+            ),
+        );
     std::fs::write(&conf, text).expect("write kdc.conf");
     std::fs::remove_file(&cfg.database_name).expect("remove the file database");
 

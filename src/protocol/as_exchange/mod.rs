@@ -69,6 +69,9 @@ pub struct AsExchangeConfig {
     pub max_clock_skew: Duration,
     /// FAST mode (RFC 6113). Default: disabled.
     pub fast: FastMode,
+    /// Service to request instead of `krbtgt/REALM` (MIT
+    /// `krb5_get_init_creds_*` `in_tkt_service`).
+    pub server: Option<PrincipalName>,
     /// PKINIT settings (RFC 4556). When set, PA-PK-AS-REQ is used if the KDC
     /// offers it; the password may then be empty. Default: none.
     #[cfg(feature = "pkinit")]
@@ -93,6 +96,7 @@ impl Default for AsExchangeConfig {
             request_pac: true,
             max_clock_skew: DEFAULT_MAX_CLOCK_SKEW,
             fast: FastMode::Disabled,
+            server: None,
             #[cfg(feature = "pkinit")]
             pkinit: None,
         }

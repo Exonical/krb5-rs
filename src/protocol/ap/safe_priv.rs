@@ -3,6 +3,16 @@
 use super::*;
 
 impl AuthContext {
+    /// Start chaining KRB-PRIV cipher state (`krb5_auth_con_initivector`,
+    /// auth_con.c:315-322); only AES enctypes carry state.
+    pub fn init_ivector(&mut self) -> Result<(), Krb5Error> {
+        if self.key.is_none() {
+            return Err(Krb5Error::ReplyValidation("no key"));
+        }
+        self.cstate = Some([0u8; 16]);
+        Ok(())
+    }
+
     /// Build a KRB-SAFE message (mk_safe.c:44-174).
     pub fn mk_safe(&mut self, user_data: &[u8]) -> Result<(Vec<u8>, ReplayData), Krb5Error> {
         if self.local_addr.is_none() {
@@ -157,9 +167,16 @@ impl AuthContext {
             r_address: remote,
         };
         let der = rasn::der::encode(&encpart)?;
-        let cipher = profile
-            .encrypt(key.key_bytes(), key_usage::KRB_PRIV_ENCPART, &der)
-            .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
+        let cipher = match self.cstate.as_mut() {
+            Some(state) => profile.encrypt_with_state(
+                key.key_bytes(),
+                key_usage::KRB_PRIV_ENCPART,
+                &der,
+                state,
+            ),
+            None => profile.encrypt(key.key_bytes(), key_usage::KRB_PRIV_ENCPART, &der),
+        }
+        .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
         let privmsg = KrbPriv {
             pvno: 5,
             msg_type: 21,
@@ -203,13 +220,17 @@ impl AuthContext {
             .ok_or(Krb5Error::ReplyValidation("no key"))?;
         let profile =
             find_etype(privmsg.enc_part.etype).map_err(|e| Krb5Error::Crypto(e.to_string()))?;
-        let plain = profile
-            .decrypt(
+        let cipher = &privmsg.enc_part.cipher;
+        let plain = match self.cstate.as_mut() {
+            Some(state) => profile.decrypt_with_state(
                 key.key_bytes(),
                 key_usage::KRB_PRIV_ENCPART,
-                &privmsg.enc_part.cipher,
-            )
-            .map_err(|_| Krb5Error::Ap(ApError::BadIntegrity))?;
+                cipher,
+                state,
+            ),
+            None => profile.decrypt(key.key_bytes(), key_usage::KRB_PRIV_ENCPART, cipher),
+        }
+        .map_err(|_| Krb5Error::Ap(ApError::BadIntegrity))?;
         let encpart: EncKrbPrivPart =
             rasn::der::decode(&plain).map_err(|_| Krb5Error::Ap(ApError::BadIntegrity))?;
         self.check_addrs(Some(&encpart.s_address), encpart.r_address.as_ref())?;

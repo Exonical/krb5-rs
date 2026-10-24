@@ -61,9 +61,26 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- default (include "krb5-rs-kdc.fullname" .) .Values.secrets.existingSecret }}
 {{- end }}
 
-{{/* Service name of the primary (propagation + KDC port for replicas). */}}
+{{/* Service name of the primary (governs its StatefulSet pod DNS name). */}}
 {{- define "krb5-rs-kdc.primaryService" -}}
 {{- printf "%s-primary" (include "krb5-rs-kdc.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/* Headless Service and StatefulSet name of the file-mode replicas. */}}
+{{- define "krb5-rs-kdc.replicaService" -}}
+{{- printf "%s-replicas" (include "krb5-rs-kdc.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/* FQDN of the primary pod; kprop authenticates as host/<this>. */}}
+{{- define "krb5-rs-kdc.primaryHost" -}}
+{{- $svc := include "krb5-rs-kdc.primaryService" . }}
+{{- printf "%s-0.%s.%s.svc.%s" $svc $svc .Release.Namespace .Values.clusterDomain }}
+{{- end }}
+
+{{/* FQDN of replica pod "i". Args: dict "ctx" root "i" index. */}}
+{{- define "krb5-rs-kdc.replicaHost" -}}
+{{- $svc := include "krb5-rs-kdc.replicaService" .ctx }}
+{{- printf "%s-%d.%s.%s.svc.%s" $svc .i $svc .ctx.Release.Namespace .ctx.Values.clusterDomain }}
 {{- end }}
 
 {{/*
@@ -212,16 +229,6 @@ priorityClassName: {{ . }}
   max_life = {{ $v.kdc.maxLife }}
   max_renewable_life = {{ $v.kdc.maxRenewableLife }}
   supported_enctypes = {{ $v.kdc.supportedEnctypes }}
-  kprop_service = {{ $v.propagation.servicePrincipal }}
-  kprop_client = {{ $v.propagation.clientPrincipal }}
-{{- if eq .role "primary" }}
-  kprop_listen = 0.0.0.0:{{ $v.propagation.port }}
-{{- else }}
-  kprop_primary = {{ include "krb5-rs-kdc.primaryService" $ctx }}:{{ $v.propagation.port }}
-  kprop_primary_kdc = {{ include "krb5-rs-kdc.primaryService" $ctx }}:{{ $v.kdc.containerPort }}
-  kprop_password_file = /secrets/kprop-password
-  kprop_poll_interval = {{ $v.propagation.pollInterval }}
-{{- end }}
  }
 {{- with $v.kdc.extraKdcConf }}
 

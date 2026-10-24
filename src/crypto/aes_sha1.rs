@@ -7,7 +7,7 @@ use sha1::Digest;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use super::aes_cts::{aes_cts_decrypt, aes_cts_encrypt};
+use super::aes_cts::{aes_cts_decrypt_iv, aes_cts_encrypt, aes_cts_encrypt_iv};
 use super::dk::{derive_key, dk};
 use super::hmac_sha1::hmac_sha1_96;
 use super::util::generate_random;
@@ -29,6 +29,7 @@ fn aes_encrypt(
     key_usage: i32,
     plaintext: &[u8],
     expected_key_len: usize,
+    state: &mut [u8; AES_BLOCK],
 ) -> Result<Vec<u8>, CryptoError> {
     validate_exact_key_len(key, expected_key_len)?;
     let ke = derive_key(key, key_usage, 0xAA)?;
@@ -40,7 +41,7 @@ fn aes_encrypt(
     data.extend_from_slice(plaintext);
 
     let hmac = hmac_sha1_96(&ki, &data);
-    let mut ct = aes_cts_encrypt(&ke, &data)?;
+    let mut ct = aes_cts_encrypt_iv(&ke, state, &data)?;
     ct.extend_from_slice(&hmac);
     Ok(ct)
 }
@@ -50,6 +51,7 @@ fn aes_decrypt(
     key_usage: i32,
     ciphertext: &[u8],
     expected_key_len: usize,
+    state: &mut [u8; AES_BLOCK],
 ) -> Result<Vec<u8>, CryptoError> {
     validate_exact_key_len(key, expected_key_len)?;
     let ke = derive_key(key, key_usage, 0xAA)?;
@@ -65,7 +67,7 @@ fn aes_decrypt(
     }
 
     let (ct, received_hmac) = ciphertext.split_at(ct_len);
-    let plain = Zeroizing::new(aes_cts_decrypt(&ke, ct)?);
+    let plain = Zeroizing::new(aes_cts_decrypt_iv(&ke, state, ct)?);
     let computed_hmac = hmac_sha1_96(&ki, plain.as_slice());
 
     if !bool::from(computed_hmac.ct_eq(received_hmac)) {
@@ -172,7 +174,13 @@ macro_rules! impl_aes_sha1_profile {
                 key_usage: i32,
                 plaintext: &[u8],
             ) -> Result<Vec<u8>, CryptoError> {
-                aes_encrypt(key, key_usage, plaintext, self.key_length())
+                aes_encrypt(
+                    key,
+                    key_usage,
+                    plaintext,
+                    self.key_length(),
+                    &mut [0u8; AES_BLOCK],
+                )
             }
 
             fn decrypt(
@@ -181,7 +189,33 @@ macro_rules! impl_aes_sha1_profile {
                 key_usage: i32,
                 ciphertext: &[u8],
             ) -> Result<Vec<u8>, CryptoError> {
-                aes_decrypt(key, key_usage, ciphertext, self.key_length())
+                aes_decrypt(
+                    key,
+                    key_usage,
+                    ciphertext,
+                    self.key_length(),
+                    &mut [0u8; AES_BLOCK],
+                )
+            }
+
+            fn encrypt_with_state(
+                &self,
+                key: &[u8],
+                key_usage: i32,
+                plaintext: &[u8],
+                state: &mut [u8; 16],
+            ) -> Result<Vec<u8>, CryptoError> {
+                aes_encrypt(key, key_usage, plaintext, self.key_length(), state)
+            }
+
+            fn decrypt_with_state(
+                &self,
+                key: &[u8],
+                key_usage: i32,
+                ciphertext: &[u8],
+                state: &mut [u8; 16],
+            ) -> Result<Vec<u8>, CryptoError> {
+                aes_decrypt(key, key_usage, ciphertext, self.key_length(), state)
             }
 
             fn string_to_key(

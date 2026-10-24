@@ -24,18 +24,13 @@ use std::time::Duration;
 
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
-use krb5_rs::kdc::kdb::admin::parse_principal;
-use krb5_rs::kdc::kdb::propagation::{
-    initial_pull, run_replica_loop, serve_propagation, PropClientConfig, PropEvent, PropLogger,
-    PropSecret, PropServerConfig,
-};
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, FileStore};
 #[cfg(feature = "cockroach")]
 use krb5_rs::kdc::GateSubject;
 use krb5_rs::kdc::{
     default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
     MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig, RequestLogger,
-    ServeOptions, StoreError, StoreErrorKind,
+    ServeOptions, StoreError,
 };
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
@@ -98,6 +93,12 @@ struct Cli {
     /// Serve Prometheus metrics and health endpoints on this address.
     #[arg(long, value_name = "ADDR")]
     metrics_listen: Option<SocketAddr>,
+
+    /// Retry opening a missing or unreadable database every second instead of
+    /// exiting, binding no listener until it opens (a kpropd replica that has
+    /// not received its first propagation).
+    #[arg(long)]
+    wait_for_database: bool,
 }
 
 struct Listen {
@@ -226,11 +227,9 @@ async fn keytab_mode(
     ))
 }
 
-/// Propagation roles of this process (kdc.conf `kprop_*`).
+/// Extra runtime pieces a database mode contributes.
 #[derive(Default)]
-struct PropParts {
-    server: Option<(Arc<FileStore>, PropServerConfig, Vec<SocketAddr>)>,
-    replica: Option<PropClientConfig>,
+struct ModeParts {
     metrics_listen: Option<SocketAddr>,
     #[cfg(feature = "cockroach")]
     replication: Option<ReplicationRuntime>,
@@ -264,59 +263,6 @@ impl krb5_rs::kdc::ConsistencyGate for RuntimeGate {
     }
 }
 
-fn prop_logger() -> PropLogger {
-    Arc::new(|event| match event {
-        PropEvent::Refused { .. } | PropEvent::PullFailed { .. } => {
-            warn!(target: "kprop", "{event}")
-        }
-        _ => info!(target: "kprop", "{event}"),
-    })
-}
-
-fn principal(spec: &str, realm: &str) -> std::io::Result<PrincipalName> {
-    let (name, r) = parse_principal(spec, realm).map_err(io_err)?;
-    if r != realm {
-        return Err(io_err(format!("{spec} is not in realm {realm}")));
-    }
-    Ok(name)
-}
-
-fn replica_config(
-    cfg: &RealmConfig,
-    realm: &str,
-    master: &EncryptionKey,
-) -> std::io::Result<PropClientConfig> {
-    let p = &cfg.propagation;
-    let secret = match (&p.keytab, &p.password_file) {
-        (Some(k), None) => PropSecret::Keytab(k.clone()),
-        (None, Some(f)) => PropSecret::PasswordFile(f.clone()),
-        _ => {
-            return Err(io_err(
-                "a replica needs exactly one of kprop_keytab and kprop_password_file",
-            ))
-        }
-    };
-    Ok(PropClientConfig {
-        realm: realm.to_string(),
-        primary: p
-            .primary
-            .clone()
-            .ok_or_else(|| io_err("kprop_primary is not set"))?,
-        kdc: p
-            .primary_kdc
-            .clone()
-            .ok_or_else(|| io_err("kprop_primary_kdc is not set"))?,
-        client: principal(&p.client, realm)?,
-        service: principal(&p.service, realm)?,
-        secret,
-        db_path: cfg.database_name.clone(),
-        master_key: master.clone(),
-        poll_interval: p.poll_interval,
-        io_timeout: Duration::from_secs(10),
-        logger: Some(prop_logger()),
-    })
-}
-
 /// Serve from a Turso replica (`db_library = krb5-rs-turso`), read-only.
 /// Replication into it is not wired here yet.
 #[cfg(feature = "turso")]
@@ -325,14 +271,9 @@ async fn turso_mode(
     cfg: RealmConfig,
     master: krb5_rs::types::EncryptionKey,
     metrics: Arc<metrics::Metrics>,
-) -> std::io::Result<(DynKdc, Listen, PropParts)> {
+) -> std::io::Result<(DynKdc, Listen, ModeParts)> {
     use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
 
-    if cfg.propagation.is_replica() || !cfg.propagation.listen.is_empty() {
-        return Err(io_err(
-            "kprop_* settings cannot be combined with db_library = krb5-rs-turso",
-        ));
-    }
     let path = cfg
         .db_module
         .get("replica_path")
@@ -375,9 +316,9 @@ async fn turso_mode(
     Ok((
         kdc,
         Listen { udp, tcp },
-        PropParts {
+        ModeParts {
             metrics_listen,
-            ..PropParts::default()
+            ..ModeParts::default()
         },
     ))
 }
@@ -388,7 +329,7 @@ async fn turso_mode(
     _cfg: RealmConfig,
     _master: krb5_rs::types::EncryptionKey,
     _metrics: Arc<metrics::Metrics>,
-) -> std::io::Result<(DynKdc, Listen, PropParts)> {
+) -> std::io::Result<(DynKdc, Listen, ModeParts)> {
     Err(io_err(
         "db_library krb5-rs-turso needs a krb5-rs-kdc built with the `turso` feature",
     ))
@@ -419,18 +360,37 @@ fn module_duration(cfg: &RealmConfig, key: &str, default: Duration) -> std::io::
     Ok(Duration::from_millis(millis))
 }
 
+/// One `--wait-for-database` retry: report the first failure, then sleep.
+async fn database_wait(waiting: bool, e: &dyn std::fmt::Display) -> bool {
+    if !waiting {
+        eprintln!("waiting for the database: {e}");
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    true
+}
+
 #[cfg(feature = "klmdb")]
 async fn klmdb_mode(
     cli: &Cli,
     cfg: RealmConfig,
     master: EncryptionKey,
     metrics: Arc<metrics::Metrics>,
-) -> std::io::Result<(DynKdc, Listen, PropParts)> {
-    let config = cfg.clone();
-    let store = tokio::task::spawn_blocking(move || LmdbStore::open(&config, &master))
-        .await
-        .map_err(io_err)?
-        .map_err(io_err)?;
+) -> std::io::Result<(DynKdc, Listen, ModeParts)> {
+    let mut waiting = false;
+    let store = loop {
+        let config = cfg.clone();
+        let key = master.clone();
+        match tokio::task::spawn_blocking(move || LmdbStore::open(&config, &key))
+            .await
+            .map_err(io_err)?
+        {
+            Ok(store) => break store,
+            Err(e) if cli.wait_for_database => {
+                waiting = database_wait(waiting, &e).await;
+            }
+            Err(e) => return Err(io_err(e)),
+        }
+    };
     let store = Arc::new(store);
     let (udp, tcp) = if cli.listen.is_empty() {
         (cfg.udp_listen, cfg.tcp_listen)
@@ -446,9 +406,9 @@ async fn klmdb_mode(
     Ok((
         kdc,
         Listen { udp, tcp },
-        PropParts {
+        ModeParts {
             metrics_listen,
-            ..PropParts::default()
+            ..ModeParts::default()
         },
     ))
 }
@@ -459,7 +419,7 @@ async fn klmdb_mode(
     _cfg: RealmConfig,
     _master: EncryptionKey,
     _metrics: Arc<metrics::Metrics>,
-) -> std::io::Result<(DynKdc, Listen, PropParts)> {
+) -> std::io::Result<(DynKdc, Listen, ModeParts)> {
     Err(io_err(
         "db_library klmdb needs a krb5-rs-kdc built with the `klmdb` feature",
     ))
@@ -472,18 +432,13 @@ async fn cockroach_mode(
     master: EncryptionKey,
     _shutdown: &watch::Receiver<bool>,
     metrics: Arc<metrics::Metrics>,
-) -> std::io::Result<Option<(DynKdc, Listen, PropParts)>> {
+) -> std::io::Result<Option<(DynKdc, Listen, ModeParts)>> {
     use krb5_rs::kdc::replication::{
         FreshnessGate, RebuildPolicy, ReplicationConfig, ReplicationEngine, StrictGate,
     };
     use krb5_rs_kdb_cockroach::{CockroachConfig, CockroachLockoutReporter, CockroachStore};
     use krb5_rs_kdb_turso::{TursoOptions, TursoReplica};
 
-    if cfg.propagation.is_replica() || !cfg.propagation.listen.is_empty() {
-        return Err(io_err(
-            "kprop_* cannot be combined with db_library = krb5-rs-cockroach",
-        ));
-    }
     let authority_config = CockroachConfig::from_db_module(&cfg.db_module).map_err(io_err)?;
     let replica_path = cfg
         .db_module
@@ -621,7 +576,7 @@ async fn cockroach_mode(
         (addrs.clone(), addrs)
     };
     let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
-    let parts = PropParts {
+    let parts = ModeParts {
         metrics_listen,
         replication: Some(ReplicationRuntime {
             engine,
@@ -629,7 +584,6 @@ async fn cockroach_mode(
             status,
             max_staleness,
         }),
-        ..PropParts::default()
     };
     Ok(Some((kdc, Listen { udp, tcp }, parts)))
 }
@@ -641,36 +595,20 @@ async fn cockroach_mode(
     _master: EncryptionKey,
     _shutdown: &watch::Receiver<bool>,
     _metrics: Arc<metrics::Metrics>,
-) -> std::io::Result<Option<(DynKdc, Listen, PropParts)>> {
+) -> std::io::Result<Option<(DynKdc, Listen, ModeParts)>> {
     Err(io_err(
         "db_library krb5-rs-cockroach needs a krb5-rs-kdc built with the `cockroach` feature",
     ))
 }
 
-async fn initial_pull_or_shutdown(
-    client: &PropClientConfig,
-    shutdown_rx: &watch::Receiver<bool>,
-) -> std::io::Result<bool> {
-    let mut rx = shutdown_rx.clone();
-    let pulled = tokio::select! {
-        result = initial_pull(client, &mut rx) => result,
-        signal = termination_signal() => {
-            info!("received {}, exiting", signal?);
-            None
-        }
-    };
-    Ok(pulled.is_some())
-}
-
-/// Load kdc.conf and open the database. A replica without a valid local
-/// database pulls one first (retrying until the primary answers) and only then
-/// lets the caller bind its listeners; `None` means shutdown arrived meanwhile.
+/// Load kdc.conf and open the database; `None` means shutdown arrived
+/// before the KDC could start.
 async fn config_mode(
     cli: &Cli,
     krb5_conf_explicit: bool,
     shutdown_rx: &watch::Receiver<bool>,
     metrics: Arc<metrics::Metrics>,
-) -> std::io::Result<Option<(DynKdc, Listen, PropParts)>> {
+) -> std::io::Result<Option<(DynKdc, Listen, ModeParts)>> {
     let conf = cli
         .config
         .clone()
@@ -689,11 +627,6 @@ async fn config_mode(
         .or_else(|| default_realm(&kdc_conf, krb5.as_ref()))
         .ok_or_else(|| io_err("no realm given and no default realm found"))?;
     let cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm).map_err(io_err)?;
-    if cfg.db_module.library.as_deref() == Some("klmdb") && cfg.propagation.is_configured() {
-        return Err(io_err(
-            "kprop_* settings cannot be combined with db_library = klmdb",
-        ));
-    }
     let master = match &cli.master_password_file {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -708,7 +641,7 @@ async fn config_mode(
     };
 
     match cfg.db_module.library.as_deref() {
-        None => {}
+        None | Some("krb5-rs-file") => {}
         Some("krb5-rs-turso") => {
             return turso_mode(cli, cfg, master, metrics).await.map(Some);
         }
@@ -721,60 +654,15 @@ async fn config_mode(
         Some(other) => return Err(io_err(format!("unknown db_library {other:?}"))),
     }
 
-    let mut parts = PropParts::default();
-    let replica_client = if cfg.propagation.is_replica() {
-        let client = replica_config(&cfg, &realm, &master)?;
-        if !cfg.database_name.exists() {
-            info!(
-                "no local database {}; pulling from {} before serving",
-                cfg.database_name.display(),
-                client.primary
-            );
-            if !initial_pull_or_shutdown(&client, shutdown_rx).await? {
-                return Ok(None);
-            }
+    let mut parts = ModeParts::default();
+    let mut waiting = false;
+    let store = loop {
+        match FileStore::open(&cfg.database_name, &master) {
+            Ok(store) => break Arc::new(store),
+            Err(e) if cli.wait_for_database => waiting = database_wait(waiting, &e).await,
+            Err(e) => return Err(io_err(e)),
         }
-        Some(client)
-    } else {
-        None
     };
-
-    let store = match FileStore::open(&cfg.database_name, &master) {
-        Ok(store) => Arc::new(store),
-        Err(error) if replica_client.is_some() && error.kind() == StoreErrorKind::Corrupt => {
-            let client = replica_client.as_ref().expect("replica client is present");
-            warn!(
-                "local replica database {} is damaged; pulling a fresh copy from {}: {}",
-                cfg.database_name.display(),
-                client.primary,
-                error.message()
-            );
-            if !initial_pull_or_shutdown(client, shutdown_rx).await? {
-                return Ok(None);
-            }
-            Arc::new(FileStore::open(&cfg.database_name, &master).map_err(io_err)?)
-        }
-        Err(error) => return Err(io_err(error)),
-    };
-    parts.replica = replica_client;
-    if !cfg.propagation.listen.is_empty() {
-        let service = principal(&cfg.propagation.service, &realm)?;
-        if store
-            .lookup(&service, &realm)
-            .await
-            .map_err(io_err)?
-            .is_none()
-        {
-            return Err(io_err(format!(
-                "kprop service principal {} is not in the database",
-                cfg.propagation.service
-            )));
-        }
-        let mut server = PropServerConfig::new(service, cfg.propagation.acl.clone());
-        server.clockskew = cfg.kdc.clockskew;
-        server.logger = Some(prop_logger());
-        parts.server = Some((Arc::clone(&store), server, cfg.propagation.listen.clone()));
-    }
     let (udp, tcp) = if cli.listen.is_empty() {
         (cfg.udp_listen, cfg.tcp_listen)
     } else {
@@ -827,7 +715,7 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
                 return Err(io_err("--keytab and --config are mutually exclusive"));
             }
             let (kdc, addrs) = keytab_mode(&cli, kt, Arc::clone(&metrics)).await?;
-            (kdc, addrs, PropParts::default())
+            (kdc, addrs, ModeParts::default())
         }
         None => {
             if cli.max_life.is_some() || cli.max_renewable_life.is_some() {
@@ -877,34 +765,9 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
             Err(e) => return Err(io_err(format!("bind tcp {addr}: {e}"))),
         }
     }
-    if let Some((store, config, addrs)) = prop.server {
-        for addr in addrs {
-            let listener = TcpListener::bind(addr)
-                .await
-                .map_err(|e| io_err(format!("bind kprop {addr}: {e}")))?;
-            info!("listening on {} (kprop)", listener.local_addr()?);
-            tasks.spawn(serve_propagation(
-                Arc::clone(&store),
-                config.clone(),
-                listener,
-                Some(shutdown_rx.clone()),
-            ));
-        }
-    }
     let metrics_listen = cli.metrics_listen.or(prop.metrics_listen);
     #[cfg(feature = "cockroach")]
     let replication = prop.replication;
-    if let Some(client) = prop.replica {
-        info!(
-            "replica of {}: polling every {:?}",
-            client.primary, client.poll_interval
-        );
-        let rx = shutdown_rx.clone();
-        tasks.spawn(async move {
-            run_replica_loop(client, rx).await;
-            Ok(())
-        });
-    }
     if bound_kdc_listeners == 0 {
         return Err(io_err("no KDC listen address could be bound"));
     }

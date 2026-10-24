@@ -17,6 +17,14 @@ path = "src/bin/krb5-rs-kdc.rs"
 name = "krb5-rs-kdb"
 path = "src/bin/krb5-rs-kdb.rs"
 
+[[bin]]
+name = "krb5-rs-kprop"
+path = "src/bin/krb5-rs-kprop.rs"
+
+[[bin]]
+name = "krb5-rs-kpropd"
+path = "src/bin/krb5-rs-kpropd.rs"
+
 [features]
 # MIT-compatible LMDB backend, selected with `db_library = klmdb`.
 default = ["klmdb"]
@@ -34,7 +42,7 @@ krb5-rs-kdb-turso = { path = "../krb5-rs-kdb-turso", optional = true }
 krb5-rs-kdb-cockroach = { path = "../krb5-rs-kdb-cockroach", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 krb5-rs = { path = "../..", features = ["kdc", "tokio", "pkinit"] }
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 prometheus-client = "=0.25.1"

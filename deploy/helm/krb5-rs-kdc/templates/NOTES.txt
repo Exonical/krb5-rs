@@ -23,7 +23,7 @@ krb5-rs KDC for realm {{ .Values.realm }}: one primary and {{ .Values.replicas.r
        }
 
 3. Administer the database. Writes go ONLY to the primary pod; replicas are read-only copies
-   that pull every {{ .Values.propagation.pollInterval }}. Passwords are read from stdin (use -i):
+   the primary pushes to every {{ .Values.propagation.interval }}s (MIT kprop to kpropd). Passwords are read from stdin (use -i):
 
      printf 'the-password\n' | kubectl exec -i --namespace {{ .Release.Namespace }} statefulset/{{ include "krb5-rs-kdc.fullname" . }}-primary -c kdc -- \
        krb5-rs-kdb --config /etc/krb5-rs/kdc.conf --krb5-config /etc/krb5-rs/krb5.conf --realm {{ .Values.realm }} addprinc alice
@@ -31,9 +31,9 @@ krb5-rs KDC for realm {{ .Values.realm }}: one primary and {{ .Values.replicas.r
    Other commands: delprinc, cpw, modprinc, getprinc, listprincs, ktadd -k PATH NAME.
 
 What HA means here: the replicas keep answering AS and TGS requests while the primary is down
-or restarting, using the last database they pulled. Administrative changes wait for the
-primary (as with MIT kprop) and reach the replicas within one poll interval after it returns.
-The "master-password" and "kprop-password" keys live in Secret "{{ include "krb5-rs-kdc.secretName" . }}".
+or restarting, using the last database they received. Administrative changes wait for the
+primary (as with MIT kprop) and reach the replicas within one propagation interval after it returns.
+The "master-password" and "kprop-password" (host/ kprop principals) keys live in Secret "{{ include "krb5-rs-kdc.secretName" . }}".
 {{- else }}
 krb5-rs KDC for realm {{ .Values.realm }}: {{ .Values.kdcs.replicaCount }} CockroachDB-backed KDC pod(s).
 

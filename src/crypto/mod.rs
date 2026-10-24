@@ -224,6 +224,29 @@ pub trait EtypeProfile: Send + Sync {
 
     /// Convert random bytes to a protocol key.
     fn random_to_key(&self, random: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError>;
+
+    /// [`Self::encrypt`] chaining the cipher state `state` like MIT
+    /// `krb5_k_encrypt` with an ivec (`krb5_c_init_state` gives zeroes).
+    fn encrypt_with_state(
+        &self,
+        _key: &[u8],
+        _key_usage: i32,
+        _plaintext: &[u8],
+        _state: &mut [u8; 16],
+    ) -> Result<Vec<u8>, CryptoError> {
+        Err(CryptoError::UnsupportedEtype)
+    }
+
+    /// [`Self::decrypt`] chaining the cipher state `state`.
+    fn decrypt_with_state(
+        &self,
+        _key: &[u8],
+        _key_usage: i32,
+        _ciphertext: &[u8],
+        _state: &mut [u8; 16],
+    ) -> Result<Vec<u8>, CryptoError> {
+        Err(CryptoError::UnsupportedEtype)
+    }
 }
 
 /// Registry of available encryption types.
