@@ -1,10 +1,10 @@
-CREATE TABLE realms (
+CREATE TABLE IF NOT EXISTS realms (
     name STRING NOT NULL PRIMARY KEY,
     master_kvno INT8 NOT NULL,
     master_enctype INT8 NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE TABLE principals (
+CREATE TABLE IF NOT EXISTS principals (
     realm STRING NOT NULL,
     name STRING NOT NULL,
     name_type INT8 NOT NULL,
@@ -25,7 +25,7 @@ CREATE TABLE principals (
     deleted BOOL NOT NULL DEFAULT false,
     PRIMARY KEY (realm, name)
 );
-CREATE TABLE principal_keys (
+CREATE TABLE IF NOT EXISTS principal_keys (
     realm STRING NOT NULL,
     name STRING NOT NULL,
     kvno INT8 NOT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE principal_keys (
     s2kparams BYTES,
     PRIMARY KEY (realm, name, kvno, enctype)
 );
-CREATE TABLE policies (
+CREATE TABLE IF NOT EXISTS policies (
     name STRING NOT NULL PRIMARY KEY,
     pw_min_life INT8 NOT NULL,
     pw_max_life INT8 NOT NULL,
@@ -53,7 +53,7 @@ CREATE TABLE policies (
     security_epoch INT8 NOT NULL,
     deleted BOOL NOT NULL DEFAULT false
 );
-CREATE TABLE lockouts (
+CREATE TABLE IF NOT EXISTS lockouts (
     realm STRING NOT NULL,
     name STRING NOT NULL,
     name_type INT8 NOT NULL,
@@ -63,26 +63,26 @@ CREATE TABLE lockouts (
     deleted BOOL NOT NULL DEFAULT false,
     PRIMARY KEY (realm, name)
 );
-CREATE TABLE replication_meta (
+CREATE TABLE IF NOT EXISTS replication_meta (
     id INT8 NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     pruned_before DECIMAL NOT NULL DEFAULT 0,
     bucket_width_seconds INT8 NOT NULL DEFAULT 10,
     transaction_timeout_ms INT8 NOT NULL DEFAULT 30000
 );
-INSERT INTO replication_meta (id, pruned_before) VALUES (1, 0);
-CREATE TABLE replica_status (
+INSERT INTO replication_meta (id, pruned_before) VALUES (1, 0) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS replica_status (
     kdc_id STRING NOT NULL PRIMARY KEY,
     region STRING NOT NULL,
     applied_ts DECIMAL NOT NULL,
     seen_at TIMESTAMPTZ NOT NULL
 );
-CREATE TABLE transaction_markers (
+CREATE TABLE IF NOT EXISTS transaction_markers (
     id STRING NOT NULL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     logical_id STRING NOT NULL DEFAULT ''
 );
-CREATE INDEX transaction_markers_logical_id ON transaction_markers (logical_id);
-CREATE TABLE replication_log (
+CREATE INDEX IF NOT EXISTS transaction_markers_logical_id ON transaction_markers (logical_id);
+CREATE TABLE IF NOT EXISTS replication_log (
     bucket INT8 NOT NULL,
     id UUID NOT NULL,
     entity STRING NOT NULL,
@@ -92,5 +92,5 @@ CREATE TABLE replication_log (
     txn_id UUID NOT NULL,
     PRIMARY KEY (bucket, id)
 );
-CREATE INDEX replication_log_txn_id ON replication_log (txn_id);
-CREATE INDEX replication_log_entity_key ON replication_log (entity, realm, "key", bucket, id);
+CREATE INDEX IF NOT EXISTS replication_log_txn_id ON replication_log (txn_id);
+CREATE INDEX IF NOT EXISTS replication_log_entity_key ON replication_log (entity, realm, "key", bucket, id);
