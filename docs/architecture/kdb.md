@@ -195,8 +195,9 @@ Deviations:
   fields) is rejected; MIT treats it as the end of the dump and drops the
   record (`dump.c:616, 898, 907, 917`). A complete policy missing only its
   final newline is kept.
-- `-hash` is accepted and ignored; `-c`, `-rev` and `-recurse` are accepted
-  and ignored on dump; iprop (`-i`) and `-mkey_convert` are rejected.
+- `-hash` is accepted and ignored; `-rev` and `-recurse` are accepted and
+  ignored on dump; `-mkey_convert` is rejected. `-i`/`-c` are described in
+  §MIT iprop update log.
 - `e_data` is always written empty, as klmdb never stores it
   (`plugins/kdb/lmdb/marshal.c`).
 - The file store keeps only what its record model has: string attributes
@@ -204,6 +205,41 @@ Deviations:
   tl-data, MIT tl-data and the lockout fields (`last_success`,
   `last_failed`, `fail_auth_count`; the file store keeps lockout counters in
   memory, see section 8) are dropped on load and dumped as zero.
+
+### MIT iprop update log
+
+With `iprop_enable = true` in the realm (klmdb only), every principal change
+made through the klmdb store is appended to MIT's update log
+(`src/lib/kdb/kdb_log.c`, `kdb_log.h`, `iprop.x`; code in
+`src/kdc/kdb/mit/ulog.rs`). The file is `iprop_logfile` (default
+`<database_name>.ulog`) and holds `iprop_ulogsize` entries (default 1000;
+`iprop_master_ulogsize` is the older name), byte-compatible with MIT: a
+40-byte host-endian `kdb_hlog_t` header, then `ULOG_BLOCK`-sized slots
+indexed by `(serial - 1) % entries`, each an XDR `kdb_incr_update_t`. Writes
+take MIT's exclusive `fcntl` lock and mark the log unstable around the
+update; a record larger than the block grows every slot to the next 2048-byte
+multiple; a full ring advances `kdb_first_sno`; serial `u32::MAX` resets the
+log. Updates are built like `kdb_convert.c`: a new principal sends every
+attribute, a modified one only the changed attributes, and `last_success`,
+`last_failed` and `fail_auth_count` are never sent. Policy changes reset the
+log, as in MIT.
+
+- `krb5-rs-kdb dump -i` writes the `iprop` format and `dump -i1` the
+  `ipropx 1` format, headed by the log's last serial and time and with the
+  lockout fields zeroed; `-c` skips the dump when the serial in the existing
+  file is still in the log (`dump.c:current_dump_sno_in_ulog`).
+- `load -i` reads either header, keeps the replica's lockout state
+  (`merge_nra` in `kdb_lmdb.c`), reinitializes the log and sets its last
+  serial and time from the header (`ulog_set_last`).
+- `krb5-rs-kproplog [-h] [-v] [-v] [-e num]` and `-R` print or reset the log
+  like MIT `kproplog`; the two print identical output for the same log.
+- Without `iprop_enable`, `-i`, `-c` and `load -i` fail with "Iprop not
+  enabled" as in MIT, and no log is written.
+
+Deviations: `load -update` with iprop enabled reinitializes the log instead
+of logging each loaded principal; the file store and CockroachDB never write
+a log. The `kadmind` iprop service and kpropd iprop mode are not implemented
+yet, so the log is written but not served.
 
 ### MIT kprop/kpropd
 
@@ -224,8 +260,8 @@ an exclusive lock, renames it to `<file>`, runs
 acknowledges only after the load succeeds, so a failed load is a failed
 propagation on the primary.
 
-Deviations: no iprop (`-A`, `-x` are accepted and ignored; the `ulog` and
-`kadmind -p` side do not exist); kpropd does not daemonize (`-D` or a
+Deviations: no iprop (`-A`, `-x` are accepted and ignored; the `kadmind -p`
+side does not exist, see §MIT iprop update log); kpropd does not daemonize (`-D` or a
 supervisor), and `--pid-file` writes the pid of the foreground process.
 krb5-rs-only additions: `krb5-rs-kprop --interval SECS [--watch PATH] [--kdb PROGRAM]
 host...` dumps and pushes forever (the cron job, for shell-less images), and
