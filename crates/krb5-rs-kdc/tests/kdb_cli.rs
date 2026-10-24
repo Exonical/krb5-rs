@@ -335,7 +335,10 @@ fn policy_commands_and_principal_policy_options() {
     let short = env.run(&["addprinc", "-policy", "strict", "bob"], "pw\n");
     assert_eq!(short.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&short.stderr).contains("Password is too short"));
-    env.ok(&["addprinc", "-policy", "strict", "bob"], "long-enough-pw\n");
+    env.ok(
+        &["addprinc", "-policy", "strict", "bob"],
+        "long-enough-pw\n",
+    );
     assert!(env.ok(&["getprinc", "bob"], "").contains("Policy: strict"));
     env.ok(&["modprinc", "-unlock", "bob"], "");
     env.ok(&["modprinc", "-clearpolicy", "bob"], "");
