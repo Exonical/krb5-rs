@@ -285,8 +285,8 @@ fn main() {
         let Some(flags) = arg.strip_prefix('-').filter(|f| !f.is_empty()) else {
             usage()
         };
-        let mut chars = flags.char_indices();
-        while let Some((i, c)) = chars.next() {
+        let chars = flags.char_indices();
+        for (i, c) in chars {
             match c {
                 'h' => headeronly = true,
                 'R' => reset = true,

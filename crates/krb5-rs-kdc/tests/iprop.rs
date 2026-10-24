@@ -204,3 +204,40 @@ fn iprop_options_need_iprop_enable() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("Iprop not enabled"));
     assert!(!dir.path("kdc/principal.ulog").exists());
 }
+
+#[test]
+fn legacy_iprop_dump_with_policies_loads() {
+    let dir = TempDir::new("legacy");
+    let primary = write_conf(&dir, "primary", true);
+    kdb_ok(&primary, &["create", "-s"], MASTER);
+    kdb_ok(&primary, &["addpol", "-maxlife", "1h", "p1"], "");
+    kdb_ok(
+        &primary,
+        &["addprinc", "-randkey", "-policy", "p1", "erin"],
+        "",
+    );
+    let dump = dir.path("iprop.dump");
+    let dump_s = dump.to_string_lossy().to_string();
+    kdb_ok(&primary, &["dump", "-i", &dump_s], "");
+    assert!(std::fs::read_to_string(&dump)
+        .expect("dump")
+        .starts_with("iprop "));
+
+    let replica = write_conf(&dir, "replica", true);
+    kdb_ok(&replica, &["load", "-i", &dump_s], "");
+    assert!(kdb_ok(&replica, &["getprinc", "erin"], "").contains("p1"));
+}
+
+#[test]
+fn database_override_logs_to_its_own_ulog() {
+    let dir = TempDir::new("override");
+    let conf = write_conf(&dir, "primary", true);
+    let alt = dir.path("alt");
+    std::fs::create_dir_all(&alt).expect("alt dir");
+    let alt_db = alt.join("principal");
+    let alt_s = alt_db.to_string_lossy().to_string();
+    kdb_ok(&conf, &["-d", &alt_s, "create", "-s"], MASTER);
+    kdb_ok(&conf, &["-d", &alt_s, "addprinc", "-randkey", "dave"], "");
+    assert!(alt.join("principal.ulog").exists());
+    assert!(!dir.path("primary").join("principal.ulog").exists());
+}

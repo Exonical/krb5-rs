@@ -287,6 +287,13 @@ fn main() {
         .unwrap_or_else(|| fail("no realm given and no default realm found"));
     let mut cfg = ok(RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm));
     if let Some(database) = database {
+        let mut default_log = cfg.database_name.clone().into_os_string();
+        default_log.push(".ulog");
+        if cfg.iprop.logfile.as_os_str() == default_log {
+            let mut log = database.clone().into_os_string();
+            log.push(".ulog");
+            cfg.iprop.logfile = PathBuf::from(log);
+        }
         cfg.database_name = database;
     }
 
@@ -586,7 +593,8 @@ fn load_command(
             std::process::exit(1)
         });
         iprop_header = Some(header);
-        read_records(body, &file, DumpVersion::R111).map(|(r, w)| (DumpVersion::R111, r, w))
+        let version = header.policy_version();
+        read_records(body, &file, version).map(|(r, w)| (version, r, w))
     } else {
         read_dump(&data, &file, forced)
     };
