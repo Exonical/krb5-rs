@@ -227,7 +227,7 @@ propagation on the primary.
 Deviations: no iprop (`-A`, `-x` are accepted and ignored; the `ulog` and
 `kadmind -p` side do not exist); kpropd does not daemonize (`-D` or a
 supervisor), and `--pid-file` writes the pid of the foreground process.
-krb5-rs-only additions: `krb5-rs-kprop --interval SECS [--kdb PROGRAM]
+krb5-rs-only additions: `krb5-rs-kprop --interval SECS [--watch PATH] [--kdb PROGRAM]
 host...` dumps and pushes forever (the cron job, for shell-less images), and
 `krb5-rs-kdc --wait-for-database` lets a replica start before its first push.
 The previous krb5-rs pull protocol (`KRB5RS-PROP-1`) and its `kprop_*`

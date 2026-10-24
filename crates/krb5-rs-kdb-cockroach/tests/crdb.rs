@@ -355,8 +355,6 @@ impl krb5_rs::kdc::replication::ReplicaSink for GatedSink {
 #[tokio::test]
 #[ignore = "needs the CockroachDB test cluster"]
 async fn concurrent_migrations_of_a_fresh_database_all_succeed() {
-    // Racing migrations force serialization retries of the schema script; a
-    // retry must not re-run DDL that an earlier attempt already committed.
     for _ in 0..3 {
         let db = TestDb::new("migrate_race").await;
         let opts = MigrateOptions {

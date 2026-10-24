@@ -35,8 +35,6 @@ spec:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- include "krb5-rs-kdc.scheduling" (dict "ctx" . "cfg" .Values.replicas) | nindent 6 }}
       initContainers:
-        # The replica's host/ key, derived from the kprop password in a
-        # throwaway database (the image has no shell or ktutil).
         - name: init-keytab-db
           image: {{ include "krb5-rs-kdc.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}

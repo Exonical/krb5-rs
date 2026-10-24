@@ -8,7 +8,6 @@ metadata:
     app.kubernetes.io/component: replica
 spec:
   clusterIP: None
-  # kprop must reach a replica before its first load makes it Ready.
   publishNotReadyAddresses: true
   ports:
     - name: kprop

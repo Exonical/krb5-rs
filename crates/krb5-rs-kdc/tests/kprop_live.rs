@@ -99,20 +99,19 @@ cat > "$B/krb5.conf" <<EOF
 EOF
 export KRB5_CONFIG=$B/krb5.conf
 mit() { KRB5_KDC_PROFILE=$B/$1.conf "${@:2}"; }
-# Without connecting: a -t kpropd treats any connection as its one transfer.
 wait_listen() { local hex; hex=$(printf '%04X' "$1"); for _ in $(seq 1 100); do grep -Eq ":$hex [0-9A-F]+:0000 0A" /proc/net/tcp /proc/net/tcp6 && return 0; sleep 0.1; done; return 1; }
 wait_port() { for _ in $(seq 1 100); do (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 mit mit kdb5_util create -r $R -s -P master-password >/dev/null
 mit mit kadmin.local -r $R -q "addprinc -pw alice-pw alice" >/dev/null
 mit mit kadmin.local -r $R -q "addprinc -randkey host/$H" >/dev/null
 mit mit kadmin.local -r $R -q "ktadd -k $B/host.keytab host/$H" >/dev/null
+for i in $(seq 1 60); do echo "addprinc -randkey filler$i"; done | mit mit kadmin.local -r $R >/dev/null
 mit mit kdb5_util -r $R dump "$B/dump"
 mit mit krb5kdc -r $R -n > "$B/kdc.log" 2>&1 &
 wait_port 18888
 echo "host/$H@$R" > "$B/ok.acl"
 echo "host/other@$R" > "$B/bad.acl"
 
-# 1. krb5-rs kprop -> MIT kpropd (MIT kdb5_util load).
 mit mitrep kpropd -D -t -P 17540 -r $R -s "$B/host.keytab" -a "$B/ok.acl" \
   -f "$B/mitrep/from_master" -p "$(command -v kdb5_util)" > "$B/mitkpropd.log" 2>&1 &
 P=$!
@@ -124,7 +123,6 @@ mit mitrep kadmin.local -r $R -q "getprinc alice" | grep -q "Principal: alice@$R
 test -f "$B/dump.$H.last_prop"
 echo "rs kprop -> MIT kpropd ok"
 
-# 2. MIT kprop -> krb5-rs kpropd (krb5-rs-kdb load into klmdb).
 KRB5_KDC_PROFILE=$B/rsrep.conf $BIN/krb5-rs-kpropd -D -t -P 17541 -r $R -s "$B/host.keytab" \
   -a "$B/ok.acl" -f "$B/rsrep/from_master" -p $BIN/krb5-rs-kdb > "$B/rskpropd.log" 2>&1 &
 P=$!
@@ -135,7 +133,6 @@ cmp "$B/dump" "$B/rsrep/from_master"
 $BIN/krb5-rs-kdb --config "$B/rsrep.conf" --realm $R getprinc alice | grep -q "alice@$R"
 echo "MIT kprop -> rs kpropd ok"
 
-# 3. Unauthorized client, both directions: the sender fails, nothing loads.
 rm -rf "$B/rsrep"/* "$B/mitrep/from_master"
 KRB5_KDC_PROFILE=$B/rsrep.conf $BIN/krb5-rs-kpropd -D -t -P 17542 -r $R -s "$B/host.keytab" \
   -a "$B/bad.acl" -f "$B/rsrep/from_master" -p $BIN/krb5-rs-kdb > "$B/rsbad.log" 2>&1 &
@@ -157,6 +154,95 @@ fi
 wait $P || true
 test ! -e "$B/mitrep/from_master"
 echo "unauthorized rejected both ways"
+
+cat > "$B/probe.py" <<'PROBE'
+import socket, struct, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+for v in sys.argv[2:4]:
+    m = v.encode() + b"\0"
+    s.sendall(struct.pack(">I", len(m)) + m)
+b = s.recv(1)
+print(b[0] if b else "eof")
+PROBE
+probe() { # port sendauth-version appl-version expected-byte server
+  if [ "$5" = mit ]; then
+    mit mitrep kpropd -D -t -P $1 -r $R -s "$B/host.keytab" -a "$B/ok.acl" \
+      -f "$B/mitrep/from_master" -p "$(command -v kdb5_util)" > "$B/probe$1.log" 2>&1 &
+  else
+    KRB5_KDC_PROFILE=$B/rsrep.conf $BIN/krb5-rs-kpropd -D -t -P $1 -r $R -s "$B/host.keytab" \
+      -a "$B/ok.acl" -f "$B/rsrep/from_master" -p $BIN/krb5-rs-kdb > "$B/probe$1.log" 2>&1 &
+  fi
+  local p=$!
+  wait_listen $1
+  test "$(python3 "$B/probe.py" $1 "$2" "$3")" = "$4"
+  wait $p || true
+}
+probe 17546 KRB5_SENDAUTH_V9.9 kprop5_01 1 rs
+probe 17547 KRB5_SENDAUTH_V1.0 kprop5_99 2 rs
+probe 17548 KRB5_SENDAUTH_V9.9 kprop5_01 1 mit
+probe 17549 KRB5_SENDAUTH_V1.0 kprop5_99 2 mit
+test ! -e "$B/rsrep/from_master"
+test ! -e "$B/mitrep/from_master"
+echo "bad versions rejected by both"
+
+cat > "$B/cut.py" <<'CUT'
+import socket, sys, threading
+lport, dhost, dport, cap = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+l = socket.socket()
+l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind(("0.0.0.0", lport))
+l.listen(1)
+c, _ = l.accept()
+d = socket.create_connection((dhost, dport))
+def back():
+    try:
+        while True:
+            x = d.recv(65536)
+            if not x:
+                break
+            c.sendall(x)
+    except OSError:
+        pass
+threading.Thread(target=back, daemon=True).start()
+sent = 0
+while sent < cap:
+    x = c.recv(min(65536, cap - sent))
+    if not x:
+        break
+    d.sendall(x)
+    sent += len(x)
+d.shutdown(socket.SHUT_RDWR)
+d.close()
+c.close()
+CUT
+test "$(stat -c %s "$B/dump")" -gt 12000
+KRB5_KDC_PROFILE=$B/rsrep.conf $BIN/krb5-rs-kpropd -D -t -P 17550 -r $R -s "$B/host.keytab" \
+  -a "$B/ok.acl" -f "$B/rsrep/from_master" -p $BIN/krb5-rs-kdb > "$B/rscut.log" 2>&1 &
+P=$!
+wait_listen 17550
+python3 "$B/cut.py" 17551 "$H" 17550 6000 &
+C=$!
+wait_listen 17551
+if kprop -r $R -f "$B/dump" -P 17551 -s "$B/host.keytab" "$H" > "$B/mitkprop-cut.log" 2>&1; then
+  echo "MIT kprop succeeded over a truncated stream" >&2; exit 1
+fi
+wait $C || true
+wait $P || true
+test ! -e "$B/rsrep/from_master"
+mit mitrep kpropd -D -t -P 17552 -r $R -s "$B/host.keytab" -a "$B/ok.acl" \
+  -f "$B/mitrep/from_master" -p "$(command -v kdb5_util)" > "$B/mitcut.log" 2>&1 &
+P=$!
+wait_listen 17552
+python3 "$B/cut.py" 17553 "$H" 17552 6000 &
+C=$!
+wait_listen 17553
+if $BIN/krb5-rs-kprop -r $R -f "$B/dump" -P 17553 -s "$B/host.keytab" "$H" > "$B/rskprop-cut.log" 2>&1; then
+  echo "krb5-rs kprop succeeded over a truncated stream" >&2; exit 1
+fi
+wait $C || true
+wait $P || true
+test ! -e "$B/mitrep/from_master"
+echo "truncated transfers rejected both ways"
 
 pkill -f "krb5kdc -r $R" || true
 echo KPROP_LIVE_OK
