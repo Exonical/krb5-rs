@@ -93,6 +93,19 @@ struct Inner {
     master: EncryptionKey,
     realm: String,
     options: LmdbOptions,
+    #[cfg(test)]
+    fail_lockout_write: std::sync::atomic::AtomicBool,
+}
+
+/// Failure injection for the crash-safety tests; always default otherwise.
+#[derive(Clone, Copy, Default)]
+struct Faults {
+    /// Stop publishing before this step of [`PUBLISH_ORDER`].
+    publish_stop: Option<usize>,
+    /// Stop after publishing a conversion, before the legacy backup rename.
+    before_backup: bool,
+    /// Fail `create` once its temporary environments exist.
+    after_create_envs: bool,
 }
 
 /// A synchronous LMDB store. Store reads are done inline because they are
@@ -220,9 +233,21 @@ where
 impl LmdbStore {
     /// Create the two MIT-klmdb environments and seed `K/M` and `krbtgt`
     /// (`kadmin/dbutil/kdb5_create.c:291-292, 378-467`).
+    ///
+    /// The entries are built before anything touches disk, then written to
+    /// temporary environments that are published only once seeded and
+    /// verified, so a failed `create` leaves nothing behind and can be rerun.
     pub fn create(
         config: &krb5_rs::kdc::RealmConfig,
         master: &EncryptionKey,
+    ) -> Result<Self, StoreError> {
+        Self::create_with(config, master, Faults::default())
+    }
+
+    fn create_with(
+        config: &krb5_rs::kdc::RealmConfig,
+        master: &EncryptionKey,
+        faults: Faults,
     ) -> Result<Self, StoreError> {
         let options = LmdbOptions::from_db_module(
             &config.db_module,
@@ -247,8 +272,6 @@ impl LmdbStore {
                 database_name.display()
             )));
         }
-        create_parent(database_name)?;
-        let store = Self::open_environments(database_name, realm, master, options, true)?;
         let now = now_time();
         let life = (max_life != Duration::ZERO).then_some(max_life);
         let renewable = (max_renewable_life != Duration::ZERO).then_some(max_renewable_life);
@@ -300,6 +323,7 @@ impl LmdbStore {
             last_pwd_change: None,
             mod_time: Some(now),
             mod_by: Some(creator_key.clone()),
+            password_history: None,
         };
         let mut tgt_keys = Vec::with_capacity(keysalts.len());
         // MIT kdb5_create's TGT keysalt iterator ignores the salt type and
@@ -331,6 +355,7 @@ impl LmdbStore {
             last_pwd_change: None,
             mod_time: Some(now),
             mod_by: Some(creator_key.clone()),
+            password_history: None,
         };
         let mut km = new_entry(&km_record, master, &creator_key)?;
         let mkvno_tl = km
@@ -351,21 +376,56 @@ impl LmdbStore {
         }
         let mut tgt = new_entry(&tgt_record, master, &creator_key)?;
         tgt.tl_data.retain(|tl| tl.kind != MKVNO);
-        store.insert_initial(vec![km, tgt])?;
-        if let Some((env, db)) = &store.inner.lockout {
-            let mut txn = env
-                .write_txn()
-                .map_err(|e| backend("opening lockout write transaction", e))?;
-            for principal in [&master_principal, &tgt_principal] {
-                let key = lockout_key(principal, realm);
-                db.put(&mut txn, &key, &zero_record())
-                    .map_err(|e| backend("seeding lockout record", e))?;
+
+        create_parent(database_name)?;
+        let temp_base = appended(database_name, ".create.tmp");
+        let temp_guard = TempEnvironments(temp_base.clone());
+        temp_guard.remove_files();
+        {
+            let temp = Self::open_environments(&temp_base, realm, master, options.clone(), true)?;
+            if faults.after_create_envs {
+                return Err(StoreError::backend(
+                    "injected failure after creating environments",
+                ));
             }
-            txn.commit()
-                .map_err(|e| backend("committing lockout records", e))?;
+            temp.insert_initial(vec![km, tgt])?;
+            if let Some((env, db)) = &temp.inner.lockout {
+                let mut txn = env
+                    .write_txn()
+                    .map_err(|e| backend("opening lockout write transaction", e))?;
+                for principal in [&master_principal, &tgt_principal] {
+                    let key = lockout_key(principal, realm);
+                    db.put(&mut txn, &key, &zero_record())
+                        .map_err(|e| backend("seeding lockout record", e))?;
+                }
+                txn.commit()
+                    .map_err(|e| backend("committing lockout records", e))?;
+            }
+            temp.verify_master()?;
+            temp.sync_all()?;
         }
+        if main_path(database_name).exists() {
+            return Err(StoreError::conflict(format!(
+                "database {}.mdb already exists",
+                database_name.display()
+            )));
+        }
+        publish_environments(&temp_base, database_name, faults.publish_stop)?;
+        let store = Self::open_environments(database_name, realm, master, options, false)?;
         store.verify_master()?;
         Ok(store)
+    }
+
+    fn sync_all(&self) -> Result<(), StoreError> {
+        self.inner
+            .main_env
+            .force_sync()
+            .map_err(|e| backend("syncing principal environment", e))?;
+        if let Some((env, _)) = &self.inner.lockout {
+            env.force_sync()
+                .map_err(|e| backend("syncing lockout environment", e))?;
+        }
+        Ok(())
     }
 
     /// Open an MIT klmdb database, converting a legacy krb5-rs file database
@@ -382,8 +442,12 @@ impl LmdbStore {
         let database_name = &config.database_name;
         let realm = config.kdc.realm.as_str();
         let main = main_path(database_name);
-        if !main.exists() && FileStore::has_database_magic(database_name)? {
-            auto_convert_legacy(database_name, master, realm, &options)?;
+        if FileStore::has_database_magic(database_name)? {
+            if main.exists() {
+                finish_legacy_backup(database_name)?;
+            } else {
+                auto_convert_legacy(database_name, master, realm, &options, Faults::default())?;
+            }
         }
         if !main.exists() {
             return Err(StoreError::not_found(format!(
@@ -452,6 +516,8 @@ impl LmdbStore {
                 master: master.clone(),
                 realm: realm.to_owned(),
                 options,
+                #[cfg(test)]
+                fail_lockout_write: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -655,6 +721,7 @@ impl LmdbStore {
             mod_time: Some(now_time()),
             last_pwd_change,
             mod_by: Some(modifier.clone()),
+            password_history: None,
             entry,
         };
         let raw = new_entry(&record, &self.inner.master, &modifier)?;
@@ -680,17 +747,43 @@ impl LmdbStore {
             .principal_db
             .put(&mut txn, &key, &value)
             .map_err(|e| backend("writing principal", e))?;
-        txn.commit()
-            .map_err(|e| backend("committing principal", e))?;
+        // MIT's klmdb_put_principal commits the principal first and then
+        // reports a lockout write failure (`plugins/kdb/lmdb/kdb_lmdb.c:
+        // 747-816`), leaving a principal that a retried create refuses. Here
+        // the lockout record is committed while the principal transaction is
+        // still open: a lockout failure aborts the create, and a principal
+        // commit failure leaves only a harmless zeroed lockout record that
+        // the next create overwrites.
         if let Some((env, db)) = &self.inner.lockout {
-            let mut txn = env
+            self.check_lockout_fault()?;
+            let mut lockout_txn = env
                 .write_txn()
                 .map_err(|e| backend("opening lockout write transaction", e))?;
-            db.put(&mut txn, &key, &zero_record())
+            db.put(&mut lockout_txn, &key, &zero_record())
                 .map_err(|e| backend("creating lockout record", e))?;
-            txn.commit()
+            lockout_txn
+                .commit()
                 .map_err(|e| backend("committing lockout record", e))?;
         }
+        txn.commit()
+            .map_err(|e| backend("committing principal", e))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check_lockout_fault(&self) -> Result<(), StoreError> {
+        if self
+            .inner
+            .fail_lockout_write
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StoreError::backend("injected lockout write failure"));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn check_lockout_fault(&self) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -749,16 +842,19 @@ impl LmdbStore {
             .map_err(|e| backend("deleting principal", e))?;
         txn.commit()
             .map_err(|e| backend("committing principal deletion", e))?;
-        if deleted {
-            if let Some((env, db)) = &self.inner.lockout {
+        // Like MIT, a lockout deletion failure is ignored once the principal
+        // is gone (`plugins/kdb/lmdb/kdb_lmdb.c:833-834`); a later create
+        // overwrites any leftover record.
+        if let (true, Some((env, db))) = (deleted, &self.inner.lockout) {
+            let _ = self.check_lockout_fault().and_then(|()| {
                 let mut txn = env
                     .write_txn()
                     .map_err(|e| backend("opening lockout delete transaction", e))?;
                 db.delete(&mut txn, &key)
                     .map_err(|e| backend("deleting lockout record", e))?;
                 txn.commit()
-                    .map_err(|e| backend("committing lockout deletion", e))?;
-            }
+                    .map_err(|e| backend("committing lockout deletion", e))
+            });
         }
         Ok(deleted)
     }
@@ -871,14 +967,108 @@ impl Drop for ConvertLock {
     }
 }
 
+/// Environment files in publish order. The main `.mdb` goes last, so its
+/// presence means the whole set is in place.
+const PUBLISH_ORDER: [&str; 4] = [".lockout.mdb-lock", ".lockout.mdb", ".mdb-lock", ".mdb"];
+
 struct TempEnvironments(PathBuf);
 
-impl Drop for TempEnvironments {
-    fn drop(&mut self) {
-        for suffix in [".mdb", ".mdb-lock", ".lockout.mdb", ".lockout.mdb-lock"] {
+impl TempEnvironments {
+    fn remove_files(&self) {
+        for suffix in PUBLISH_ORDER {
             let _ = fs::remove_file(appended(&self.0, suffix));
         }
     }
+}
+
+impl Drop for TempEnvironments {
+    fn drop(&mut self) {
+        self.remove_files();
+    }
+}
+
+/// Move closed temporary environments into place, main `.mdb` last.
+fn publish_environments(
+    temp_base: &Path,
+    database_name: &Path,
+    stop_before: Option<usize>,
+) -> Result<(), StoreError> {
+    for (step, suffix) in PUBLISH_ORDER.into_iter().enumerate() {
+        if stop_before == Some(step) {
+            return Err(StoreError::backend("injected stop while publishing"));
+        }
+        rename_env_file(
+            &appended(temp_base, suffix),
+            &appended(database_name, suffix),
+        )?;
+    }
+    sync_parent(&main_path(database_name));
+    Ok(())
+}
+
+fn conversion_lock(database_name: &Path) -> Result<ConvertLock, StoreError> {
+    let lock_path = appended(database_name, ".convert.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| {
+            StoreError::backend(format!(
+                "opening conversion lock {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+    FileExt::lock_exclusive(&lock_file).map_err(|e| {
+        StoreError::unavailable(format!(
+            "acquiring conversion lock {}: {e}",
+            lock_path.display()
+        ))
+    })?;
+    Ok(ConvertLock(lock_file))
+}
+
+fn backup_path(database_name: &Path) -> PathBuf {
+    appended(database_name, ".krb5rs-file.bak")
+}
+
+/// Move the converted legacy file to its backup name. Run once the klmdb
+/// environments are published, and again by `open` when a conversion stopped
+/// between publishing and this step.
+fn move_legacy_to_backup(database_name: &Path) -> Result<(), StoreError> {
+    let backup = backup_path(database_name);
+    fs::rename(database_name, &backup).map_err(|e| {
+        StoreError::backend(format!(
+            "moving converted legacy database to {}: {e}",
+            backup.display()
+        ))
+    })?;
+    sync_parent(&backup);
+    eprintln!(
+        "converted legacy krb5-rs database {} to MIT klmdb; backup: {}",
+        database_name.display(),
+        backup.display()
+    );
+    Ok(())
+}
+
+/// Finish a conversion interrupted after the klmdb environments were
+/// published but before the legacy file was moved to its backup.
+fn finish_legacy_backup(database_name: &Path) -> Result<(), StoreError> {
+    let _guard = conversion_lock(database_name)?;
+    if !main_path(database_name).exists() || !FileStore::has_database_magic(database_name)? {
+        return Ok(());
+    }
+    let backup = backup_path(database_name);
+    if backup.exists() {
+        return Err(StoreError::conflict(format!(
+            "both a legacy krb5-rs file database {} and its backup {} exist next to the klmdb environment; remove the one that is not wanted",
+            database_name.display(),
+            backup.display()
+        )));
+    }
+    move_legacy_to_backup(database_name)
 }
 
 #[cfg(unix)]
@@ -941,41 +1131,27 @@ fn ensure_master_actkvno(entry: &mut MitEntry) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Convert a legacy krb5-rs file database to klmdb, keeping it as a backup.
+///
+/// Crash safety: the environments are built under temporary names and
+/// published with the main `.mdb` last, so a missing `.mdb` means the next
+/// open converts again from scratch, and a present one means only the backup
+/// rename may be left (see [`finish_legacy_backup`]). The file store's own
+/// write lock is held from export to backup, so no file-store writer can
+/// change the database while it is converted.
 fn auto_convert_legacy(
     database_name: &Path,
     master: &EncryptionKey,
     realm: &str,
     options: &LmdbOptions,
+    faults: Faults,
 ) -> Result<(), StoreError> {
     let main = main_path(database_name);
+    let _guard = conversion_lock(database_name)?;
     if main.exists() || !FileStore::has_database_magic(database_name)? {
         return Ok(());
     }
-    let lock_path = appended(database_name, ".convert.lock");
-    let lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| {
-            StoreError::backend(format!(
-                "opening conversion lock {}: {e}",
-                lock_path.display()
-            ))
-        })?;
-    FileExt::lock_exclusive(&lock_file).map_err(|e| {
-        StoreError::unavailable(format!(
-            "acquiring conversion lock {}: {e}",
-            lock_path.display()
-        ))
-    })?;
-    let _guard = ConvertLock(lock_file);
-
-    if main.exists() {
-        return Ok(());
-    }
-    let backup = appended(database_name, ".krb5rs-file.bak");
+    let backup = backup_path(database_name);
     if backup.exists() {
         return Err(StoreError::conflict(format!(
             "legacy database backup {} already exists",
@@ -990,69 +1166,47 @@ fn auto_convert_legacy(
             legacy.realm()
         )));
     }
-    let (records, policies) = legacy.export_records()?;
-    let temp_base = appended(database_name, ".convert.tmp");
-    let _temp_guard = TempEnvironments(temp_base.clone());
-    for suffix in [".mdb", ".mdb-lock", ".lockout.mdb", ".lockout.mdb-lock"] {
-        let _ = fs::remove_file(appended(&temp_base, suffix));
-    }
-    let temp = LmdbStore::open_environments(&temp_base, realm, master, options.clone(), true)?;
-    let creator = creator_name(realm);
-    let mut raw_entries = Vec::with_capacity(records.len());
-    for record in &records {
-        let mut entry = new_entry(record, master, &creator)?;
-        ensure_master_actkvno(&mut entry)?;
-        raw_entries.push(entry);
-    }
-    temp.insert_initial(raw_entries)?;
-    for policy in policies.iter().cloned() {
-        temp.create_policy_sync(policy)?;
-    }
-
-    if temp.list_records_sync()?.len() != records.len()
-        || temp.list_policies_sync()?.len() != policies.len()
-    {
-        return Err(StoreError::corrupt(
-            "legacy database conversion count verification failed",
-        ));
-    }
-    temp.verify_master()?;
-    temp.inner
-        .main_env
-        .force_sync()
-        .map_err(|e| backend("syncing converted principal environment", e))?;
-    if let Some((env, _)) = &temp.inner.lockout {
-        env.force_sync()
-            .map_err(|e| backend("syncing converted lockout environment", e))?;
-    }
-    drop(temp);
-
-    rename_env_file(&appended(&temp_base, ".mdb"), &main)?;
-    rename_env_file(
-        &appended(&temp_base, ".mdb-lock"),
-        &appended(database_name, ".mdb-lock"),
-    )?;
-    rename_env_file(
-        &appended(&temp_base, ".lockout.mdb"),
-        &lockout_path(database_name),
-    )?;
-    rename_env_file(
-        &appended(&temp_base, ".lockout.mdb-lock"),
-        &appended(database_name, ".lockout.mdb-lock"),
-    )?;
-    fs::rename(database_name, &backup).map_err(|e| {
-        StoreError::backend(format!(
-            "moving converted legacy database to {}: {e}",
-            backup.display()
+    let _writer = legacy.write_lock().map_err(|e| {
+        StoreError::unavailable(format!(
+            "the legacy file database is locked by a writer ({e}); retry once file-store writers have stopped"
         ))
     })?;
-    sync_parent(&main);
-    eprintln!(
-        "converted legacy krb5-rs database {} to MIT klmdb; backup: {}",
-        database_name.display(),
-        backup.display()
-    );
-    Ok(())
+    let (records, policies) = legacy.export_records()?;
+    let temp_base = appended(database_name, ".convert.tmp");
+    let temp_guard = TempEnvironments(temp_base.clone());
+    temp_guard.remove_files();
+    {
+        let temp = LmdbStore::open_environments(&temp_base, realm, master, options.clone(), true)?;
+        let creator = creator_name(realm);
+        let mut raw_entries = Vec::with_capacity(records.len());
+        for record in &records {
+            let mut entry = new_entry(record, master, &creator)?;
+            ensure_master_actkvno(&mut entry)?;
+            raw_entries.push(entry);
+        }
+        temp.insert_initial(raw_entries)?;
+        for policy in policies.iter().cloned() {
+            temp.create_policy_sync(policy)?;
+        }
+
+        if temp.list_records_sync()?.len() != records.len()
+            || temp.list_policies_sync()?.len() != policies.len()
+        {
+            return Err(StoreError::corrupt(
+                "legacy database conversion count verification failed",
+            ));
+        }
+        temp.verify_master()?;
+        temp.sync_all()?;
+    }
+
+    publish_environments(&temp_base, database_name, faults.publish_stop)?;
+    if faults.before_backup {
+        return Err(StoreError::backend(
+            "injected stop before the legacy backup",
+        ));
+    }
+    move_legacy_to_backup(database_name)
 }
 
 impl PrincipalStore for LmdbStore {
@@ -1202,7 +1356,7 @@ mod tests {
     use super::*;
     use krb5_rs::kdc::kdb::admin::AdminOps;
     use krb5_rs::kdc::kdb::{master_key_from_password, FileStore};
-    use krb5_rs::kdc::store::AdminStore;
+    use krb5_rs::kdc::store::{AdminStore, StoreErrorKind};
     use krb5_rs::profile::Profile;
 
     fn test_config(path: &Path) -> krb5_rs::kdc::RealmConfig {
@@ -1782,5 +1936,271 @@ mod tests {
             expected_records.len()
         );
         assert_eq!(fs::read(backup).expect("backup unchanged"), backup_bytes);
+    }
+
+    /// A legacy file database holding `alice` and `bob`.
+    async fn legacy_database(path: &Path) -> EncryptionKey {
+        let master =
+            master_key_from_password("LMDB.TEST", "master password", 18).expect("master key");
+        let file = FileStore::create(path, "LMDB.TEST", &master).expect("create file db");
+        for name in ["alice", "bob"] {
+            file.create_principal(principal(name), None)
+                .await
+                .expect("add principal to file db");
+        }
+        master
+    }
+
+    fn klmdb_files(path: &Path) -> Vec<PathBuf> {
+        PUBLISH_ORDER
+            .iter()
+            .flat_map(|suffix| {
+                [
+                    appended(path, suffix),
+                    appended(&appended(path, ".convert.tmp"), suffix),
+                    appended(&appended(path, ".create.tmp"), suffix),
+                ]
+            })
+            .filter(|file| file.exists())
+            .collect()
+    }
+
+    fn assert_converted(store: &LmdbStore, path: &Path) {
+        let names: Vec<String> = store
+            .list_records_sync()
+            .expect("records")
+            .iter()
+            .map(|record| record.entry.name.to_string())
+            .collect();
+        for name in ["alice", "bob"] {
+            assert!(
+                names.contains(&name.to_string()),
+                "{name} missing: {names:?}"
+            );
+        }
+        assert!(!path.exists(), "legacy file left in place");
+        assert!(backup_path(path).exists(), "no legacy backup");
+        assert!(lockout_path(path).exists(), "no lockout environment");
+    }
+
+    #[tokio::test]
+    async fn conversion_stopped_before_publishing_main_is_redone_on_open() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let master = legacy_database(&path).await;
+        let config = test_config(&path);
+        let options = LmdbOptions::default();
+        let faults = Faults {
+            publish_stop: Some(PUBLISH_ORDER.len() - 1),
+            ..Faults::default()
+        };
+        auto_convert_legacy(&path, &master, "LMDB.TEST", &options, faults)
+            .expect_err("injected stop");
+        assert!(lockout_path(&path).exists(), "lockout published first");
+        assert!(!main_path(&path).exists(), "main must be published last");
+        assert!(path.exists() && !backup_path(&path).exists());
+
+        let store = LmdbStore::open(&config, &master).expect("open redoes the conversion");
+        assert_converted(&store, &path);
+    }
+
+    #[tokio::test]
+    async fn conversion_stopped_before_backup_is_finished_on_open() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let master = legacy_database(&path).await;
+        let config = test_config(&path);
+        let faults = Faults {
+            before_backup: true,
+            ..Faults::default()
+        };
+        auto_convert_legacy(&path, &master, "LMDB.TEST", &LmdbOptions::default(), faults)
+            .expect_err("injected stop");
+        assert!(main_path(&path).exists() && path.exists());
+        assert!(!backup_path(&path).exists());
+
+        let store = LmdbStore::open(&config, &master).expect("open finishes the backup");
+        assert_converted(&store, &path);
+    }
+
+    #[tokio::test]
+    async fn open_refuses_both_legacy_file_and_backup_beside_klmdb() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let master = legacy_database(&path).await;
+        let config = test_config(&path);
+        let faults = Faults {
+            before_backup: true,
+            ..Faults::default()
+        };
+        auto_convert_legacy(&path, &master, "LMDB.TEST", &LmdbOptions::default(), faults)
+            .expect_err("injected stop");
+        fs::copy(&path, backup_path(&path)).expect("second copy");
+
+        let error = match LmdbStore::open(&config, &master) {
+            Ok(_) => panic!("open guessed which legacy file to keep"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StoreErrorKind::Conflict);
+        assert!(path.exists() && backup_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn conversion_waits_for_file_store_writers() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let master = legacy_database(&path).await;
+        let legacy_bytes = fs::read(&path).expect("legacy bytes");
+        let config = test_config(&path);
+        let writer = FileStore::open(&path, &master).expect("writer");
+        let lock = writer.write_lock().expect("writer lock");
+
+        let error = match LmdbStore::open(&config, &master) {
+            Ok(_) => panic!("converted while a file-store writer held the lock"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StoreErrorKind::Unavailable);
+        assert!(klmdb_files(&path).is_empty(), "{:?}", klmdb_files(&path));
+        assert_eq!(fs::read(&path).expect("legacy unchanged"), legacy_bytes);
+
+        drop(lock);
+        let store = LmdbStore::open(&config, &master).expect("convert after the writer");
+        assert_converted(&store, &path);
+    }
+
+    #[test]
+    fn failed_create_leaves_nothing_and_can_be_rerun() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let config = test_config(&path);
+        let master =
+            master_key_from_password("LMDB.TEST", "master password", 18).expect("master key");
+        for faults in [
+            Faults {
+                after_create_envs: true,
+                ..Faults::default()
+            },
+            Faults {
+                publish_stop: Some(PUBLISH_ORDER.len() - 1),
+                ..Faults::default()
+            },
+        ] {
+            assert!(LmdbStore::create_with(&config, &master, faults).is_err());
+            assert!(!main_path(&path).exists());
+            assert!(!appended(&appended(&path, ".create.tmp"), ".mdb").exists());
+        }
+        let store = LmdbStore::create(&config, &master).expect("rerun create");
+        store.verify_master().expect("seeded K/M");
+    }
+
+    #[tokio::test]
+    async fn klmdb_keeps_mit_password_history() {
+        use krb5_rs::kdc::kdb::admin::PrincipalOptions;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let config = test_config(&path);
+        let (store, _master) = test_store(&path);
+        let admin = AdminOps::new(store.clone(), config.supported_keysalts.clone());
+        admin
+            .add_policy(Policy {
+                name: "hist".into(),
+                pw_history_num: 3,
+                ..Policy::default()
+            })
+            .await
+            .expect("policy");
+        let alice = PrincipalName::new_principal("alice");
+        let opts = PrincipalOptions {
+            policy: Some(Some("hist".into())),
+            ..PrincipalOptions::default()
+        };
+        admin
+            .add_principal(&alice, "LMDB.TEST", Some("pw-0"), &opts)
+            .await
+            .expect("add");
+        let cpw = |pw: &'static str| admin.change_password(&alice, "LMDB.TEST", Some(pw), false);
+        for pw in ["pw-a", "pw-b", "pw-c"] {
+            cpw(pw).await.expect(pw);
+        }
+        // pw_history_num 3 keeps the two previous passwords plus the current.
+        for pw in ["pw-a", "pw-b", "pw-c"] {
+            let error = cpw(pw).await.expect_err(pw);
+            assert_eq!(error.kind(), StoreErrorKind::Rejected, "{pw}: {error}");
+            assert_eq!(error.message(), "Cannot reuse password");
+        }
+        let record = store
+            .get_record_sync(&alice, "LMDB.TEST")
+            .expect("read")
+            .expect("alice");
+        let history = record.password_history.expect("klmdb stores history");
+        assert_eq!(history.old_keys.len(), 2);
+        assert_eq!(history.admin_history_kvno, 2);
+
+        let hist_name = PrincipalName {
+            name_type: 1,
+            name_string: vec![
+                KerberosString::from_bytes(b"kadmin").expect("kadmin"),
+                KerberosString::from_bytes(b"history").expect("history"),
+            ],
+        };
+        let hist = store
+            .get_record_sync(&hist_name, "LMDB.TEST")
+            .expect("read")
+            .expect("kadmin/history created on first use");
+        assert_eq!(hist.entry.keys.iter().map(|k| k.kvno).max(), Some(2));
+        assert_eq!(hist.entry.max_life, Some(Duration::from_secs(64)));
+        let error = admin
+            .change_password(&hist_name, "LMDB.TEST", Some("x"), false)
+            .await
+            .expect_err("protected");
+        assert_eq!(error.message(), "Cannot change protected principal");
+
+        cpw("pw-0").await.expect("dropped out of the history");
+        // A new history key makes the old entries unreadable, so MIT resets
+        // the history on the next change (svr_principal.c:1106-1114, 1317).
+        admin
+            .change_password(&hist_name, "LMDB.TEST", None, false)
+            .await
+            .expect("randkey kadmin/history");
+        cpw("pw-a")
+            .await
+            .expect("history reset by the new history key");
+        let history = store
+            .get_record_sync(&alice, "LMDB.TEST")
+            .expect("read")
+            .expect("alice")
+            .password_history
+            .expect("history");
+        assert_eq!(history.admin_history_kvno, 3);
+        assert_eq!(history.old_keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lockout_write_failure_does_not_strand_a_principal() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let (store, _master) = test_store(&path);
+        let alice = PrincipalName::new_principal("alice");
+        let fault = &store.inner.fail_lockout_write;
+        fault.store(true, std::sync::atomic::Ordering::SeqCst);
+        store
+            .create_principal(principal("alice"), None)
+            .await
+            .expect_err("lockout failure fails the create");
+        assert!(store.get_raw(&alice, "LMDB.TEST").expect("read").is_none());
+
+        fault.store(false, std::sync::atomic::Ordering::SeqCst);
+        store
+            .create_principal(principal("alice"), None)
+            .await
+            .expect("retried create");
+
+        fault.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(store
+            .delete_principal(&alice, "LMDB.TEST")
+            .await
+            .expect("delete ignores the lockout failure"));
+        assert!(store.get_raw(&alice, "LMDB.TEST").expect("read").is_none());
     }
 }

@@ -17,7 +17,7 @@ use crate::crypto::SaltType;
 use crate::kdc::db::{salt_bytes, KeyEntry, PrincipalAttributes, PrincipalEntry};
 use crate::kdc::kdb::master::{decrypt_key, encrypt_key};
 use crate::kdc::policy::kerberos_time;
-use crate::kdc::store::{Policy, PrincipalRecord, StoreError};
+use crate::kdc::store::{PasswordHistory, Policy, PrincipalRecord, StoreError};
 use crate::types::{EncryptionKey, KerberosTime, PrincipalName};
 
 /// LE u32 timestamp (`lib/kdb/kdb5.c:2055-2066`).
@@ -212,20 +212,71 @@ fn mod_principal_data(entry: &MitEntry) -> Result<Option<(u32, Vec<u8>)>, StoreE
     Ok(Some((timestamp, bytes[4..bytes.len() - 1].to_vec())))
 }
 
-fn policy_from_tl(entry: &MitEntry) -> Result<Option<String>, StoreError> {
+fn policy_and_history_from_tl(
+    entry: &MitEntry,
+) -> Result<(Option<String>, PasswordHistory), StoreError> {
     let Some(bytes) = bytes_tl(entry, KADM_DATA) else {
-        return Ok(None);
+        return Ok((None, PasswordHistory::default()));
     };
     let osa = OsaPrincipalData::decode(bytes)?;
+    let history = PasswordHistory {
+        admin_history_kvno: osa.admin_history_kvno,
+        old_key_next: osa.old_key_next,
+        old_keys: osa.old_keys,
+    };
     if osa.aux_attributes & KADM5_POLICY == 0 {
-        return Ok(None);
+        return Ok((None, history));
     }
     let name = osa
         .policy
         .ok_or_else(|| corrupt("MIT KADM_DATA policy bit set without a policy name"))?;
-    String::from_utf8(name)
-        .map(Some)
-        .map_err(|_| corrupt("MIT KADM_DATA policy name is not UTF-8"))
+    let name =
+        String::from_utf8(name).map_err(|_| corrupt("MIT KADM_DATA policy name is not UTF-8"))?;
+    Ok((Some(name), history))
+}
+
+/// A kadm5 password-history entry for `entry`'s current password: each key
+/// of the highest kvno, re-encrypted in the history key with its salt
+/// (`create_history_entry`, `lib/kadm5/srv/svr_principal.c:1003-1062`). MIT
+/// passes a keysalt there, so every entry is key-data version 2.
+pub fn history_entry(
+    entry: &PrincipalEntry,
+    hist_key: &EncryptionKey,
+) -> Result<Vec<KeyData>, StoreError> {
+    let Some(kvno) = entry.current_kvno() else {
+        return Ok(Vec::new());
+    };
+    entry
+        .keys
+        .iter()
+        .filter(|key| key.kvno == kvno)
+        .map(|key| {
+            let mut data = key_data_from_entry(entry, key, hist_key)?;
+            if data.fields.len() == 1 {
+                data.fields.push((0, Vec::new()));
+            }
+            data.ver = 2;
+            Ok(data)
+        })
+        .collect()
+}
+
+/// Whether a history key-data decrypts, with any of `hist_keys`, to `key`
+/// (`check_pw_reuse`, `svr_principal.c:925-969`; keys that fail to decrypt
+/// are skipped).
+pub fn history_key_matches(
+    data: &KeyData,
+    hist_keys: &[EncryptionKey],
+    key: &EncryptionKey,
+) -> bool {
+    let Some((etype, ciphertext)) = data.fields.first() else {
+        return false;
+    };
+    i32::from(*etype) == key.keytype
+        && hist_keys.iter().any(|hist_key| {
+            decrypt_key(hist_key, key.keytype, ciphertext)
+                .is_ok_and(|old| old.key_bytes() == key.key_bytes())
+        })
 }
 
 fn mkvno(entry: &MitEntry) -> Result<u16, StoreError> {
@@ -443,6 +494,7 @@ pub fn record_from_entry(
     };
     let last_admin_unlock =
         get_u32_tl(entry, LAST_ADMIN_UNLOCK)?.map(|time| kerberos_time(i64::from(time)));
+    let (policy, password_history) = policy_and_history_from_tl(entry)?;
     Ok(PrincipalRecord {
         entry: PrincipalEntry {
             name: entry.principal.clone(),
@@ -456,19 +508,27 @@ pub fn record_from_entry(
             keys,
             allowed_to_delegate_to: constrained_delegation_values(entry)?,
             allowed_to_delegate_from,
-            policy: policy_from_tl(entry)?,
+            policy,
             security_epoch: 0,
             last_admin_unlock,
         },
         last_pwd_change,
         mod_time,
         mod_by,
+        password_history: Some(password_history),
     })
 }
 
-fn update_kadm_data(entry: &mut MitEntry, policy: Option<&str>) -> Result<(), StoreError> {
+/// Write the policy and, when given, the password history into
+/// `KRB5_TL_KADM_DATA`, keeping its other fields.
+fn update_kadm_data(
+    entry: &mut MitEntry,
+    policy: Option<&str>,
+    history: Option<&PasswordHistory>,
+) -> Result<(), StoreError> {
     let old = bytes_tl(entry, KADM_DATA);
-    if old.is_none() && policy.is_none() {
+    let empty_history = history.is_none_or(|h| *h == PasswordHistory::default());
+    if old.is_none() && policy.is_none() && empty_history {
         return Ok(());
     }
     let mut osa = match old {
@@ -487,6 +547,11 @@ fn update_kadm_data(entry: &mut MitEntry, policy: Option<&str>) -> Result<(), St
             osa.policy = None;
             osa.aux_attributes &= !KADM5_POLICY;
         }
+    }
+    if let Some(history) = history {
+        osa.admin_history_kvno = history.admin_history_kvno;
+        osa.old_key_next = history.old_key_next;
+        osa.old_keys = history.old_keys.clone();
     }
     set_tl(entry, KADM_DATA, Some(osa.encode()?));
     Ok(())
@@ -572,7 +637,11 @@ pub fn merge_record(
         });
     }
     update_string_attrs(entry, &record.entry.allowed_to_delegate_from)?;
-    update_kadm_data(entry, record.entry.policy.as_deref())?;
+    update_kadm_data(
+        entry,
+        record.entry.policy.as_deref(),
+        record.password_history.as_ref(),
+    )?;
     let reencrypted_keys = update_keys(entry, record, master)?;
     if reencrypted_keys {
         set_tl(entry, MKVNO, Some(1u16.to_le_bytes().to_vec()));
@@ -699,19 +768,17 @@ mod tests {
 
     fn test_entry(master: &EncryptionKey) -> MitEntry {
         let key = EncryptionKey::new(18, vec![0x45; 32]);
-        let mut osa = OsaPrincipalData {
+        let osa = OsaPrincipalData {
             policy: Some(b"old-policy".to_vec()),
             aux_attributes: KADM5_POLICY | 0x40,
             old_key_next: 17,
             admin_history_kvno: 9,
-            ..OsaPrincipalData::default()
+            old_keys: vec![vec![KeyData {
+                ver: 1,
+                kvno: 4,
+                fields: vec![(18, vec![0x11, 0x22])],
+            }]],
         };
-        osa.set_history_for_tests(&[vec![KeyData {
-            ver: 1,
-            kvno: 4,
-            fields: vec![(18, vec![0x11, 0x22])],
-        }]])
-        .expect("old key history");
         let mut mod_princ = 20u32.to_le_bytes().to_vec();
         mod_princ.extend_from_slice(b"db_creation@R\0");
         let mut strings = b"foreign\0keep-me\0".to_vec();
@@ -850,7 +917,7 @@ mod tests {
             updated_osa.admin_history_kvno,
             original_osa.admin_history_kvno
         );
-        assert_eq!(updated_osa.old_keys_wire, original_osa.old_keys_wire);
+        assert_eq!(updated_osa.old_keys, original_osa.old_keys);
         assert!(string_attributes(&entry)
             .expect("string attributes")
             .contains(&(b"foreign".to_vec(), b"keep-me".to_vec())));
@@ -960,6 +1027,7 @@ mod tests {
             last_pwd_change: None,
             mod_time: Some(kerberos_time(42)),
             mod_by: None,
+            password_history: None,
         };
         let creator = unparse_name(&name(b"db_creation"), "R");
         let entry = new_entry(&record, &master, &creator).expect("new entry");

@@ -89,7 +89,16 @@ When `db_library` is unset, the existing `FileStore` remains in use.
   permissions 0600, and LMDB's default reader count when `max_readers = 0`.
 - `krb5-rs-kdb create` / `init` seed `K/M` and `krbtgt` with the realm's
   `max_life`, `max_renewable_life`, and optional
-  `default_principal_expiration` values.
+  `default_principal_expiration` values. The entries are built in memory,
+  written to `<database_name>.create.tmp.*` environments, verified, and only
+  then renamed into place (main `.mdb` last), so a failed `create` leaves
+  nothing behind and can simply be rerun.
+- Creating a principal commits its zeroed lockout record before the
+  principal itself. MIT's `klmdb_put_principal` commits the principal first
+  and then reports a lockout failure (`plugins/kdb/lmdb/kdb_lmdb.c:747-816`),
+  leaving a principal a retried create refuses; here a lockout failure aborts
+  the create. Deleting a principal ignores lockout errors, as MIT does
+  (`kdb_lmdb.c:833-834`).
 - Initial records use MIT's `db_creation` modifier. Later krb5-rs admin
   mutations use `krb5-rs-kdb@REALM`; the `AdminStore` API has no authenticated
   modifier identity.
@@ -113,7 +122,37 @@ sequential use is supported. When klmdb is
 selected and `<database_name>.mdb` is absent, a legacy krb5-rs file database
 is converted under `<database_name>.convert.lock`; the original is retained
 as `<database_name>.krb5rs-file.bak`. Conversion writes and verifies temporary
-environments before renaming them into place.
+environments before renaming them into place, the main `.mdb` last, so its
+presence marks a complete set: if a conversion stops before that rename, the
+next open converts again from scratch; if it stops between that rename and the
+backup rename, the next open finishes the backup rename (and refuses, naming
+both, if a backup already exists). Conversion also holds the file store's own
+write lock (`<database_name>.lock`) from export to backup, so it fails with
+"retry" rather than lose writes from a process still using the file backend. A
+crash leaves that lock file behind, exactly as a crashed file-store writer
+does; remove it once no file-store writer is running.
+
+### Password policy
+
+`krb5-rs-kdb` applies kadm5's password rules for every backend:
+`addprinc` with a password and `cpw` check the policy's minimum length and
+character classes (`lib/kadm5/srv/server_misc.c:73-102`); `cpw` refuses the
+current password, and `addprinc`, `cpw`, randkey and `modprinc -policy` /
+`-clearpolicy` set the password expiration from the policy's `pw_max_life` as
+MIT does (`lib/kadm5/srv/svr_principal.c:364-412, 601-634, 1219-1497`).
+Rejections use MIT's messages ("Password is too short", "Password does not
+contain enough character classes", "Cannot reuse password").
+
+Deeper history needs storage for old keys, which only klmdb has (in
+`KRB5_TL_KADM_DATA`): there `cpw` also refuses the passwords kept by
+`pw_history_num` and adds the old password to the queue exactly as MIT's
+`add_to_history` (`svr_principal.c:1091-1208`), so MIT and krb5-rs tools
+share one history. History keys are encrypted in the `kadmin/history`
+principal's key, created on first use like MIT's `create_hist`
+(`lib/kadm5/srv/server_kdb.c:141-223`), including MIT's 64-second `max_life`
+(it stores `KRB5_KDB_DISALLOW_ALL_TIX` there) and initial kvno 2;
+`kadmin/history` itself cannot be given a password. The file and CockroachDB
+stores check only the current password.
 
 `security_epoch` is a krb5-rs extension and is not persisted in MIT klmdb;
 loaded principals and policies use epoch zero. MIT key-data has no
@@ -130,7 +169,8 @@ fails explicitly.
 
 All of these are async (`fn …(&self, …) -> impl Future<Output = …> + Send`),
 `Send + Sync`, and return structured errors (`StoreError` with a kind:
-`NotFound`, `Conflict`, `Unavailable`, `Corrupt`, `Stale`, `Backend`). No
+`NotFound`, `Conflict`, `Unavailable`, `Corrupt`, `Stale`, `Rejected`,
+`Backend`). No
 backend types appear in the signatures.
 
 | Trait | Used by | Responsibility | Implementations |

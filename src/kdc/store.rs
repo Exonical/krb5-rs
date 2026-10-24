@@ -29,6 +29,9 @@ pub enum StoreErrorKind {
     Corrupt,
     /// The data is older than the caller may accept.
     Stale,
+    /// The request violates policy: password quality or history, or a
+    /// protected principal (kadm5 `KADM5_PASS_*`, `KADM5_PROTECT_PRINCIPAL`).
+    Rejected,
     /// Any other backend failure.
     Backend,
 }
@@ -78,6 +81,11 @@ impl StoreError {
     /// A [`StoreErrorKind::Stale`] error.
     pub fn stale(message: impl Into<String>) -> Self {
         Self::new(StoreErrorKind::Stale, message)
+    }
+
+    /// A [`StoreErrorKind::Rejected`] error.
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self::new(StoreErrorKind::Rejected, message)
     }
 
     /// The failure category.
@@ -291,6 +299,22 @@ pub struct PrincipalRecord {
     /// MIT unparsed modifier principal bytes from `KRB5_TL_MOD_PRINC`, when
     /// the backend represents it.
     pub mod_by: Option<Vec<u8>>,
+    /// kadm5 password history; `None` when the backend does not store it
+    /// (the file and CockroachDB stores), which then ignore it on write.
+    pub password_history: Option<PasswordHistory>,
+}
+
+/// kadm5 password history, the `osa_princ_ent_rec` old-key queue
+/// (`lib/kadm5/srv/adb_xdr.c:55-96`, `svr_principal.c:1064-1208`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PasswordHistory {
+    /// kvno of the `kadmin/history` key the entries are encrypted in.
+    pub admin_history_kvno: u32,
+    /// Index in `old_keys` where the next entry is written.
+    pub old_key_next: u32,
+    /// One entry per old password: its keys as MIT key-data, encrypted in
+    /// the `kadmin/history` key.
+    pub old_keys: Vec<Vec<crate::kdc::kdb::mit::KeyData>>,
 }
 
 /// Administrative access to the authoritative store (docs/architecture §3).

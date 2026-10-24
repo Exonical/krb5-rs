@@ -140,7 +140,12 @@ fn init(
         ok(write_stash(&cfg.key_stash_file, realm, &key));
         println!("Stash {} written.", cfg.key_stash_file.display());
     }
-    let admin = Blocking::new(runtime(), store, cfg.supported_keysalts.clone());
+    let admin = Blocking::new(
+        runtime(),
+        store,
+        cfg.supported_keysalts.clone(),
+        cfg.master_key_type,
+    );
     ensure_init_principals(&admin, realm, &randkeys, &passwords);
 }
 
@@ -334,7 +339,12 @@ fn main() {
 
     let master = master_key(&cfg, &realm, master_password_file.as_deref());
     let store = ok(FileStore::open(&cfg.database_name, &master));
-    let admin = Blocking::new(runtime(), &store, cfg.supported_keysalts.clone());
+    let admin = Blocking::new(
+        runtime(),
+        &store,
+        cfg.supported_keysalts.clone(),
+        cfg.master_key_type,
+    );
     run_admin(&admin, &cmd, args, &realm);
 }
 
@@ -389,7 +399,12 @@ fn klmdb_command(
                 ok(write_stash(&cfg.key_stash_file, realm, &master));
                 println!("Stash {} written.", cfg.key_stash_file.display());
             }
-            let admin = Blocking::new(rt, store, cfg.supported_keysalts.clone());
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
             ensure_init_principals(&admin, realm, &randkeys, &passwords);
         }
         "create" => {
@@ -412,7 +427,12 @@ fn klmdb_command(
         _ => {
             let master = master_key(cfg, realm, global_master_password_file);
             let store = ok(LmdbStore::open(cfg, &master));
-            let admin = Blocking::new(rt, store, cfg.supported_keysalts.clone());
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
             run_admin(&admin, cmd, args, realm);
         }
     }
@@ -473,10 +493,11 @@ impl<S: AdminStore> Blocking<S> {
         rt: tokio::runtime::Runtime,
         store: S,
         keysalts: Vec<(i32, krb5_rs::crypto::SaltType)>,
+        master_key_type: i32,
     ) -> Self {
         Self {
             rt,
-            ops: AdminOps::new(store, keysalts),
+            ops: AdminOps::new(store, keysalts).with_history_enctype(master_key_type),
         }
     }
 
@@ -832,7 +853,12 @@ fn cockroach_command(
                 ok(write_stash(&cfg.key_stash_file, realm, &key));
                 println!("Stash {} written.", cfg.key_stash_file.display());
             }
-            let admin = Blocking::new(rt, store, cfg.supported_keysalts.clone());
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
             ensure_init_principals(&admin, realm, &randkeys, &passwords);
         }
         "database" => {
@@ -968,7 +994,12 @@ fn cockroach_command(
         _ => {
             let master = master_key(cfg, realm, global_master_password_file);
             let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
-            let admin = Blocking::new(rt, store, cfg.supported_keysalts.clone());
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
             run_admin(&admin, cmd, args, realm);
         }
     }

@@ -626,6 +626,7 @@ impl CockroachStore {
             last_pwd_change: last_pwd_change.map(kt),
             mod_time: mod_time.map(kt),
             mod_by: None,
+            password_history: None,
         })
     }
 
@@ -953,6 +954,7 @@ impl AdminStore for CockroachStore {
                         last_pwd_change: last_pwd.map(kt),
                         mod_time: mod_time.map(kt),
                         mod_by: None,
+                        password_history: None,
                     };
                     let unlock_before = rec.entry.last_admin_unlock.map(|t| t.timestamp());
                     {

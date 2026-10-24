@@ -413,6 +413,7 @@ impl FileStore {
                 last_admin_unlock: r.last_admin_unlock,
             },
             last_pwd_change: to_time(&r.last_pwd_change),
+            password_history: None,
             mod_time: to_time(&r.mod_time),
             mod_by: None,
         })
@@ -481,6 +482,12 @@ impl FileStore {
             }
         })?;
         Ok(LockGuard(path))
+    }
+
+    /// Take the write lock (`<path>.lock`) until the guard drops, so no
+    /// file-store writer changes the database meanwhile (klmdb migration).
+    pub fn write_lock(&self) -> Result<impl Drop, StoreError> {
+        self.lock()
     }
 
     /// Run `f` over the on-disk principal list under the write lock.

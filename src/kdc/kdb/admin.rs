@@ -10,13 +10,114 @@ use chrono::{DateTime, Utc};
 use super::file::FileStore;
 use crate::crypto::{enctype_name, SaltType};
 use crate::kdc::db::{keys_from_password, random_keys, PrincipalAttributes, PrincipalEntry};
+use crate::kdc::kdb::mit::{history_entry, history_key_matches, KeyData};
 use crate::kdc::policy::kerberos_time;
-use crate::kdc::store::{AdminStore, Policy, PrincipalRecord, StoreError};
+use crate::kdc::store::{
+    AdminStore, PasswordHistory, Policy, PrincipalRecord, StoreError, StoreErrorKind,
+};
 use crate::keytab::{FileKeytab, Keytab, KeytabEntry};
-use crate::types::{KerberosTime, PrincipalName};
+use crate::types::{EncryptionKey, KerberosString, KerberosTime, PrincipalName};
 
 fn err(msg: impl Into<String>) -> StoreError {
     StoreError::backend(msg)
+}
+
+/// kadm5 error texts (`lib/kadm5/kadm_err.et:29-37`).
+const PASS_Q_TOOSHORT: &str = "Password is too short";
+const PASS_Q_CLASS: &str = "Password does not contain enough character classes";
+const PASS_REUSE: &str = "Cannot reuse password";
+const PROTECT_PRINCIPAL: &str = "Cannot change protected principal";
+
+/// `aes256-cts-hmac-sha1-96`, MIT's default `master_key_type`.
+const DEFAULT_HISTORY_ENCTYPE: i32 = 18;
+
+/// The policy part of `passwd_check` (`check_against_policy`,
+/// `lib/kadm5/srv/server_misc.c:73-102`): the length in bytes, then the
+/// number of C-locale character classes (lower, upper, digit, punctuation,
+/// and everything else, including space and non-ASCII bytes).
+pub fn check_password(password: &str, policy: &Policy) -> Result<(), StoreError> {
+    if password.len() < policy.pw_min_length as usize {
+        return Err(StoreError::rejected(PASS_Q_TOOSHORT));
+    }
+    let mut classes = [false; 5];
+    for byte in password.bytes() {
+        let class = match byte {
+            b'a'..=b'z' => 0,
+            b'A'..=b'Z' => 1,
+            b'0'..=b'9' => 2,
+            0x21..=0x2f | 0x3a..=0x40 | 0x5b..=0x60 | 0x7b..=0x7e => 3,
+            _ => 4,
+        };
+        classes[class] = true;
+    }
+    if (classes.iter().filter(|&&c| c).count() as u32) < policy.pw_min_classes {
+        return Err(StoreError::rejected(PASS_Q_CLASS));
+    }
+    Ok(())
+}
+
+/// Add one password to the history queue (`add_to_history`,
+/// `lib/kadm5/srv/svr_principal.c:1091-1208`). The queue holds at most
+/// `pw_history_num - 1` entries; it is reset when the history key changed,
+/// grows by inserting at `old_key_next`, and keeps only the newest entries
+/// when the policy's history shrank.
+fn add_to_history(
+    hist: &mut PasswordHistory,
+    hist_kvno: u32,
+    pw_history_num: u32,
+    entry: Vec<KeyData>,
+) {
+    let nhist = pw_history_num;
+    if nhist <= 1 {
+        return;
+    }
+    if hist.admin_history_kvno != hist_kvno {
+        hist.old_keys.clear();
+        hist.old_key_next = 0;
+        hist.admin_history_kvno = hist_kvno;
+    }
+    let nkeys = hist.old_keys.len();
+    let mut knext = hist.old_key_next as usize;
+    let keep = nhist as usize - 1;
+    if nkeys + 1 < nhist as usize {
+        // Shift the entries from knext on forward to make room (:1119-1140).
+        hist.old_keys.insert(knext.min(nkeys), Vec::new());
+    } else if nkeys + 1 > nhist as usize {
+        // tmp[i] = old[(i + nkeys + knext - keep) % nkeys] (:1141-1184).
+        hist.old_keys = (0..keep)
+            .map(|i| hist.old_keys[(i + nkeys + knext - keep) % nkeys].clone())
+            .collect();
+        knext = 0;
+    }
+    if knext + 1 > hist.old_keys.len() {
+        knext = 0;
+    }
+    hist.old_keys[knext] = entry;
+    knext += 1;
+    if knext == keep {
+        knext = 0;
+    }
+    hist.old_key_next = knext as u32;
+}
+
+/// `kadmin/history` (`KADM5_HIST_PRINCIPAL`, `lib/kadm5/admin.h:66`).
+fn history_principal() -> PrincipalName {
+    let part = |s: &[u8]| KerberosString::from_bytes(s).expect("ASCII name component");
+    PrincipalName {
+        name_type: 1,
+        name_string: vec![part(b"kadmin"), part(b"history")],
+    }
+}
+
+/// Whether `name` is `kadmin/history`, comparing name components but not the
+/// name type, as `krb5_principal_compare` does (the realm is the one being
+/// administered).
+fn is_history_principal(name: &PrincipalName) -> bool {
+    name.name_string == history_principal().name_string
+}
+
+fn plus_seconds(time: i64, seconds: u32) -> KerberosTime {
+    kerberos_time(time + i64::from(seconds))
 }
 
 fn missing(what: impl std::fmt::Display) -> StoreError {
@@ -226,13 +327,76 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 pub struct AdminOps<S: AdminStore> {
     store: S,
     keysalts: Vec<(i32, SaltType)>,
+    history_enctype: i32,
 }
 
 impl<S: AdminStore> AdminOps<S> {
     /// Administer `store`, generating keys for `keysalts`
     /// (`supported_enctypes`).
     pub fn new(store: S, keysalts: Vec<(i32, SaltType)>) -> Self {
-        Self { store, keysalts }
+        Self {
+            store,
+            keysalts,
+            history_enctype: DEFAULT_HISTORY_ENCTYPE,
+        }
+    }
+
+    /// The enctype of a newly created `kadmin/history` key: MIT uses the
+    /// realm's `master_key_type` (`lib/kadm5/srv/server_kdb.c:154`).
+    pub fn with_history_enctype(mut self, enctype: i32) -> Self {
+        self.history_enctype = enctype;
+        self
+    }
+
+    /// The policy `name` refers to, if it exists; a missing policy counts as
+    /// none (`get_policy`, `svr_principal.c:103-118`).
+    async fn policy_named(&self, name: Option<&str>) -> Result<Option<Policy>, StoreError> {
+        match name {
+            Some(name) => self.store.get_policy(name).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The `kadmin/history` keys and their kvno, creating the principal on
+    /// first use (`kdb_get_hist_key`/`create_hist`,
+    /// `lib/kadm5/srv/server_kdb.c:141-223`).
+    async fn history_keys(&self, realm: &str) -> Result<(Vec<EncryptionKey>, u32), StoreError> {
+        let name = history_principal();
+        let record = match self.store.get_record(&name, realm).await? {
+            Some(record) => record,
+            None => {
+                // MIT sets max_life to KRB5_KDB_DISALLOW_ALL_TIX (0x40), i.e.
+                // 64 seconds, and re-randomizes the key to kvno 2 for pre-1.8
+                // compatibility (server_kdb.c:147-163); mirrored as is.
+                let entry = PrincipalEntry {
+                    name: name.clone(),
+                    realm: realm.to_owned(),
+                    attributes: PrincipalAttributes::empty(),
+                    max_life: Some(Duration::from_secs(0x40)),
+                    max_renewable_life: None,
+                    expiration: None,
+                    pw_expiration: None,
+                    keys: random_keys(2, &[self.history_enctype])
+                        .map_err(|e| err(e.to_string()))?,
+                    allowed_to_delegate_to: Vec::new(),
+                    allowed_to_delegate_from: Vec::new(),
+                    policy: None,
+                    security_epoch: 1,
+                    last_admin_unlock: None,
+                };
+                let now = Some(kerberos_time(Utc::now().timestamp()));
+                match self.store.create_principal(entry, now).await {
+                    Err(e) if e.kind() != StoreErrorKind::Conflict => return Err(e),
+                    _ => {}
+                }
+                self.require(&name, realm).await?
+            }
+        };
+        let kvno = record
+            .entry
+            .current_kvno()
+            .ok_or_else(|| err("History entry contains no key data"))?;
+        Ok((record.entry.keys.into_iter().map(|k| k.key).collect(), kvno))
     }
 
     async fn require(
@@ -329,6 +493,14 @@ impl<S: AdminStore> AdminOps<S> {
             return Err(duplicate(format!("{name}@{realm}")));
         }
         self.check_policy(opts).await?;
+        // svr_principal.c:364-374: a password must satisfy the policy.
+        let policy = match &opts.policy {
+            Some(Some(name)) => self.policy_named(Some(name)).await?,
+            _ => None,
+        };
+        if let (Some(pw), Some(policy)) = (password, &policy) {
+            check_password(pw, policy)?;
+        }
         let keys = match password {
             Some(pw) => keys_from_password(name, realm, pw, 1, &self.keysalts),
             None => random_keys(1, &self.etypes()),
@@ -350,9 +522,17 @@ impl<S: AdminStore> AdminOps<S> {
             keys,
         };
         Self::apply_options(&mut entry, opts);
+        let now = Utc::now().timestamp();
+        // svr_principal.c:406-412: without -pwexpire, the policy's
+        // pw_max_life sets the password expiration.
+        if opts.pw_expiration.is_none() {
+            if let Some(policy) = policy.filter(|p| p.pw_max_life != 0) {
+                entry.pw_expiration = Some(plus_seconds(now, policy.pw_max_life));
+            }
+        }
         entry.security_epoch = 1;
         self.store
-            .create_principal(entry, Some(kerberos_time(Utc::now().timestamp())))
+            .create_principal(entry, Some(kerberos_time(now)))
             .await
     }
 
@@ -379,9 +559,16 @@ impl<S: AdminStore> AdminOps<S> {
         }
     }
 
-    /// `cpw` (`kadm5_chpass_principal` / `kadm5_randkey_principal`): the new
-    /// keys get kvno = highest + 1; older keys are dropped unless
-    /// `keep_old`. Clears REQUIRES_PWCHANGE and records the password change.
+    /// `cpw` (`kadm5_chpass_principal_3`, `svr_principal.c:1219-1360`, and
+    /// `kadm5_randkey_principal_3`, `:1388-1497`): the new keys get kvno =
+    /// highest + 1; older keys are dropped unless `keep_old`. Clears
+    /// REQUIRES_PWCHANGE and records the password change.
+    ///
+    /// With a password and a policy, the password must satisfy the policy and
+    /// must not be the current one; where the backend stores kadm5 password
+    /// history (klmdb), it must not be in the history either, and the old
+    /// password is added to it. Either way the password expiration restarts
+    /// from the policy's `pw_max_life`, or is cleared without one.
     pub async fn change_password(
         &self,
         name: &PrincipalName,
@@ -389,13 +576,39 @@ impl<S: AdminStore> AdminOps<S> {
         password: Option<&str>,
         keep_old: bool,
     ) -> Result<u32, StoreError> {
+        let history_target = is_history_principal(name);
+        // svr_principal.c:1247-1249, 1430-1438.
+        if history_target && (password.is_some() || keep_old) {
+            return Err(StoreError::rejected(PROTECT_PRINCIPAL));
+        }
+        let current = self.require(name, realm).await?;
+        let policy_name = current.entry.policy.clone();
+        let policy = self.policy_named(policy_name.as_deref()).await?;
+        let mut hist = None;
+        if let (Some(pw), Some(policy)) = (password, &policy) {
+            // MIT fetches (creating) the history key before checking the
+            // password (svr_principal.c:1269-1284).
+            if current.password_history.is_some() {
+                hist = Some(self.history_keys(realm).await?);
+            }
+            check_password(pw, policy)?;
+        }
+
         let keysalts = self.keysalts.clone();
-        let etypes = self.etypes();
+        let mut etypes = self.etypes();
+        if history_target {
+            etypes.truncate(1);
+        }
         let callback_name = name.clone();
         let callback_realm = realm.to_owned();
         let password = password.map(str::to_owned);
         self.store
             .update_principal(name, realm, move |rec| {
+                if rec.entry.policy != policy_name {
+                    return Err(StoreError::conflict(
+                        "principal policy changed concurrently; retry",
+                    ));
+                }
                 let kvno = rec.entry.current_kvno().unwrap_or(0) + 1;
                 let mut keys = match password.as_deref() {
                     Some(pw) => {
@@ -404,6 +617,45 @@ impl<S: AdminStore> AdminOps<S> {
                     None => random_keys(kvno, &etypes),
                 }
                 .map_err(|e| err(e.to_string()))?;
+                if let (Some(_), Some(policy)) = (&password, &policy) {
+                    // check_pw_reuse against the current password
+                    // (svr_principal.c:1307-1312), then against the history
+                    // and add the current password to it (:1314-1333).
+                    let old_kvno = rec.entry.current_kvno();
+                    let current_keys: Vec<&EncryptionKey> = rec
+                        .entry
+                        .keys
+                        .iter()
+                        .filter(|k| Some(k.kvno) == old_kvno)
+                        .map(|k| &k.key)
+                        .collect();
+                    let reused = keys.iter().any(|new| {
+                        current_keys.iter().any(|old| {
+                            old.keytype == new.key.keytype && old.key_bytes() == new.key.key_bytes()
+                        })
+                    });
+                    if reused {
+                        return Err(StoreError::rejected(PASS_REUSE));
+                    }
+                    if let (true, Some(history), Some((hist_keys, hist_kvno))) = (
+                        policy.pw_history_num > 1,
+                        rec.password_history.as_mut(),
+                        &hist,
+                    ) {
+                        if history.admin_history_kvno == *hist_kvno
+                            && history.old_keys.iter().flatten().any(|data| {
+                                keys.iter()
+                                    .any(|new| history_key_matches(data, hist_keys, &new.key))
+                            })
+                        {
+                            return Err(StoreError::rejected(PASS_REUSE));
+                        }
+                        let entry = history_entry(&rec.entry, &hist_keys[0])?;
+                        if !entry.is_empty() {
+                            add_to_history(history, *hist_kvno, policy.pw_history_num, entry);
+                        }
+                    }
+                }
                 if keep_old {
                     keys.extend(rec.entry.keys.iter().cloned());
                 }
@@ -416,16 +668,24 @@ impl<S: AdminStore> AdminOps<S> {
                 // (svr_principal.c:1343, 1473); the counter lives in the KDC
                 // process here, so record an unlock time.
                 rec.entry.security_epoch += 1;
-                let now = kerberos_time(Utc::now().timestamp());
-                rec.entry.last_admin_unlock = Some(now);
-                rec.last_pwd_change = Some(now);
+                let now = Utc::now().timestamp();
+                // svr_principal.c:1306, 1335-1336, 1465-1467.
+                rec.entry.pw_expiration = policy
+                    .as_ref()
+                    .filter(|p| p.pw_max_life != 0)
+                    .map(|p| plus_seconds(now, p.pw_max_life));
+                rec.entry.last_admin_unlock = Some(kerberos_time(now));
+                rec.last_pwd_change = Some(kerberos_time(now));
                 Ok(())
             })
             .await
             .map(|updated| updated.entry.current_kvno().unwrap_or(0))
     }
 
-    /// `modprinc`.
+    /// `modprinc` (`kadm5_modify_principal`, `svr_principal.c:601-634`):
+    /// setting a policy restarts the password expiration from the last
+    /// password change and the policy's `pw_max_life` unless `-pwexpire` is
+    /// given; clearing the policy clears it, even over `-pwexpire`.
     pub async fn modify_principal(
         &self,
         name: &PrincipalName,
@@ -433,10 +693,29 @@ impl<S: AdminStore> AdminOps<S> {
         opts: &PrincipalOptions,
     ) -> Result<(), StoreError> {
         self.check_policy(opts).await?;
+        let new_policy = match &opts.policy {
+            Some(Some(name)) => self.policy_named(Some(name)).await?,
+            _ => None,
+        };
         let opts = opts.clone();
         self.store
             .update_principal(name, realm, move |rec| {
-                Self::apply_options(&mut rec.entry, &opts);
+                let had_policy = rec.entry.policy.is_some();
+                let bumped = Self::apply_options(&mut rec.entry, &opts);
+                let before = rec.entry.pw_expiration;
+                if opts.pw_expiration.is_none() {
+                    if let Some(policy) = &new_policy {
+                        let changed = rec.last_pwd_change.map_or(0, |t| t.timestamp());
+                        rec.entry.pw_expiration = (policy.pw_max_life != 0)
+                            .then(|| plus_seconds(changed, policy.pw_max_life));
+                    }
+                }
+                if matches!(opts.policy, Some(None)) && had_policy {
+                    rec.entry.pw_expiration = None;
+                }
+                if !bumped && rec.entry.pw_expiration != before {
+                    rec.entry.security_epoch += 1;
+                }
                 Ok(())
             })
             .await?;
@@ -856,4 +1135,274 @@ pub fn attribute_names(attrs: PrincipalAttributes) -> String {
         .map(|(_, n)| *n)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kdc::kdb::master_key_from_password;
+
+    fn policy(min_length: u32, min_classes: u32) -> Policy {
+        Policy {
+            name: "p".into(),
+            pw_min_length: min_length,
+            pw_min_classes: min_classes,
+            ..Policy::default()
+        }
+    }
+
+    fn rejected_with(result: Result<impl std::fmt::Debug, StoreError>, text: &str) {
+        let error = result.expect_err("expected a policy rejection");
+        assert_eq!(error.kind(), StoreErrorKind::Rejected, "{error}");
+        assert_eq!(error.message(), text);
+    }
+
+    #[test]
+    fn password_length_is_checked_in_bytes_before_classes() {
+        rejected_with(check_password("abcdefg", &policy(8, 0)), PASS_Q_TOOSHORT);
+        check_password("abcdefgh", &policy(8, 0)).expect("8 bytes");
+        // Two bytes in UTF-8: one character, but long enough at length 2.
+        check_password("\u{e9}", &policy(2, 0)).expect("UTF-8 counts bytes");
+        rejected_with(check_password("ab", &policy(8, 4)), PASS_Q_TOOSHORT);
+    }
+
+    #[test]
+    fn password_classes_follow_the_c_locale() {
+        let classes = |pw: &str| {
+            (1..=6)
+                .take_while(|&n| check_password(pw, &policy(0, n)).is_ok())
+                .last()
+                .unwrap_or(0)
+        };
+        assert_eq!(classes("lower"), 1);
+        assert_eq!(classes("lowerUPPER"), 2);
+        assert_eq!(classes("lowerUPPER123"), 3);
+        for punct in ["!", "/", ":", "@", "[", "`", "{", "~"] {
+            assert_eq!(classes(punct), 1, "{punct}");
+            assert_eq!(classes(&format!("a{punct}")), 2, "{punct}");
+        }
+        // Space, controls and non-ASCII bytes are the fifth class.
+        assert_eq!(classes("a "), 2);
+        assert_eq!(classes("a\u{e9}"), 2);
+        assert_eq!(classes("aA1! "), 5);
+        rejected_with(check_password("aaaaaaaa", &policy(0, 2)), PASS_Q_CLASS);
+    }
+
+    fn key(tag: u8) -> Vec<KeyData> {
+        vec![KeyData {
+            ver: 2,
+            kvno: u16::from(tag),
+            fields: vec![(18, vec![tag]), (0, Vec::new())],
+        }]
+    }
+
+    fn tags(hist: &PasswordHistory) -> Vec<u8> {
+        hist.old_keys.iter().map(|e| e[0].fields[0].1[0]).collect()
+    }
+
+    #[test]
+    fn history_queue_grows_wraps_and_resets_like_mit() {
+        // Traced through svr_principal.c:1091-1208 with pw_history_num 3,
+        // i.e. at most 2 stored passwords.
+        let mut hist = PasswordHistory::default();
+        add_to_history(&mut hist, 2, 3, key(b'A'));
+        assert_eq!((tags(&hist), hist.old_key_next), (b"A".to_vec(), 1));
+        add_to_history(&mut hist, 2, 3, key(b'B'));
+        assert_eq!((tags(&hist), hist.old_key_next), (b"AB".to_vec(), 0));
+        add_to_history(&mut hist, 2, 3, key(b'C'));
+        assert_eq!((tags(&hist), hist.old_key_next), (b"CB".to_vec(), 1));
+        add_to_history(&mut hist, 2, 3, key(b'D'));
+        assert_eq!((tags(&hist), hist.old_key_next), (b"CD".to_vec(), 0));
+        // pw_history_num 1 only checks the current password: no change.
+        add_to_history(&mut hist, 2, 1, key(b'X'));
+        assert_eq!((tags(&hist), hist.old_key_next), (b"CD".to_vec(), 0));
+        // A new history key restarts the queue (:1106-1114).
+        add_to_history(&mut hist, 3, 3, key(b'E'));
+        assert_eq!((tags(&hist), hist.old_key_next), (b"E".to_vec(), 1));
+        assert_eq!(hist.admin_history_kvno, 3);
+    }
+
+    #[test]
+    fn history_queue_grows_mid_queue_and_shrinks_to_the_newest() {
+        // [C, B] with next 1 (C newest); history grows to 4: D is inserted
+        // at index 1 and B, the oldest, is overwritten next.
+        let mut hist = PasswordHistory {
+            admin_history_kvno: 2,
+            old_key_next: 1,
+            old_keys: vec![key(b'C'), key(b'B')],
+        };
+        add_to_history(&mut hist, 2, 4, key(b'D'));
+        assert_eq!((tags(&hist), hist.old_key_next), (b"CDB".to_vec(), 2));
+
+        // [E, B, C, D] with next 1 (E newest, D before it). Shrinking to 3
+        // copies old[(i + 4 + 1 - 2) % 4] = [D, E], then F replaces D.
+        let mut hist = PasswordHistory {
+            admin_history_kvno: 2,
+            old_key_next: 1,
+            old_keys: vec![key(b'E'), key(b'B'), key(b'C'), key(b'D')],
+        };
+        add_to_history(&mut hist, 2, 3, key(b'F'));
+        assert_eq!((tags(&hist), hist.old_key_next), (b"FE".to_vec(), 1));
+    }
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("krb5rs_admin_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("principal")
+    }
+
+    fn file_store(tag: &str) -> FileStore {
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        FileStore::create(&temp(tag), "R", &master).expect("create")
+    }
+
+    fn with_policy(name: &str) -> PrincipalOptions {
+        PrincipalOptions {
+            policy: Some(Some(name.into())),
+            ..PrincipalOptions::default()
+        }
+    }
+
+    const DAY: u32 = 86_400;
+
+    #[test]
+    fn file_store_enforces_policy_quality_and_current_password_reuse() {
+        let store = file_store("quality");
+        let admin = Admin::new(&store, vec![(18, SaltType::Normal)]);
+        admin
+            .add_policy(Policy {
+                name: "strict".into(),
+                pw_min_length: 8,
+                pw_min_classes: 2,
+                pw_history_num: 3,
+                ..Policy::default()
+            })
+            .expect("policy");
+        let alice = PrincipalName::new_principal("alice");
+        rejected_with(
+            admin.add_principal(&alice, "R", Some("Short1"), &with_policy("strict")),
+            PASS_Q_TOOSHORT,
+        );
+        assert!(store.get_record(&alice, "R").expect("read").is_none());
+        admin
+            .add_principal(&alice, "R", Some("Longer-pw1"), &with_policy("strict"))
+            .expect("good password");
+        rejected_with(
+            admin.change_password(&alice, "R", Some("alllowercase"), false),
+            PASS_Q_CLASS,
+        );
+        rejected_with(
+            admin.change_password(&alice, "R", Some("Longer-pw1"), false),
+            PASS_REUSE,
+        );
+        admin
+            .change_password(&alice, "R", Some("Another-pw2"), false)
+            .expect("new password");
+        // The file store keeps no history, so only the current password is
+        // refused.
+        admin
+            .change_password(&alice, "R", Some("Longer-pw1"), false)
+            .expect("no deep history on the file store");
+        // Without a policy any password goes.
+        let bob = PrincipalName::new_principal("bob");
+        admin
+            .add_principal(&bob, "R", Some("x"), &PrincipalOptions::default())
+            .expect("no policy");
+        admin
+            .change_password(&bob, "R", Some("x"), false)
+            .expect("no policy, no reuse check");
+    }
+
+    #[test]
+    fn password_expiration_follows_the_policy() {
+        let store = file_store("pwexpire");
+        let admin = Admin::new(&store, vec![(18, SaltType::Normal)]);
+        admin
+            .add_policy(Policy {
+                name: "expiring".into(),
+                pw_max_life: DAY,
+                ..Policy::default()
+            })
+            .expect("policy");
+        let alice = PrincipalName::new_principal("alice");
+        let expiry = |admin: &Admin| {
+            let record = admin.get_principal(&alice, "R").expect("alice");
+            (
+                record.entry.pw_expiration.map(|t| t.timestamp()),
+                record.last_pwd_change.map(|t| t.timestamp()).unwrap_or(0),
+            )
+        };
+        let near = |(expiry, changed): (Option<i64>, i64)| {
+            expiry.is_some_and(|e| e - changed == i64::from(DAY))
+        };
+
+        admin
+            .add_principal(&alice, "R", None, &with_policy("expiring"))
+            .expect("add");
+        assert!(near(expiry(&admin)), "{:?}", expiry(&admin));
+
+        let explicit = PrincipalOptions {
+            pw_expiration: Some(Some(kerberos_time(2_000_000_000))),
+            ..PrincipalOptions::default()
+        };
+        admin
+            .modify_principal(&alice, "R", &explicit)
+            .expect("pwexpire");
+        assert_eq!(expiry(&admin).0, Some(2_000_000_000));
+
+        admin
+            .change_password(&alice, "R", None, false)
+            .expect("randkey");
+        assert!(near(expiry(&admin)), "randkey restarts it");
+
+        admin
+            .modify_principal(&alice, "R", &explicit)
+            .expect("pwexpire");
+        admin
+            .modify_principal(&alice, "R", &with_policy("expiring"))
+            .expect("set policy");
+        assert!(near(expiry(&admin)), "setting the policy restarts it");
+
+        let clear = PrincipalOptions {
+            policy: Some(None),
+            pw_expiration: Some(Some(kerberos_time(2_000_000_000))),
+            ..PrincipalOptions::default()
+        };
+        admin
+            .modify_principal(&alice, "R", &clear)
+            .expect("clear policy");
+        assert_eq!(expiry(&admin).0, None, "clearing wins over -pwexpire");
+
+        admin
+            .modify_principal(&alice, "R", &explicit)
+            .expect("pwexpire");
+        admin
+            .change_password(&alice, "R", None, false)
+            .expect("randkey");
+        assert_eq!(expiry(&admin).0, None, "no policy: randkey clears it");
+    }
+
+    #[test]
+    fn history_principal_is_protected() {
+        let store = file_store("protect");
+        let admin = Admin::new(&store, vec![(18, SaltType::Normal), (17, SaltType::Normal)]);
+        let hist = history_principal();
+        admin
+            .add_principal(&hist, "R", None, &PrincipalOptions::default())
+            .expect("add kadmin/history");
+        rejected_with(
+            admin.change_password(&hist, "R", Some("pw"), false),
+            PROTECT_PRINCIPAL,
+        );
+        rejected_with(
+            admin.change_password(&hist, "R", None, true),
+            PROTECT_PRINCIPAL,
+        );
+        admin
+            .change_password(&hist, "R", None, false)
+            .expect("randkey");
+        let keys = admin.get_principal(&hist, "R").expect("hist").entry.keys;
+        assert_eq!(keys.len(), 1, "randkey gives the history principal one key");
+    }
 }

@@ -795,8 +795,14 @@ fn policies_persist_and_follow_mit_kadmin_rules() {
         policy: Some(Some("strict".into())),
         ..PrincipalOptions::default()
     };
-    admin
+    // The policy's minimum length applies (server_misc.c:73-102).
+    let short = admin
         .add_principal(&name("x"), REALM, Some("pw"), &under)
+        .expect_err("password shorter than pw_min_length");
+    assert_eq!(short.kind(), krb5_rs::kdc::StoreErrorKind::Rejected);
+    assert_eq!(short.message(), "Password is too short");
+    admin
+        .add_principal(&name("x"), REALM, Some("long-enough-pw"), &under)
         .expect("addprinc -policy");
     assert!(krb5_rs::kdc::kdb::admin::format_principal(
         &admin.get_principal(&name("x"), REALM).expect("principal")

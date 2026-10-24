@@ -97,7 +97,15 @@ The principal/policy environment is `<database_name>.mdb`; lockout records
 live separately in `<database_name>.lockout.mdb` and are always unsynced. A
 krb5-rs file database is automatically converted when klmdb is selected and
 the `.mdb` file is absent; the original is retained as
-`<database_name>.krb5rs-file.bak`.
+`<database_name>.krb5rs-file.bak`. An interrupted conversion is redone or
+finished on the next start.
+
+`krb5-rs-kdb` enforces password policies (minimum length and character
+classes, no reuse of the current password, password expiration from
+`pw_max_life`) for every database. With klmdb it also keeps MIT's password
+history, so a password refused by MIT's `kadmin.local` is refused by
+`krb5-rs-kdb` and vice versa; the file and CockroachDB databases keep no
+history beyond the current password.
 The optional realm `default_principal_expiration` value is applied to the
 initial `K/M` and `krbtgt` records; it defaults to `never`.
 Bootstrap records use MIT's `db_creation@REALM` modifier; later mutations

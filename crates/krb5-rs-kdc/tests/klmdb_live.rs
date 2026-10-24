@@ -305,6 +305,46 @@ env KRB5_KDC_PROFILE="$MIT_DIR/kdc.conf" KRB5_CONFIG="$MIT_DIR/krb5.conf" \
   > "$MIT_DIR/history.log" 2>&1 || true
 grep -qi 'Cannot reuse password' "$MIT_DIR/history.log"
 
+# Password policy: krb5-rs applies MIT's quality rules and shares MIT's
+# password history in both directions.
+rs_cpw() {
+  printf '%s\n' "$3" | rs_kdb "$1" cpw "$2" >/dev/null
+}
+rs_cpw_fails() {
+  local dir=$1 name=$2 password=$3 text=$4
+  if printf '%s\n' "$password" | rs_kdb "$dir" cpw "$name" > "$dir/rs-cpw.log" 2>&1; then
+    echo "krb5-rs accepted password $password for $name" >&2
+    exit 1
+  fi
+  if ! grep -q "$text" "$dir/rs-cpw.log"; then
+    cat "$dir/rs-cpw.log" >&2
+    exit 1
+  fi
+}
+mit_admin "$MIT_DIR" 'add_policy -minlength 8 -minclasses 2 -history 3 -maxlife 1d strict-policy' >/dev/null
+mit_addprinc "$MIT_DIR" carol 'Carol-Password-0'
+mit_admin "$MIT_DIR" 'modprinc -policy strict-policy carol' >/dev/null
+rs_cpw_fails "$MIT_DIR" carol 'Sh0rt' 'Password is too short'
+rs_cpw_fails "$MIT_DIR" carol 'alllowercase' 'Password does not contain enough character classes'
+rs_cpw "$MIT_DIR" carol 'Carol-Password-A'
+rs_cpw "$MIT_DIR" carol 'Carol-Password-B'
+mit_admin "$MIT_DIR" 'cpw -pw Carol-Password-A carol' > "$MIT_DIR/carol-mit.log" 2>&1 || true
+if ! grep -qi 'Cannot reuse password' "$MIT_DIR/carol-mit.log"; then
+  cat "$MIT_DIR/carol-mit.log" >&2
+  echo "MIT accepted a password krb5-rs put in the history" >&2
+  exit 1
+fi
+mit_admin "$MIT_DIR" 'cpw -pw Carol-Password-X carol' >/dev/null 2>&1
+mit_admin "$MIT_DIR" 'cpw -pw Carol-Password-Y carol' >/dev/null 2>&1
+rs_cpw_fails "$MIT_DIR" carol 'Carol-Password-X' 'Cannot reuse password'
+rs_cpw "$MIT_DIR" carol 'Carol-Password-Z'
+mit_admin "$MIT_DIR" 'getprinc carol' > "$MIT_DIR/carol-getprinc.log"
+if ! grep 'Password expiration date' "$MIT_DIR/carol-getprinc.log" | grep -vq '\[never\]'; then
+  cat "$MIT_DIR/carol-getprinc.log" >&2
+  echo "krb5-rs cpw did not set the policy's password expiration" >&2
+  exit 1
+fi
+
 rs_kdc_start "$MIT_DIR"
 authenticated=0
 for attempt in $(seq 1 12); do
