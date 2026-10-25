@@ -364,12 +364,22 @@ impl RealmConfig {
             .or_else(|| r("database_name"))
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("{KDC_DIR}/principal")));
-        let ulogsize = ["iprop_ulogsize", "iprop_master_ulogsize"]
+        let ulogsize = match ["iprop_ulogsize", "iprop_master_ulogsize"]
             .iter()
-            .filter_map(|k| r(k).and_then(|v| v.trim().parse::<i32>().ok()))
-            .find(|&v| v > 0)
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(DEF_ULOGENTRIES);
+            .find_map(|k| r(k).map(|v| (*k, v)))
+        {
+            None => DEF_ULOGENTRIES,
+            Some((key, value)) => value
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|&v| v > 0)
+                .ok_or_else(|| {
+                    ConfigError::Invalid(format!(
+                        "{key} must be a positive number of entries, not {value:?}"
+                    ))
+                })?,
+        };
         let iprop = IpropConfig {
             enabled: kdc_conf.get_boolean(&["realms", realm, "iprop_enable"], false)?,
             logfile: r("iprop_logfile").map(PathBuf::from).unwrap_or_else(|| {
@@ -533,6 +543,20 @@ default_principal_flags = +preauth\n    }\n";
         assert!(cfg.udp_listen.iter().all(|a| a.port() == 88));
         assert_eq!(cfg.tcp_listen, cfg.udp_listen);
         assert_eq!(cfg.master_key_type, 18);
+    }
+
+    #[test]
+    fn invalid_iprop_ulogsize_is_an_error() {
+        for bad in ["0", "-5", "lots"] {
+            let conf = format!("[realms]\n R = {{\n  iprop_ulogsize = {bad}\n }}\n");
+            assert!(
+                RealmConfig::from_profiles(&profile(&conf), None, "R").is_err(),
+                "{bad}"
+            );
+        }
+        let conf = "[realms]\n R = {\n  iprop_ulogsize = 42\n }\n";
+        let cfg = RealmConfig::from_profiles(&profile(conf), None, "R").expect("config");
+        assert_eq!(cfg.iprop.ulogsize, 42);
     }
 
     #[test]

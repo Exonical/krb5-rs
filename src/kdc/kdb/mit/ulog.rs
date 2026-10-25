@@ -754,7 +754,7 @@ fn changed_attrs(current: &MitEntry, new: &MitEntry) -> Vec<i32> {
             .key_data
             .iter()
             .zip(&new.key_data)
-            .any(|(a, b)| a.kvno != b.kvno)
+            .any(|(a, b)| a != b)
     {
         attrs.push(9);
     }
@@ -1017,6 +1017,14 @@ pub fn read_entry(
 pub struct Ulog {
     file: File,
     entries: u32,
+    writer: std::sync::Mutex<()>,
+}
+
+/// The update log held exclusively, by this thread and this process, so a
+/// database write and its log entry are ordered together.
+pub struct UlogLock<'a> {
+    _file: Locked<'a>,
+    _writer: std::sync::MutexGuard<'a, ()>,
 }
 
 impl Ulog {
@@ -1033,7 +1041,11 @@ impl Ulog {
             .mode(0o600)
             .open(path)
             .map_err(|e| io_error(&format!("opening ulog {}", path.display()), e))?;
-        let ulog = Self { file, entries };
+        let ulog = Self {
+            file,
+            entries,
+            writer: std::sync::Mutex::new(()),
+        };
         if !exists {
             ulog.extend_to(HEADER_SIZE + u64::from(entries) * u64::from(ULOG_BLOCK))?;
         }
@@ -1249,7 +1261,28 @@ impl Ulog {
     /// `ulog_add_update` (`kdb_log.c:361-385`): assign the next serial number
     /// and the current time to `upd` and append it.
     pub fn add_update(&self, upd: &mut Update) -> Result<(), StoreError> {
-        let _lock = Locked::new(&self.file, FlockOperation::LockExclusive)?;
+        let held = self.lock()?;
+        self.add_update_locked(&held, upd)
+    }
+
+    /// Hold the log exclusively until the returned guard is dropped.
+    pub fn lock(&self) -> Result<UlogLock<'_>, StoreError> {
+        let writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(UlogLock {
+            _file: Locked::new(&self.file, FlockOperation::LockExclusive)?,
+            _writer: writer,
+        })
+    }
+
+    /// [`Ulog::add_update`] while `held` is already held.
+    pub fn add_update_locked(
+        &self,
+        _held: &UlogLock<'_>,
+        upd: &mut Update,
+    ) -> Result<(), StoreError> {
         let mut hdr = read_header(&self.file)?;
         if hdr.last_sno == u32::MAX {
             hdr = self.reset()?;
@@ -1311,11 +1344,18 @@ impl Ulog {
         &self,
         last: &Last,
     ) -> Result<(UpdateStatus, Vec<Update>, Last), StoreError> {
-        let _lock = Locked::new(&self.file, FlockOperation::LockShared)?;
+        let mut lock = Locked::new(&self.file, FlockOperation::LockShared)?;
         let mut hdr = read_header(&self.file)?;
         if hdr.state != KDB_STABLE {
-            hdr = self.reset()?;
+            // Reset only under the exclusive lock so no reader sees it half done.
+            drop(lock);
+            lock = Locked::new(&self.file, FlockOperation::LockExclusive)?;
+            hdr = read_header(&self.file)?;
+            if hdr.state != KDB_STABLE {
+                hdr = self.reset()?;
+            }
         }
+        let _lock = lock;
         let status = self.sno_status(&hdr, last)?;
         if status != UpdateStatus::Ok {
             return Ok((status, Vec::new(), Last::default()));
@@ -1344,6 +1384,27 @@ impl Ulog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_changes_without_a_new_kvno_are_logged() {
+        let current = mit_entry(b"alice");
+        let mut changed = current.clone();
+        if changed.key_data.is_empty() {
+            changed.key_data.push(KeyData {
+                ver: 1,
+                kvno: 1,
+                fields: vec![(18, vec![1; 40])],
+            });
+        } else {
+            changed.key_data[0].fields[0].1[0] ^= 1;
+        }
+        let update = update_from_entry(Some(&current), &changed);
+        assert!(
+            update.values.iter().any(|v| matches!(v, Value::KeyData(_))),
+            "{:?}",
+            update.values
+        );
+    }
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ulog-test-{}-{name}", std::process::id()));
