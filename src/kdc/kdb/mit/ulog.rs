@@ -861,6 +861,8 @@ struct Shared {
 #[derive(Default)]
 struct Gate {
     owner: Option<std::thread::ThreadId>,
+    shared_guards: u32,
+    exclusive_guards: u32,
     exclusive: bool,
 }
 
@@ -874,11 +876,14 @@ fn gate(shared: &Shared) -> std::sync::MutexGuard<'_, Gate> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The log locked by this thread; nested locks on the same thread only
-/// strengthen the outer lock and restore it when dropped.
+/// The log locked by this thread. Guards on one thread nest in any drop
+/// order: the file lock is exclusive while any exclusive guard lives and is
+/// released with the last guard. Guards are not `Send`, so the owning
+/// thread always holds them.
 struct Locked<'a> {
     shared: &'a Shared,
-    outer_exclusive: Option<bool>,
+    exclusive: bool,
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl<'a> Locked<'a> {
@@ -886,34 +891,29 @@ impl<'a> Locked<'a> {
         let me = std::thread::current().id();
         let exclusive = op == FlockOperation::LockExclusive;
         let mut g = gate(shared);
-        if g.owner == Some(me) {
-            let outer = g.exclusive;
-            if exclusive && !outer {
-                fcntl_lock(&shared.file, op).map_err(|e| io_error("locking ulog", e.into()))?;
-                g.exclusive = true;
+        if g.owner != Some(me) {
+            while g.owner.is_some() {
+                g = shared
+                    .freed
+                    .wait(g)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            return Ok(Self {
-                shared,
-                outer_exclusive: Some(outer),
-            });
+            fcntl_lock(&shared.file, op).map_err(|e| io_error("locking ulog", e.into()))?;
+            g.owner = Some(me);
+            g.exclusive = exclusive;
+        } else if exclusive && !g.exclusive {
+            fcntl_lock(&shared.file, op).map_err(|e| io_error("locking ulog", e.into()))?;
+            g.exclusive = true;
         }
-        while g.owner.is_some() {
-            g = shared
-                .freed
-                .wait(g)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        g.owner = Some(me);
-        g.exclusive = exclusive;
-        drop(g);
-        if let Err(e) = fcntl_lock(&shared.file, op) {
-            *gate(shared) = Gate::default();
-            shared.freed.notify_one();
-            return Err(io_error("locking ulog", e.into()));
+        if exclusive {
+            g.exclusive_guards += 1;
+        } else {
+            g.shared_guards += 1;
         }
         Ok(Self {
             shared,
-            outer_exclusive: None,
+            exclusive,
+            _not_send: std::marker::PhantomData,
         })
     }
 }
@@ -921,19 +921,19 @@ impl<'a> Locked<'a> {
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
         let mut g = gate(self.shared);
-        match self.outer_exclusive {
-            Some(outer) => {
-                if g.exclusive && !outer {
-                    let _ = fcntl_lock(&self.shared.file, FlockOperation::LockShared);
-                    g.exclusive = false;
-                }
-            }
-            None => {
-                let _ = fcntl_lock(&self.shared.file, FlockOperation::Unlock);
-                *g = Gate::default();
-                drop(g);
-                self.shared.freed.notify_one();
-            }
+        if self.exclusive {
+            g.exclusive_guards -= 1;
+        } else {
+            g.shared_guards -= 1;
+        }
+        if g.exclusive_guards + g.shared_guards == 0 {
+            let _ = fcntl_lock(&self.shared.file, FlockOperation::Unlock);
+            *g = Gate::default();
+            drop(g);
+            self.shared.freed.notify_one();
+        } else if g.exclusive_guards == 0 && g.exclusive {
+            let _ = fcntl_lock(&self.shared.file, FlockOperation::LockShared);
+            g.exclusive = false;
         }
     }
 }
@@ -1668,6 +1668,33 @@ mod tests {
         assert_eq!(&b[32..36], &8u32.to_ne_bytes());
         assert_eq!(&b[38..40], &ULOG_BLOCK.to_ne_bytes());
         assert_eq!(Header::decode(&b), h);
+    }
+
+    #[test]
+    fn nested_guards_hold_the_log_until_the_last_one_drops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let path = std::env::temp_dir().join(format!("ulog-nested-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let a = Ulog::map(&path, 8).expect("map a");
+        let b = Ulog::map(&path, 8).expect("map b");
+        let released = AtomicBool::new(false);
+        let first = a.lock().expect("first");
+        let second = a.lock().expect("second");
+        drop(first);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                let _held = b.lock().expect("lock b");
+                released.load(Ordering::SeqCst)
+            });
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            released.store(true, Ordering::SeqCst);
+            drop(second);
+            assert!(
+                waiter.join().expect("join"),
+                "b locked while second was live"
+            );
+        });
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
