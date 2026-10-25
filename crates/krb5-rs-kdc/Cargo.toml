@@ -57,6 +57,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 prometheus-client = "=0.25.1"
 regex = "1"
+sha2 = "0.11"
 chrono = { version = "0.4.38", default-features = false, features = ["clock"] }
 
 [dev-dependencies]

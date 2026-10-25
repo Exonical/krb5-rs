@@ -345,6 +345,19 @@ ACL restrictions are not supported (restrictions are parsed and ignored, as
 they never apply to iprop or kpasswd); `-port` is accepted and ignored because it
 sets only the kadmin port; klmdb only.
 
+Deliberate iprop-service deviations from MIT `ipropd_svc.c`:
+
+- `IPROP_FULL_RESYNC[_EXT]` is only honored for `kiprop/<host>` clients; any
+  other principal with the `p` permission gets `UPDATE_PERM_DENIED`.
+- Each replica's resync dump goes to `<dump-file>.<host>-<digest>`: up to
+  64 characters of the host (characters outside `[A-Za-z0-9.-]` become `_`)
+  and the first 8 bytes of the host's SHA-256 in hex, so concurrent resyncs
+  never share one file and long hostnames stay within filename limits.
+- `iprop_listen` entries may also be separated by tabs.
+- Not yet changed: LMDB reads for service keys and ulog entries still run on
+  the event-loop thread, as in MIT's single-threaded kadmind; moving them off
+  needs a `Send` key source for the GSS acceptor.
+
 ### kpasswd service
 
 Without `-proponly`, `krb5-rs-kadmind` serves MIT's password-change protocol
