@@ -133,6 +133,7 @@ fn init(
         .unwrap_or_else(|| fail("init requires --master-password-file"));
     let key = master_key(cfg, realm, Some(master_file));
     let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
+    let mut created = false;
     let store = if cfg.database_name.exists() {
         ok(FileStore::open(&cfg.database_name, &key))
     } else {
@@ -143,6 +144,7 @@ fn init(
             &etypes,
         ));
         println!("Database {} created.", cfg.database_name.display());
+        created = true;
         store
     };
     if stash && !cfg.key_stash_file.exists() {
@@ -155,6 +157,9 @@ fn init(
         cfg.supported_keysalts.clone(),
         cfg.master_key_type,
     );
+    if created {
+        add_admin_princs(&admin, realm);
+    }
     ensure_init_principals(&admin, realm, &randkeys, &passwords);
 }
 
@@ -332,12 +337,18 @@ fn main() {
                 cfg.master_key_type,
             ));
             let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
-            ok(FileStore::create_with(
+            let store = ok(FileStore::create_with(
                 &cfg.database_name,
                 &realm,
                 &key,
                 &etypes,
             ));
+            let admin =
+                krb5_rs::kdc::kdb::admin::Admin::new(&store, cfg.supported_keysalts.clone());
+            for (name, attrs, life) in ADMIN_PRINCS {
+                let (name, r) = ok(parse_principal(name, &realm));
+                ok(admin.add_principal(&name, &r, None, &admin_princ_options(attrs, life)));
+            }
             if stash {
                 ok(write_stash(&cfg.key_stash_file, &realm, &key));
             }
@@ -714,9 +725,9 @@ fn klmdb_command(
             let store = if mdb.exists() || cfg.database_name.exists() {
                 ok(LmdbStore::open(cfg, &master))
             } else {
-                let store = ok(LmdbStore::create(cfg, &master));
+                create_klmdb(runtime(), cfg, realm, &master);
                 println!("Database {}.mdb created.", cfg.database_name.display());
-                store
+                ok(LmdbStore::open(cfg, &master))
             };
             if stash && !cfg.key_stash_file.exists() {
                 ok(write_stash(&cfg.key_stash_file, realm, &master));
@@ -737,7 +748,7 @@ fn klmdb_command(
                 _ => usage(),
             };
             let master = master_key_or_prompt(cfg, realm, global_master_password_file);
-            ok(LmdbStore::create(cfg, &master));
+            create_klmdb(rt, cfg, realm, &master);
             if stash {
                 ok(write_stash(&cfg.key_stash_file, realm, &master));
             }
@@ -920,6 +931,71 @@ impl<S: AdminStore> Blocking<S> {
         randomize: bool,
     ) -> Result<u32, StoreError> {
         self.rt.block_on(self.ops.ktadd(n, r, keytab, randomize))
+    }
+}
+
+/// `kdb5_util create` for klmdb (`kdb5_create.c:255-335`): `K/M`, `krbtgt`
+/// and the `kadm5_create` principals. As in MIT, the update log is left
+/// holding only its dummy entry.
+#[cfg(feature = "klmdb")]
+fn create_klmdb(
+    rt: tokio::runtime::Runtime,
+    cfg: &RealmConfig,
+    realm: &str,
+    master: &krb5_rs::types::EncryptionKey,
+) {
+    let mut unlogged = cfg.clone();
+    unlogged.iprop.enabled = false;
+    let store = ok(LmdbStore::create(&unlogged, master));
+    add_admin_princs(
+        &Blocking::new(
+            rt,
+            store,
+            cfg.supported_keysalts.clone(),
+            cfg.master_key_type,
+        ),
+        realm,
+    );
+    if cfg.iprop.enabled {
+        ok(Ulog::map(&cfg.iprop.logfile, cfg.iprop.ulogsize));
+    }
+}
+
+/// `add_admin_princs` (`kadmin/dbutil/kadm5_create.c:139-154`): the
+/// principals `kdb5_util create` adds after `K/M` and `krbtgt`, with random
+/// keys, attributes and max life (`ADMIN_LIFETIME`, `CHANGEPW_LIFETIME`).
+const ADMIN_PRINCS: [(&str, u32, u64); 2] = [
+    // DISALLOW_TGT_BASED | LOCKDOWN_KEYS
+    ("kadmin/admin", 0x0000_0004 | 0x0080_0000, 60 * 60 * 3),
+    // DISALLOW_TGT_BASED | PWCHANGE_SERVICE | LOCKDOWN_KEYS
+    (
+        "kadmin/changepw",
+        0x0000_0004 | 0x0000_2000 | 0x0080_0000,
+        60 * 5,
+    ),
+];
+
+/// `add_admin_princ` (`kadm5_create.c:185-222`).
+fn admin_princ_options(attrs: u32, life: u64) -> PrincipalOptions {
+    PrincipalOptions {
+        attributes: AttrChange {
+            set: attrs,
+            clear: 0,
+        },
+        max_life: Some(Some(std::time::Duration::from_secs(life))),
+        ..PrincipalOptions::default()
+    }
+}
+
+/// `add_admin_princs`; an existing principal is kept (`KADM5_DUP`).
+fn add_admin_princs<S: AdminStore>(admin: &Blocking<S>, realm: &str) {
+    for (name, attrs, life) in ADMIN_PRINCS {
+        let (name, r) = ok(parse_principal(name, realm));
+        match admin.add_principal(&name, &r, None, &admin_princ_options(attrs, life)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == StoreErrorKind::Conflict => {}
+            Err(e) => fail(format!("{e} while creating principal {name}@{r}")),
+        }
     }
 }
 
