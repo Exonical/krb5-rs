@@ -440,6 +440,11 @@ impl GssServer {
         if gc.version != RPCSEC_GSS_VERSION {
             return auth_error(h.xid, AuthStat::BadCred);
         }
+        // One security context per connection: a second INIT is refused
+        // before any replay-window check.
+        if self.est.is_some() && matches!(gc.proc_, proc_::INIT | proc_::CONTINUE_INIT) {
+            return auth_error(h.xid, AuthStat::BadCred);
+        }
         // The replay window is only checked here; it advances after the
         // call's MIC verifies, so forged calls cannot move it.
         if let Some(est) = &self.est {
@@ -454,10 +459,6 @@ impl GssServer {
             }
         }
         match gc.proc_ {
-            // One security context per connection: a second INIT is refused.
-            proc_::INIT | proc_::CONTINUE_INIT if self.est.is_some() => {
-                auth_error(h.xid, AuthStat::BadCred)
-            }
             proc_::INIT | proc_::CONTINUE_INIT => self.init(call, service),
             proc_::DATA | proc_::DESTROY => {
                 let Some(est) = &mut self.est else {

@@ -332,6 +332,18 @@ fn server_enforces_the_sequence_window() {
         sent(server.handle(&huge)),
         Reply::AuthError(AuthStat::GssCtxProblem)
     );
+    // A second INIT is refused as BadCred even when its sequence number has
+    // fallen out of the replay window.
+    let mut again = cred(proc_::INIT, 0);
+    again.handle.clear();
+    let reinit = Call {
+        header: header(6, 0, &again),
+        args: Vec::new(),
+    };
+    assert_eq!(
+        sent(server.handle(&reinit)),
+        Reply::AuthError(AuthStat::BadCred)
+    );
 }
 
 #[test]
