@@ -376,6 +376,16 @@ iprop program (100423, version 1) as `kiprop/<host>` with privacy.
 Deviations: no UDP transport; one GSS context per connection; only the
 default QOP.
 
+Deliberate RPCSEC_GSS server deviations from MIT `svc_auth_gss.c`:
+
+- The replay window advances only after the call header's MIC verifies, so a
+  forged call with a high sequence number cannot make valid calls stale.
+- Once a context is established, a further `INIT`/`CONTINUE_INIT` on the
+  connection is refused with `AUTH_BADCRED` instead of replacing the identity.
+- `DATA` and `DESTROY` must carry the server's context handle and the service
+  (none, integrity, privacy) agreed at `INIT`; any other value is
+  `AUTH_BADCRED`.
+
 ### MIT kprop/kpropd
 
 `krb5-rs-kprop` and `krb5-rs-kpropd` follow MIT 1.22.2 `src/kprop`

@@ -440,23 +440,24 @@ impl GssServer {
         if gc.version != RPCSEC_GSS_VERSION {
             return auth_error(h.xid, AuthStat::BadCred);
         }
-        if let Some(est) = &mut self.est {
+        // The replay window is only checked here; it advances after the
+        // call's MIC verifies, so forged calls cannot move it.
+        if let Some(est) = &self.est {
             if gc.seq > MAXSEQ {
                 return auth_error(h.xid, AuthStat::GssCtxProblem);
             }
-            if gc.seq > est.seqlast {
-                let shift = gc.seq - est.seqlast;
-                est.seqmask = est.seqmask.checked_shl(shift).unwrap_or(0) | 1;
-                est.seqlast = gc.seq;
-            } else {
+            if gc.seq <= est.seqlast {
                 let offset = est.seqlast - gc.seq;
                 if offset >= SEQ_WINDOW || est.seqmask & (1 << offset) != 0 {
                     return auth_error(h.xid, AuthStat::GssCtxProblem);
                 }
-                est.seqmask |= 1 << offset;
             }
         }
         match gc.proc_ {
+            // One security context per connection: a second INIT is refused.
+            proc_::INIT | proc_::CONTINUE_INIT if self.est.is_some() => {
+                auth_error(h.xid, AuthStat::BadCred)
+            }
             proc_::INIT | proc_::CONTINUE_INIT => self.init(call, service),
             proc_::DATA | proc_::DESTROY => {
                 let Some(est) = &mut self.est else {
@@ -465,8 +466,18 @@ impl GssServer {
                 if gc.proc_ == proc_::DESTROY && h.proc_ != 0 {
                     return auth_error(h.xid, AuthStat::Failed);
                 }
+                if gc.handle != SERVER_HANDLE || service != est.service {
+                    return auth_error(h.xid, AuthStat::BadCred);
+                }
                 if est.ctx.verify_mic(&h.signed_part(), &h.verf.body).is_err() {
                     return auth_error(h.xid, AuthStat::GssCredProblem);
+                }
+                if gc.seq > est.seqlast {
+                    let shift = gc.seq - est.seqlast;
+                    est.seqmask = est.seqmask.checked_shl(shift).unwrap_or(0) | 1;
+                    est.seqlast = gc.seq;
+                } else {
+                    est.seqmask |= 1 << (est.seqlast - gc.seq);
                 }
                 if gc.proc_ == proc_::DESTROY {
                     let out = self.reply(h.xid, gc.seq, &[]);
