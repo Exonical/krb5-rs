@@ -526,6 +526,11 @@ enum Tok {
     Set { negate: bool, items: Vec<SetItem> },
 }
 
+enum BracketAtom {
+    Byte(u8),
+    Item(SetItem),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetItem {
     Range(u8, u8),
@@ -640,37 +645,69 @@ impl Glob {
 
     /// A POSIX bracket expression starting after `[` (`regcomp` in
     /// `svr_iters.c`); `None` for an unknown `[:class:]`.
-    fn bracket(glob: &[u8], mut i: usize) -> Option<(Tok, usize)> {
-        let negate = glob.get(i) == Some(&b'^');
+    fn bracket(re: &[u8], mut i: usize) -> Option<(Tok, usize)> {
+        let negate = re.get(i) == Some(&b'^');
         if negate {
             i += 1;
         }
+        // glibc `regcomp` rejects a `-` that would start a range right after
+        // a range (`[a-c-z]`) or from or to a class (`[[:digit:]-a]`), and a
+        // reversed range (`[z-a]`); a `-` before `]` is literal.
+        let range_dash = |re: &[u8], i: usize| {
+            re.get(i) == Some(&b'-') && re.get(i + 1).is_some_and(|&c| c != b']')
+        };
         let mut items = Vec::new();
         let mut first = true;
         loop {
-            let c = *glob.get(i)?;
-            if c == b']' && !first {
+            if re.get(i) == Some(&b']') && !first {
                 return Some((Tok::Set { negate, items }, i + 1));
             }
             first = false;
-            if c == b'[' && glob.get(i + 1) == Some(&b':') {
-                let name_start = i + 2;
-                let len = glob[name_start..].windows(2).position(|w| w == b":]")?;
-                items.push(SetItem::class(&glob[name_start..name_start + len])?);
-                i = name_start + len + 2;
+            let (atom, next) = Self::bracket_atom(re, i)?;
+            i = next;
+            if !range_dash(re, i) {
+                items.push(match atom {
+                    BracketAtom::Byte(b) => SetItem::Range(b, b),
+                    BracketAtom::Item(item) => item,
+                });
                 continue;
             }
-            match (glob.get(i + 1), glob.get(i + 2)) {
-                (Some(b'-'), Some(&hi)) if hi != b']' => {
-                    items.push(SetItem::Range(c, hi));
-                    i += 3;
-                }
-                _ => {
-                    items.push(SetItem::Range(c, c));
-                    i += 1;
-                }
+            let BracketAtom::Byte(lo) = atom else {
+                return None;
+            };
+            let (BracketAtom::Byte(hi), next) = Self::bracket_atom(re, i + 1)? else {
+                return None;
+            };
+            if hi < lo || range_dash(re, next) {
+                return None;
             }
+            items.push(SetItem::Range(lo, hi));
+            i = next;
         }
+    }
+
+    /// One bracket member: `[:class:]`, `[=c=]` (neither may bound a range),
+    /// `[.c.]` or a byte. Only single-byte collating elements exist in the
+    /// C locale.
+    fn bracket_atom(re: &[u8], i: usize) -> Option<(BracketAtom, usize)> {
+        let c = *re.get(i)?;
+        let delim = match re.get(i + 1) {
+            Some(&d @ (b':' | b'.' | b'=')) if c == b'[' => d,
+            _ => return Some((BracketAtom::Byte(c), i + 1)),
+        };
+        let start = i + 2;
+        let len = re
+            .get(start..)?
+            .windows(2)
+            .position(|w| w == [delim, b']'])?;
+        let name = &re[start..start + len];
+        let atom = match (delim, name) {
+            (b':', _) => BracketAtom::Item(SetItem::class(name)?),
+            (b'.', &[b]) => BracketAtom::Byte(b),
+            (b'=', &[b]) => BracketAtom::Item(SetItem::Range(b, b)),
+            _ => return None,
+        };
+        Some((atom, start + len + 2))
     }
 
     /// Whether `name` matches, in O(pattern * name) time: every token but
@@ -813,6 +850,20 @@ mod tests {
         assert!(dot.matches(b".@R") && dot.matches(b"\\@R") && !dot.matches(b"a@R"));
         assert!(g("[[:upper:]a-c]").expect("valid").matches(b"Q@R"));
         assert!(g("[[:bogus:]]").is_none());
+        for bad in [
+            "[[:digit:]-a]",
+            "[a-[:digit:]]",
+            "[z-a]",
+            "[a-c-z]",
+            "[[=a=]-c]",
+        ] {
+            assert!(g(bad).is_none(), "{bad}");
+        }
+        let h = |e: &str| Glob::new(Some(e), false).expect("valid");
+        assert!(h("[[:digit:]-]").matches(b"-") && h("[[:digit:]-]").matches(b"7"));
+        assert!(h("[a-]").matches(b"-") && h("[-a]").matches(b"-"));
+        assert!(h("[]-a]").matches(b"]") && h("[]-a]").matches(b"_"));
+        assert!(h("[[=a=]]").matches(b"a") && !h("[[=a=]]").matches(b"b"));
         assert!(g("[[:digit:").is_none());
         let stars = g(&"*a".repeat(30)).expect("valid");
         assert!(!stars.matches(&[b'a'; 4000]));

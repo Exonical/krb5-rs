@@ -131,7 +131,7 @@ EOF
 # database (MIT's liblmdb cannot open it while they do).
 CMDS=("getprinc alice" "getprinc -terse alice" "getprinc kadmin/admin" "listprincs"
       "listprincs k*" "listprincs *@OTHER" "listprincs [[:digit:]]*" "listprincs [^[:alpha:]]*"
-      "listprincs *a*d*m*i*n*@*" "getpol strict" "getpol -terse strict"
+      "listprincs *a*d*m*i*n*@*" "listprincs [[:digit:]-a]*" "listprincs [a-c-z]*" "getpol strict" "getpol -terse strict"
       "getpol plain" "listpols" "listpols s*" "getstrs alice" "getstrs bob" "getprivs")
 i=0
 for cmd in "${CMDS[@]}"; do
