@@ -200,8 +200,11 @@ for resource-based delegation. klmdb is the default `db_library`;
   compares `list_mkeys`, `update_princ_encryption` and `purge_mkeys` output
   and the decrypted principal keys.
 
-Deviations: `use_mkey` TIME takes unix seconds or RFC 3339, not getdate(3)
-syntax; errors are reported as
+`use_mkey` TIME is parsed by `krb5_rs::kdc::kdb::getdate`, a port of MIT's
+`get_date` (`src/kadmin/cli/getdate.y`); as an extension, unix seconds and
+RFC 3339 are accepted when `get_date` fails.
+
+Deviations: errors are reported as
 `krb5-rs-kdb: <message>` rather than com_err text; FileStore and CockroachDB
 keep a single master key.
 

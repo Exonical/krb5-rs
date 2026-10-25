@@ -1662,10 +1662,9 @@ fn mkey_command(
                 .unwrap_or_else(|| fail(format!("{requested} is an invalid KVNO value")));
             let start = match args.get(1) {
                 None => now,
-                Some(s) => parse_time(s)
-                    .ok()
-                    .flatten()
-                    .and_then(|t| u32::try_from(t.timestamp()).ok())
+                Some(s) => krb5_rs::kdc::kdb::getdate::get_date(s)
+                    .or_else(|| parse_time(s).ok().map(|t| t.map_or(0, |t| t.timestamp())))
+                    .and_then(|t| u32::try_from(t).ok())
                     .unwrap_or_else(|| fail(format!("could not parse date-time string '{s}'"))),
             };
             ok(store.update_raw(&km, realm, |entry, _| {
