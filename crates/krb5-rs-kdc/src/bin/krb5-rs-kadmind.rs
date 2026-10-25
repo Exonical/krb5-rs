@@ -1,12 +1,19 @@
-//! `krb5-rs-kadmind`: MIT `kadmind -proponly`, serving only the iprop RPC
-//! program (kadmin/server/ovsec_kadmd.c, ipropd_svc.c).
+//! `krb5-rs-kadmind`: MIT `kadmind` serving the kpasswd service
+//! (kadmin/server/schpw.c) and, with `iprop_enable`, the iprop RPC program
+//! (ipropd_svc.c); `-proponly` serves only iprop (ovsec_kadmd.c). The
+//! kadm5 admin RPC program is not served.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use krb5_rs::gssapi::krb5::Krb5Acceptor;
+use krb5_rs::kdc::kdb::admin::AdminOps;
+use krb5_rs::kdc::kdb::kpasswd::{process_request, Service, KPASSWD_PORT};
+use krb5_rs::kdc::kdb::kprop::ReplayCache;
 use krb5_rs::kdc::kdb::mit::parse_name_with_default;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
 use krb5_rs::kdc::kdb::read_stash;
@@ -17,7 +24,8 @@ use krb5_rs::rpc::gss::{GssServer, ServerStep};
 use krb5_rs::rpc::{read_record, write_record, AcceptStat, AuthStat, Call, CallError, Reply};
 use krb5_rs::types::{EncryptionKey, PrincipalName};
 use krb5_rs_kdb_lmdb::LmdbStore;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const KDC_DIR: &str = "/usr/local/var/krb5kdc";
 const IPROP_PROG: u32 = 100_423;
@@ -34,7 +42,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: krb5-rs-kadmind -proponly [-r realm] [-nofork] [-port port-number] [-P pid_file] [-p path-to-kdb5_util] [-F dump-file] [-K path-to-kprop] [-k kprop-port]"
+        "Usage: krb5-rs-kadmind [-proponly] [-r realm] [-nofork] [-port port-number] [-P pid_file] [-p path-to-kdb5_util] [-F dump-file] [-K path-to-kprop] [-k kprop-port]"
     );
     std::process::exit(1);
 }
@@ -330,7 +338,7 @@ struct State {
     realm: String,
     store: Arc<LmdbStore>,
     ulog: Ulog,
-    acl: Vec<AclEntry>,
+    acl: Arc<Vec<AclEntry>>,
     kdb_util: PathBuf,
     kprop: PathBuf,
     kprop_port: Option<String>,
@@ -554,9 +562,6 @@ fn listen_addrs(listen: Option<String>, port: u16) -> Vec<SocketAddr> {
 #[tokio::main]
 async fn main() {
     let args = parse_args();
-    if !args.proponly {
-        die("only -proponly mode is supported");
-    }
     let config = std::env::var_os("KRB5_KDC_PROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(KDC_DIR).join("kdc.conf"));
@@ -576,50 +581,45 @@ async fn main() {
         .unwrap_or_else(|| die("no realm given and no default realm found"));
     let cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm)
         .unwrap_or_else(|e| die(format!("while initializing, {e}")));
-    if !cfg.iprop.enabled {
+    if args.proponly && !cfg.iprop.enabled {
         die("-proponly can only be used when iprop_enable is true");
     }
     let r = |key: &str| kdc_conf.get_string(&["realms", &realm, key]);
     let acl_file =
         r("acl_file").map_or_else(|| Path::new(KDC_DIR).join("kadm5.acl"), PathBuf::from);
     let acl = load_acl(&acl_file, &realm).unwrap_or_else(|e| die(e));
-    let port = match r("iprop_port") {
+    let acl = Arc::new(acl);
+    let iprop_port = cfg.iprop.enabled.then(|| match r("iprop_port") {
         Some(p) => p
             .trim()
             .parse::<u16>()
             .unwrap_or_else(|_| die(format!("invalid iprop_port {p}"))),
         None => die("iprop_port must be set when iprop_enable is true"),
-    };
+    });
     let master = read_stash(&cfg.key_stash_file, &realm)
         .unwrap_or_else(|e| die(format!("{e} while reading master key")));
-    let store = LmdbStore::open(&cfg, &master)
-        .unwrap_or_else(|e| die(format!("{e} while initializing database")));
-    let ulog = Ulog::map(&cfg.iprop.logfile, cfg.iprop.ulogsize)
-        .unwrap_or_else(|e| die(format!("{e} mapping update log")));
-    let state = Arc::new(State {
-        realm: realm.clone(),
-        store: Arc::new(store),
-        ulog,
-        acl,
-        kdb_util: args.kdb_util.unwrap_or_else(|| sibling("krb5-rs-kdb")),
-        kprop: args.kprop.unwrap_or_else(|| sibling("krb5-rs-kprop")),
-        kprop_port: args.kprop_port,
-        dump_file: args
-            .dump_file
-            .unwrap_or_else(|| Path::new(KDC_DIR).join("replica_datatrans")),
-    });
+    let store = Arc::new(
+        LmdbStore::open(&cfg, &master)
+            .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+    );
 
-    let mut listeners = Vec::new();
-    for addr in listen_addrs(r("iprop_listen"), port) {
-        match TcpListener::bind(addr).await {
-            Ok(l) => listeners.push(l),
-            Err(e) if addr.ip().is_unspecified() && addr.is_ipv6() && !listeners.is_empty() => {
-                eprintln!("krb5-rs-kadmind: not listening on {addr}: {e}");
-            }
-            Err(e) => die(format!("{e} while binding {addr}")),
-        }
+    let mut iprop_listeners = Vec::new();
+    if let Some(port) = iprop_port {
+        bind_tcp(listen_addrs(r("iprop_listen"), port), &mut iprop_listeners).await;
     }
-    if listeners.is_empty() {
+    let mut kpasswd_udp = Vec::new();
+    let mut kpasswd_tcp = Vec::new();
+    if !args.proponly {
+        let port = r("kpasswd_port").map_or(KPASSWD_PORT, |p| {
+            p.trim()
+                .parse::<u16>()
+                .unwrap_or_else(|_| die(format!("invalid kpasswd_port {p}")))
+        });
+        let addrs = listen_addrs(r("kpasswd_listen"), port);
+        bind_udp(addrs.clone(), &mut kpasswd_udp).await;
+        bind_tcp(addrs, &mut kpasswd_tcp).await;
+    }
+    if iprop_listeners.is_empty() && kpasswd_udp.is_empty() && kpasswd_tcp.is_empty() {
         die("no sockets set up?");
     }
     if let Some(pid_file) = &args.pid_file {
@@ -630,33 +630,193 @@ async fn main() {
             ));
         }
     }
-    eprintln!("krb5-rs-kadmind: starting, iprop service only");
     let local = tokio::task::LocalSet::new();
     let mut tasks = tokio::task::JoinSet::new();
-    for listener in listeners {
-        let state = state.clone();
-        tasks.spawn_local_on(
-            async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, from)) => {
-                            let state = state.clone();
-                            tokio::task::spawn_local(async move {
-                                if let Err(e) = serve(state, stream).await {
-                                    eprintln!("krb5-rs-kadmind: {from}: {e}");
-                                }
-                            });
+    if iprop_port.is_some() {
+        let state = Arc::new(State {
+            realm: realm.clone(),
+            store: store.clone(),
+            ulog: Ulog::map(&cfg.iprop.logfile, cfg.iprop.ulogsize)
+                .unwrap_or_else(|e| die(format!("{e} mapping update log"))),
+            acl: acl.clone(),
+            kdb_util: args.kdb_util.unwrap_or_else(|| sibling("krb5-rs-kdb")),
+            kprop: args.kprop.unwrap_or_else(|| sibling("krb5-rs-kprop")),
+            kprop_port: args.kprop_port,
+            dump_file: args
+                .dump_file
+                .unwrap_or_else(|| Path::new(KDC_DIR).join("replica_datatrans")),
+        });
+        for listener in iprop_listeners {
+            let state = state.clone();
+            tasks.spawn_local_on(
+                async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((stream, from)) => {
+                                let state = state.clone();
+                                tokio::task::spawn_local(async move {
+                                    if let Err(e) = serve(state, stream).await {
+                                        eprintln!("krb5-rs-kadmind: {from}: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => eprintln!("krb5-rs-kadmind: accept: {e}"),
                         }
-                        Err(e) => eprintln!("krb5-rs-kadmind: accept: {e}"),
                     }
-                }
-            },
-            &local,
-        );
+                },
+                &local,
+            );
+        }
+    }
+    let kpasswd = Rc::new(Kpasswd {
+        keys: DbKeys {
+            store: store.clone(),
+            realm: realm.clone(),
+        },
+        admin: AdminOps::new(store, cfg.supported_keysalts.clone())
+            .with_history_enctype(cfg.master_key_type),
+        realm,
+        acl,
+        replay: ReplayCache::default(),
+        clockskew: cfg.kdc.clockskew,
+    });
+    for socket in kpasswd_udp {
+        tasks.spawn_local_on(serve_kpasswd_udp(kpasswd.clone(), socket), &local);
+    }
+    for listener in kpasswd_tcp {
+        tasks.spawn_local_on(serve_kpasswd_tcp(kpasswd.clone(), listener), &local);
+    }
+    if args.proponly {
+        eprintln!("krb5-rs-kadmind: starting, iprop service only");
+    } else {
+        eprintln!("krb5-rs-kadmind: starting");
     }
     local
         .run_until(async { while tasks.join_next().await.is_some() {} })
         .await;
+}
+
+/// Bind every address; a failed `[::]` after another socket is only
+/// logged (dual-stack hosts), anything else is fatal.
+async fn bind_tcp(addrs: Vec<SocketAddr>, out: &mut Vec<TcpListener>) {
+    for addr in addrs {
+        match TcpListener::bind(addr).await {
+            Ok(l) => out.push(l),
+            Err(e) if addr.ip().is_unspecified() && addr.is_ipv6() && !out.is_empty() => {
+                eprintln!("krb5-rs-kadmind: not listening on {addr}: {e}");
+            }
+            Err(e) => die(format!("{e} while binding {addr}")),
+        }
+    }
+}
+
+async fn bind_udp(addrs: Vec<SocketAddr>, out: &mut Vec<UdpSocket>) {
+    for addr in addrs {
+        match UdpSocket::bind(addr).await {
+            Ok(l) => out.push(l),
+            Err(e) if addr.ip().is_unspecified() && addr.is_ipv6() && !out.is_empty() => {
+                eprintln!("krb5-rs-kadmind: not listening on {addr}: {e}");
+            }
+            Err(e) => die(format!("{e} while binding {addr}")),
+        }
+    }
+}
+
+/// The kpasswd service (`schpw.c` `dispatch`).
+struct Kpasswd {
+    realm: String,
+    admin: AdminOps<Arc<LmdbStore>>,
+    keys: DbKeys,
+    acl: Arc<Vec<AclEntry>>,
+    replay: ReplayCache,
+    clockskew: Duration,
+}
+
+impl Kpasswd {
+    async fn handle(&self, local: &SocketAddr, remote: &SocketAddr, req: &[u8]) -> Option<Vec<u8>> {
+        let authorize = |c: &PrincipalName, cr: &str, t: &PrincipalName, tr: &str| {
+            acl_check(&self.acl, ACL_CHANGEPW, (c, cr), Some((t, tr)))
+        };
+        let svc = Service {
+            realm: &self.realm,
+            keys: &self.keys,
+            replay: Some(&self.replay),
+            clockskew: self.clockskew,
+            authorize: &authorize,
+        };
+        let done = process_request(&self.admin, &svc, local, remote, req).await;
+        eprintln!("krb5-rs-kadmind: {}", done.log);
+        done.reply
+    }
+}
+
+/// `MAX_DGRAM_SIZE` (`net-server.c`).
+const MAX_DGRAM_SIZE: usize = 65536;
+
+async fn serve_kpasswd_udp(kpasswd: Rc<Kpasswd>, socket: UdpSocket) {
+    let socket = Rc::new(socket);
+    let Ok(local) = socket.local_addr() else {
+        return;
+    };
+    loop {
+        let mut buf = vec![0u8; MAX_DGRAM_SIZE];
+        let (n, from) = match socket.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("krb5-rs-kadmind: kpasswd recvfrom: {e}");
+                continue;
+            }
+        };
+        buf.truncate(n);
+        let (kpasswd, socket) = (kpasswd.clone(), socket.clone());
+        tokio::task::spawn_local(async move {
+            if let Some(reply) = kpasswd.handle(&local, &from, &buf).await {
+                if let Err(e) = socket.send_to(&reply, from).await {
+                    eprintln!("krb5-rs-kadmind: kpasswd sendto {from}: {e}");
+                }
+            }
+        });
+    }
+}
+
+async fn serve_kpasswd_tcp(kpasswd: Rc<Kpasswd>, listener: TcpListener) {
+    loop {
+        let (mut stream, from) = match listener.accept().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("krb5-rs-kadmind: accept: {e}");
+                continue;
+            }
+        };
+        let kpasswd = kpasswd.clone();
+        tokio::task::spawn_local(async move {
+            let Ok(local) = stream.local_addr() else {
+                return;
+            };
+            let mut len = [0u8; 4];
+            if stream.read_exact(&mut len).await.is_err() {
+                return;
+            }
+            let len = u32::from_be_bytes(len) as usize;
+            if len > MAX_DGRAM_SIZE {
+                return;
+            }
+            let mut req = vec![0u8; len];
+            if stream.read_exact(&mut req).await.is_err() {
+                return;
+            }
+            if let Some(reply) = kpasswd.handle(&local, &from, &req).await {
+                let mut out = u32::try_from(reply.len())
+                    .unwrap_or(u32::MAX)
+                    .to_be_bytes()
+                    .to_vec();
+                out.extend_from_slice(&reply);
+                if stream.write_all(&out).await.is_ok() {
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]
