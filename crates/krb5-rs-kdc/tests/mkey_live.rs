@@ -297,11 +297,14 @@ mit_util "$B" purge_mkeys -f -v > "$BASE/b.mit.purge"
 grep -q '^1 key(s) purged.$' "$BASE/b.mit.purge"
 rs_util "$B" list_mkeys > "$BASE/b3.rs.list"
 test "$(grep -c '^KVNO' "$BASE/b3.rs.list")" = 1
-if printf '%s\n' "$MASTER" | rs_util "$B" stash 2>/dev/null; then
+printf '%s\n' "$MASTER" > "$BASE/purged.pw"
+if rs_util "$B" --master-password-file "$BASE/purged.pw" stash 2>/dev/null; then
   echo "purged master password still opened the database" >&2
   exit 1
 fi
-printf '%s\n' "$SECOND" | rs_util "$B" stash 2>/dev/null
+mit_util "$B" stash > "$BASE/b.mit.stash"
+rs_util "$B" stash > "$BASE/b.rs.stash"
+same "$BASE/b.mit.stash" "$BASE/b.rs.stash"
 rs_util "$B" getprinc dave | grep -q 'dave@KLMDB.LIVE'
 keys_of "$B" dave "$BASE/dave.kt" > /dev/null
 

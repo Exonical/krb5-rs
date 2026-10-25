@@ -35,7 +35,7 @@ use krb5_rs_kdb_lmdb::LmdbStore;
 fn print_usage() {
     eprintln!(
         "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] [--master-password-file PATH] [-r REALM] [-d DATABASE] <command>\n\
-         commands:\n  init [--master-password-file F] [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash\n  add_mkey [-e ENCTYPE] [-s]\n  use_mkey KVNO [TIME]\n  list_mkeys\n  purge_mkeys [-f] [-n] [-v]\n  update_princ_encryption [-f] [-n] [-v] [PRINC-PATTERN]\n  \
+         commands:\n  init [--master-password-file F] [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash [-f KEYFILE]\n  add_mkey [-e ENCTYPE] [-s]\n  use_mkey KVNO [TIME]\n  list_mkeys\n  purge_mkeys [-f] [-n] [-v]\n  update_princ_encryption [-f] [-n] [-v] [PRINC-PATTERN]\n  \
          addprinc [-randkey] [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
          delprinc NAME\n  cpw [-randkey] [-keepold] NAME\n  \
          modprinc [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] [-allow_delegate_to P]... [-allow_delegate_from P]... [-clear_delegate_to] [-clear_delegate_from] [-policy P | -clearpolicy] [-unlock] NAME\n  \
@@ -99,6 +99,45 @@ fn master_key(
         )),
         None => ok(read_stash(&cfg.key_stash_file, realm)),
     }
+}
+
+/// `kdb5_stash` (`kdb5_stash.c:66-132`): `stash [-f keyfile]` rewrites the
+/// stash from the existing one when it opens the database, else prompts once
+/// for the master password. `--master-password-file` stands in for `-m`.
+fn stash_source<T>(
+    args: &[String],
+    cfg: &RealmConfig,
+    realm: &str,
+    master_password_file: Option<&str>,
+    open: impl Fn(&krb5_rs::types::EncryptionKey) -> Result<T, StoreError>,
+) -> (PathBuf, T) {
+    let keyfile = match args {
+        [] => cfg.key_stash_file.clone(),
+        [flag, path] if flag == "-f" => PathBuf::from(path),
+        _ => usage(),
+    };
+    if master_password_file.is_none() {
+        if let Ok(opened) = read_stash(&cfg.key_stash_file, realm).and_then(|k| open(&k)) {
+            println!("Using existing stashed keys to update stash file.");
+            return (keyfile, opened);
+        }
+    }
+    let key = match master_password_file {
+        Some(path) => ok(master_key_from_password(
+            realm,
+            &read_secret_file(path),
+            cfg.master_key_type,
+        )),
+        None => {
+            let password = read_line(&format!("Enter KDC database master key for {realm}: "));
+            ok(master_key_from_password(
+                realm,
+                &password,
+                cfg.master_key_type,
+            ))
+        }
+    };
+    (keyfile, ok(open(&key)))
 }
 
 /// Idempotent bootstrap: create the database (and stash) if missing, then
@@ -353,14 +392,11 @@ fn main() {
             return;
         }
         "stash" => {
-            let password = read_line(&format!("Enter KDC database master key for {realm}: "));
-            let key = ok(master_key_from_password(
-                &realm,
-                &password,
-                cfg.master_key_type,
-            ));
-            ok(FileStore::open(&cfg.database_name, &key));
-            ok(write_stash(&cfg.key_stash_file, &realm, &key));
+            let (keyfile, key) =
+                stash_source(&args, &cfg, &realm, master_password_file.as_deref(), |k| {
+                    FileStore::open(&cfg.database_name, k).map(|_| k.clone())
+                });
+            ok(write_stash(&keyfile, &realm, &key));
             return;
         }
         "dump" => {
@@ -753,10 +789,12 @@ fn klmdb_command(
             }
         }
         "stash" => {
-            let master = master_key_or_prompt(cfg, realm, global_master_password_file);
-            let store = ok(LmdbStore::open(cfg, &master));
+            let (keyfile, store) =
+                stash_source(&args, cfg, realm, global_master_password_file, |k| {
+                    LmdbStore::open(cfg, k)
+                });
             let keys = ok(store.master_key_list());
-            ok(write_stash_list(&cfg.key_stash_file, realm, &keys.keys));
+            ok(write_stash_list(&keyfile, realm, &keys.keys));
         }
         "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
             mkey_command(cmd, args, cfg, realm, global_master_password_file);
@@ -1330,14 +1368,12 @@ fn cockroach_command(
             }
         }
         "stash" => {
-            let password = read_line(&format!("Enter KDC database master key for {realm}: "));
-            let key = ok(master_key_from_password(
-                realm,
-                &password,
-                cfg.master_key_type,
-            ));
-            ok(rt.block_on(CockroachStore::open(config, key.clone(), realm)));
-            ok(write_stash(&cfg.key_stash_file, realm, &key));
+            let (keyfile, key) =
+                stash_source(&args, cfg, realm, global_master_password_file, |k| {
+                    rt.block_on(CockroachStore::open(config.clone(), k.clone(), realm))
+                        .map(|_| k.clone())
+                });
+            ok(write_stash(&keyfile, realm, &key));
         }
         "replication" => {
             let master = master_key(cfg, realm, global_master_password_file);
