@@ -133,7 +133,6 @@ fn init(
         .unwrap_or_else(|| fail("init requires --master-password-file"));
     let key = master_key(cfg, realm, Some(master_file));
     let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
-    let mut created = false;
     let store = if cfg.database_name.exists() {
         ok(FileStore::open(&cfg.database_name, &key))
     } else {
@@ -144,7 +143,6 @@ fn init(
             &etypes,
         ));
         println!("Database {} created.", cfg.database_name.display());
-        created = true;
         store
     };
     if stash && !cfg.key_stash_file.exists() {
@@ -157,9 +155,7 @@ fn init(
         cfg.supported_keysalts.clone(),
         cfg.master_key_type,
     );
-    if created {
-        add_admin_princs(&admin, realm);
-    }
+    add_admin_princs(&admin, realm);
     ensure_init_principals(&admin, realm, &randkeys, &passwords);
 }
 
@@ -739,6 +735,7 @@ fn klmdb_command(
                 cfg.supported_keysalts.clone(),
                 cfg.master_key_type,
             );
+            add_admin_princs(&admin, realm);
             ensure_init_principals(&admin, realm, &randkeys, &passwords);
         }
         "create" => {
@@ -1265,6 +1262,7 @@ fn cockroach_command(
                 cfg.supported_keysalts.clone(),
                 cfg.master_key_type,
             );
+            add_admin_princs(&admin, realm);
             ensure_init_principals(&admin, realm, &randkeys, &passwords);
         }
         "database" => {

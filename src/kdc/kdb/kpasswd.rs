@@ -436,6 +436,7 @@ pub async fn process_request<S: AdminStore>(
     };
     let server = changepw_principal(svc.realm);
     let mut ctx = AuthContext::new();
+    ctx.set_clockskew(svc.clockskew);
     ctx.set_flags(AuthContextFlags::DO_SEQUENCE);
     let mut ap_rep = Vec::new();
     let (status, mut text, code, log) =

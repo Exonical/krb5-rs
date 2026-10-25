@@ -311,7 +311,9 @@ and a KRB-PRIV result, or a KRB-ERROR carrying the result in `e-data`, with
 MIT's result codes (access denied, initial ticket needed, soft error for
 password quality, reuse and `minlife`, hard error otherwise) and
 `chpass_util` messages. Database creation adds `kadmin/admin` and
-`kadmin/changepw` like `kadm5_create.c`. The live test
+`kadmin/changepw` like `kadm5_create.c`, and `krb5-rs-kdb init` adds any that
+are missing from an existing database (one created by an earlier krb5-rs
+release), so rerun `init` after upgrading before starting kadmind. The live test
 `crates/krb5-rs-kdc/tests/kpasswd_live.rs` runs MIT 1.22.2 `kpasswd` over UDP
 and TCP and `krb5_set_password_using_ccache` against it.
 
