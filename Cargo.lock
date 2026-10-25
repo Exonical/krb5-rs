@@ -1714,6 +1714,7 @@ dependencies = [
  "rasn-cms",
  "rasn-pkix",
  "rsa",
+ "rustix 1.1.5",
  "sha1",
  "sha2",
  "subtle",
@@ -1773,6 +1774,7 @@ dependencies = [
 name = "krb5-rs-kdc"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "krb5-rs",
  "krb5-rs-kdb-cockroach",

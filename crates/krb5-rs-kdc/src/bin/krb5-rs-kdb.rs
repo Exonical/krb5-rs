@@ -17,11 +17,15 @@ use krb5_rs::kdc::kdb::admin::{
     AttrChange, PolicyChange, PrincipalOptions,
 };
 use krb5_rs::kdc::kdb::mit::dump::{
-    policy_record, principal_record, read_dump, DumpVersion, LoadFailure, Record,
+    policy_record, principal_record, read_dump, read_records, DumpVersion, IpropHeader,
+    LoadFailure, Record,
 };
+use krb5_rs::kdc::kdb::mit::ulog::{Last, Time, Ulog, UpdateStatus};
 use krb5_rs::kdc::kdb::mit::{unparse_name, MitEntry, MitPolicy};
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, write_stash, FileStore};
-use krb5_rs::kdc::{default_realm, AdminStore, RealmConfig, StoreError, StoreErrorKind};
+use krb5_rs::kdc::{
+    default_realm, AdminStore, IpropConfig, RealmConfig, StoreError, StoreErrorKind,
+};
 use krb5_rs::profile::Profile;
 #[cfg(feature = "klmdb")]
 use krb5_rs_kdb_lmdb::LmdbStore;
@@ -283,6 +287,14 @@ fn main() {
         .unwrap_or_else(|| fail("no realm given and no default realm found"));
     let mut cfg = ok(RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm));
     if let Some(database) = database {
+        if kdc_conf
+            .get_string(&["realms", &realm, "iprop_logfile"])
+            .is_none()
+        {
+            let mut log = database.clone().into_os_string();
+            log.push(".ulog");
+            cfg.iprop.logfile = PathBuf::from(log);
+        }
         cfg.database_name = database;
     }
 
@@ -343,14 +355,14 @@ fn main() {
             return;
         }
         "dump" => {
-            dump_command(args, || {
+            dump_command(args, None, || {
                 let master = master_key(&cfg, &realm, master_password_file.as_deref());
                 FileStore::open(&cfg.database_name, &master)?.dump_entries()
             });
             return;
         }
         "load" => {
-            load_command(args, |entries, policies, update| {
+            load_command(args, None, |entries, policies, update, _| {
                 let master = master_key(&cfg, &realm, master_password_file.as_deref());
                 FileStore::load_dump(
                     &cfg.database_name,
@@ -379,12 +391,18 @@ fn main() {
 
 type DumpEntries = (Vec<MitEntry>, Vec<MitPolicy>);
 
-/// `kdb5_util dump` (`kadmin/dbutil/dump.c:1137-1362`). Deviation: `-c`,
-/// `-rev` and `-recurse` are accepted and ignored (klmdb iterates in key
-/// order); `-mkey_convert`/`-new_mkey_file` are not supported.
-fn dump_command(args: Vec<String>, read: impl FnOnce() -> Result<DumpEntries, StoreError>) {
+/// `kdb5_util dump` (`kadmin/dbutil/dump.c:1137-1362`). `iprop` is set
+/// when `iprop_enable` is. Deviation: `-rev` and `-recurse` are accepted and
+/// ignored (klmdb iterates in key order); `-mkey_convert`/`-new_mkey_file`
+/// are not supported.
+fn dump_command(
+    args: Vec<String>,
+    iprop: Option<&IpropConfig>,
+    read: impl FnOnce() -> Result<DumpEntries, StoreError>,
+) {
     let mut version = DumpVersion::R111;
     let mut verbose = false;
+    let (mut iprop_dump, mut conditional) = (None, false);
     let mut it = args.into_iter().peekable();
     while let Some(arg) = it.next_if(|a| a.starts_with('-') && a != "-") {
         match arg.as_str() {
@@ -392,10 +410,17 @@ fn dump_command(args: Vec<String>, read: impl FnOnce() -> Result<DumpEntries, St
             "-r13" => version = DumpVersion::R13,
             "-r18" => version = DumpVersion::R18,
             "-ov" => fail("OV dump format not supported"),
-            "-c" | "-rev" | "-recurse" => {}
+            "-c" => conditional = true,
+            "-rev" | "-recurse" => {}
             "-verbose" => verbose = true,
             "-mkey_convert" | "-new_mkey_file" => fail("master key conversion is not supported"),
-            a if a.starts_with("-i") => fail("Iprop not enabled"),
+            a if a.starts_with("-i") => {
+                if iprop.is_none() {
+                    fail("Iprop not enabled");
+                }
+                let digits: String = a[2..].chars().take_while(char::is_ascii_digit).collect();
+                iprop_dump = Some(digits.parse::<u64>().map_or(!digits.is_empty(), |n| n != 0));
+            }
             _ => usage(),
         }
     }
@@ -406,22 +431,55 @@ fn dump_command(args: Vec<String>, read: impl FnOnce() -> Result<DumpEntries, St
                 .unwrap_or_else(|e| fail(format!("regular expression error: {e}")))
         })
         .collect();
+    let ulog = iprop_dump
+        .and(iprop)
+        .map(|c| ok(Ulog::map(&c.logfile, c.ulogsize)));
+    if let (Some(file), true) = (&file, conditional) {
+        let Some(ulog) = &ulog else {
+            fail("Conditional dump is an undocumented option for use only for iprop dumps")
+        };
+        if dump_is_current(Path::new(file), ulog) {
+            return;
+        }
+    }
+    let (mut out, policy_version) = match (iprop_dump, &ulog) {
+        (Some(extensible), Some(ulog)) => {
+            let last = ulog
+                .get_last()
+                .unwrap_or_else(|e| fail(format!("{e} while reading update log header")));
+            let header = IpropHeader {
+                extensible,
+                sno: last.sno,
+                seconds: last.time.seconds,
+                useconds: last.time.useconds,
+            };
+            (header.line().into_bytes(), header.policy_version())
+        }
+        _ => (version.header().as_bytes().to_vec(), version),
+    };
     let (entries, policies) = ok(read());
-    let mut out = version.header().as_bytes().to_vec();
     for entry in &entries {
         let name = unparse_name(&entry.principal, &entry.realm);
         let name = String::from_utf8_lossy(&name);
         if !names.is_empty() && !names.iter().any(|r| r.is_match(&name)) {
             continue;
         }
-        out.extend(principal_record(entry, version));
+        if iprop_dump.is_some() {
+            let mut replicated = entry.clone();
+            replicated.last_success = 0;
+            replicated.last_failed = 0;
+            replicated.fail_auth_count = 0;
+            out.extend(principal_record(&replicated, DumpVersion::R111));
+        } else {
+            out.extend(principal_record(entry, version));
+        }
         if verbose {
             eprintln!("{name}");
         }
     }
     if names.is_empty() {
         for policy in &policies {
-            out.extend(policy_record(policy, version));
+            out.extend(policy_record(policy, policy_version));
         }
     }
     match file {
@@ -429,6 +487,34 @@ fn dump_command(args: Vec<String>, read: impl FnOnce() -> Result<DumpEntries, St
         Some(file) => ok(write_dump_file(Path::new(&file), &out)
             .map_err(|e| format!("{e} while opening {file} for writing"))),
     }
+}
+
+/// `current_dump_sno_in_ulog` (`kadmin/dbutil/dump.c:1107-1135`).
+fn dump_is_current(path: &Path, ulog: &Ulog) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut line = Vec::new();
+    if std::io::BufReader::new(std::io::Read::take(file, 8192))
+        .read_until(b'\n', &mut line)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(header) = IpropHeader::parse(&line) else {
+        return false;
+    };
+    let last = Last {
+        sno: header.sno,
+        time: Time {
+            seconds: header.seconds,
+            useconds: header.useconds,
+        },
+    };
+    matches!(
+        ulog.get_sno_status(&last),
+        UpdateStatus::Ok | UpdateStatus::Nil
+    )
 }
 
 /// `create_ofile`/`finish_ofile` and the `.dump_ok` stamp
@@ -464,12 +550,16 @@ fn private_file(path: &Path, new: bool) -> std::io::Result<std::fs::File> {
 
 /// `kdb5_util load` (`kadmin/dbutil/dump.c:1384-1610`). The whole dump is
 /// parsed before the database is touched. `-hash` selects db2's hash
-/// format in MIT and is ignored here.
+/// format in MIT and is ignored here. With `iprop` set, the ulog is
+/// reinitialized after a full load and `-i` records the dump's serial number
+/// in it. Deviation: MIT logs each principal an `-update` load writes; here
+/// such a load reinitializes the ulog, so replicas resync fully.
 fn load_command(
     args: Vec<String>,
-    store: impl FnOnce(&[MitEntry], &[MitPolicy], bool) -> Result<(), StoreError>,
+    iprop: Option<&IpropConfig>,
+    store: impl FnOnce(&[MitEntry], &[MitPolicy], bool, bool) -> Result<(), StoreError>,
 ) {
-    let (mut forced, mut verbose, mut update) = (None, false, false);
+    let (mut forced, mut verbose, mut update, mut iprop_load) = (None, false, false, false);
     let mut it = args.into_iter();
     while it.len() > 1 {
         match it.next().as_deref() {
@@ -477,6 +567,7 @@ fn load_command(
             Some("-r13") => forced = Some(DumpVersion::R13),
             Some("-r18") => forced = Some(DumpVersion::R18),
             Some("-ov") => fail("OV dump format not supported"),
+            Some("-i") if iprop.is_some() => iprop_load = true,
             Some("-i") => fail("Iprop not enabled"),
             Some("-verbose") => verbose = true,
             Some("-update") => update = true,
@@ -486,7 +577,34 @@ fn load_command(
     }
     let Some(file) = it.next() else { usage() };
     let data = std::fs::read(&file).unwrap_or_else(|e| fail(format!("{e} while opening {file}")));
-    let (version, records, warnings) = match read_dump(&data, &file, forced) {
+    let mut iprop_header = None;
+    let loaded = if iprop_load {
+        let end = data
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(data.len(), |i| i + 1);
+        let (line, body) = data.split_at(end);
+        if !line.starts_with(b"iprop") {
+            fail(format!("dump header bad in {file}"));
+        }
+        let header = IpropHeader::parse(line).unwrap_or_else(|message| {
+            if !message.is_empty() {
+                eprintln!("krb5-rs-kdb: {message}");
+            }
+            std::process::exit(1)
+        });
+        iprop_header = Some(header);
+        let version = header.policy_version();
+        read_records(body, &file, version).map(|(r, w)| (version, r, w))
+    } else {
+        read_dump(&data, &file, forced)
+    };
+    let restore_name = |version: DumpVersion| match iprop_header {
+        Some(h) if h.extensible => "Kerberos iprop extensible version",
+        Some(_) => "Kerberos iprop version",
+        None => version.name(),
+    };
+    let (version, records, warnings) = match loaded {
         Ok(loaded) => loaded,
         Err(LoadFailure::Header(message)) => fail(message),
         Err(LoadFailure::Record {
@@ -504,7 +622,7 @@ fn load_command(
                 "krb5-rs-kdb: error processing line {} of {file}",
                 error.line
             );
-            fail(format!("{} restore failed", version.name()));
+            fail(format!("{} restore failed", restore_name(version)));
         }
     };
     for line in &warnings {
@@ -528,9 +646,27 @@ fn load_command(
             }
         }
     }
-    if let Err(e) = store(&entries, &policies, update) {
+    if let Err(e) = store(&entries, &policies, update, iprop_load) {
         eprintln!("krb5-rs-kdb: {e}");
-        fail(format!("{} restore failed", version.name()));
+        fail(format!("{} restore failed", restore_name(version)));
+    }
+    if let Some(cfg) = iprop {
+        let reset = Ulog::map(&cfg.logfile, cfg.ulogsize).and_then(|ulog| {
+            ulog.init_header()?;
+            match iprop_header {
+                Some(h) if !update => ulog.set_last(Last {
+                    sno: h.sno,
+                    time: Time {
+                        seconds: h.seconds,
+                        useconds: h.useconds,
+                    },
+                }),
+                _ => Ok(()),
+            }
+        });
+        if let Err(e) = reset {
+            fail(format!("{e} while reinitializing update log"));
+        }
     }
 }
 
@@ -546,6 +682,7 @@ fn klmdb_command(
         fail(format!("`{cmd}` needs db_library = krb5-rs-cockroach"));
     }
     let rt = runtime();
+    let iprop = cfg.iprop.enabled.then_some(&cfg.iprop);
     match cmd {
         "init" => {
             let mut master_file = None;
@@ -610,12 +747,12 @@ fn klmdb_command(
             ok(LmdbStore::open(cfg, &master));
             ok(write_stash(&cfg.key_stash_file, realm, &master));
         }
-        "dump" => dump_command(args, || {
+        "dump" => dump_command(args, iprop, || {
             let master = master_key(cfg, realm, global_master_password_file);
             LmdbStore::open(cfg, &master)?.dump_entries()
         }),
-        "load" => load_command(args, |entries, policies, update| {
-            LmdbStore::load_dump(cfg, entries, policies, update)
+        "load" => load_command(args, iprop, |entries, policies, update, merge_nra| {
+            LmdbStore::load_dump(cfg, entries, policies, update, merge_nra)
         }),
         _ => {
             let master = master_key(cfg, realm, global_master_password_file);

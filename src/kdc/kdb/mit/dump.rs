@@ -564,12 +564,96 @@ pub fn read_dump(
     forced: Option<DumpVersion>,
 ) -> Result<(DumpVersion, Vec<Record>, Vec<String>), LoadFailure> {
     let (version, body) = read_header(data, fname, forced).map_err(LoadFailure::Header)?;
+    let (records, warnings) = read_records(body, fname, version)?;
+    Ok((version, records, warnings))
+}
+
+/// The first line of an iprop dump (`dump.c:1046-1105`). `extensible`
+/// selects `ipropx` version 1, whose policies use the 1.11 format; `iprop`
+/// dumps use the short policy format. Both use 1.11 principal records with
+/// the non-replicated attributes zeroed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpropHeader {
+    /// `ipropx 1` rather than `iprop`.
+    pub extensible: bool,
+    /// The ulog's last serial number.
+    pub sno: u32,
+    /// The ulog's last update time, seconds.
+    pub seconds: u32,
+    /// The ulog's last update time, microseconds.
+    pub useconds: u32,
+}
+
+impl IpropHeader {
+    /// The header line, including its newline (`dump.c:1316-1328`).
+    pub fn line(&self) -> String {
+        let (head, version) = if self.extensible {
+            ("ipropx", " 1")
+        } else {
+            ("iprop", "")
+        };
+        format!(
+            "{head}{version} {} {} {}\n",
+            self.sno, self.seconds, self.useconds
+        )
+    }
+
+    /// `parse_iprop_header` (`dump.c:1068-1105`); the error is MIT's message,
+    /// or empty where MIT prints none.
+    pub fn parse(line: &[u8]) -> Result<Self, String> {
+        let text = String::from_utf8_lossy(line);
+        let mut words = text.split_ascii_whitespace();
+        let head = words.next().ok_or_else(String::new)?;
+        let nums: Vec<u32> = words.take(4).map_while(|w| w.parse::<u32>().ok()).collect();
+        let (extensible, rest) = match head {
+            "ipropx" => {
+                if nums.len() != 4 {
+                    return Err(String::new());
+                }
+                match nums[0] {
+                    0 => (false, &nums[1..]),
+                    1 => (true, &nums[1..]),
+                    v => return Err(format!("Unknown iprop dump version {v}")),
+                }
+            }
+            "iprop" => {
+                if nums.len() < 3 {
+                    return Err(String::new());
+                }
+                (false, &nums[..3])
+            }
+            _ => return Err("Invalid iprop header".into()),
+        };
+        Ok(Self {
+            extensible,
+            sno: rest[0],
+            seconds: rest[1],
+            useconds: rest[2],
+        })
+    }
+
+    /// The format of the records that follow the header.
+    pub fn policy_version(&self) -> DumpVersion {
+        if self.extensible {
+            DumpVersion::R111
+        } else {
+            DumpVersion::Beta7
+        }
+    }
+}
+
+/// Load the records after a header that has already been checked.
+pub fn read_records(
+    body: &[u8],
+    fname: &str,
+    version: DumpVersion,
+) -> Result<(Vec<Record>, Vec<String>), LoadFailure> {
     let mut loader = Loader::new(body, fname, version);
     let mut records = Vec::new();
     loop {
         match loader.next_record() {
             Ok(Some(record)) => records.push(record),
-            Ok(None) => return Ok((version, records, loader.warnings)),
+            Ok(None) => return Ok((records, loader.warnings)),
             Err(error) => {
                 return Err(LoadFailure::Record {
                     version,

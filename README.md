@@ -249,8 +249,12 @@ ticket enctype), receives into `<file>.temp` under a lock, renames it to
 `krb5-rs-kdb -r REALM load [-d DB] <file>` (`-p` selects the program), and only
 then acknowledges. The replica needs the same master key stash as the primary.
 
-Deliberate deviations: iprop (incremental propagation, `kadmind -p`/`kpropd`
-`-A`/`-x`) is not implemented, and `-A`/`-x` are accepted and ignored;
+With `iprop_enable = true`, klmdb principal changes are also written to MIT's
+iprop update log (`<database_name>.ulog`); `krb5-rs-kdb dump -i1 [-c]`,
+`load -i` and `krb5-rs-kproplog` work on it as their MIT counterparts do.
+
+Deliberate deviations: serving iprop (`kadmind -p`, `kpropd` `-A`/`-x`) is not
+implemented yet, and `-A`/`-x` are accepted and ignored;
 `krb5-rs-kpropd` never forks into the background (use `-D` or a supervisor).
 The `kprop_*` kdc.conf keys of the earlier krb5-rs pull protocol
 (`KRB5RS-PROP-1`) were removed; configurations that still set them fail with

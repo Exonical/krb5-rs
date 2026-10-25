@@ -8,6 +8,8 @@ mod codec;
 pub mod dump;
 mod name;
 mod tl;
+#[cfg(unix)]
+pub mod ulog;
 mod xdr;
 
 pub use codec::{decode_lockout, encode_lockout, KeyData, MitEntry, MitPolicy, TlData};

@@ -57,6 +57,7 @@ rasn-pkix = { version = "0.28", optional = true }
 # getaddrinfo(AI_CANONNAME) host-name canonicalization (kprop).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 rasn-cms = "0.28"
