@@ -625,6 +625,17 @@ impl LmdbStore {
             .transpose()
     }
 
+    /// The decrypted entry for `name`, read synchronously.
+    pub fn principal_sync(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<PrincipalEntry>, StoreError> {
+        Ok(self
+            .get_record_sync(name, realm)?
+            .map(|record| record.entry))
+    }
+
     fn get_record_sync(
         &self,
         name: &PrincipalName,

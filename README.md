@@ -253,8 +253,13 @@ With `iprop_enable = true`, klmdb principal changes are also written to MIT's
 iprop update log (`<database_name>.ulog`); `krb5-rs-kdb dump -i1 [-c]`,
 `load -i` and `krb5-rs-kproplog` work on it as their MIT counterparts do.
 
-Deliberate deviations: serving iprop (`kadmind -p`, `kpropd` `-A`/`-x`) is not
-implemented yet, and `-A`/`-x` are accepted and ignored;
+`krb5-rs-kadmind -proponly` serves that log to MIT kpropd in iprop mode
+(iprop RPC over RPCSEC_GSS as `kiprop/<host>`, the `p` permission in
+`acl_file`, full resyncs through `krb5-rs-kdb dump -i1 -c` and
+`krb5-rs-kprop`); it supports no other kadmind mode.
+
+Deliberate deviations: kpropd iprop mode (`-A`/`-x`) is not implemented yet,
+and `-A`/`-x` are accepted and ignored;
 `krb5-rs-kpropd` never forks into the background (use `-D` or a supervisor).
 The `kprop_*` kdc.conf keys of the earlier krb5-rs pull protocol
 (`KRB5RS-PROP-1`) were removed; configurations that still set them fail with
