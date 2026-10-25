@@ -63,7 +63,11 @@ pub fn gmtime(t: i64) -> Option<Tm> {
 #[cfg(unix)]
 #[expect(unsafe_code, reason = "std has no localtime_r")]
 fn localtime(t: i64) -> Option<Tm> {
-    let t = libc::time_t::try_from(t).ok()?;
+    #[allow(
+        clippy::useless_conversion,
+        reason = "time_t is 32-bit on some targets"
+    )]
+    let t = TryFrom::try_from(t).ok()?;
     // SAFETY: an all-zero tm is valid storage for localtime_r to fill.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers refer to live locals for the whole call.
