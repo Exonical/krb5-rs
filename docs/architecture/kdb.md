@@ -348,10 +348,18 @@ replica's serial (`ulog_get_entries`); `IPROP_FULL_RESYNC[_EXT]` runs
 through a full resync and then incremental updates.
 
 Deviations: the process stays in the foreground (`-nofork` is implied) and
-`-P` writes its pid; `-x`, the kadm5 admin RPC service (program 2112) and
-ACL restrictions are not supported (restrictions are parsed and ignored, as
-they never apply to iprop or kpasswd); `-port` is accepted and ignored because it
-sets only the kadmin port; klmdb only.
+`-P` writes its pid; `-x` and the kadm5 admin RPC service (program 2112)
+are not supported; `-port` is accepted and ignored because it sets only the
+kadmin port; klmdb only.
+
+ACL restrictions (the fourth `kadm5.acl` field) are parsed and validated like
+`auth_acl.c` `parse_restrictions`: `[+-]flag`, `-clearpolicy`, `-policy POL`
+and `-expire`/`-pwexpire`/`-maxlife`/`-maxrenewlife DELTAT`. An invalid
+restriction makes the ACL file a syntax error, as in MIT.
+`krb5_rs::kdc::kdb::restrictions::AclRestrictions::impose` applies them the way
+`auth.c` `impose_restrictions` does. MIT only applies restrictions to kadm5
+`create_principal` and `modify_principal`, so they have no effect on iprop or
+kpasswd, and they will take effect once the kadm5 admin RPC service exists.
 
 Deliberate iprop-service deviations from MIT `ipropd_svc.c`:
 
