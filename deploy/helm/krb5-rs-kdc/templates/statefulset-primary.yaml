@@ -31,6 +31,9 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.propagation.iprop.enabled }}
+      shareProcessNamespace: true
+      {{- end }}
       {{- include "krb5-rs-kdc.scheduling" (dict "ctx" . "cfg" .Values.primary) | nindent 6 }}
       initContainers:
         - name: init-database
@@ -53,6 +56,14 @@ spec:
             {{- range $i := until (int .Values.replicas.replicaCount) }}
             - --password
             - host/{{ include "krb5-rs-kdc.replicaHost" (dict "ctx" $ "i" $i) }}=/secrets/kprop-password
+            {{- end }}
+            {{- if .Values.propagation.iprop.enabled }}
+            - --password
+            - kiprop/{{ include "krb5-rs-kdc.primaryHost" . }}=/secrets/kprop-password
+            {{- range $i := until (int .Values.replicas.replicaCount) }}
+            - --password
+            - kiprop/{{ include "krb5-rs-kdc.replicaHost" (dict "ctx" $ "i" $i) }}=/secrets/kprop-password
+            {{- end }}
             {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
@@ -79,6 +90,9 @@ spec:
             - /keytab/krb5.keytab
             - -norandkey
             - host/{{ include "krb5-rs-kdc.primaryHost" . }}
+            {{- if .Values.propagation.iprop.enabled }}
+            - kiprop/{{ include "krb5-rs-kdc.primaryHost" . }}
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           volumeMounts:
@@ -142,6 +156,48 @@ spec:
               mountPath: /secrets
               readOnly: true
         {{- if gt (int .Values.replicas.replicaCount) 0 }}
+        {{- if .Values.propagation.iprop.enabled }}
+        # MIT iprop service; full resyncs are pushed with krb5-rs-kprop.
+        - name: kadmind
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kadmind"]
+          args:
+            - -proponly
+            - -nofork
+            - -r
+            - {{ .Values.realm }}
+            - -p
+            - /usr/local/bin/krb5-rs-kdb
+            - -K
+            - /usr/local/bin/krb5-rs-kprop
+            - -k
+            - {{ .Values.propagation.port | quote }}
+            - -F
+            - /var/lib/krb5-rs/replica_datatrans
+          ports:
+            - name: iprop
+              containerPort: {{ .Values.propagation.iprop.port }}
+              protocol: TCP
+          env:
+            - name: KRB5_KDC_PROFILE
+              value: /etc/krb5-rs/kdc.conf
+            - name: KRB5_CONFIG
+              value: /etc/krb5-rs/kprop-krb5.conf
+            - name: KRB5_KTNAME
+              value: FILE:/keytab/krb5.keytab
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/krb5-rs
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: keytab
+              mountPath: /keytab
+              readOnly: true
+        {{- else }}
         # Push the database to every replica's kpropd (MIT kprop).
         - name: kprop
           image: {{ include "krb5-rs-kdc.image" . | quote }}
@@ -182,6 +238,7 @@ spec:
               mountPath: /keytab
               readOnly: true
         {{- end }}
+        {{- end }}
       volumes:
         - name: config
           configMap:
@@ -193,6 +250,10 @@ spec:
                 path: krb5.conf
               - key: kprop-krb5.conf
                 path: kprop-krb5.conf
+              {{- if .Values.propagation.iprop.enabled }}
+              - key: kadm5.acl
+                path: kadm5.acl
+              {{- end }}
         - name: secrets
           secret:
             secretName: {{ include "krb5-rs-kdc.secretName" . }}

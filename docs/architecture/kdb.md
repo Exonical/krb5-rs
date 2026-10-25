@@ -238,7 +238,32 @@ log, as in MIT.
 
 Deviations: `load -update` with iprop enabled reinitializes the log instead
 of logging each loaded principal; the file store and CockroachDB never write
-a log. kpropd iprop mode is not implemented yet.
+a log.
+
+### kpropd iprop mode
+
+With `iprop_enable = true` in the replica's kdc.conf realm, `krb5-rs-kpropd`
+also runs MIT's `do_iprop` loop (`src/kprop/kpropd.c:628-1018`) next to its
+kprop listener. It gets an initial ticket from the `-s` keytab as
+`kiprop/<host>` for `kiprop/<admin_server>` (`-A` overrides the krb5.conf
+`admin_server`), connects to `iprop_port` with RPCSEC_GSS privacy and calls
+`IPROP_GET_UPDATES` with its log's last serial every `iprop_replica_poll`
+(else `iprop_slave_poll`, default 2m; 0 means 10s). Updates are applied as
+`ulog_replay` does (`kdb_log.c:401-476`, `kdb_convert.c:550-760`): lockout
+attributes are ignored, new tl-data types are prepended, each update is
+stored in the replica's log under the primary's serial and a failed replay
+reinitializes the log. `UPDATE_FULL_RESYNC_NEEDED` sends
+`IPROP_FULL_RESYNC_EXT` (falling back to `IPROP_FULL_RESYNC`) at most once
+per `iprop_resync_timeout` (default 5m); the primary then pushes with kprop
+and kpropd loads it with `load -i`. Busy replies and connection failures
+back off `2 << n` seconds up to `MAX_BACKOFF` (300s); permission-denied and
+error replies end kpropd with status 1, like MIT. With iprop disabled,
+kpropd only receives kprop pushes, the default.
+`crates/krb5-rs-kdc/tests/kpropd_iprop_live.rs` has it follow MIT 1.22.2
+`kadmind -proponly`.
+
+Deviations: kpropd requires `iprop_port` instead of looking the service up
+with the portmapper; `-x` is accepted and ignored; klmdb only.
 
 ### kadmind iprop service
 
@@ -303,8 +328,7 @@ an exclusive lock, renames it to `<file>`, runs
 acknowledges only after the load succeeds, so a failed load is a failed
 propagation on the primary.
 
-Deviations: no kpropd iprop mode (`-A`, `-x` are accepted and ignored; the
-primary side is `krb5-rs-kadmind -proponly`, see §kadmind iprop service); kpropd does not daemonize (`-D` or a
+Deviations: iprop mode is described in §kpropd iprop mode; kpropd does not daemonize (`-D` or a
 supervisor), and `--pid-file` writes the pid of the foreground process.
 krb5-rs-only additions: `krb5-rs-kprop --interval SECS [--watch PATH] [--kdb PROGRAM]
 host...` dumps and pushes forever (the cron job, for shell-less images), and

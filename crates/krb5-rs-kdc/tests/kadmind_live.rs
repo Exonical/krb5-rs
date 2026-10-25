@@ -79,9 +79,10 @@ set -euo pipefail
 B=/tmp/kadmind-live
 BIN=$B/bin
 R=KADMIND.LIVE
-for f in kdc kadmind kpropd; do [ -f $B/$f.pid ] && kill "$(cat $B/$f.pid)" 2>/dev/null || true; done
-pkill -f "kpropd -D -d -P 17560" 2>/dev/null || true
-sleep 0.2
+stop() { pkill -f "$BIN/|kpropd -D -d -P 17560" 2>/dev/null || true; }
+stop
+sleep 0.5
+trap stop EXIT
 rm -rf "$B/p" "$B/r" "$B"/*.conf "$B"/*.log "$B"/*.acl "$B/kt" "$B/stash" "$B"/*.pid
 mkdir -p "$B/p" "$B/r"
 H=$(hostname | tr 'A-Z' 'a-z')
@@ -158,11 +159,10 @@ for _ in $(seq 1 300); do synced bob && ! synced alice && break; sleep 0.1; done
 synced bob || fail "bob not propagated"
 ! synced alice || fail "alice deletion not propagated"
 test "$(grep -c 'Full propagation transfer finished' "$B/kpropd.log")" -eq 1 || fail "unexpected extra full resync"
-P=$(p kproplog -h | awk '/Last serial #/ {print $4}')
-R2=$(r kproplog -h | awk '/Last serial #/ {print $4}')
+P=$(p kproplog -h | awk '/Last serial #/ {print $NF}')
+R2=$(r kproplog -h | awk '/Last serial #/ {print $NF}')
 [ "$P" = "$R2" ] || fail "serials differ: primary $P replica $R2"
 echo "incremental ok (serial $P)"
 
-for f in kpropd kadmind kdc; do kill "$(cat $B/$f.pid)" 2>/dev/null || true; done
 echo KADMIND_LIVE_OK
 "#;

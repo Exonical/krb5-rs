@@ -148,6 +148,8 @@ jobs:
           bash deploy/helm/krb5-rs-kdc/ci/k3d-import.sh e2e localhost/krb5-rs-kdc:e2e krb5-rs-mit-test:1.22.2
       - name: Chart end-to-end
         run: bash deploy/helm/krb5-rs-kdc/ci/e2e.sh
+      - name: Chart end-to-end with iprop
+        run: E2E_IPROP=1 REL=kdci bash deploy/helm/krb5-rs-kdc/ci/e2e.sh
 
   helm-e2e-cockroach:
     runs-on: ubuntu-latest

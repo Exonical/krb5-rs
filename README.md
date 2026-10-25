@@ -258,8 +258,17 @@ iprop update log (`<database_name>.ulog`); `krb5-rs-kdb dump -i1 [-c]`,
 `acl_file`, full resyncs through `krb5-rs-kdb dump -i1 -c` and
 `krb5-rs-kprop`); it supports no other kadmind mode.
 
-Deliberate deviations: kpropd iprop mode (`-A`/`-x`) is not implemented yet,
-and `-A`/`-x` are accepted and ignored;
+With `iprop_enable = true` in the replica's kdc.conf, `krb5-rs-kpropd` also
+polls the primary's iprop service like MIT kpropd: every `iprop_replica_poll`
+it asks for the updates after its log's last serial as `kiprop/<its hostname>`
+(to `kiprop/<admin_server>`, `-A` overrides `admin_server`), applies them to
+the klmdb database and its own update log, and asks for a full resync, which
+arrives as a normal kprop push, when the primary no longer has them. The
+primary can be MIT `kadmind` or `krb5-rs-kadmind -proponly`. Push-only
+replication stays the default.
+
+Deliberate deviations: kpropd `-x` is accepted and ignored and iprop needs
+`iprop_port` (no portmapper lookup);
 `krb5-rs-kpropd` never forks into the background (use `-D` or a supervisor).
 The `kprop_*` kdc.conf keys of the earlier krb5-rs pull protocol
 (`KRB5RS-PROP-1`) were removed; configurations that still set them fail with

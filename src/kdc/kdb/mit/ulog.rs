@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{fcntl_lock, FlockOperation};
 
-use super::codec::MitEntry;
+use super::codec::{KeyData, MitEntry, TlData};
 use super::name::{parse_name, unparse_name};
 use super::tl::{LAST_PWD_CHANGE, MOD_PRINC};
 use crate::kdc::store::StoreError;
@@ -866,6 +866,110 @@ impl Drop for Locked<'_> {
 
 /// Read `buf.len()` bytes at `offset`, treating bytes past the end of the
 /// file as zero like MIT's mmap.
+fn princ_name(p: &Princ) -> Result<(crate::types::PrincipalName, String), StoreError> {
+    let name_string = p
+        .components
+        .iter()
+        .map(|(_, c)| {
+            rasn::types::GeneralString::from_bytes(c)
+                .map_err(|_| StoreError::backend("invalid principal component in update"))
+        })
+        .collect::<Result<_, _>>()?;
+    let realm = String::from_utf8(p.realm.clone())
+        .map_err(|_| StoreError::backend("invalid principal realm in update"))?;
+    Ok((
+        crate::types::PrincipalName {
+            name_type: p.name_type,
+            name_string,
+        },
+        realm,
+    ))
+}
+
+/// `krb5_db_update_tl_data` (`kdb5.c:2285-2335`): a new type is prepended.
+fn set_tl(entry: &mut MitEntry, kind: u16, data: Vec<u8>) {
+    match entry.tl_data.iter_mut().find(|t| t.kind == kind) {
+        Some(t) => t.data = data,
+        None => entry.tl_data.insert(0, TlData { kind, data }),
+    }
+}
+
+/// `ulog_conv_2dbentry` (`kdb_convert.c:550-760`) on a replica: apply the
+/// attributes of `upd` to the stored entry `current`, or to an empty entry
+/// for an add. Lockout attributes are ignored, as on an `IPROP_REPLICA`.
+pub fn entry_from_update(current: Option<MitEntry>, upd: &Update) -> Result<MitEntry, StoreError> {
+    let mut entry = match current {
+        Some(e) => e,
+        None => {
+            let (principal, realm) = parse_name(&upd.princ_name)?;
+            MitEntry {
+                principal,
+                realm,
+                attributes: 0,
+                max_life: 0,
+                max_renewable_life: 0,
+                expiration: 0,
+                pw_expiration: 0,
+                last_success: 0,
+                last_failed: 0,
+                fail_auth_count: 0,
+                tl_data: Vec::new(),
+                key_data: Vec::new(),
+            }
+        }
+    };
+    let (mut mod_princ, mut mod_time) = (None, 0);
+    for value in &upd.values {
+        match value {
+            Value::AttrFlags(v) => entry.attributes = *v,
+            Value::MaxLife(v) => entry.max_life = *v,
+            Value::MaxRenewLife(v) => entry.max_renewable_life = *v,
+            Value::Exp(v) => entry.expiration = *v,
+            Value::PwExp(v) => entry.pw_expiration = *v,
+            Value::Princ(p) => (entry.principal, entry.realm) = princ_name(p)?,
+            Value::KeyData(keys) => {
+                entry.key_data = keys
+                    .iter()
+                    .map(|k| {
+                        if k.ver > 2 {
+                            return Err(StoreError::backend("invalid key data version in update"));
+                        }
+                        let n = k.ver.max(0) as usize;
+                        Ok(KeyData {
+                            ver: k.ver as u16,
+                            kvno: k.kvno as u16,
+                            fields: (0..n)
+                                .map(|i| {
+                                    (
+                                        k.enctypes.get(i).copied().unwrap_or(0) as i16,
+                                        k.contents.get(i).cloned().unwrap_or_default(),
+                                    )
+                                })
+                                .collect(),
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+            }
+            Value::TlData(tls) => {
+                for t in tls {
+                    set_tl(&mut entry, t.kind as u16, t.data.clone());
+                }
+            }
+            Value::PwLastChange(v) => set_tl(&mut entry, LAST_PWD_CHANGE, v.to_le_bytes().to_vec()),
+            Value::ModPrinc(p) => mod_princ = Some(princ_name(p)?),
+            Value::ModTime(v) => mod_time = *v,
+            _ => {}
+        }
+    }
+    if let (Some((name, realm)), true) = (mod_princ, mod_time != 0) {
+        let mut data = mod_time.to_le_bytes().to_vec();
+        data.extend_from_slice(&unparse_name(&name, &realm));
+        data.push(0);
+        set_tl(&mut entry, MOD_PRINC, data);
+    }
+    Ok(entry)
+}
+
 fn read_zero_padded(file: &File, buf: &mut [u8], offset: u64) -> Result<(), StoreError> {
     buf.fill(0);
     let mut done = 0;
@@ -1253,6 +1357,90 @@ mod tests {
             values: vec![Value::AttrFlags(0x80), Value::Len(38)],
             ..Update::default()
         }
+    }
+
+    fn mit_entry(name: &[u8]) -> MitEntry {
+        MitEntry {
+            principal: crate::types::PrincipalName {
+                name_type: 1,
+                name_string: vec![rasn::types::GeneralString::from_bytes(name).expect("name")],
+            },
+            realm: "EXAMPLE.COM".into(),
+            attributes: 0x80,
+            max_life: 36000,
+            max_renewable_life: 604800,
+            expiration: 0,
+            pw_expiration: 1_900_000_000,
+            last_success: 0,
+            last_failed: 0,
+            fail_auth_count: 0,
+            tl_data: vec![
+                TlData {
+                    kind: LAST_PWD_CHANGE,
+                    data: 1_700_000_000u32.to_le_bytes().to_vec(),
+                },
+                TlData {
+                    kind: MOD_PRINC,
+                    data: [&1_700_000_001u32.to_le_bytes()[..], b"admin@EXAMPLE.COM\0"].concat(),
+                },
+                TlData {
+                    kind: 0x7fff,
+                    data: b"x".to_vec(),
+                },
+            ],
+            key_data: vec![KeyData {
+                ver: 2,
+                kvno: 3,
+                fields: vec![(18, vec![7; 34]), (3, b"salt".to_vec())],
+            }],
+        }
+    }
+
+    #[test]
+    fn replayed_add_reproduces_the_logged_entry() {
+        let mut e = mit_entry(b"alice");
+        let upd = update_from_entry(None, &e);
+        e.last_success = 5;
+        let got = entry_from_update(None, &upd).expect("replay");
+        e.last_success = 0;
+        e.tl_data = vec![
+            e.tl_data[1].clone(),
+            e.tl_data[2].clone(),
+            e.tl_data[0].clone(),
+        ];
+        assert_eq!(got, e);
+    }
+
+    #[test]
+    fn replayed_change_keeps_unlogged_lockout_fields() {
+        let old = MitEntry {
+            fail_auth_count: 4,
+            ..mit_entry(b"bob")
+        };
+        let mut new = old.clone();
+        new.max_life = 7200;
+        new.key_data[0].kvno = 4;
+        new.tl_data[0].data = 1_700_000_100u32.to_le_bytes().to_vec();
+        let upd = update_from_entry(Some(&old), &new);
+        assert!(upd
+            .values
+            .iter()
+            .all(|v| !matches!(v, Value::FailAuthCount(_))));
+        let got = entry_from_update(Some(old), &upd).expect("replay");
+        assert_eq!(got, new);
+    }
+
+    #[test]
+    fn replay_rejects_key_data_version_above_two() {
+        let upd = Update {
+            princ_name: b"carol@EXAMPLE.COM".to_vec(),
+            values: vec![Value::KeyData(vec![Key {
+                ver: 3,
+                ..Key::default()
+            }])],
+            ..Update::default()
+        };
+        assert!(entry_from_update(None, &upd).is_err());
     }
 
     #[test]
