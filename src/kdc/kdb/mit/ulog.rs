@@ -754,7 +754,7 @@ fn changed_attrs(current: &MitEntry, new: &MitEntry) -> Vec<i32> {
             .key_data
             .iter()
             .zip(&new.key_data)
-            .any(|(a, b)| a.kvno != b.kvno)
+            .any(|(a, b)| a != b)
     {
         attrs.push(9);
     }
@@ -849,18 +849,92 @@ pub fn update_from_entry(current: Option<&MitEntry>, entry: &MitEntry) -> Update
     }
 }
 
-struct Locked<'a>(&'a File);
+/// One open update log shared by every [`Ulog`] handle to it in this
+/// process. `fcntl` locks belong to the process, so threads and handles are
+/// ordered by `gate` and the descriptor is only closed with the last handle.
+struct Shared {
+    file: File,
+    gate: std::sync::Mutex<Gate>,
+    freed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Gate {
+    owner: Option<std::thread::ThreadId>,
+    shared_guards: u32,
+    exclusive_guards: u32,
+    exclusive: bool,
+}
+
+type OpenLogs = Vec<((u64, u64), std::sync::Weak<Shared>)>;
+static OPEN_LOGS: std::sync::Mutex<OpenLogs> = std::sync::Mutex::new(Vec::new());
+
+fn gate(shared: &Shared) -> std::sync::MutexGuard<'_, Gate> {
+    shared
+        .gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The log locked by this thread. Guards on one thread nest in any drop
+/// order: the file lock is exclusive while any exclusive guard lives and is
+/// released with the last guard. Guards are not `Send`, so the owning
+/// thread always holds them.
+struct Locked<'a> {
+    shared: &'a Shared,
+    exclusive: bool,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
 
 impl<'a> Locked<'a> {
-    fn new(file: &'a File, op: FlockOperation) -> Result<Self, StoreError> {
-        fcntl_lock(file, op).map_err(|e| io_error("locking ulog", e.into()))?;
-        Ok(Self(file))
+    fn new(shared: &'a Shared, op: FlockOperation) -> Result<Self, StoreError> {
+        let me = std::thread::current().id();
+        let exclusive = op == FlockOperation::LockExclusive;
+        let mut g = gate(shared);
+        if g.owner != Some(me) {
+            while g.owner.is_some() {
+                g = shared
+                    .freed
+                    .wait(g)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            fcntl_lock(&shared.file, op).map_err(|e| io_error("locking ulog", e.into()))?;
+            g.owner = Some(me);
+            g.exclusive = exclusive;
+        } else if exclusive && !g.exclusive {
+            fcntl_lock(&shared.file, op).map_err(|e| io_error("locking ulog", e.into()))?;
+            g.exclusive = true;
+        }
+        if exclusive {
+            g.exclusive_guards += 1;
+        } else {
+            g.shared_guards += 1;
+        }
+        Ok(Self {
+            shared,
+            exclusive,
+            _not_send: std::marker::PhantomData,
+        })
     }
 }
 
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
-        let _ = fcntl_lock(self.0, FlockOperation::Unlock);
+        let mut g = gate(self.shared);
+        if self.exclusive {
+            g.exclusive_guards -= 1;
+        } else {
+            g.shared_guards -= 1;
+        }
+        if g.exclusive_guards + g.shared_guards == 0 {
+            let _ = fcntl_lock(&self.shared.file, FlockOperation::Unlock);
+            *g = Gate::default();
+            drop(g);
+            self.shared.freed.notify_one();
+        } else if g.exclusive_guards == 0 && g.exclusive {
+            let _ = fcntl_lock(&self.shared.file, FlockOperation::LockShared);
+            g.exclusive = false;
+        }
     }
 }
 
@@ -1015,8 +1089,14 @@ pub fn read_entry(
 
 /// A mapped update log (`kdb_log_context`).
 pub struct Ulog {
-    file: File,
+    shared: std::sync::Arc<Shared>,
     entries: u32,
+}
+
+/// The update log held exclusively, by this thread and this process, so a
+/// database write and its log entry are ordered together.
+pub struct UlogLock<'a> {
+    _held: Locked<'a>,
 }
 
 impl Ulog {
@@ -1025,15 +1105,42 @@ impl Ulog {
         if entries == 0 {
             return Err(StoreError::backend("iprop_ulogsize must be positive"));
         }
-        let exists = path.exists();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(!exists)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| io_error(&format!("opening ulog {}", path.display()), e))?;
-        let ulog = Self { file, entries };
+        use std::os::unix::fs::MetadataExt;
+        let mut open = OPEN_LOGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        open.retain(|(_, w)| w.strong_count() > 0);
+        let id = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        let exists = id.is_some();
+        let found = id.and_then(|id| {
+            open.iter()
+                .find(|(k, _)| *k == id)
+                .and_then(|(_, w)| w.upgrade())
+        });
+        let shared = match found {
+            Some(shared) => shared,
+            None => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(!exists)
+                    .mode(0o600)
+                    .open(path)
+                    .map_err(|e| io_error(&format!("opening ulog {}", path.display()), e))?;
+                let m = file
+                    .metadata()
+                    .map_err(|e| io_error(&format!("opening ulog {}", path.display()), e))?;
+                let shared = std::sync::Arc::new(Shared {
+                    file,
+                    gate: std::sync::Mutex::new(Gate::default()),
+                    freed: std::sync::Condvar::new(),
+                });
+                open.push(((m.dev(), m.ino()), std::sync::Arc::downgrade(&shared)));
+                shared
+            }
+        };
+        drop(open);
+        let ulog = Self { shared, entries };
         if !exists {
             ulog.extend_to(HEADER_SIZE + u64::from(entries) * u64::from(ULOG_BLOCK))?;
         }
@@ -1044,8 +1151,8 @@ impl Ulog {
     fn check_on_map(&self, path: &Path) -> Result<(), StoreError> {
         let ulog = self;
         let entries = self.entries;
-        let _lock = Locked::new(&ulog.file, FlockOperation::LockExclusive)?;
-        let mut hdr = read_header(&ulog.file)?;
+        let _lock = Locked::new(&ulog.shared, FlockOperation::LockExclusive)?;
+        let mut hdr = read_header(&ulog.shared.file)?;
         if hdr.hmagic != KDB_ULOG_HDR_MAGIC {
             if hdr.hmagic != 0 {
                 return Err(StoreError::corrupt(format!(
@@ -1078,12 +1185,14 @@ impl Ulog {
             return Err(StoreError::backend("ulog too large"));
         }
         let len = self
+            .shared
             .file
             .metadata()
             .map_err(|e| io_error("reading ulog size", e))?
             .len();
         if len < size {
-            self.file
+            self.shared
+                .file
                 .set_len(size)
                 .map_err(|e| io_error("extending ulog", e))?;
         }
@@ -1091,13 +1200,15 @@ impl Ulog {
     }
 
     fn write_at(&self, data: &[u8], offset: u64) -> Result<(), StoreError> {
-        self.file
+        self.shared
+            .file
             .write_all_at(data, offset)
             .map_err(|e| io_error("writing ulog", e))
     }
 
     fn sync(&self) -> Result<(), StoreError> {
-        self.file
+        self.shared
+            .file
             .sync_data()
             .map_err(|e| io_error("syncing ulog", e))
     }
@@ -1108,7 +1219,7 @@ impl Ulog {
 
     fn entry_header(&self, hdr: &Header, index: u32) -> Result<EntryHeader, StoreError> {
         let mut b = [0; ENTRY_DATA_OFFSET];
-        read_zero_padded(&self.file, &mut b, entry_offset(index, hdr.block))?;
+        read_zero_padded(&self.shared.file, &mut b, entry_offset(index, hdr.block))?;
         Ok(EntryHeader::decode(&b))
     }
 
@@ -1190,7 +1301,7 @@ impl Ulog {
         for i in (0..self.entries).rev() {
             buf.fill(0);
             read_zero_padded(
-                &self.file,
+                &self.shared.file,
                 &mut buf[..old_block],
                 entry_offset(i, hdr.block),
             )?;
@@ -1249,8 +1360,24 @@ impl Ulog {
     /// `ulog_add_update` (`kdb_log.c:361-385`): assign the next serial number
     /// and the current time to `upd` and append it.
     pub fn add_update(&self, upd: &mut Update) -> Result<(), StoreError> {
-        let _lock = Locked::new(&self.file, FlockOperation::LockExclusive)?;
-        let mut hdr = read_header(&self.file)?;
+        let held = self.lock()?;
+        self.add_update_locked(&held, upd)
+    }
+
+    /// Hold the log exclusively until the returned guard is dropped.
+    pub fn lock(&self) -> Result<UlogLock<'_>, StoreError> {
+        Ok(UlogLock {
+            _held: Locked::new(&self.shared, FlockOperation::LockExclusive)?,
+        })
+    }
+
+    /// [`Ulog::add_update`] while `held` is already held.
+    pub fn add_update_locked(
+        &self,
+        _held: &UlogLock<'_>,
+        upd: &mut Update,
+    ) -> Result<(), StoreError> {
+        let mut hdr = read_header(&self.shared.file)?;
         if hdr.last_sno == u32::MAX {
             hdr = self.reset()?;
         }
@@ -1262,8 +1389,8 @@ impl Ulog {
     /// Append an update received from the primary, keeping its serial number
     /// and time (`ulog_replay`, `kdb_log.c:445-457`).
     pub fn store_replayed(&self, upd: &Update) -> Result<(), StoreError> {
-        let _lock = Locked::new(&self.file, FlockOperation::LockExclusive)?;
-        let mut hdr = read_header(&self.file)?;
+        let _lock = Locked::new(&self.shared, FlockOperation::LockExclusive)?;
+        let mut hdr = read_header(&self.shared.file)?;
         if hdr.num != 0 && upd.sno != hdr.last_sno.wrapping_add(1) {
             hdr = self.reset()?;
         }
@@ -1272,14 +1399,14 @@ impl Ulog {
 
     /// `ulog_init_header` (`kdb_log.c:474-490`).
     pub fn init_header(&self) -> Result<(), StoreError> {
-        let _lock = Locked::new(&self.file, FlockOperation::LockExclusive)?;
+        let _lock = Locked::new(&self.shared, FlockOperation::LockExclusive)?;
         self.reset().map(drop)
     }
 
     /// `ulog_get_last` (`kdb_log.c:672-688`).
     pub fn get_last(&self) -> Result<Last, StoreError> {
-        let _lock = Locked::new(&self.file, FlockOperation::LockShared)?;
-        let hdr = read_header(&self.file)?;
+        let _lock = Locked::new(&self.shared, FlockOperation::LockShared)?;
+        let hdr = read_header(&self.shared.file)?;
         Ok(Last {
             sno: hdr.last_sno,
             time: hdr.last_time,
@@ -1288,8 +1415,8 @@ impl Ulog {
 
     /// `ulog_set_last` (`kdb_log.c:691-706`).
     pub fn set_last(&self, last: Last) -> Result<(), StoreError> {
-        let _lock = Locked::new(&self.file, FlockOperation::LockExclusive)?;
-        let mut hdr = read_header(&self.file)?;
+        let _lock = Locked::new(&self.shared, FlockOperation::LockExclusive)?;
+        let mut hdr = read_header(&self.shared.file)?;
         self.set_dummy(&mut hdr, last.sno, last.time)?;
         self.write_header(&hdr)?;
         self.sync()
@@ -1297,10 +1424,10 @@ impl Ulog {
 
     /// `ulog_get_sno_status` (`kdb_log.c:658-669`).
     pub fn get_sno_status(&self, last: &Last) -> UpdateStatus {
-        let Ok(_lock) = Locked::new(&self.file, FlockOperation::LockShared) else {
+        let Ok(_lock) = Locked::new(&self.shared, FlockOperation::LockShared) else {
             return UpdateStatus::Error;
         };
-        read_header(&self.file)
+        read_header(&self.shared.file)
             .and_then(|hdr| self.sno_status(&hdr, last))
             .unwrap_or(UpdateStatus::Error)
     }
@@ -1311,18 +1438,25 @@ impl Ulog {
         &self,
         last: &Last,
     ) -> Result<(UpdateStatus, Vec<Update>, Last), StoreError> {
-        let _lock = Locked::new(&self.file, FlockOperation::LockShared)?;
-        let mut hdr = read_header(&self.file)?;
+        let mut lock = Locked::new(&self.shared, FlockOperation::LockShared)?;
+        let mut hdr = read_header(&self.shared.file)?;
         if hdr.state != KDB_STABLE {
-            hdr = self.reset()?;
+            // Reset only under the exclusive lock so no reader sees it half done.
+            drop(lock);
+            lock = Locked::new(&self.shared, FlockOperation::LockExclusive)?;
+            hdr = read_header(&self.shared.file)?;
+            if hdr.state != KDB_STABLE {
+                hdr = self.reset()?;
+            }
         }
+        let _lock = lock;
         let status = self.sno_status(&hdr, last)?;
         if status != UpdateStatus::Ok {
             return Ok((status, Vec::new(), Last::default()));
         }
         let mut updates = Vec::new();
         for sno in last.sno..hdr.last_sno {
-            let (ent, data) = read_entry(&self.file, hdr.block, sno % self.entries)?;
+            let (ent, data) = read_entry(&self.shared.file, hdr.block, sno % self.entries)?;
             let mut upd = Update::decode(&data)?;
             upd.commit = ent.commit;
             updates.push(upd);
@@ -1336,14 +1470,35 @@ impl Ulog {
 
     /// The current header.
     pub fn header(&self) -> Result<Header, StoreError> {
-        let _lock = Locked::new(&self.file, FlockOperation::LockShared)?;
-        read_header(&self.file)
+        let _lock = Locked::new(&self.shared, FlockOperation::LockShared)?;
+        read_header(&self.shared.file)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_changes_without_a_new_kvno_are_logged() {
+        let current = mit_entry(b"alice");
+        let mut changed = current.clone();
+        if changed.key_data.is_empty() {
+            changed.key_data.push(KeyData {
+                ver: 1,
+                kvno: 1,
+                fields: vec![(18, vec![1; 40])],
+            });
+        } else {
+            changed.key_data[0].fields[0].1[0] ^= 1;
+        }
+        let update = update_from_entry(Some(&current), &changed);
+        assert!(
+            update.values.iter().any(|v| matches!(v, Value::KeyData(_))),
+            "{:?}",
+            update.values
+        );
+    }
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ulog-test-{}-{name}", std::process::id()));
@@ -1516,6 +1671,58 @@ mod tests {
     }
 
     #[test]
+    fn nested_guards_hold_the_log_until_the_last_one_drops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let path = std::env::temp_dir().join(format!("ulog-nested-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let a = Ulog::map(&path, 8).expect("map a");
+        let b = Ulog::map(&path, 8).expect("map b");
+        let released = AtomicBool::new(false);
+        let first = a.lock().expect("first");
+        let second = a.lock().expect("second");
+        drop(first);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                let _held = b.lock().expect("lock b");
+                released.load(Ordering::SeqCst)
+            });
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            released.store(true, Ordering::SeqCst);
+            drop(second);
+            assert!(
+                waiter.join().expect("join"),
+                "b locked while second was live"
+            );
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handles_to_one_log_exclude_each_other_in_one_process() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let path = std::env::temp_dir().join(format!("ulog-two-handles-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let a = Ulog::map(&path, 8).expect("map a");
+        let b = Ulog::map(&path, 8).expect("map b");
+        let released = AtomicBool::new(false);
+        let held = a.lock().expect("lock a");
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                let _held = b.lock().expect("lock b");
+                b.get_last().expect("last");
+                released.load(Ordering::SeqCst)
+            });
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            released.store(true, Ordering::SeqCst);
+            drop(held);
+            assert!(waiter.join().expect("join"), "b locked while a held it");
+        });
+        drop(a);
+        let _again = b.lock().expect("lock b after a is closed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn map_creates_a_stable_log_with_a_dummy_entry() {
         let path = tmp("create");
         let log = Ulog::map(&path, 4).expect("map");
@@ -1584,7 +1791,7 @@ mod tests {
         log.add_update(&mut big).expect("add big");
         let h = log.header().expect("header");
         assert_eq!(h.block, 4096);
-        let (_, data) = read_entry(&log.file, h.block, 1).expect("entry");
+        let (_, data) = read_entry(&log.shared.file, h.block, 1).expect("entry");
         assert_eq!(
             Update::decode(&data).expect("decode").princ_name,
             b"small@EX.COM"

@@ -7,7 +7,7 @@ use fs2::FileExt;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, WithTls, WithoutTls};
 use krb5_rs::kdc::kdb::mit::mkey::{entry_mkvno, MasterKeys};
-use krb5_rs::kdc::kdb::mit::ulog::{entry_from_update, update_from_entry, Ulog, Update};
+use krb5_rs::kdc::kdb::mit::ulog::{entry_from_update, update_from_entry, Ulog, UlogLock, Update};
 use krb5_rs::kdc::kdb::mit::{
     decode_lockout, encode_lockout, merge_policy, merge_record, new_entry, policy_from_entry,
     record_from_entry, unparse_name, MitEntry, MitPolicy, TlData, ACTKVNO, MKVNO,
@@ -443,12 +443,17 @@ impl LmdbStore {
         self.inner.ulog.as_ref()
     }
 
-    /// `ulog_add_update` after a logged change (`lib/kdb/kdb5.c:981-1051`).
-    fn log(&self, mut update: Update) -> Result<(), StoreError> {
-        self.inner
-            .ulog
-            .as_ref()
-            .map_or(Ok(()), |ulog| ulog.add_update(&mut update))
+    /// Hold the update log across a database write and its log entry
+    /// (`krb5_db_put_principal`, `lib/kdb/kdb5.c:981-1051`).
+    fn lock_ulog(&self) -> Result<Option<UlogLock<'_>>, StoreError> {
+        self.inner.ulog.as_ref().map(Ulog::lock).transpose()
+    }
+
+    fn log_held(&self, held: Option<&UlogLock<'_>>, mut update: Update) -> Result<(), StoreError> {
+        match (self.inner.ulog.as_ref(), held) {
+            (Some(ulog), Some(held)) => ulog.add_update_locked(held, &mut update),
+            _ => Ok(()),
+        }
     }
 
     /// Policy changes reinitialize the ulog so replicas resync fully
@@ -804,6 +809,7 @@ impl LmdbStore {
         };
         let raw = new_entry(&record, &self.master_keys(), &modifier)?;
         let (_, value) = raw.encode()?;
+        let held = self.lock_ulog()?;
         let mut txn = self
             .inner
             .main_env
@@ -845,7 +851,7 @@ impl LmdbStore {
         }
         txn.commit()
             .map_err(|e| backend("committing principal", e))?;
-        self.log(update_from_entry(None, &raw))
+        self.log_held(held.as_ref(), update_from_entry(None, &raw))
     }
 
     #[cfg(test)]
@@ -876,6 +882,7 @@ impl LmdbStore {
     {
         self.refresh_master()?;
         let key = unparse_name(name, realm);
+        let held = self.lock_ulog()?;
         let mut txn = self
             .inner
             .main_env
@@ -906,7 +913,7 @@ impl LmdbStore {
         txn.commit()
             .map_err(|e| backend("committing updated principal", e))?;
         if let Some(current) = current {
-            self.log(update_from_entry(Some(&current), &raw))?;
+            self.log_held(held.as_ref(), update_from_entry(Some(&current), &raw))?;
         }
         Ok(record)
     }
@@ -932,6 +939,7 @@ impl LmdbStore {
         self.refresh_master()?;
         let keys = self.master_keys().clone();
         let key = unparse_name(name, realm);
+        let held = self.lock_ulog()?;
         let mut txn = self
             .inner
             .main_env
@@ -959,17 +967,18 @@ impl LmdbStore {
         txn.commit()
             .map_err(|e| backend("committing updated principal", e))?;
         if self.inner.ulog.is_some() {
-            self.log(update_from_entry(Some(&current), &raw))?;
+            self.log_held(held.as_ref(), update_from_entry(Some(&current), &raw))?;
         }
         self.refresh_master()?;
         Ok(true)
     }
 
     fn delete_principal_sync(&self, name: &PrincipalName, realm: &str) -> Result<bool, StoreError> {
+        let held = self.lock_ulog()?;
         let key = unparse_name(name, realm);
         let deleted = self.delete_unlogged(&key)?;
         if deleted {
-            self.log(Update::deletion(key))?;
+            self.log_held(held.as_ref(), Update::deletion(key))?;
         }
         Ok(deleted)
     }

@@ -278,6 +278,21 @@ Deviations: `load -update` with iprop enabled reinitializes the log instead
 of logging each loaded principal; the file store and CockroachDB never write
 a log.
 
+Deliberate deviations from MIT's log handling (MIT 1.22.2 behaves
+otherwise):
+
+- A klmdb principal write and its log entry happen under one exclusive log
+  lock (taken before the LMDB write transaction, held by thread and process;
+  every `Ulog` handle to the same file in one process shares one descriptor
+  and one per-thread gate, since `fcntl` locks only exclude other processes),
+  so concurrent writers cannot log changes in a different order than they
+  were committed.
+- A key change that keeps the same kvno (e.g. `ktadd -norandkey` style
+  rewrites or a master-key rewrap) is logged; MIT compares only key versions.
+- A log found unstable by a reader is reset only under the exclusive lock.
+- An invalid or non-positive `iprop_ulogsize` is a configuration error
+  instead of silently falling back to 1000 entries.
+
 ### kpropd iprop mode
 
 With `iprop_enable = true` in the replica's kdc.conf realm, `krb5-rs-kpropd`
