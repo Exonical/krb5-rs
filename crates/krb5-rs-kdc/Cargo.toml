@@ -26,6 +26,11 @@ name = "krb5-rs-kpropd"
 path = "src/bin/krb5-rs-kpropd.rs"
 
 [[bin]]
+name = "krb5-rs-kadmind"
+path = "src/bin/krb5-rs-kadmind.rs"
+required-features = ["klmdb"]
+
+[[bin]]
 name = "krb5-rs-kproplog"
 path = "src/bin/krb5-rs-kproplog.rs"
 

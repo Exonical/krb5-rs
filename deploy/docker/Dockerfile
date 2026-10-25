@@ -41,7 +41,7 @@ RUN export CC_x86_64_unknown_linux_musl=musl-gcc \
  && mkdir -p /out/data \
  && cp "target/$TARGET/release/krb5-rs-kdc" "target/$TARGET/release/krb5-rs-kdb" \
       "target/$TARGET/release/krb5-rs-kprop" "target/$TARGET/release/krb5-rs-kpropd" \
-      "target/$TARGET/release/krb5-rs-kproplog" /out/
+      "target/$TARGET/release/krb5-rs-kproplog" "target/$TARGET/release/krb5-rs-kadmind" /out/
 
 # gcr.io/distroless/static-debian12:nonroot (index digest)
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
@@ -54,7 +54,7 @@ LABEL org.opencontainers.image.title="krb5-rs-kdc" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}"
 
-COPY --from=build /out/krb5-rs-kdc /out/krb5-rs-kdb /out/krb5-rs-kprop /out/krb5-rs-kpropd /out/krb5-rs-kproplog /usr/local/bin/
+COPY --from=build /out/krb5-rs-kdc /out/krb5-rs-kdb /out/krb5-rs-kprop /out/krb5-rs-kpropd /out/krb5-rs-kproplog /out/krb5-rs-kadmind /usr/local/bin/
 # Pre-owned data directory: new volumes mounted here inherit uid 65532.
 COPY --from=build --chown=65532:65532 /out/data /var/lib/krb5-rs
 

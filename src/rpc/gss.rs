@@ -553,6 +553,27 @@ impl GssServer {
         )
     }
 
+    /// The reply record for a dispatched call that failed with `stat`
+    /// (`svcerr_noproc`, `svcerr_decode`, ...), with the call's verifier.
+    pub fn reply_error(
+        &mut self,
+        xid: u32,
+        seq: u32,
+        stat: AcceptStat,
+    ) -> Result<Vec<u8>, RpcError> {
+        let est = self
+            .est
+            .as_mut()
+            .ok_or_else(|| RpcError::Gss("no context".into()))?;
+        let verf = gss_verf(est.ctx.get_mic(&seq.to_be_bytes()).map_err(gss)?);
+        Ok(Reply::Accepted {
+            verf,
+            stat,
+            results: Vec::new(),
+        }
+        .encode(xid))
+    }
+
     /// The reply record for a dispatched call (`svcauth_gss_nextverf` and
     /// `svcauth_gss_wrap`).
     pub fn reply(&mut self, xid: u32, seq: u32, results: &[u8]) -> Result<Vec<u8>, RpcError> {

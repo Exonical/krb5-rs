@@ -238,8 +238,33 @@ log, as in MIT.
 
 Deviations: `load -update` with iprop enabled reinitializes the log instead
 of logging each loaded principal; the file store and CockroachDB never write
-a log. The `kadmind` iprop service and kpropd iprop mode are not implemented
-yet, so the log is written but not served.
+a log. kpropd iprop mode is not implemented yet.
+
+### kadmind iprop service
+
+`krb5-rs-kadmind -proponly` serves the log like MIT `kadmind -proponly`
+(`src/kadmin/server/ovsec_kadmd.c`, `ipropd_svc.c`): it refuses to start
+without `-proponly` or without `iprop_enable`, and requires `iprop_port`
+(listening on `iprop_listen` if set). Program 100423 version 1 runs over
+RPCSEC_GSS (§ONC RPC and RPCSEC_GSS) with service keys read from the klmdb
+database; calls whose service principal is not `kiprop/<host>@REALM` are
+rejected as too weak. The client must hold the `p` permission in `acl_file`
+(default `/usr/local/var/krb5kdc/kadm5.acl`), parsed like `auth_acl.c`:
+whitespace or comma separated fields, `\` continuation, `*` wildcards in
+components and realm, `x`/`*` for every permission, an uppercase letter
+removing one, the first matching entry deciding, and entries with a target
+not applying to iprop. `IPROP_GET_UPDATES` returns the log entries after the
+replica's serial (`ulog_get_entries`); `IPROP_FULL_RESYNC[_EXT]` runs
+`krb5-rs-kdb -r REALM dump -i[1] -c FILE` (`-p`, `-F`) and then
+`krb5-rs-kprop -r REALM -f FILE [-P PORT] <host>` (`-K`, `-k`). The live test
+`crates/krb5-rs-kdc/tests/kadmind_live.rs` has MIT 1.22.2 kpropd follow it
+through a full resync and then incremental updates.
+
+Deviations: only `-proponly`; the process stays in the foreground (`-nofork`
+is implied) and `-P` writes its pid; `-x`, the kadmin and kpasswd services
+and ACL restrictions are not supported (restrictions are parsed and ignored,
+as they never apply to iprop); `-port` is accepted and ignored because it
+sets only the kadmin port; klmdb only.
 
 ### ONC RPC and RPCSEC_GSS
 
@@ -278,8 +303,8 @@ an exclusive lock, renames it to `<file>`, runs
 acknowledges only after the load succeeds, so a failed load is a failed
 propagation on the primary.
 
-Deviations: no iprop (`-A`, `-x` are accepted and ignored; the `kadmind -p`
-side does not exist, see §MIT iprop update log); kpropd does not daemonize (`-D` or a
+Deviations: no kpropd iprop mode (`-A`, `-x` are accepted and ignored; the
+primary side is `krb5-rs-kadmind -proponly`, see §kadmind iprop service); kpropd does not daemonize (`-D` or a
 supervisor), and `--pid-file` writes the pid of the foreground process.
 krb5-rs-only additions: `krb5-rs-kprop --interval SECS [--watch PATH] [--kdb PROGRAM]
 host...` dumps and pushes forever (the cron job, for shell-less images), and
