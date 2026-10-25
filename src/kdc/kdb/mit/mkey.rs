@@ -396,6 +396,22 @@ pub fn purge_mkeys(km: &mut MitEntry, in_use: &[u16]) -> Result<Vec<u16>, StoreE
     Ok(purged)
 }
 
+/// Rewrap one key-data record's key from master key `from` to `to`, keeping
+/// its version and salt field.
+pub fn rewrap_key_data(
+    data: &mut super::KeyData,
+    from: &EncryptionKey,
+    to: &EncryptionKey,
+) -> Result<(), StoreError> {
+    let (etype, blob) = data
+        .fields
+        .first_mut()
+        .ok_or_else(|| corrupt("key-data record has no key field"))?;
+    let key = decrypt_key(from, i32::from(*etype), blob)?;
+    *blob = encrypt_key(to, &key)?;
+    Ok(())
+}
+
 /// `master_key_convert` (`dump.c:83-129`) for a non-`K/M` entry: rewrap
 /// every key in `new` (version `new_kvno`), keeping each key's version and
 /// salt, and set `KRB5_TL_MKVNO`.
@@ -412,12 +428,7 @@ pub fn convert_entry(
         ))
     })?;
     for data in &mut entry.key_data {
-        let (etype, blob) = data
-            .fields
-            .first_mut()
-            .ok_or_else(|| corrupt("key-data record has no key field"))?;
-        let key = decrypt_key(old, i32::from(*etype), blob)?;
-        *blob = encrypt_key(new, &key)?;
+        rewrap_key_data(data, old, new)?;
     }
     put_tl(entry, super::MKVNO, Some(new_kvno.to_le_bytes().to_vec()));
     Ok(())

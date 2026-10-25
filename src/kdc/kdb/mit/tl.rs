@@ -9,7 +9,7 @@ use chrono::Utc;
 use rasn::types::GeneralString;
 
 use super::codec::{KeyData, MitEntry, MitPolicy, TlData};
-use super::mkey::{entry_mkvno as mkvno, MasterKeys};
+use super::mkey::{entry_mkvno as mkvno, rewrap_key_data, MasterKeys};
 use super::name::parse_name;
 #[cfg(test)]
 use super::name::unparse_name;
@@ -392,6 +392,7 @@ fn update_keys(
     let mut remaining = entry.key_data.clone();
     let mut updated = Vec::with_capacity(record.entry.keys.len());
     let mut reencrypted = false;
+    let mut retained = Vec::new();
     for key in &record.entry.keys {
         let reused = old_master.and_then(|master| {
             remaining
@@ -399,6 +400,7 @@ fn update_keys(
                 .position(|old| reusable_key_data(old, key, &record.entry, master))
         });
         if let Some(index) = reused {
+            retained.push(updated.len());
             updated.push(remaining.remove(index));
         } else {
             reencrypted = true;
@@ -406,13 +408,13 @@ fn update_keys(
         }
     }
     if reencrypted && old_mkvno != active_kvno {
-        // Every key must be wrapped by the master key named in MKVNO.
-        updated = record
-            .entry
-            .keys
-            .iter()
-            .map(|key| key_data_from_entry(&record.entry, key, active))
-            .collect::<Result<_, _>>()?;
+        // Every key must be wrapped by the master key named in MKVNO; retained
+        // key data keeps its version and salt field (`master_key_convert`).
+        if let Some(old) = old_master {
+            for at in retained {
+                rewrap_key_data(&mut updated[at], old, active)?;
+            }
+        }
     }
     entry.key_data = updated;
     Ok(reencrypted)
@@ -962,6 +964,48 @@ mod tests {
             record_from_entry(&entry, &MasterKeys::single(master.clone())).expect("map record");
         assert_eq!(record.entry.security_epoch, 0);
         assert!(record.entry.keys.iter().all(|key| key.s2kparams.is_none()));
+    }
+
+    #[test]
+    fn retained_keys_keep_their_salt_fields_when_the_master_key_changes() {
+        use crate::kdc::kdb::mit::mkey::ActKvno;
+        let m1 = master_key_from_password("R", "master", 18).expect("m1");
+        let m2 = master_key_from_password("R", "second", 18).expect("m2");
+        let keys = MasterKeys {
+            keys: vec![(2, m2.clone()), (1, m1.clone())],
+            actkvno: vec![
+                ActKvno {
+                    kvno: 1,
+                    act_time: 0,
+                },
+                ActKvno {
+                    kvno: 2,
+                    act_time: 0,
+                },
+            ],
+        };
+        let mut entry = test_entry(&m1);
+        entry.key_data = vec![encrypted_key_data(
+            &m1,
+            &EncryptionKey::new(18, vec![0x5a; 32]),
+            2,
+            5,
+            b"x",
+        )];
+        let mut record = record_from_entry(&entry, &keys).expect("record");
+        let mut added = record.entry.keys[0].clone();
+        added.kvno += 1;
+        added.key = EncryptionKey::new(18, vec![0x6b; 32]);
+        record.entry.keys.insert(0, added);
+        merge_record(&mut entry, &record, &keys, None).expect("merge");
+        assert_eq!(mkvno(&entry).expect("mkvno"), 2);
+        let retained = entry
+            .key_data
+            .iter()
+            .find(|k| k.fields.get(1) == Some(&(5, b"x".to_vec())))
+            .expect("salt type 5 kept");
+        let key = decrypt_key(&m2, 18, &retained.fields[0].1).expect("rewrapped");
+        assert_eq!(key.key_bytes(), &[0x5a; 32][..]);
     }
 
     #[test]

@@ -582,7 +582,17 @@ impl LmdbStore {
         let raw = self
             .get_raw(&name, &self.inner.realm)?
             .ok_or_else(|| StoreError::backend("klmdb database has no K/M principal"))?;
-        let keys = MasterKeys::fetch(&raw, &self.inner.supplied_master)?;
+        // krb5_dbe_find_mkey reloads with the loaded list's keys, which still
+        // open K/M after the startup key has been purged.
+        let loaded = self.master_keys().keys.clone();
+        let keys = match loaded
+            .iter()
+            .map(|(_, key)| key)
+            .find_map(|key| MasterKeys::fetch(&raw, key).ok())
+        {
+            Some(keys) => keys,
+            None => MasterKeys::fetch(&raw, &self.inner.supplied_master)?,
+        };
         *self
             .inner
             .master
@@ -2101,6 +2111,64 @@ mod tests {
             .expect("read rekeyed record")
             .expect("alice");
         assert_eq!(rekeyed.entry.keys.iter().map(|key| key.kvno).max(), Some(2));
+    }
+
+    #[test]
+    fn a_running_store_survives_purging_its_startup_master_key() {
+        use krb5_rs::kdc::kdb::mit::mkey::{
+            add_new_mkey, convert_entry, lookup_actkvno, now, purge_mkeys, update_actkvno, use_mkey,
+        };
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let (store, master) = test_store(&path);
+        let km = PrincipalName {
+            name_type: 1,
+            name_string: vec![
+                KerberosString::from_bytes(b"K").expect("K"),
+                KerberosString::from_bytes(b"M").expect("M"),
+            ],
+        };
+        let second =
+            krb5_rs::kdc::kdb::master_key_from_password("LMDB.TEST", "second", master.keytype)
+                .expect("second master key");
+        store
+            .update_raw(&km, "LMDB.TEST", |entry, keys| {
+                add_new_mkey(entry, keys, &second)?;
+                let mut list = lookup_actkvno(entry)?;
+                use_mkey(&mut list, 2, 0, now())?;
+                update_actkvno(entry, &list);
+                Ok(true)
+            })
+            .expect("rotate");
+        for entry in store.raw_entries().expect("entries") {
+            if entry.principal.name_string == km.name_string {
+                continue;
+            }
+            store
+                .update_raw(&entry.principal, &entry.realm, |e, keys| {
+                    convert_entry(e, keys, 2, &second)?;
+                    Ok(true)
+                })
+                .expect("rewrap");
+        }
+        store
+            .update_raw(&km, "LMDB.TEST", |entry, _| {
+                purge_mkeys(entry, &[2])?;
+                Ok(true)
+            })
+            .expect("purge the startup key");
+        assert_eq!(store.master_key_list().expect("master keys").keys.len(), 1);
+        let krbtgt = PrincipalName {
+            name_type: 2,
+            name_string: vec![
+                KerberosString::from_bytes(b"krbtgt").expect("krbtgt"),
+                KerberosString::from_bytes(b"LMDB.TEST").expect("realm"),
+            ],
+        };
+        assert!(store
+            .get_record_sync(&krbtgt, "LMDB.TEST")
+            .expect("read after purge")
+            .is_some());
     }
 
     #[test]
