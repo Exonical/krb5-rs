@@ -681,7 +681,11 @@ impl LmdbStore {
         name: &PrincipalName,
         realm: &str,
     ) -> Result<Option<MitEntry>, StoreError> {
-        self.get_raw(name, realm)
+        let Some(mut entry) = self.get_raw(name, realm)? else {
+            return Ok(None);
+        };
+        entry.set_auth_state(self.auth_state_sync(&lockout_key(name, realm))?)?;
+        Ok(Some(entry))
     }
 
     /// The stored policy `name`, read synchronously (`krb5_db_get_policy`).
@@ -1999,6 +2003,11 @@ mod tests {
                 .to_vec()
         };
         assert_eq!(before, after, "lockout state belongs only to lockout.mdb");
+        let raw = store
+            .raw_entry(&alice, "LMDB.TEST")
+            .expect("raw read")
+            .expect("alice");
+        assert_eq!((raw.fail_auth_count, raw.last_failed), (1, 100));
         assert_eq!(
             store
                 .auth_state(&alice, "LMDB.TEST")

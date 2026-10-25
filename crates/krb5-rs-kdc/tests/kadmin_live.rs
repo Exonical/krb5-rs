@@ -118,7 +118,7 @@ kl() { kadmin.local -r $R -q "$1" >/dev/null; }
 kdb5_util create -r $R -s -P master-password >/dev/null
 kl "addpol -minlength 8 -minclasses 2 -maxlife 30d -history 3 -maxfailure 5 -failurecountinterval 1h -lockoutduration 10m -allowedkeysalts aes256-cts-hmac-sha1-96:normal strict"
 kl "addpol plain"
-for p in admin reader nobody bob; do kl "addprinc -pw $p-pw $p"; done
+for p in admin reader nobody bob 7zip; do kl "addprinc -pw $p-pw $p"; done
 kl "addprinc -pw alice-pw-1 -policy strict -maxlife 8h -expire 2040-01-01 +requires_preauth alice"
 kl "setstr alice color blue"
 kl "setstr alice size large"
@@ -130,7 +130,8 @@ EOF
 # The same commands through kadmin.local, before our daemons hold the
 # database (MIT's liblmdb cannot open it while they do).
 CMDS=("getprinc alice" "getprinc -terse alice" "getprinc kadmin/admin" "listprincs"
-      "listprincs k*" "listprincs *@OTHER" "getpol strict" "getpol -terse strict"
+      "listprincs k*" "listprincs *@OTHER" "listprincs [[:digit:]]*" "listprincs [^[:alpha:]]*"
+      "listprincs *a*d*m*i*n*@*" "getpol strict" "getpol -terse strict"
       "getpol plain" "listpols" "listpols s*" "getstrs alice" "getstrs bob" "getprivs")
 i=0
 for cmd in "${CMDS[@]}"; do

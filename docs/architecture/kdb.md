@@ -420,7 +420,14 @@ The read-only calls are implemented: `get_principal`, `get_principals`,
 `get_policy`, `get_policies`, `get_privs` and `get_strings`, with records
 encoded like `kadm_rpc_xdr.c` for the negotiated API version and
 `get_principals`/`get_policies` globbing like `svr_iters.c` (an expression
-without `@` matches the default realm). Authorization combines MIT's two
+without `@` matches the default realm). The glob is turned into the same
+anchored POSIX regular expression as `glob_to_regexp`, so bracket sets accept
+`[:class:]` names and, as in MIT, a `^`, `.` or `$` inside brackets is a
+literal member together with `\` (there is no bracket negation); it is then
+matched in linear time per `*`. Escapes that MIT's BRE would read as groups,
+intervals or back-references (`\(`, `\{`, `\1`) are taken as literals.
+`get_principal` reports the live `last_success`, `last_failed` and failure
+count from `lockout.mdb`, as `krb5_db_get_principal` does. Authorization combines MIT's two
 default kadm5_auth modules: `self` (`auth_self.c`: one's own principal and
 strings, and one's own policy) and `acl` (`acl_file`, the `i` and `l`
 permissions). A `kadmin/changepw` ticket may only read its own principal and

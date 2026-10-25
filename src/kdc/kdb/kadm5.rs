@@ -523,7 +523,46 @@ enum Tok {
     Any,
     Star,
     Byte(u8),
-    Set { negate: bool, items: Vec<(u8, u8)> },
+    Set { negate: bool, items: Vec<SetItem> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetItem {
+    Range(u8, u8),
+    /// A POSIX `[:name:]` class, in the C locale.
+    Class(&'static str),
+}
+
+impl SetItem {
+    const CLASSES: [&'static str; 12] = [
+        "alpha", "digit", "alnum", "upper", "lower", "space", "blank", "punct", "print", "graph",
+        "cntrl", "xdigit",
+    ];
+
+    fn contains(self, c: u8) -> bool {
+        match self {
+            Self::Range(lo, hi) => lo <= c && c <= hi,
+            Self::Class("alpha") => c.is_ascii_alphabetic(),
+            Self::Class("digit") => c.is_ascii_digit(),
+            Self::Class("alnum") => c.is_ascii_alphanumeric(),
+            Self::Class("upper") => c.is_ascii_uppercase(),
+            Self::Class("lower") => c.is_ascii_lowercase(),
+            Self::Class("space") => matches!(c, b' ' | b'\t'..=b'\r'),
+            Self::Class("blank") => matches!(c, b' ' | b'\t'),
+            Self::Class("punct") => c.is_ascii_punctuation(),
+            Self::Class("print") => (b' '..=b'~').contains(&c),
+            Self::Class("graph") => c.is_ascii_graphic(),
+            Self::Class("cntrl") => c.is_ascii_control(),
+            Self::Class(_) => c.is_ascii_hexdigit(),
+        }
+    }
+
+    fn class(name: &[u8]) -> Option<Self> {
+        Self::CLASSES
+            .into_iter()
+            .find(|c| c.as_bytes() == name)
+            .map(Self::Class)
+    }
 }
 
 /// A `kadm5_get_principals` / `kadm5_get_policies` expression: the shell
@@ -541,34 +580,66 @@ impl Glob {
         if glob.last() == Some(&b'\\') {
             return None;
         }
-        let mut toks = Vec::new();
+        // `glob_to_regexp`: `.`, `^` and `$` are quoted even inside
+        // brackets, so `[^...]` is a set containing `\` and `^`, not a
+        // negation, exactly as MIT's `regcomp` sees it.
+        let mut re = Vec::with_capacity(glob.len() * 2 + 3);
         let mut i = 0;
         while i < glob.len() {
             match glob[i] {
-                b'?' => toks.push(Tok::Any),
-                b'*' => toks.push(Tok::Star),
+                b'?' => re.push(b'.'),
+                b'*' => re.extend_from_slice(b".*"),
+                c @ (b'.' | b'^' | b'$') => re.extend_from_slice(&[b'\\', c]),
                 b'\\' => {
                     i += 1;
-                    toks.push(Tok::Byte(glob[i]));
+                    re.extend_from_slice(&[b'\\', glob[i]]);
                 }
-                b'[' => {
-                    let (tok, next) = Self::bracket(glob, i + 1)?;
-                    toks.push(tok);
-                    i = next;
-                    continue;
-                }
-                c => toks.push(Tok::Byte(c)),
+                c => re.push(c),
             }
             i += 1;
         }
         if realm_default && !glob.contains(&b'@') {
-            toks.push(Tok::Byte(b'@'));
-            toks.push(Tok::Star);
+            re.extend_from_slice(b"@.*");
+        }
+        Self::compile(&re)
+    }
+
+    /// The anchored POSIX basic regular expression `glob_to_regexp` builds.
+    /// `\X` is taken as a literal `X` (MIT's BRE would treat `\(`, `\{` and
+    /// `\1`..`\9` as groups, intervals and back-references).
+    fn compile(re: &[u8]) -> Option<Self> {
+        let mut toks = Vec::new();
+        let mut i = 0;
+        while i < re.len() {
+            match re[i] {
+                b'\\' => {
+                    toks.push(Tok::Byte(*re.get(i + 1)?));
+                    i += 2;
+                }
+                b'.' if re.get(i + 1) == Some(&b'*') => {
+                    toks.push(Tok::Star);
+                    i += 2;
+                }
+                b'.' => {
+                    toks.push(Tok::Any);
+                    i += 1;
+                }
+                b'[' => {
+                    let (tok, next) = Self::bracket(re, i + 1)?;
+                    toks.push(tok);
+                    i = next;
+                }
+                c => {
+                    toks.push(Tok::Byte(c));
+                    i += 1;
+                }
+            }
         }
         Some(Self(toks))
     }
 
-    /// A POSIX bracket expression starting after `[`.
+    /// A POSIX bracket expression starting after `[` (`regcomp` in
+    /// `svr_iters.c`); `None` for an unknown `[:class:]`.
     fn bracket(glob: &[u8], mut i: usize) -> Option<(Tok, usize)> {
         let negate = glob.get(i) == Some(&b'^');
         if negate {
@@ -582,42 +653,55 @@ impl Glob {
                 return Some((Tok::Set { negate, items }, i + 1));
             }
             first = false;
+            if c == b'[' && glob.get(i + 1) == Some(&b':') {
+                let name_start = i + 2;
+                let len = glob[name_start..].windows(2).position(|w| w == b":]")?;
+                items.push(SetItem::class(&glob[name_start..name_start + len])?);
+                i = name_start + len + 2;
+                continue;
+            }
             match (glob.get(i + 1), glob.get(i + 2)) {
                 (Some(b'-'), Some(&hi)) if hi != b']' => {
-                    items.push((c, hi));
+                    items.push(SetItem::Range(c, hi));
                     i += 3;
                 }
                 _ => {
-                    items.push((c, c));
+                    items.push(SetItem::Range(c, c));
                     i += 1;
                 }
             }
         }
     }
 
-    /// Whether `name` matches.
+    /// Whether `name` matches, in O(pattern * name) time: every token but
+    /// `*` consumes one byte, so on a mismatch only the latest `*` needs to
+    /// absorb one more byte.
     pub fn matches(&self, name: &[u8]) -> bool {
-        fn go(toks: &[Tok], s: &[u8]) -> bool {
-            match toks.split_first() {
-                None => s.is_empty(),
-                Some((Tok::Star, rest)) => (0..=s.len()).any(|k| go(rest, &s[k..])),
-                Some((t, rest)) => match s.split_first() {
-                    None => false,
-                    Some((&c, tail)) => {
-                        let ok = match t {
-                            Tok::Any => true,
-                            Tok::Byte(b) => *b == c,
-                            Tok::Set { negate, items } => {
-                                items.iter().any(|&(lo, hi)| lo <= c && c <= hi) != *negate
-                            }
-                            Tok::Star => unreachable!(),
-                        };
-                        ok && go(rest, tail)
-                    }
-                },
+        let one = |t: &Tok, c: u8| match t {
+            Tok::Any => true,
+            Tok::Byte(b) => *b == c,
+            Tok::Set { negate, items } => items.iter().any(|i| i.contains(c)) != *negate,
+            Tok::Star => false,
+        };
+        let toks = &self.0;
+        let (mut t, mut n) = (0, 0);
+        let mut star: Option<(usize, usize)> = None;
+        while n < name.len() {
+            if matches!(toks.get(t), Some(Tok::Star)) {
+                star = Some((t, n));
+                t += 1;
+            } else if toks.get(t).is_some_and(|tok| one(tok, name[n])) {
+                t += 1;
+                n += 1;
+            } else if let Some((st, sn)) = star {
+                star = Some((st, sn + 1));
+                t = st + 1;
+                n = sn + 1;
+            } else {
+                return false;
             }
         }
-        go(&self.0, name)
+        toks[t..].iter().all(|tok| matches!(tok, Tok::Star))
     }
 }
 
@@ -702,7 +786,8 @@ mod tests {
         assert!(g("alice@R", true).matches(b"alice@R"));
         assert!(!g("alice@R", true).matches(b"alice@S"));
         assert!(g("k[a-m]*/*", true).matches(b"kadmin/admin@R"));
-        assert!(!g("k[^a-m]*", true).matches(b"kadmin/admin@R"));
+        // MIT has no bracket negation: `^` is quoted into the set.
+        assert!(g("k[^a-m]*", true).matches(b"kadmin/admin@R"));
         assert!(g("a\\*", false).matches(b"a*"));
         assert!(!g("a\\*", false).matches(b"ab"));
         assert!(g("a.b", false).matches(b"a.b") && !g("a.b", false).matches(b"axb"));
@@ -710,6 +795,29 @@ mod tests {
         assert!(Glob::new(Some("a\\"), true).is_none());
         assert!(Glob::new(Some("[ab"), true).is_none());
         assert!(Glob::new(None, false).expect("star").matches(b"anything"));
+    }
+
+    #[test]
+    fn glob_posix_classes_and_linear_time() {
+        let g = |e: &str| Glob::new(Some(e), true);
+        let digit = g("[[:digit:]]*").expect("valid");
+        assert!(digit.matches(b"1alice@R"));
+        assert!(!digit.matches(b"alice@R"));
+        // MIT quotes `^` inside brackets too: a set of `\`, `^`, letters, `_`.
+        let caret = g("[^[:alpha:]_]x").expect("valid");
+        assert!(!caret.matches(b"9x@R"));
+        for name in [&b"ax@R"[..], b"_x@R", b"^x@R", b"\\x@R"] {
+            assert!(caret.matches(name));
+        }
+        let dot = g("[.]").expect("valid");
+        assert!(dot.matches(b".@R") && dot.matches(b"\\@R") && !dot.matches(b"a@R"));
+        assert!(g("[[:upper:]a-c]").expect("valid").matches(b"Q@R"));
+        assert!(g("[[:bogus:]]").is_none());
+        assert!(g("[[:digit:").is_none());
+        let stars = g(&"*a".repeat(30)).expect("valid");
+        assert!(!stars.matches(&[b'a'; 4000]));
+        assert!(g("a*b*c").expect("valid").matches(b"aXbYbc@R"));
+        assert!(!g("a*b*c").expect("valid").matches(b"aXbYb@R"));
     }
 
     fn entry() -> MitEntry {
