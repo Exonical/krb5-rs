@@ -513,12 +513,24 @@ async fn serve(state: Arc<State>, mut stream: TcpStream) -> Result<(), String> {
     }));
     while let Some(record) = read_record(&mut stream).await.map_err(|e| e.to_string())? {
         let out = match Call::decode(&record) {
-            Ok(call) => match gss.handle(&call) {
-                ServerStep::Send(r) => r,
-                ServerStep::Dispatch { proc_, args, seq } => {
-                    state.dispatch(&mut gss, &call, proc_, &args, seq)?
-                }
-            },
+            Ok(call) => {
+                // Service-key and ulog reads hit LMDB; keep them off the
+                // event loop.
+                let st = state.clone();
+                let (back, out) = tokio::task::spawn_blocking(move || {
+                    let out = match gss.handle(&call) {
+                        ServerStep::Send(r) => Ok(r),
+                        ServerStep::Dispatch { proc_, args, seq } => {
+                            st.dispatch(&mut gss, &call, proc_, &args, seq)
+                        }
+                    };
+                    (gss, out)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                gss = back;
+                out?
+            }
             Err(CallError::RpcMismatch(xid)) => Reply::RpcMismatch(2, 2).encode(xid),
             Err(CallError::Garbage(e)) => return Err(format!("undecodable call: {e:?}")),
         };
