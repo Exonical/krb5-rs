@@ -451,10 +451,7 @@ fn listen_addrs(listen: Option<String>, port: u16) -> Vec<SocketAddr> {
         return wild(port);
     };
     let mut out = Vec::new();
-    for tok in listen
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|t| !t.is_empty())
-    {
+    for tok in listen.split([',', ';', ' ']).filter(|t| !t.is_empty()) {
         if let Ok(p) = tok.parse::<u16>() {
             out.extend(wild(p));
         } else if let Ok(a) = tok.parse::<SocketAddr>() {
@@ -547,6 +544,9 @@ async fn main() {
             Err(e) => die(format!("{e} while binding {addr}")),
         }
     }
+    if listeners.is_empty() {
+        die("no sockets set up?");
+    }
     if let Some(pid_file) = &args.pid_file {
         if let Err(e) = std::fs::write(pid_file, format!("{}\n", std::process::id())) {
             die(format!(
@@ -623,6 +623,23 @@ mod tests {
             "kiprop/replica@R"
         ));
         assert!(permits("kiprop/replica,p", "kiprop/replica@R"));
+    }
+
+    #[test]
+    fn iprop_listen_uses_mit_delimiters() {
+        let addrs = listen_addrs(Some("127.0.0.1:1;127.0.0.2,127.0.0.3 2".into()), 9);
+        let got: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            got,
+            [
+                "127.0.0.1:1",
+                "127.0.0.2:9",
+                "127.0.0.3:9",
+                "0.0.0.0:2",
+                "[::]:2"
+            ]
+        );
+        assert!(listen_addrs(Some(String::new()), 9).is_empty());
     }
 
     #[test]
