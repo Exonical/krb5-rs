@@ -6,7 +6,7 @@ use std::time::Duration;
 use fs2::FileExt;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, WithTls, WithoutTls};
-use krb5_rs::kdc::kdb::mit::ulog::{update_from_entry, Ulog, Update};
+use krb5_rs::kdc::kdb::mit::ulog::{entry_from_update, update_from_entry, Ulog, Update};
 use krb5_rs::kdc::kdb::mit::{
     decode_lockout, encode_lockout, merge_policy, merge_record, new_entry, policy_from_entry,
     record_from_entry, unparse_name, MitEntry, MitPolicy, TlData, ACTKVNO, MKVNO,
@@ -877,6 +877,67 @@ impl LmdbStore {
 
     fn delete_principal_sync(&self, name: &PrincipalName, realm: &str) -> Result<bool, StoreError> {
         let key = unparse_name(name, realm);
+        let deleted = self.delete_unlogged(&key)?;
+        if deleted {
+            self.log(Update::deletion(key))?;
+        }
+        Ok(deleted)
+    }
+
+    /// `ulog_replay` (`lib/kdb/kdb_log.c:401-476`): apply updates received
+    /// from the primary without logging them as new changes, then store each
+    /// one in the ulog with its primary serial number. On failure the ulog is
+    /// reinitialized, so the next poll asks for a full resync.
+    pub fn replay_updates(&self, updates: &[Update]) -> Result<(), StoreError> {
+        let ulog = self
+            .inner
+            .ulog
+            .as_ref()
+            .ok_or_else(|| StoreError::backend("Iprop not enabled"))?;
+        let result = updates.iter().filter(|u| u.commit).try_for_each(|upd| {
+            if upd.deleted {
+                self.delete_unlogged(&upd.princ_name)?;
+            } else {
+                self.replay_put(upd)?;
+            }
+            ulog.store_replayed(upd)
+        });
+        if result.is_err() {
+            let _ = ulog.init_header();
+        }
+        result
+    }
+
+    fn replay_put(&self, upd: &Update) -> Result<(), StoreError> {
+        let mut txn = self
+            .inner
+            .main_env
+            .write_txn()
+            .map_err(|e| backend("opening principal write transaction", e))?;
+        let current = self
+            .inner
+            .principal_db
+            .get(&txn, &upd.princ_name)
+            .map_err(|e| backend("reading principal for update", e))?
+            .map(|v| MitEntry::decode(&upd.princ_name, v))
+            .transpose()?;
+        let entry = entry_from_update(current, upd)?;
+        let (key, value) = entry.encode()?;
+        if key != upd.princ_name {
+            self.inner
+                .principal_db
+                .delete(&mut txn, &upd.princ_name)
+                .map_err(|e| backend("deleting renamed principal", e))?;
+        }
+        self.inner
+            .principal_db
+            .put(&mut txn, &key, &value)
+            .map_err(|e| backend("writing replayed principal", e))?;
+        txn.commit()
+            .map_err(|e| backend("committing replayed principal", e))
+    }
+
+    fn delete_unlogged(&self, key: &[u8]) -> Result<bool, StoreError> {
         let mut txn = self
             .inner
             .main_env
@@ -885,7 +946,7 @@ impl LmdbStore {
         let deleted = self
             .inner
             .principal_db
-            .delete(&mut txn, &key)
+            .delete(&mut txn, key)
             .map_err(|e| backend("deleting principal", e))?;
         txn.commit()
             .map_err(|e| backend("committing principal deletion", e))?;
@@ -897,14 +958,11 @@ impl LmdbStore {
                 let mut txn = env
                     .write_txn()
                     .map_err(|e| backend("opening lockout delete transaction", e))?;
-                db.delete(&mut txn, &key)
+                db.delete(&mut txn, key)
                     .map_err(|e| backend("deleting lockout record", e))?;
                 txn.commit()
                     .map_err(|e| backend("committing lockout deletion", e))
             });
-        }
-        if deleted {
-            self.log(Update::deletion(key))?;
         }
         Ok(deleted)
     }

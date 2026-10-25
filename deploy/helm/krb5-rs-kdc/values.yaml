@@ -139,6 +139,16 @@ propagation:
   # seconds. `port` is the kpropd port (MIT's 754 needs root).
   port: 7540
   interval: 60
+  # MIT incremental propagation, off by default. When enabled the primary
+  # runs krb5-rs-kadmind -proponly instead of the kprop sidecar, and each
+  # replica's kpropd polls it every `pollInterval` as kiprop/<pod FQDN>,
+  # falling back to a full kprop push when it falls behind the update log.
+  iprop:
+    enabled: false
+    port: 7550
+    pollInterval: 2m
+    ulogSize: 1000
+    resyncTimeout: 5m
 
 # Cluster DNS domain, part of the pods' host/<FQDN> kprop principals.
 clusterDomain: cluster.local

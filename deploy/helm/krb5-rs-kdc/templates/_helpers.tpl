@@ -161,6 +161,14 @@ Set "kdc" to include the KDC replication and local-replica options.
   max_life = {{ $v.kdc.maxLife }}
   max_renewable_life = {{ $v.kdc.maxRenewableLife }}
   supported_enctypes = {{ $v.kdc.supportedEnctypes }}
+{{- if $v.propagation.iprop.enabled }}
+  acl_file = /etc/krb5-rs/kadm5.acl
+  iprop_enable = true
+  iprop_port = {{ $v.propagation.iprop.port }}
+  iprop_ulogsize = {{ $v.propagation.iprop.ulogSize }}
+  iprop_replica_poll = {{ $v.propagation.iprop.pollInterval }}
+  iprop_resync_timeout = {{ $v.propagation.iprop.resyncTimeout }}
+{{- end }}
  }
 {{- with $v.kdc.extraKdcConf }}
 
@@ -229,6 +237,14 @@ priorityClassName: {{ . }}
   max_life = {{ $v.kdc.maxLife }}
   max_renewable_life = {{ $v.kdc.maxRenewableLife }}
   supported_enctypes = {{ $v.kdc.supportedEnctypes }}
+{{- if $v.propagation.iprop.enabled }}
+  acl_file = /etc/krb5-rs/kadm5.acl
+  iprop_enable = true
+  iprop_port = {{ $v.propagation.iprop.port }}
+  iprop_ulogsize = {{ $v.propagation.iprop.ulogSize }}
+  iprop_replica_poll = {{ $v.propagation.iprop.pollInterval }}
+  iprop_resync_timeout = {{ $v.propagation.iprop.resyncTimeout }}
+{{- end }}
  }
 {{- with $v.kdc.extraKdcConf }}
 

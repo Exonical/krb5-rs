@@ -36,5 +36,16 @@ spec:
       ports:
         - port: {{ .Values.propagation.port }}
           protocol: TCP
+    {{- if .Values.propagation.iprop.enabled }}
+    # iprop polls from the replicas to the primary's kadmind.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "krb5-rs-kdc.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: replica
+      ports:
+        - port: {{ .Values.propagation.iprop.port }}
+          protocol: TCP
+    {{- end }}
 {{- end }}
 {{- end }}

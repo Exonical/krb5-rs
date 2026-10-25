@@ -8,6 +8,7 @@
 # image already loaded into it. Overridable via the environment:
 #   HELM (default: helm)   CHART (default: deploy/helm/krb5-rs-kdc)
 #   REL, KDC_IMAGE_REPO, KDC_IMAGE_TAG, MIT_IMAGE
+#   E2E_IPROP=1 enables propagation.iprop (MIT incremental propagation)
 set -euo pipefail
 
 REL=${REL:-kdc}
@@ -20,6 +21,10 @@ REALM=E2E.TEST
 FULL=${REL}-krb5-rs-kdc
 PRIMARY=${FULL}-primary
 KDB="krb5-rs-kdb --config /etc/krb5-rs/kdc.conf --krb5-config /etc/krb5-rs/krb5.conf --realm ${REALM}"
+IPROP_SET=()
+if [ "${E2E_IPROP:-}" = 1 ]; then
+  IPROP_SET=(--set propagation.iprop.enabled=true --set propagation.iprop.pollInterval=2s)
+fi
 
 step() { printf '\n=== %s\n' "$*"; }
 
@@ -58,6 +63,7 @@ $HELM upgrade --install "$REL" "$CHART" \
   --set image.repository="$KDC_IMAGE_REPO" --set image.tag="$KDC_IMAGE_TAG" \
   --set image.pullPolicy=Never \
   --set propagation.interval=5 \
+  "${IPROP_SET[@]}" \
   --wait --timeout 5m
 kubectl rollout status "statefulset/${PRIMARY}" --timeout=120s
 kubectl rollout status "statefulset/${FULL}-replicas" --timeout=120s
@@ -136,6 +142,24 @@ echo bob-pw | KRB5_CONFIG=/tmp/r.conf KRB5CCNAME=/tmp/ccb kinit bob@${REALM} >/d
   [ "$seen" = 1 ] || { echo "replica $ip never learned bob"; exit 1; }
   echo "replica $ip serves bob"
 done
+
+if [ "${E2E_IPROP:-}" = 1 ]; then
+  step "iprop: every replica reaches the primary's update log serial"
+  serial() { # pod container
+    kubectl exec "$1" -c "$2" -- krb5-rs-kproplog -h |
+      awk '/Last serial #/ {print $NF}'
+  }
+  want=$(serial "${PRIMARY}-0" kadmind)
+  for pod in $(kubectl get pods -l app.kubernetes.io/component=replica -o name); do
+    got=
+    for _ in $(seq 1 30); do
+      got=$(serial "${pod#pod/}" kpropd) && [ "$got" = "$want" ] && break
+      sleep 2
+    done
+    [ "$got" = "$want" ] || { echo "${pod}: serial ${got}, primary ${want}"; exit 1; }
+    echo "${pod} at serial ${want}"
+  done
+fi
 
 step "primary pod deletion (StatefulSet restart) keeps the database"
 kubectl delete pod "${PRIMARY}-0" --wait=true

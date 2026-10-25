@@ -69,6 +69,41 @@ podman kube play --publish 8088:8888/udp --publish 8088:8888/tcp my-kdc.yaml
 
 and point clients at `host:8088` in `krb5.conf` (`kdc = host:8088`).
 
+### Incremental propagation (opt-in)
+
+To use MIT iprop instead of full pushes, add to the realm in both files'
+`kdc.conf`:
+
+```
+  acl_file = /etc/krb5-rs/kadm5.acl
+  iprop_enable = true
+  iprop_port = 7550
+  iprop_replica_poll = 2m
+```
+
+On the primary, add `kiprop/kdc1.example.com` and `kiprop/kdc2.example.com`
+to the `init-database` `--password` list (with `/secrets/kprop-password`),
+`kiprop/kdc1.example.com` to the `init-keytab` principals, a `kadm5.acl`
+entry `kiprop/kdc2.example.com@EXAMPLE.COM p` to the ConfigMap, and replace
+the `kprop` container with
+`krb5-rs-kadmind -proponly -nofork -r EXAMPLE.COM -p /usr/local/bin/krb5-rs-kdb
+-K /usr/local/bin/krb5-rs-kprop -k 7540 -F /var/lib/krb5-rs/replica_datatrans`
+(environment `KRB5_KTNAME=FILE:/var/lib/krb5-rs/krb5.keytab` plus the kprop
+container's `KRB5_KDC_PROFILE`/`KRB5_CONFIG`; publish TCP 7550). On the
+replica, add `kiprop/kdc2.example.com` to its keytab database and keytab and
+`-A kdc1.example.com` to the kpropd arguments. kpropd authenticates to the primary's
+KDC, so the replica's `krb5.conf` needs
+`[realms] EXAMPLE.COM = { kdc = kdc1.example.com }`, and it reads the
+replica's `key_stash_file`, so write it before kpropd starts (`krb5-rs-kdb
+--master-password-file /secrets/master-password stash` with a config whose
+`database_name` is the keytab database and whose `key_stash_file` is the
+replica's). Set `shareProcessNamespace: true` in
+both pods: kadmind or kpropd and the KDC then open the LMDB database at the
+same time, and LMDB's reader locks need distinct process IDs. kpropd then polls for updates
+and the primary pushes a full dump only when the replica falls behind the
+update log. The Helm chart does all of this with
+`propagation.iprop.enabled=true`.
+
 ## Administer
 
 The tools are inside the container; secrets come from stdin, never from argv

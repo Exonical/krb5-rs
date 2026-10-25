@@ -17,8 +17,23 @@ data:
       key_stash_file = /keytab/stash
       supported_enctypes = {{ .Values.kdc.supportedEnctypes }}
      }
+  {{- if .Values.propagation.iprop.enabled }}
+  replica-stash.conf: |
+    [realms]
+     {{ .Values.realm }} = {
+      database_name = /keytab/principal
+      key_stash_file = /var/lib/krb5-rs/stash
+      supported_enctypes = {{ .Values.kdc.supportedEnctypes }}
+     }
+  {{- end }}
   kpropd.acl: |
     host/{{ include "krb5-rs-kdc.primaryHost" . }}@{{ .Values.realm }}
+  {{- if .Values.propagation.iprop.enabled }}
+  kadm5.acl: |
+    {{- range $i := until (int .Values.replicas.replicaCount) }}
+    kiprop/{{ include "krb5-rs-kdc.replicaHost" (dict "ctx" $ "i" $i) }}@{{ $.Values.realm }} p
+    {{- end }}
+  {{- end }}
   kprop-krb5.conf: |
     [libdefaults]
      default_realm = {{ .Values.realm }}
@@ -29,6 +44,18 @@ data:
      {{ .Values.realm }} = {
       kdc = 127.0.0.1:{{ .Values.kdc.containerPort }}
      }
+  {{- if .Values.propagation.iprop.enabled }}
+  iprop-krb5.conf: |
+    [libdefaults]
+     default_realm = {{ .Values.realm }}
+     dns_lookup_kdc = false
+     dns_lookup_realm = false
+     udp_preference_limit = 1
+    [realms]
+     {{ .Values.realm }} = {
+      kdc = {{ include "krb5-rs-kdc.primaryHost" . }}:{{ .Values.kdc.containerPort }}
+     }
+  {{- end }}
   krb5.conf: |
     [libdefaults]
      default_realm = {{ required "realm is required" .Values.realm }}
