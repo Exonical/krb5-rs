@@ -236,6 +236,21 @@ rs_util "$A" list_mkeys > "$BASE/a.rs.list"
 same "$BASE/a.mit.list" "$BASE/a.rs.list"
 grep -q 'KVNO: 2, Enctype: aes256-cts-hmac-sha1-96, No activate time set' "$BASE/a.rs.list"
 
+n=0
+for when in "2030-01-15 10:30" "jan 15, 2030 10pm est" "15-jan-2030" \
+  "1/15/2030 22:30:05 gmt" "next monday" "(soon) 2030-06-01 12am" never; do
+  n=$((n + 1))
+  mit_util "$A" use_mkey 2 "$when"
+  mit_util "$A" list_mkeys > "$BASE/date$n.mit.list"
+  rs_util "$A" use_mkey 2 "$when"
+  rs_util "$A" list_mkeys > "$BASE/date$n.rs.list"
+  same "$BASE/date$n.mit.list" "$BASE/date$n.rs.list"
+done
+if rs_util "$A" use_mkey 2 "10:30 11:30" 2>/dev/null; then
+  echo "use_mkey accepted a date MIT rejects" >&2
+  exit 1
+fi
+
 rs_util "$A" use_mkey 2
 mit_util "$A" list_mkeys > "$BASE/a2.mit.list"
 rs_util "$A" list_mkeys > "$BASE/a2.rs.list"
