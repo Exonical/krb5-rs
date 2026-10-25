@@ -10,6 +10,7 @@ pub mod admin;
 mod file;
 mod format;
 pub mod getdate;
+pub mod kadm5;
 #[cfg(feature = "tokio")]
 pub mod kpasswd;
 #[cfg(feature = "tokio")]

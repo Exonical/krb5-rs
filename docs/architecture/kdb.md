@@ -351,9 +351,7 @@ replica's serial (`ulog_get_entries`); `IPROP_FULL_RESYNC[_EXT]` runs
 through a full resync and then incremental updates.
 
 Deviations: the process stays in the foreground (`-nofork` is implied) and
-`-P` writes its pid; `-x` and the kadm5 admin RPC service (program 2112)
-are not supported; `-port` is accepted and ignored because it sets only the
-kadmin port; klmdb only.
+`-P` writes its pid; `-x` is not supported; klmdb only.
 
 ACL restrictions (the fourth `kadm5.acl` field) are parsed and validated like
 `auth_acl.c` `parse_restrictions`: `[+-]flag`, `-clearpolicy`, `-policy POL`
@@ -361,8 +359,9 @@ and `-expire`/`-pwexpire`/`-maxlife`/`-maxrenewlife DELTAT`. An invalid
 restriction makes the ACL file a syntax error, as in MIT.
 `krb5_rs::kdc::kdb::restrictions::AclRestrictions::impose` applies them the way
 `auth.c` `impose_restrictions` does. MIT only applies restrictions to kadm5
-`create_principal` and `modify_principal`, so they have no effect on iprop or
-kpasswd, and they will take effect once the kadm5 admin RPC service exists.
+`create_principal` and `modify_principal`, so they have no effect on iprop,
+kpasswd or the read-only kadm5 calls, and they will take effect once the kadm5
+admin RPC service gains `create_principal` and `modify_principal`.
 
 Deliberate iprop-service deviations from MIT `ipropd_svc.c`:
 
@@ -404,6 +403,46 @@ and TCP and `krb5_set_password_using_ccache` against it.
 
 Deviations: authorization uses only `acl_file` (no kadm5_auth plugins);
 klmdb only.
+
+### kadm5 admin RPC service
+
+Without `-proponly`, `krb5-rs-kadmind` serves MIT's kadm5 admin protocol
+(ONC RPC program 2112 version 2, `src/lib/kadm5/kadm_rpc_xdr.c`,
+`src/kadmin/server/server_stubs.c`) over RPCSEC_GSS on TCP at
+`kadmind_listen`, or at `-port`, `kadmind_port` (default 749) on every
+address. As in `kadm_rpc_svc.c` `check_rpcsec_auth`, the service principal
+must be `kadmin/<instance>@REALM` other than `kadmin/history`, so
+`kadmin/admin`, `kadmin/<fqdn>` and `kadmin/changepw` tickets are accepted;
+anything else is rejected as too weak. `INIT` negotiates the API version like
+`server_stubs.c` (`KADM5_API_VERSION_2`..`4`; MIT clients fall back from 4).
+
+The read-only calls are implemented: `get_principal`, `get_principals`,
+`get_policy`, `get_policies`, `get_privs` and `get_strings`, with records
+encoded like `kadm_rpc_xdr.c` for the negotiated API version and
+`get_principals`/`get_policies` globbing like `svr_iters.c` (an expression
+without `@` matches the default realm). The glob is turned into the same
+anchored POSIX regular expression as `glob_to_regexp`, so bracket sets accept
+`[:class:]` names and, as in MIT, a `^`, `.` or `$` inside brackets is a
+literal member together with `\` (there is no bracket negation); it is then
+matched in linear time per `*`. Escapes that MIT's BRE would read as groups,
+intervals or back-references (`\(`, `\{`, `\1`) are taken as literals.
+`get_principal` reports the live `last_success`, `last_failed` and failure
+count from `lockout.mdb`, as `krb5_db_get_principal` does. Authorization combines MIT's two
+default kadm5_auth modules: `self` (`auth_self.c`: one's own principal and
+strings, and one's own policy) and `acl` (`acl_file`, the `i` and `l`
+permissions). A `kadmin/changepw` ticket may only read its own principal and
+policy, as in `server_stubs.c`. Requests and denials are logged in MIT's
+`Request: ...` / `Unauthorized request: ...` format. The other procedures
+answer `PROC_UNAVAIL` for now. The live test
+`crates/krb5-rs-kdc/tests/kadmin_live.rs` checks that MIT 1.22.2 `kadmin`
+prints the same `getprinc`, `listprincs`, `getpol`, `listpols`, `getstrs` and
+`getprivs` output as `kadmin.local` on the same database, MIT's denial
+messages, and the `kadmin/changepw` limits through libkadm5clnt at API
+versions 2, 3 and 4.
+
+Deviations: no kadm5_auth plugins beyond the built-in `self` and `acl`
+behavior; the principal, policy and key changing calls are not implemented
+yet; klmdb only.
 
 ### ONC RPC and RPCSEC_GSS
 
