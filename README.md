@@ -120,9 +120,12 @@ at the same time; sequential use is supported. MIT extensions in tl-data, string
 password history, and unmodeled attribute bits are preserved on updates.
 `security_epoch` and key `s2kparams` are krb5-rs-only and are not persisted by
 MIT klmdb; reads return epoch zero and no s2kparams.
-Master-key rotation through `kdb5_util add_mkey` / `use_mkey` is not
-supported; opening a database whose `K/M` has multiple key-data entries fails
-with an explicit error.
+Master-key rotation matches MIT 1.22.2 on klmdb: `krb5-rs-kdb add_mkey
+[-e ENCTYPE] [-s]`, `use_mkey KVNO [TIME]`, `list_mkeys`,
+`update_princ_encryption [-f] [-n] [-v] [PATTERN]` and `purge_mkeys [-f] [-n]
+[-v]` read and write the same `K/M` key data, `KRB5_TL_MKVNO`,
+`KRB5_TL_ACTKVNO` and `KRB5_TL_MKEY_AUX` as `kdb5_util`, and `stash` writes
+every master key version. MIT and krb5-rs can take turns on one rotation.
 
 `krb5-rs-kdb dump [-b7|-r13|-r18] [-verbose] [FILE [NAME-REGEX]...]` and
 `krb5-rs-kdb load [-b7|-r13|-r18] [-verbose] [-update] [-hash] FILE` read and

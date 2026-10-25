@@ -161,9 +161,47 @@ loaded principals and policies use epoch zero. MIT key-data has no
 `allowed_to_delegate_from` uses the krb5-rs string attribute
 `krb5rs_allowed_to_delegate_from`; MIT db2/klmdb do not define a native field
 for resource-based delegation. klmdb is the default `db_library`;
-`db_library = krb5-rs-file` selects `FileStore`. MIT dump/load is described below. Master-key rotation via `kdb5_util add_mkey` /
-`use_mkey` is not supported; opening a `K/M` with multiple key-data records
-fails explicitly.
+`db_library = krb5-rs-file` selects `FileStore`. MIT dump/load is described below.
+
+### MIT master-key rotation
+
+`krb5_rs::kdc::kdb::mit::mkey` mirrors `lib/kdb/kdb5.c`,
+`lib/kdb/kdb_default.c` and `kadmin/dbutil/kdb5_mkey.c`:
+
+- **Key list.** `MasterKeys::fetch` is `krb5_def_fetch_mkey_list`: the
+  supplied key (stash or password) decrypts `K/M`'s first key-data record
+  directly or through a `KRB5_TL_MKEY_AUX` entry, and that newest key
+  decrypts the older records. klmdb keeps the list and selects each entry's
+  wrapping key by its `KRB5_TL_MKVNO` (default 1).
+- **Active key.** `KRB5_TL_ACTKVNO` (default: oldest key active from 0)
+  picks the key for new and rekeyed principals (`find_actkvno`). A rekey under
+  a different active key rewraps all of the entry's keys and sets `MKVNO`;
+  unchanged entries keep their wrapping key.
+- **Commands** (klmdb only; same output and messages as `kdb5_util`):
+  - `add_mkey [-e ENCTYPE] [-s]` prompts twice for the new password, adds the
+    key as the next `K/M` version (inactive), rewraps the old keys in it and
+    adds `MKEY_AUX` entries; `-s` stashes only the new key.
+  - `use_mkey KVNO [TIME]` edits `ACTKVNO` as MIT does and requires a key
+    active now.
+  - `list_mkeys` prints MIT's list, `*` marking the active key.
+  - `update_princ_encryption [-f] [-n] [-v] [PATTERN]` rewraps every matching
+    principal not on the active key, keeping each key's kvno and salt.
+  - `purge_mkeys [-f] [-n] [-v]` drops keys no principal's `MKVNO` uses, with
+    their `ACTKVNO`/`MKEY_AUX` entries, and refuses to drop the stashed key.
+  - `stash` writes every master key version, like `kdb5_util stash`.
+- **Running services** reread `K/M` when an entry names a master key they
+  have not loaded, and admin writes reread it first, so `use_mkey` and
+  `update_princ_encryption` need no restart.
+- **Live test:** `crates/krb5-rs-kdc/tests/mkey_live.rs` runs one rotation
+  with MIT `kdb5_util` and finishes it with krb5-rs, then the reverse, and
+  compares `list_mkeys`, `update_princ_encryption` and `purge_mkeys` output
+  and the decrypted principal keys.
+
+Deviations: `use_mkey` TIME takes unix seconds or RFC 3339, not getdate(3)
+syntax; `stash` prompts for a master password when `--master-password-file`
+is not given (MIT reads the existing stash); errors are reported as
+`krb5-rs-kdb: <message>` rather than com_err text; FileStore and CockroachDB
+keep a single master key.
 
 ### MIT dump/load
 

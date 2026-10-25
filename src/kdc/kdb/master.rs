@@ -86,27 +86,54 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Write the stash file: a keytab holding `K/M@REALM`, replaced atomically
-/// (MIT `krb5_def_store_mkey_list`, kdb_default.c:111-212).
+/// Write the stash file: a keytab holding `K/M@REALM` at version 1,
+/// replaced atomically (MIT `krb5_def_store_mkey_list`, kdb_default.c:111-212).
 pub fn write_stash(path: &Path, realm: &str, key: &EncryptionKey) -> Result<(), StoreError> {
+    write_stash_list(path, realm, &[(1, key.clone())])
+}
+
+/// Write the stash file holding each `(kvno, key)` of a master-key list.
+pub fn write_stash_list(
+    path: &Path,
+    realm: &str,
+    keys: &[(u16, EncryptionKey)],
+) -> Result<(), StoreError> {
     let tmp = tmp_path(path);
     let _ = std::fs::remove_file(&tmp);
     let mut kt = FileKeytab::new(&tmp);
-    kt.add_entry(&KeytabEntry {
-        principal: master_principal()?,
-        realm: realm.to_string(),
-        timestamp: u32::try_from(chrono::Utc::now().timestamp()).unwrap_or(0),
-        kvno: 1,
-        key: key.clone(),
-    })
-    .map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        err(format!("writing stash: {e}"))
-    })?;
+    let timestamp = u32::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    for (kvno, key) in keys {
+        kt.add_entry(&KeytabEntry {
+            principal: master_principal()?,
+            realm: realm.to_string(),
+            timestamp,
+            kvno: u32::from(*kvno),
+            key: key.clone(),
+        })
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            err(format!("writing stash: {e}"))
+        })?;
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         err(format!("renaming stash into place: {e}"))
     })
+}
+
+/// [`read_stash`] with the stored key version (1 for MIT's old raw format,
+/// `kdb_default.c:283-284`).
+pub fn read_stash_kvno(path: &Path, realm: &str) -> Result<(u32, EncryptionKey), StoreError> {
+    let bytes =
+        std::fs::read(path).map_err(|e| err(format!("reading stash {}: {e}", path.display())))?;
+    if bytes.first() == Some(&5) {
+        let kt = FileKeytab::new(path);
+        let entry = kt
+            .get_entry(&master_principal()?, realm, None, None)
+            .map_err(|e| err(format!("stash has no K/M@{realm}: {e}")))?;
+        return Ok((entry.kvno, entry.key));
+    }
+    Ok((1, read_stash(path, realm)?))
 }
 
 /// Read the master key from a stash file: the keytab format written by

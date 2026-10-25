@@ -6,6 +6,7 @@ use std::time::Duration;
 use fs2::FileExt;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, WithTls, WithoutTls};
+use krb5_rs::kdc::kdb::mit::mkey::{entry_mkvno, MasterKeys};
 use krb5_rs::kdc::kdb::mit::ulog::{entry_from_update, update_from_entry, Ulog, Update};
 use krb5_rs::kdc::kdb::mit::{
     decode_lockout, encode_lockout, merge_policy, merge_record, new_entry, policy_from_entry,
@@ -91,7 +92,8 @@ struct Inner {
     principal_db: Db,
     policy_db: Db,
     lockout: Option<(LockoutEnv, Db)>,
-    master: EncryptionKey,
+    master: std::sync::RwLock<MasterKeys>,
+    supplied_master: EncryptionKey,
     realm: String,
     options: LmdbOptions,
     ulog: Option<Ulog>,
@@ -359,7 +361,11 @@ impl LmdbStore {
             mod_by: Some(creator_key.clone()),
             password_history: None,
         };
-        let mut km = new_entry(&km_record, master, &creator_key)?;
+        let mut km = new_entry(
+            &km_record,
+            &MasterKeys::single(master.clone()),
+            &creator_key,
+        )?;
         let mkvno_tl = km
             .tl_data
             .iter()
@@ -376,7 +382,11 @@ impl LmdbStore {
         if let Some(mkvno) = mkvno_tl {
             km.tl_data.push(mkvno);
         }
-        let mut tgt = new_entry(&tgt_record, master, &creator_key)?;
+        let mut tgt = new_entry(
+            &tgt_record,
+            &MasterKeys::single(master.clone()),
+            &creator_key,
+        )?;
         tgt.tl_data.retain(|tl| tl.kind != MKVNO);
 
         create_parent(database_name)?;
@@ -544,7 +554,8 @@ impl LmdbStore {
                 principal_db,
                 policy_db,
                 lockout,
-                master: master.clone(),
+                master: std::sync::RwLock::new(MasterKeys::single(master.clone())),
+                supplied_master: master.clone(),
                 realm: realm.to_owned(),
                 options,
                 ulog: None,
@@ -555,6 +566,12 @@ impl LmdbStore {
     }
 
     fn verify_master(&self) -> Result<(), StoreError> {
+        self.refresh_master()
+    }
+
+    /// `krb5_db_fetch_mkey_list`: reread `K/M` and decrypt its master keys
+    /// with the supplied (stashed) key.
+    fn refresh_master(&self) -> Result<(), StoreError> {
         let name = PrincipalName {
             name_type: 1,
             name_string: vec![
@@ -565,23 +582,29 @@ impl LmdbStore {
         let raw = self
             .get_raw(&name, &self.inner.realm)?
             .ok_or_else(|| StoreError::backend("klmdb database has no K/M principal"))?;
-        if raw.key_data.len() > 1 {
-            return Err(StoreError::backend(
-                "master key rotation (kdb5_util add_mkey/use_mkey) is not supported",
-            ));
-        }
-        let record = record_from_entry(&raw, &self.inner.master)?;
-        let stored = record
-            .entry
-            .keys
-            .first()
-            .ok_or_else(|| StoreError::corrupt("K/M has no key"))?;
-        if stored.key.key_bytes() != self.inner.master.key_bytes()
-            || stored.key.keytype != self.inner.master.keytype
-        {
-            return Err(StoreError::backend("incorrect master key"));
-        }
+        let keys = MasterKeys::fetch(&raw, &self.inner.supplied_master)?;
+        *self
+            .inner
+            .master
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = keys;
         Ok(())
+    }
+
+    fn master_keys(&self) -> std::sync::RwLockReadGuard<'_, MasterKeys> {
+        self.inner
+            .master
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Decode an entry, rereading the master-key list when the entry's
+    /// master key is not in it (`krb5_dbe_find_mkey`, `kdb5.c:1412-1450`).
+    fn decode(&self, entry: &MitEntry) -> Result<PrincipalRecord, StoreError> {
+        if self.master_keys().get(entry_mkvno(entry)?).is_none() {
+            self.refresh_master()?;
+        }
+        record_from_entry(entry, &self.master_keys())
     }
 
     fn insert_initial(&self, entries: Vec<MitEntry>) -> Result<(), StoreError> {
@@ -643,11 +666,12 @@ impl LmdbStore {
     ) -> Result<Option<PrincipalRecord>, StoreError> {
         self.get_raw(name, realm)?
             .as_ref()
-            .map(|entry| record_from_entry(entry, &self.inner.master))
+            .map(|entry| self.decode(entry))
             .transpose()
     }
 
     fn list_records_sync(&self) -> Result<Vec<PrincipalRecord>, StoreError> {
+        self.refresh_master()?;
         let txn = self
             .inner
             .main_env
@@ -662,7 +686,7 @@ impl LmdbStore {
         for item in iter {
             let (key, value) = item.map_err(|e| backend("reading principal iteration", e))?;
             let entry = MitEntry::decode(key, value)?;
-            records.push(record_from_entry(&entry, &self.inner.master)?);
+            records.push(record_from_entry(&entry, &self.master_keys())?);
         }
         Ok(records)
     }
@@ -758,6 +782,7 @@ impl LmdbStore {
         entry: PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
+        self.refresh_master()?;
         let key = unparse_name(&entry.name, &entry.realm);
         let modifier = admin_name(&self.inner.realm);
         let record = PrincipalRecord {
@@ -767,7 +792,7 @@ impl LmdbStore {
             password_history: None,
             entry,
         };
-        let raw = new_entry(&record, &self.inner.master, &modifier)?;
+        let raw = new_entry(&record, &self.master_keys(), &modifier)?;
         let (_, value) = raw.encode()?;
         let mut txn = self
             .inner
@@ -839,6 +864,7 @@ impl LmdbStore {
     where
         F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError>,
     {
+        self.refresh_master()?;
         let key = unparse_name(name, realm);
         let mut txn = self
             .inner
@@ -856,12 +882,12 @@ impl LmdbStore {
             .to_vec();
         let mut raw = MitEntry::decode(&key, &value)?;
         let current = self.inner.ulog.as_ref().map(|_| raw.clone());
-        let mut record = record_from_entry(&raw, &self.inner.master)?;
+        let mut record = record_from_entry(&raw, &self.master_keys())?;
         f(&mut record)?;
         record.mod_time = Some(now_time());
         let modifier = admin_name(realm);
         record.mod_by = Some(modifier.clone());
-        merge_record(&mut raw, &record, &self.inner.master, Some(&modifier))?;
+        merge_record(&mut raw, &record, &self.master_keys(), Some(&modifier))?;
         let (_, value) = raw.encode()?;
         self.inner
             .principal_db
@@ -873,6 +899,60 @@ impl LmdbStore {
             self.log(update_from_entry(Some(&current), &raw))?;
         }
         Ok(record)
+    }
+
+    /// The current master-key list (rereading `K/M`).
+    pub fn master_key_list(&self) -> Result<MasterKeys, StoreError> {
+        self.refresh_master()?;
+        Ok(self.master_keys().clone())
+    }
+
+    /// Every principal entry as stored.
+    pub fn raw_entries(&self) -> Result<Vec<MitEntry>, StoreError> {
+        Ok(self.dump_entries()?.0)
+    }
+
+    /// Read-modify-write one stored entry, as `krb5_db_get_principal` +
+    /// `krb5_db_put_principal` (logged when iprop is on). `f` returns false
+    /// to leave the entry unchanged.
+    pub fn update_raw<F>(&self, name: &PrincipalName, realm: &str, f: F) -> Result<bool, StoreError>
+    where
+        F: FnOnce(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError>,
+    {
+        self.refresh_master()?;
+        let keys = self.master_keys().clone();
+        let key = unparse_name(name, realm);
+        let mut txn = self
+            .inner
+            .main_env
+            .write_txn()
+            .map_err(|e| backend("opening principal write transaction", e))?;
+        let value = self
+            .inner
+            .principal_db
+            .get(&txn, &key)
+            .map_err(|e| backend("reading principal for update", e))?
+            .ok_or_else(|| {
+                StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
+            })?
+            .to_vec();
+        let mut raw = MitEntry::decode(&key, &value)?;
+        let current = raw.clone();
+        if !f(&mut raw, &keys)? {
+            return Ok(false);
+        }
+        let (_, value) = raw.encode()?;
+        self.inner
+            .principal_db
+            .put(&mut txn, &key, &value)
+            .map_err(|e| backend("writing updated principal", e))?;
+        txn.commit()
+            .map_err(|e| backend("committing updated principal", e))?;
+        if self.inner.ulog.is_some() {
+            self.log(update_from_entry(Some(&current), &raw))?;
+        }
+        self.refresh_master()?;
+        Ok(true)
     }
 
     fn delete_principal_sync(&self, name: &PrincipalName, realm: &str) -> Result<bool, StoreError> {
@@ -1437,7 +1517,7 @@ fn auto_convert_legacy(
         let creator = creator_name(realm);
         let mut raw_entries = Vec::with_capacity(records.len());
         for record in &records {
-            let mut entry = new_entry(record, master, &creator)?;
+            let mut entry = new_entry(record, &MasterKeys::single(master.clone()), &creator)?;
             ensure_master_actkvno(&mut entry)?;
             raw_entries.push(entry);
         }
