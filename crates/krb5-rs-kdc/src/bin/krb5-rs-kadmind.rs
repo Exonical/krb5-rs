@@ -85,12 +85,45 @@ fn parse_args() -> Args {
     a
 }
 
-/// One parsed ACL line (`auth_acl.c` `struct acl_entry`), reduced to what
-/// the iprop check needs.
+const ACL_ADD: u32 = 1;
+const ACL_DELETE: u32 = 2;
+const ACL_MODIFY: u32 = 4;
+const ACL_CHANGEPW: u32 = 8;
+const ACL_INQUIRE: u32 = 32;
+const ACL_EXTRACT: u32 = 64;
+const ACL_LIST: u32 = 128;
+const ACL_SETKEY: u32 = 256;
+const ACL_IPROP: u32 = 512;
+const ACL_ALL_MASK: u32 = ACL_ADD
+    | ACL_DELETE
+    | ACL_MODIFY
+    | ACL_CHANGEPW
+    | ACL_INQUIRE
+    | ACL_LIST
+    | ACL_IPROP
+    | ACL_SETKEY;
+
+/// `acl_op_table` (`auth_acl.c:71-84`).
+const ACL_OPS: [(char, u32); 11] = [
+    ('a', ACL_ADD),
+    ('d', ACL_DELETE),
+    ('m', ACL_MODIFY),
+    ('c', ACL_CHANGEPW),
+    ('i', ACL_INQUIRE),
+    ('l', ACL_LIST),
+    ('p', ACL_IPROP),
+    ('s', ACL_SETKEY),
+    ('x', ACL_ALL_MASK),
+    ('*', ACL_ALL_MASK),
+    ('e', ACL_EXTRACT),
+];
+
+/// One parsed ACL line (`auth_acl.c` `struct acl_entry`), without the
+/// restrictions.
 struct AclEntry {
     client: Option<(PrincipalName, String)>,
-    iprop: bool,
-    has_target: bool,
+    ops: u32,
+    target: Option<(PrincipalName, String)>,
 }
 
 /// `get_line` (`auth_acl.c:103-151`): logical lines with `\` continuations,
@@ -124,42 +157,47 @@ fn acl_lines(text: &str) -> Vec<(usize, String)> {
 }
 
 /// `parse_line` and `parse_entry` (`auth_acl.c:261-372`).
-/// Deviation: the restrictions field is not validated, since it never
-/// applies to iprop.
+/// Deviation: the restrictions field is not validated, since neither
+/// kpasswd nor iprop applies restrictions.
 fn parse_acl_line(line: &str, realm: &str) -> Option<AclEntry> {
     let ws = |c: char| matches!(c, '\t' | '\n' | '\x0c' | '\x0b' | '\r' | ' ' | ',');
     let line = line.trim_end_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
     let mut fields = line.split(ws).filter(|f| !f.is_empty());
     let client = fields.next()?;
-    let ops = fields.next()?;
-    let has_target = fields.next().is_some_and(|t| t != "*");
-    let mut iprop = false;
-    for op in ops.chars() {
-        match op {
-            'p' | 'x' | '*' => iprop = true,
-            'P' | 'X' => iprop = false,
-            c if "admcilseADMCILSE".contains(c) => {}
-            c => {
-                eprintln!("krb5-rs-kadmind: Unrecognized ACL operation '{c}' in {line}");
-                return None;
-            }
+    let op_str = fields.next()?;
+    let target = fields.next();
+    let mut ops = 0;
+    for op in op_str.chars() {
+        let lower = op.to_ascii_lowercase();
+        let Some((_, mask)) = ACL_OPS.iter().find(|(c, _)| *c == lower) else {
+            eprintln!("krb5-rs-kadmind: Unrecognized ACL operation '{op}' in {line}");
+            return None;
+        };
+        if lower == op {
+            ops |= mask;
+        } else {
+            ops &= !mask;
         }
     }
-    let client = if client == "*" {
-        None
-    } else {
-        match parse_name_with_default(client, realm) {
-            Ok(p) => Some(p),
-            Err(_) => {
-                eprintln!("krb5-rs-kadmind: Cannot parse client principal '{client}'");
-                return None;
-            }
+    let parse = |name: &str, what: &str| match parse_name_with_default(name, realm) {
+        Ok(p) => Some(p),
+        Err(_) => {
+            eprintln!("krb5-rs-kadmind: Cannot parse {what} principal '{name}'");
+            None
         }
+    };
+    let client = match client {
+        "*" => None,
+        c => Some(parse(c, "client")?),
+    };
+    let target = match target {
+        None | Some("*") => None,
+        Some(t) => Some(parse(t, "target")?),
     };
     Some(AclEntry {
         client,
-        iprop,
-        has_target,
+        ops,
+        target,
     })
 }
 
@@ -177,34 +215,71 @@ fn load_acl(path: &Path, realm: &str) -> Result<Vec<AclEntry>, String> {
         .collect()
 }
 
-/// `match_data` without back-references.
-fn match_data(pattern: &[u8], value: &[u8]) -> bool {
-    pattern == b"*" || pattern == value
+/// `match_data` (`auth_acl.c:439-466`): a client `*` records a
+/// back-reference; a target `*1`..`*9` must equal the recorded component.
+fn match_data(pattern: &[u8], value: &[u8], target: bool, ws: Option<&mut Vec<Vec<u8>>>) -> bool {
+    if pattern == b"*" {
+        if let (Some(ws), false) = (ws, target) {
+            if ws.len() < 9 {
+                ws.push(value.to_vec());
+            }
+        }
+        return true;
+    }
+    match (ws, pattern) {
+        (Some(ws), [b'*', n @ b'1'..=b'9']) if target => {
+            ws.get(usize::from(n - b'1')).is_some_and(|b| b == value)
+        }
+        _ => pattern == value,
+    }
 }
 
-/// `match_princ` (`auth_acl.c:470-490`).
-fn match_princ(pattern: &(PrincipalName, String), name: &PrincipalName, realm: &str) -> bool {
+/// `match_princ` (`auth_acl.c:468-490`).
+fn match_princ(
+    pattern: &(PrincipalName, String),
+    name: &PrincipalName,
+    realm: &str,
+    target: bool,
+    ws: &mut Vec<Vec<u8>>,
+) -> bool {
     pattern.0.name_string.len() == name.name_string.len()
-        && match_data(pattern.1.as_bytes(), realm.as_bytes())
+        && match_data(pattern.1.as_bytes(), realm.as_bytes(), target, None)
         && pattern
             .0
             .name_string
             .iter()
             .zip(&name.name_string)
-            .all(|(p, n)| match_data(p.as_ref(), n.as_ref()))
+            .all(|(p, n)| match_data(p.as_ref(), n.as_ref(), target, Some(ws)))
 }
 
-/// `acl_check(OP_IPROP)` (`auth_acl.c:494-545`): the first entry matching
-/// the client with no target decides.
-fn acl_permits_iprop(acl: &[AclEntry], client: &PrincipalName, realm: &str) -> bool {
+/// `find_entry` and `acl_check` (`auth_acl.c:492-545`): the first entry
+/// matching the client and target decides.
+fn acl_check(
+    acl: &[AclEntry],
+    op: u32,
+    (client, crealm): (&PrincipalName, &str),
+    target: Option<(&PrincipalName, &str)>,
+) -> bool {
     acl.iter()
         .find(|e| {
-            !e.has_target
-                && e.client
-                    .as_ref()
-                    .is_none_or(|p| match_princ(p, client, realm))
+            let mut ws = Vec::new();
+            if let Some(p) = &e.client {
+                if !match_princ(p, client, crealm, false, &mut ws) {
+                    return false;
+                }
+            }
+            match (&e.target, target) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(p), Some((t, trealm))) => match_princ(p, t, trealm, true, &mut ws),
+            }
         })
-        .is_some_and(|e| e.iprop)
+        .is_some_and(|e| e.ops & op != 0)
+}
+
+/// `acl_check(ACL_IPROP)` with no target.
+fn acl_permits_iprop(acl: &[AclEntry], client: &PrincipalName, realm: &str) -> bool {
+    acl_check(acl, ACL_IPROP, (client, realm), None)
 }
 
 /// Service keys read from the database (MIT's `KDB:` keytab).
@@ -625,6 +700,55 @@ mod tests {
         assert!(permits("kiprop/replica,p", "kiprop/replica@R"));
     }
 
+    fn permits_cpw(acl: &str, client: &str, target: &str) -> bool {
+        let entries: Vec<AclEntry> = acl_lines(acl)
+            .iter()
+            .map(|(_, l)| parse_acl_line(l, "R").expect("line"))
+            .collect();
+        let (c, cr) = princ(client);
+        let (t, tr) = princ(target);
+        acl_check(&entries, ACL_CHANGEPW, (&c, &cr), Some((&t, &tr)))
+    }
+
+    #[test]
+    fn changepw_acl_matches_like_mit() {
+        assert!(permits_cpw("admin@R c\n", "admin@R", "alice@R"));
+        assert!(permits_cpw("admin@R x\n", "admin@R", "alice@R"));
+        assert!(!permits_cpw("admin@R xC\n", "admin@R", "alice@R"));
+        assert!(!permits_cpw("admin@R e\n", "admin@R", "alice@R"));
+        assert!(permits_cpw("admin@R c alice@R\n", "admin@R", "alice@R"));
+        assert!(!permits_cpw("admin@R c alice@R\n", "admin@R", "bob@R"));
+        assert!(!permits_cpw("admin@R i\nadmin@R c\n", "admin@R", "alice@R"));
+        assert!(permits_cpw(
+            "admin@R c alice@R\nadmin@R c\n",
+            "admin@R",
+            "bob@R"
+        ));
+        assert!(permits_cpw(
+            "*/admin@R c *1@R\n",
+            "alice/admin@R",
+            "alice@R"
+        ));
+        assert!(!permits_cpw("*/admin@R c *1@R\n", "alice/admin@R", "bob@R"));
+        assert!(!permits_cpw(
+            "*/admin@R c *2@R\n",
+            "alice/admin@R",
+            "alice@R"
+        ));
+        assert!(permits_cpw("*/*@R c *2/*1@R\n", "a/b@R", "b/a@R"));
+        assert!(permits_cpw(
+            "admin@R c */root@*\n",
+            "admin@R",
+            "x/root@OTHER"
+        ));
+        assert!(!permits_cpw(
+            "admin@R c */root@R\n",
+            "admin@R",
+            "x/y/root@R"
+        ));
+        assert!(!permits("admin@R c alice@R\n", "admin@R"));
+    }
+
     #[test]
     fn iprop_listen_uses_mit_delimiters() {
         let addrs = listen_addrs(Some("127.0.0.1:1;127.0.0.2,127.0.0.3 2".into()), 9);
@@ -646,6 +770,7 @@ mod tests {
     fn bad_acl_lines_are_syntax_errors() {
         assert!(parse_acl_line("kiprop/replica@R q", "R").is_none());
         assert!(parse_acl_line("kiprop/replica@R", "R").is_none());
+        assert!(parse_acl_line("a@R c b@R@", "R").is_none());
         assert_eq!(acl_lines("a p\\\n b\n# x\n  \nc d").len(), 3);
     }
 }
