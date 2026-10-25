@@ -268,8 +268,9 @@ with the portmapper; `-x` is accepted and ignored; klmdb only.
 ### kadmind iprop service
 
 `krb5-rs-kadmind -proponly` serves the log like MIT `kadmind -proponly`
-(`src/kadmin/server/ovsec_kadmd.c`, `ipropd_svc.c`): it refuses to start
-without `-proponly` or without `iprop_enable`, and requires `iprop_port`
+(`src/kadmin/server/ovsec_kadmd.c`, `ipropd_svc.c`): `-proponly` refuses to
+start without `iprop_enable`; without `-proponly` the iprop service runs
+alongside kpasswd when `iprop_enable` is set. iprop requires `iprop_port`
 (listening on `iprop_listen` if set). Program 100423 version 1 runs over
 RPCSEC_GSS (§ONC RPC and RPCSEC_GSS) with service keys read from the klmdb
 database; calls whose service principal is not `kiprop/<host>@REALM` are
@@ -285,11 +286,37 @@ replica's serial (`ulog_get_entries`); `IPROP_FULL_RESYNC[_EXT]` runs
 `crates/krb5-rs-kdc/tests/kadmind_live.rs` has MIT 1.22.2 kpropd follow it
 through a full resync and then incremental updates.
 
-Deviations: only `-proponly`; the process stays in the foreground (`-nofork`
-is implied) and `-P` writes its pid; `-x`, the kadmin and kpasswd services
-and ACL restrictions are not supported (restrictions are parsed and ignored,
-as they never apply to iprop); `-port` is accepted and ignored because it
+Deviations: the process stays in the foreground (`-nofork` is implied) and
+`-P` writes its pid; `-x`, the kadm5 admin RPC service (program 2112) and
+ACL restrictions are not supported (restrictions are parsed and ignored, as
+they never apply to iprop or kpasswd); `-port` is accepted and ignored because it
 sets only the kadmin port; klmdb only.
+
+### kpasswd service
+
+Without `-proponly`, `krb5-rs-kadmind` serves MIT's password-change protocol
+(`src/kadmin/server/schpw.c`, RFC 3244) on UDP and TCP at `kpasswd_listen`,
+or at `kpasswd_port` (default 464) on every address. Requests of version 1
+and `0xff80` are authenticated with an AP-REQ for `kadmin/changepw@REALM`
+(service keys from the klmdb database, replay cache, `clockskew`) and carry
+the new password, plus an optional target principal for version `0xff80`, in
+KRB-PRIV. As in `schpw_util_wrapper` (`misc.c`), a change to the client's own
+password needs an initial ticket and respects the policy's `minlife`; any
+other target needs the `c` permission in `acl_file`, matched like
+`auth_acl.c` (targets with `*1`..`*9` back-references to the client's `*`
+components, the first matching entry deciding). The change goes through the
+same admin layer as `krb5-rs-kdb` (`kadm5_chpass_principal_util`), so policy,
+password history and the update log behave the same. The reply is an AP-REP
+and a KRB-PRIV result, or a KRB-ERROR carrying the result in `e-data`, with
+MIT's result codes (access denied, initial ticket needed, soft error for
+password quality, reuse and `minlife`, hard error otherwise) and
+`chpass_util` messages. Database creation adds `kadmin/admin` and
+`kadmin/changepw` like `kadm5_create.c`. The live test
+`crates/krb5-rs-kdc/tests/kpasswd_live.rs` runs MIT 1.22.2 `kpasswd` over UDP
+and TCP and `krb5_set_password_using_ccache` against it.
+
+Deviations: authorization uses only `acl_file` (no kadm5_auth plugins);
+klmdb only.
 
 ### ONC RPC and RPCSEC_GSS
 
