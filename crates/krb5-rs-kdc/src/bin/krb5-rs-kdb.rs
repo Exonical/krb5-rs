@@ -1379,7 +1379,7 @@ fn strdate(when: u32) -> String {
             libc::strftime(
                 out.as_mut_ptr().cast(),
                 out.len(),
-                b"%a %b %d %H:%M:%S %Z %Y\0".as_ptr().cast(),
+                c"%a %b %d %H:%M:%S %Z %Y".as_ptr(),
                 &tm,
             )
         }

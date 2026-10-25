@@ -2104,7 +2104,10 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_multiple_km_keys_as_unsupported_rotation() {
+    fn open_loads_a_rotated_master_key_list_with_old_or_new_key() {
+        use krb5_rs::kdc::kdb::mit::mkey::{
+            add_new_mkey, lookup_actkvno, now, update_actkvno, use_mkey,
+        };
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("principal");
         let config = test_config(&path);
@@ -2116,35 +2119,40 @@ mod tests {
                 KerberosString::from_bytes(b"M").expect("M"),
             ],
         };
-        let key = unparse_name(&km, "LMDB.TEST");
-        {
-            let mut txn = store.inner.main_env.write_txn().expect("write transaction");
-            let value = store
-                .inner
-                .principal_db
-                .get(&txn, &key)
-                .expect("read K/M")
-                .expect("K/M")
-                .to_vec();
-            let mut raw = MitEntry::decode(&key, &value).expect("decode K/M");
-            raw.key_data.push(raw.key_data[0].clone());
-            let (_, value) = raw.encode().expect("encode multiple keys");
-            store
-                .inner
-                .principal_db
-                .put(&mut txn, &key, &value)
-                .expect("write multiple keys");
-            txn.commit().expect("commit multiple keys");
-        }
+        let second =
+            krb5_rs::kdc::kdb::master_key_from_password("LMDB.TEST", "second", master.keytype)
+                .expect("second master key");
+        store
+            .update_raw(&km, "LMDB.TEST", |entry, keys| {
+                add_new_mkey(entry, keys, &second)?;
+                let mut list = lookup_actkvno(entry)?;
+                use_mkey(&mut list, 2, 0, now())?;
+                update_actkvno(entry, &list);
+                Ok(true)
+            })
+            .expect("rotate");
         drop(store);
 
-        let error = match LmdbStore::open(&config, &master) {
-            Ok(_) => panic!("master key rotation unexpectedly opened"),
-            Err(error) => error,
+        let krbtgt = PrincipalName {
+            name_type: 2,
+            name_string: vec![
+                KerberosString::from_bytes(b"krbtgt").expect("krbtgt"),
+                KerberosString::from_bytes(b"LMDB.TEST").expect("realm"),
+            ],
         };
-        assert!(error
-            .to_string()
-            .contains("master key rotation (kdb5_util add_mkey/use_mkey) is not supported"));
+        for supplied in [&master, &second] {
+            let store = LmdbStore::open(&config, supplied).expect("open rotated database");
+            let keys = store.master_key_list().expect("master keys");
+            assert_eq!(
+                keys.keys.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+                [2, 1]
+            );
+            assert_eq!(keys.active().expect("active").0, 2);
+            assert!(store
+                .get_record_sync(&krbtgt, "LMDB.TEST")
+                .expect("read krbtgt under master key 1")
+                .is_some());
+        }
     }
 
     #[test]
