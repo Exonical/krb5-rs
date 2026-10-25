@@ -241,6 +241,24 @@ of logging each loaded principal; the file store and CockroachDB never write
 a log. The `kadmind` iprop service and kpropd iprop mode are not implemented
 yet, so the log is written but not served.
 
+### ONC RPC and RPCSEC_GSS
+
+`krb5_rs::rpc` (feature `tokio`) is ONC RPC version 2 over TCP with MIT's
+record marking (`src/lib/rpc/xdr_rec.c`, records capped at 16 MiB) and
+RPCSEC_GSS version 1 (RFC 2203; `auth_gss.c`, `svc_auth_gss.c`,
+`authgss_prot.c`) on the krb5 GSS mechanism. `GssClient` establishes the
+context through `NULLPROC` with `RPCSEC_GSS_INIT`/`CONTINUE_INIT`, checks the
+MIC over the sequence window, signs each call header and protects arguments
+with the `none`, `integrity` or `privacy` service. `GssServer` returns MIT's
+context handle `"xxxx"` and 32-entry window, checks the header MIC, the
+replay window and the inner sequence number, and answers bad credentials,
+services and procedures with MIT's `auth_stat` values. The live test
+`crates/krb5-rs-kdc/tests/oncrpc_live.rs` calls MIT `kadmind -proponly`'s
+iprop program (100423, version 1) as `kiprop/<host>` with privacy.
+
+Deviations: no UDP transport; one GSS context per connection; only the
+default QOP.
+
 ### MIT kprop/kpropd
 
 `krb5-rs-kprop` and `krb5-rs-kpropd` follow MIT 1.22.2 `src/kprop`
