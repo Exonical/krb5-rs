@@ -59,6 +59,22 @@ pub struct RestrictedEntry {
     pub max_renewable_life: i32,
 }
 
+/// `KRB5_KDB_SUPPORT_DESMD5` and `KRB5_KDB_NEW_PRINC` specs, which
+/// `krb5_flagspec_to_mask` accepts (`str_conv.c:87-89`) but the admin CLI's
+/// [`AttrChange`] table leaves out.
+fn obsolete_flag(token: &str) -> Option<(bool, u32)> {
+    let (negated, rest) = match token.as_bytes().first() {
+        Some(b'-') => (true, &token[1..]),
+        Some(b'+') => (false, &token[1..]),
+        _ => (false, token),
+    };
+    match rest.replace('-', "_").to_ascii_lowercase().as_str() {
+        "md5" | "support_desmd5" => Some((negated, 0x4000)),
+        "new_princ" => Some((negated, 0x8000)),
+        _ => None,
+    }
+}
+
 fn ts_after(a: i32, b: i32) -> bool {
     a as u32 > b as u32
 }
@@ -86,6 +102,15 @@ impl AclRestrictions {
             if flag.add_spec(token).is_ok() {
                 rs.require_attrs |= flag.set;
                 rs.forbid_attrs &= !flag.clear;
+                rs.mask |= KADM5_ATTRIBUTES;
+                continue;
+            }
+            if let Some((negated, bits)) = obsolete_flag(token) {
+                if negated {
+                    rs.forbid_attrs &= !bits;
+                } else {
+                    rs.require_attrs |= bits;
+                }
                 rs.mask |= KADM5_ATTRIBUTES;
                 continue;
             }
@@ -209,6 +234,15 @@ mod tests {
         assert_eq!(rs.require_attrs, 0);
         assert_eq!(rs.forbid_attrs, !0x80 & !0x40);
         assert_eq!(rs.mask, KADM5_ATTRIBUTES | KADM5_POLICY_CLR);
+    }
+
+    #[test]
+    fn accepts_mit_flags_the_cli_omits() {
+        let rs = AclRestrictions::parse("+new_princ,+MD5").expect("valid");
+        assert_eq!(rs.require_attrs, 0x8000 | 0x4000);
+        let rs = AclRestrictions::parse("-new-princ -support_desmd5").expect("valid");
+        assert_eq!(rs.forbid_attrs, !(0x8000 | 0x4000));
+        assert_eq!(rs.mask, KADM5_ATTRIBUTES);
     }
 
     #[test]

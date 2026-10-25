@@ -1032,6 +1032,10 @@ mod tests {
         let rs = e.restrictions.as_ref().expect("restrictions");
         assert_eq!(rs.policy.as_deref(), Some("std"));
         assert_eq!(rs.max_life, 3_600);
+        assert!(parse_acl_line("admin@R c * +new_princ -md5", "R")
+            .expect("line")
+            .restrictions
+            .is_some());
         assert!(parse_acl_line("admin@R a * -policy", "R").is_none());
         assert!(parse_acl_line("admin@R a * -frobnicate 1h", "R").is_none());
         assert!(parse_acl_line("admin@R a *", "R")
