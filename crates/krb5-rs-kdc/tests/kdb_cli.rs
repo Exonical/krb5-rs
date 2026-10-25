@@ -461,6 +461,20 @@ fn master_key_rotation_add_use_update_and_purge() {
 
 #[cfg(feature = "klmdb")]
 #[test]
+fn stash_rewrites_from_the_existing_stash() {
+    let env = Env::new("stash_reuse");
+    env.ok(&["create", "-s"], "master-password\n");
+    let out = env.ok(&["stash"], "");
+    assert_eq!(out, "Using existing stashed keys to update stash file.\n");
+    let other = env.dir.join("other.stash");
+    let other = other.to_str().expect("utf-8 path");
+    env.ok(&["stash", "-f", other], "");
+    assert!(std::path::Path::new(other).exists());
+    assert!(!env.run(&["stash", "-x"], "").status.success());
+}
+
+#[cfg(feature = "klmdb")]
+#[test]
 fn purge_mkeys_refuses_to_drop_the_stashed_key() {
     let env = Env::new("mkey_stash");
     env.ok(&["create", "-s"], "master-password\n");

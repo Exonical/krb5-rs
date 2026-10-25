@@ -188,7 +188,10 @@ for resource-based delegation. klmdb is the default `db_library`;
     principal not on the active key, keeping each key's kvno and salt.
   - `purge_mkeys [-f] [-n] [-v]` drops keys no principal's `MKVNO` uses, with
     their `ACTKVNO`/`MKEY_AUX` entries, and refuses to drop the stashed key.
-  - `stash` writes every master key version, like `kdb5_util stash`.
+  - `stash [-f keyfile]` writes every master key version, like `kdb5_util
+    stash`. It reuses the existing stash when that opens the database
+    ("Using existing stashed keys to update stash file.") and otherwise
+    prompts once; `--master-password-file` takes the place of `-m`.
 - **Running services** reread `K/M` when an entry names a master key they
   have not loaded, and admin writes reread it first, so `use_mkey` and
   `update_princ_encryption` need no restart.
@@ -198,8 +201,7 @@ for resource-based delegation. klmdb is the default `db_library`;
   and the decrypted principal keys.
 
 Deviations: `use_mkey` TIME takes unix seconds or RFC 3339, not getdate(3)
-syntax; `stash` prompts for a master password when `--master-password-file`
-is not given (MIT reads the existing stash); errors are reported as
+syntax; errors are reported as
 `krb5-rs-kdb: <message>` rather than com_err text; FileStore and CockroachDB
 keep a single master key.
 
