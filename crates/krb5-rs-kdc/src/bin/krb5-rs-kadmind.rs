@@ -530,10 +530,13 @@ async fn serve(state: Arc<State>, mut stream: TcpStream) -> Result<(), String> {
 }
 
 /// The resync dump file for one replica, so concurrent resyncs to different
-/// hosts never share a file.
+/// hosts never share a file: a readable, length-bounded prefix of the host
+/// plus a digest of the full name keeps distinct hosts apart.
 fn replica_dump_file(base: &std::path::Path, host: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
     let safe: String = host
         .chars()
+        .take(64)
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
                 c
@@ -542,9 +545,12 @@ fn replica_dump_file(base: &std::path::Path, host: &str) -> PathBuf {
             }
         })
         .collect();
+    let tag: String = Sha256::digest(host.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let mut name = base.as_os_str().to_os_string();
-    name.push(".");
-    name.push(safe);
+    name.push(format!(".{safe}-{tag}"));
     PathBuf::from(name)
 }
 
@@ -868,15 +874,27 @@ mod tests {
 
     #[test]
     fn each_replica_gets_its_own_resync_dump_file() {
-        let base = std::path::Path::new("/var/krb5kdc/slave_datatrans");
+        let base = std::path::Path::new("/var/krb5kdc/replica_datatrans");
+        let a = replica_dump_file(base, "replica-1.example.com");
+        let a = a.to_str().unwrap();
+        assert!(a.starts_with("/var/krb5kdc/replica_datatrans.replica-1.example.com-"));
         assert_eq!(
-            replica_dump_file(base, "replica-1.example.com"),
-            PathBuf::from("/var/krb5kdc/slave_datatrans.replica-1.example.com")
+            a,
+            replica_dump_file(base, "replica-1.example.com")
+                .to_str()
+                .unwrap()
         );
-        assert_eq!(
-            replica_dump_file(base, "../evil/x"),
-            PathBuf::from("/var/krb5kdc/slave_datatrans..._evil_x")
+        assert_ne!(
+            replica_dump_file(base, "node_a"),
+            replica_dump_file(base, "node+a")
         );
+        let evil = replica_dump_file(base, "../evil/x");
+        assert_eq!(evil.parent(), base.parent());
+        let long = "a".repeat(230);
+        let name = replica_dump_file(base, &long);
+        let file = name.file_name().unwrap().len();
+        assert!(file + ".dump_ok".len() + 16 < 255, "{file}");
+        assert_ne!(name, replica_dump_file(base, &"a".repeat(231)));
     }
 
     #[test]
