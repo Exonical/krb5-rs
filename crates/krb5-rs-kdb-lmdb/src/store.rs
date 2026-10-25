@@ -674,6 +674,40 @@ impl LmdbStore {
             .map(|record| record.entry))
     }
 
+    /// The stored (still encrypted) entry for `name`, read synchronously
+    /// (`krb5_db_get_principal`).
+    pub fn raw_entry(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<MitEntry>, StoreError> {
+        self.get_raw(name, realm)
+    }
+
+    /// The stored policy `name`, read synchronously (`krb5_db_get_policy`).
+    pub fn raw_policy(&self, name: &str) -> Result<Option<MitPolicy>, StoreError> {
+        let txn = self
+            .inner
+            .main_env
+            .read_txn()
+            .map_err(|e| backend("opening policy read transaction", e))?;
+        self.inner
+            .policy_db
+            .get(&txn, name.as_bytes())
+            .map_err(|e| backend("reading policy", e))?
+            .map(|value| MitPolicy::decode(name.as_bytes(), value))
+            .transpose()
+    }
+
+    /// Every policy name, sorted (`krb5_db_iter_policy`).
+    pub fn policy_names_sync(&self) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .list_policies_sync()?
+            .into_iter()
+            .map(|p| p.name)
+            .collect())
+    }
+
     fn get_record_sync(
         &self,
         name: &PrincipalName,

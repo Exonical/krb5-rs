@@ -12,10 +12,11 @@ use std::time::Duration;
 
 use krb5_rs::gssapi::krb5::Krb5Acceptor;
 use krb5_rs::kdc::kdb::admin::AdminOps;
+use krb5_rs::kdc::kdb::kadm5::{self, code, PrincipalEnt, ReadArgs, KADM_PROG, KADM_VERS};
 use krb5_rs::kdc::kdb::kpasswd::{process_request, Service, KPASSWD_PORT};
 use krb5_rs::kdc::kdb::kprop::ReplayCache;
-use krb5_rs::kdc::kdb::mit::parse_name_with_default;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
+use krb5_rs::kdc::kdb::mit::{parse_name_with_default, MitEntry};
 use krb5_rs::kdc::kdb::read_stash;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
 use krb5_rs::kdc::{default_realm, RealmConfig};
@@ -65,7 +66,11 @@ struct Args {
     dump_file: Option<PathBuf>,
     kprop: Option<PathBuf>,
     kprop_port: Option<String>,
+    port: Option<u16>,
 }
+
+/// MIT's `DEFAULT_KADM5_PORT`.
+const KADMIND_PORT: u16 = 749;
 
 fn parse_args() -> Args {
     let mut a = Args {
@@ -79,9 +84,7 @@ fn parse_args() -> Args {
             "-r" => a.realm = Some(val()),
             "-proponly" => a.proponly = true,
             "-nofork" | "-W" => {}
-            "-port" => {
-                val();
-            }
+            "-port" => a.port = Some(val().parse().unwrap_or_else(|_| usage())),
             "-P" => a.pid_file = Some(PathBuf::from(val())),
             "-p" => a.kdb_util = Some(PathBuf::from(val())),
             "-F" => a.dump_file = Some(PathBuf::from(val())),
@@ -522,8 +525,388 @@ impl State {
     }
 }
 
-async fn serve(state: Arc<State>, mut stream: TcpStream) -> Result<(), String> {
-    let keys = (state.store.clone(), state.realm.clone());
+/// One RPC program served over RPCSEC_GSS on TCP.
+trait Program: Send + Sync + 'static {
+    fn keys(&self) -> (Arc<LmdbStore>, String);
+    fn dispatch(
+        &self,
+        gss: &mut GssServer,
+        call: &Call,
+        proc_: u32,
+        args: &[u8],
+        seq: u32,
+        from: &SocketAddr,
+    ) -> Result<Vec<u8>, String>;
+}
+
+impl Program for State {
+    fn keys(&self) -> (Arc<LmdbStore>, String) {
+        (self.store.clone(), self.realm.clone())
+    }
+
+    fn dispatch(
+        &self,
+        gss: &mut GssServer,
+        call: &Call,
+        proc_: u32,
+        args: &[u8],
+        seq: u32,
+        _from: &SocketAddr,
+    ) -> Result<Vec<u8>, String> {
+        State::dispatch(self, gss, call, proc_, args, seq)
+    }
+}
+
+/// The kadm5 admin RPC program (`kadm_rpc_svc.c`, `server_stubs.c`).
+struct Kadm5 {
+    realm: String,
+    store: Arc<LmdbStore>,
+    acl: Arc<Vec<AclEntry>>,
+}
+
+/// The authenticated caller of one kadm5 call (`stub_setup`).
+struct Caller<'a> {
+    client: PrincipalName,
+    crealm: String,
+    client_name: String,
+    service_name: String,
+    changepw: bool,
+    from: &'a SocketAddr,
+}
+
+impl Caller<'_> {
+    fn log_unauth(&self, op: &str, target: &str) {
+        eprintln!(
+            "krb5-rs-kadmind: Unauthorized request: {op}, {target}, client={}, service={}, addr={}",
+            self.client_name,
+            self.service_name,
+            self.from.ip()
+        );
+    }
+
+    fn log_done(&self, op: &str, target: &str, code: u32) {
+        let msg = if code == code::OK {
+            "success".to_string()
+        } else {
+            code::message(code)
+        };
+        eprintln!(
+            "krb5-rs-kadmind: Request: {op}, {target}, {msg}, client={}, service={}, addr={}",
+            self.client_name,
+            self.service_name,
+            self.from.ip()
+        );
+    }
+
+    fn is(&self, name: &PrincipalName, realm: &str) -> bool {
+        self.client == *name && self.crealm == realm
+    }
+}
+
+impl Kadm5 {
+    /// The `acl` kadm5_auth module; callers also apply the `self` module
+    /// (`auth_self.c`), which grants reading one's own principal, strings
+    /// and policy.
+    fn acl(&self, caller: &Caller<'_>, op: u32, target: Option<(&PrincipalName, &str)>) -> bool {
+        acl_check(&self.acl, op, (&caller.client, &caller.crealm), target).is_some()
+    }
+
+    fn parse(&self, name: &str) -> Option<(PrincipalName, String)> {
+        parse_name_with_default(name, &self.realm).ok()
+    }
+
+    /// `stub_setup` with a principal: the API version, then the entry
+    /// (`KADM5_BAD_PRINCIPAL`, `KADM5_UNK_PRINC`).
+    fn setup_princ(
+        &self,
+        api: u32,
+        princ: Option<&str>,
+    ) -> Result<(u32, PrincipalName, String, MitEntry), (u32, u32)> {
+        let c = kadm5::check_api_version(api);
+        if c != code::OK {
+            return Err((0, c));
+        }
+        let (name, realm) = princ
+            .and_then(|p| self.parse(p))
+            .ok_or((api, code::BAD_PRINCIPAL))?;
+        match self.store.raw_entry(&name, &realm) {
+            Ok(Some(e)) => Ok((api, name, realm, e)),
+            Ok(None) => Err((api, code::UNK_PRINC)),
+            Err(e) => {
+                eprintln!("krb5-rs-kadmind: reading {}: {e}", unparse(&name, &realm));
+                Err((api, code::FAILURE))
+            }
+        }
+    }
+
+    fn min_mkvno(&self) -> u16 {
+        self.store
+            .master_key_list()
+            .ok()
+            .and_then(|m| m.keys.iter().map(|k| k.0).min())
+            .unwrap_or(1)
+    }
+
+    fn get_principal(
+        &self,
+        caller: &Caller<'_>,
+        api: u32,
+        princ: Option<&str>,
+        mask: i32,
+    ) -> Vec<u8> {
+        let (api, name, realm, entry) = match self.setup_princ(api, princ) {
+            Ok(v) => v,
+            Err((api, c)) => return kadm5::gprinc_ret(api, c, None),
+        };
+        let target = unparse(&name, &realm);
+        let op = "kadm5_get_principal";
+        let own = caller.is(&name, &realm);
+        if (caller.changepw && !own)
+            || !(own || self.acl(caller, ACL_INQUIRE, Some((&name, &realm))))
+        {
+            caller.log_unauth(op, &target);
+            return kadm5::gprinc_ret(api, code::AUTH_GET, None);
+        }
+        let ent = PrincipalEnt::from_entry(&entry, mask, self.min_mkvno());
+        let c = if ent.is_ok() { code::OK } else { code::FAILURE };
+        caller.log_done(op, &target, c);
+        kadm5::gprinc_ret(api, c, ent.ok().as_ref())
+    }
+
+    fn get_strings(&self, caller: &Caller<'_>, api: u32, princ: Option<&str>) -> Vec<u8> {
+        let (api, name, realm, entry) = match self.setup_princ(api, princ) {
+            Ok(v) => v,
+            Err((api, c)) => return kadm5::gstrings_ret(api, c, &[]),
+        };
+        let target = unparse(&name, &realm);
+        let op = "kadm5_get_strings";
+        let own = caller.is(&name, &realm);
+        if caller.changepw || !(own || self.acl(caller, ACL_INQUIRE, Some((&name, &realm)))) {
+            caller.log_unauth(op, &target);
+            return kadm5::gstrings_ret(api, code::AUTH_GET, &[]);
+        }
+        let (c, strings) = match krb5_rs::kdc::kdb::mit::string_attributes(&entry) {
+            Ok(s) => (code::OK, s),
+            Err(_) => (code::FAILURE, Vec::new()),
+        };
+        caller.log_done(op, &target, c);
+        kadm5::gstrings_ret(api, c, &strings)
+    }
+
+    /// `get_princs_2_svc` / `get_pols_2_svc`.
+    fn list(&self, caller: &Caller<'_>, api: u32, exp: Option<&str>, princs: bool) -> Vec<u8> {
+        let c = kadm5::check_api_version(api);
+        if c != code::OK {
+            return kadm5::names_ret(0, c, &[]);
+        }
+        let op = if princs {
+            "kadm5_get_principals"
+        } else {
+            "kadm5_get_policies"
+        };
+        let target = exp.unwrap_or("*");
+        if caller.changepw || !self.acl(caller, ACL_LIST, None) {
+            caller.log_unauth(op, target);
+            return kadm5::names_ret(api, code::AUTH_LIST, &[]);
+        }
+        let names: Result<Vec<Vec<u8>>, String> = if princs {
+            self.store
+                .raw_entries()
+                .map(|es| {
+                    es.iter()
+                        .map(|e| krb5_rs::kdc::kdb::mit::unparse_name(&e.principal, &e.realm))
+                        .collect()
+                })
+                .map_err(|e| e.to_string())
+        } else {
+            self.store
+                .policy_names_sync()
+                .map(|ns| ns.into_iter().map(String::into_bytes).collect())
+                .map_err(|e| e.to_string())
+        };
+        let (c, names) = match (kadm5::Glob::new(exp, princs), names) {
+            (None, _) => (code::EINVAL, Vec::new()),
+            (Some(_), Err(e)) => {
+                eprintln!("krb5-rs-kadmind: {op}: {e}");
+                (code::FAILURE, Vec::new())
+            }
+            (Some(g), Ok(ns)) => (code::OK, ns.into_iter().filter(|n| g.matches(n)).collect()),
+        };
+        caller.log_done(op, target, c);
+        kadm5::names_ret(api, c, &names)
+    }
+
+    fn get_policy(&self, caller: &Caller<'_>, api: u32, name: Option<&str>) -> Vec<u8> {
+        let c = kadm5::check_api_version(api);
+        if c != code::OK {
+            return kadm5::gpol_ret(0, c, None);
+        }
+        let op = "kadm5_get_policy";
+        let target = name.unwrap_or("(null)");
+        // The caller's own policy, which kadmin/changepw may read.
+        let cpolicy = self
+            .store
+            .raw_entry(&caller.client, &caller.crealm)
+            .ok()
+            .flatten()
+            .and_then(|e| PrincipalEnt::from_entry(&e, kadm5::mask::PRINCIPAL_NORMAL_MASK, 1).ok())
+            .and_then(|e| e.policy);
+        let own = matches!((&cpolicy, name), (Some(c), Some(n)) if c.as_slice() == n.as_bytes());
+        if (caller.changepw && !own) || !(own || self.acl(caller, ACL_INQUIRE, None)) {
+            caller.log_unauth(op, target);
+            return kadm5::gpol_ret(api, code::AUTH_GET, None);
+        }
+        let (c, policy) = match name {
+            None => (code::EINVAL, None),
+            Some("") => (code::BAD_POLICY, None),
+            Some(n) => match self.store.raw_policy(n) {
+                Ok(Some(p)) => (code::OK, Some(p)),
+                Ok(None) => (code::UNK_POLICY, None),
+                Err(e) => {
+                    eprintln!("krb5-rs-kadmind: {op}: {e}");
+                    (code::FAILURE, None)
+                }
+            },
+        };
+        caller.log_done(op, target, c);
+        kadm5::gpol_ret(api, c, policy.as_ref())
+    }
+}
+
+impl Program for Kadm5 {
+    fn keys(&self) -> (Arc<LmdbStore>, String) {
+        (self.store.clone(), self.realm.clone())
+    }
+
+    /// `kadm_1` and `check_rpcsec_auth` (`kadm_rpc_svc.c`).
+    fn dispatch(
+        &self,
+        gss: &mut GssServer,
+        call: &Call,
+        proc_: u32,
+        args: &[u8],
+        seq: u32,
+        from: &SocketAddr,
+    ) -> Result<Vec<u8>, String> {
+        let xid = call.header.xid;
+        let err =
+            |gss: &mut GssServer, stat| gss.reply_error(xid, seq, stat).map_err(|e| e.to_string());
+        if call.header.prog != KADM_PROG {
+            return err(gss, AcceptStat::ProgUnavail);
+        }
+        if call.header.vers != KADM_VERS {
+            return err(gss, AcceptStat::ProgMismatch(KADM_VERS, KADM_VERS));
+        }
+        let Some(ctx) = gss.context() else {
+            return Ok(Reply::AuthError(AuthStat::BadCred).encode(xid));
+        };
+        let service = ctx.acceptor().clone();
+        let service_name = unparse(&service, &self.realm);
+        let ok = matches!(service.name_string.as_slice(),
+            [k, h] if k.as_slice() == b"kadmin" && h.as_slice() != b"history");
+        if !ok {
+            eprintln!("krb5-rs-kadmind: bad service principal {service_name}");
+            eprintln!(
+                "krb5-rs-kadmind: Authentication attempt failed: {}, RPC authentication flavor 6",
+                from.ip()
+            );
+            return Ok(Reply::AuthError(AuthStat::TooWeak).encode(xid));
+        }
+        let changepw = matches!(service.name_string.as_slice(),
+            [_, h] if h.as_slice() == b"changepw");
+        let client = ctx.initiator().clone();
+        let crealm = ctx.initiator_realm().to_string();
+        let caller = Caller {
+            client_name: unparse(&client, &crealm),
+            client,
+            crealm,
+            service_name,
+            changepw,
+            from,
+        };
+        if proc_ == kadm5::proc_::NULL {
+            return gss.reply(xid, seq, &[]).map_err(|e| e.to_string());
+        }
+        let Some(parsed) = ReadArgs::decode(proc_, args) else {
+            eprintln!(
+                "krb5-rs-kadmind: Invalid KADM5 procedure number: {}, {proc_}",
+                from.ip()
+            );
+            return err(gss, AcceptStat::ProcUnavail);
+        };
+        let Ok(parsed) = parsed else {
+            return err(gss, AcceptStat::GarbageArgs);
+        };
+        // xdr_krb5_principal fails on names krb5_parse_name rejects.
+        if let ReadArgs::GetPrincipal { princ: Some(p), .. } = &parsed {
+            if self.parse(p).is_none() {
+                return err(gss, AcceptStat::GarbageArgs);
+            }
+        }
+        if let (kadm5::proc_::GET_STRINGS, ReadArgs::Name { name: Some(p), .. }) = (proc_, &parsed)
+        {
+            if self.parse(p).is_none() {
+                return err(gss, AcceptStat::GarbageArgs);
+            }
+        }
+        let results = match (proc_, parsed) {
+            (kadm5::proc_::INIT, ReadArgs::Api(api)) => {
+                let c = kadm5::check_api_version(api);
+                if c != code::OK {
+                    kadm5::generic_ret(0, c)
+                } else {
+                    eprintln!(
+                        "krb5-rs-kadmind: Request: kadm5_init, {0}, success, client={0}, service={1}, addr={2}, vers={3}, flavor=6",
+                        caller.client_name,
+                        caller.service_name,
+                        from.ip(),
+                        api & !kadm5::API_VERSION_MASK
+                    );
+                    kadm5::generic_ret(api, code::OK)
+                }
+            }
+            (kadm5::proc_::GET_PRIVS, ReadArgs::Api(api)) => {
+                let c = kadm5::check_api_version(api);
+                if c != code::OK {
+                    kadm5::getprivs_ret(0, c, 0)
+                } else {
+                    caller.log_done("kadm5_get_privs", &caller.client_name, code::OK);
+                    // kadm5_get_privs (server_misc.c) reports every privilege.
+                    kadm5::getprivs_ret(api, code::OK, !0)
+                }
+            }
+            (
+                _,
+                ReadArgs::GetPrincipal {
+                    api_version,
+                    princ,
+                    mask,
+                },
+            ) => self.get_principal(&caller, api_version, princ.as_deref(), mask),
+            (kadm5::proc_::GET_PRINCS, ReadArgs::Name { api_version, name }) => {
+                self.list(&caller, api_version, name.as_deref(), true)
+            }
+            (kadm5::proc_::GET_POLS, ReadArgs::Name { api_version, name }) => {
+                self.list(&caller, api_version, name.as_deref(), false)
+            }
+            (kadm5::proc_::GET_POLICY, ReadArgs::Name { api_version, name }) => {
+                self.get_policy(&caller, api_version, name.as_deref())
+            }
+            (kadm5::proc_::GET_STRINGS, ReadArgs::Name { api_version, name }) => {
+                self.get_strings(&caller, api_version, name.as_deref())
+            }
+            _ => return err(gss, AcceptStat::GarbageArgs),
+        };
+        gss.reply(xid, seq, &results).map_err(|e| e.to_string())
+    }
+}
+
+async fn serve<P: Program>(
+    state: Arc<P>,
+    mut stream: TcpStream,
+    from: SocketAddr,
+) -> Result<(), String> {
+    let keys = state.keys();
     let mut gss = GssServer::new(Box::new(move || {
         let source = DbKeys {
             store: keys.0.clone(),
@@ -541,7 +924,7 @@ async fn serve(state: Arc<State>, mut stream: TcpStream) -> Result<(), String> {
                     let out = match gss.handle(&call) {
                         ServerStep::Send(r) => Ok(r),
                         ServerStep::Dispatch { proc_, args, seq } => {
-                            st.dispatch(&mut gss, &call, proc_, &args, seq)
+                            st.dispatch(&mut gss, &call, proc_, &args, seq, &from)
                         }
                     };
                     (gss, out)
@@ -687,7 +1070,26 @@ async fn main() {
         bind_udp(addrs.clone(), &mut kpasswd_udp).await;
         bind_tcp(addrs, &mut kpasswd_tcp).await;
     }
-    if iprop_listeners.is_empty() && kpasswd_udp.is_empty() && kpasswd_tcp.is_empty() {
+    let mut kadm5_listeners = Vec::new();
+    if !args.proponly {
+        let port = args.port.unwrap_or_else(|| {
+            r("kadmind_port").map_or(KADMIND_PORT, |p| {
+                p.trim()
+                    .parse::<u16>()
+                    .unwrap_or_else(|_| die(format!("invalid kadmind_port {p}")))
+            })
+        });
+        bind_tcp(
+            listen_addrs(r("kadmind_listen"), port),
+            &mut kadm5_listeners,
+        )
+        .await;
+    }
+    if iprop_listeners.is_empty()
+        && kpasswd_udp.is_empty()
+        && kpasswd_tcp.is_empty()
+        && kadm5_listeners.is_empty()
+    {
         die("no sockets set up?");
     }
     if let Some(pid_file) = &args.pid_file {
@@ -714,28 +1116,14 @@ async fn main() {
                 .dump_file
                 .unwrap_or_else(|| Path::new(KDC_DIR).join("replica_datatrans")),
         });
-        for listener in iprop_listeners {
-            let state = state.clone();
-            tasks.spawn_local_on(
-                async move {
-                    loop {
-                        match listener.accept().await {
-                            Ok((stream, from)) => {
-                                let state = state.clone();
-                                tokio::task::spawn_local(async move {
-                                    if let Err(e) = serve(state, stream).await {
-                                        eprintln!("krb5-rs-kadmind: {from}: {e}");
-                                    }
-                                });
-                            }
-                            Err(e) => eprintln!("krb5-rs-kadmind: accept: {e}"),
-                        }
-                    }
-                },
-                &local,
-            );
-        }
+        spawn_rpc(&mut tasks, &local, &state, iprop_listeners);
     }
+    let kadm5 = Arc::new(Kadm5 {
+        realm: realm.clone(),
+        store: store.clone(),
+        acl: acl.clone(),
+    });
+    spawn_rpc(&mut tasks, &local, &kadm5, kadm5_listeners);
     let kpasswd = Rc::new(Kpasswd {
         keys: DbKeys {
             store: store.clone(),
@@ -762,6 +1150,36 @@ async fn main() {
     local
         .run_until(async { while tasks.join_next().await.is_some() {} })
         .await;
+}
+
+/// Accept RPC connections for `state` on every listener.
+fn spawn_rpc<P: Program>(
+    tasks: &mut tokio::task::JoinSet<()>,
+    local: &tokio::task::LocalSet,
+    state: &Arc<P>,
+    listeners: Vec<TcpListener>,
+) {
+    for listener in listeners {
+        let state = state.clone();
+        tasks.spawn_local_on(
+            async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, from)) => {
+                            let state = state.clone();
+                            tokio::task::spawn_local(async move {
+                                if let Err(e) = serve(state, stream, from).await {
+                                    eprintln!("krb5-rs-kadmind: {from}: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => eprintln!("krb5-rs-kadmind: accept: {e}"),
+                    }
+                }
+            },
+            local,
+        );
+    }
 }
 
 /// Bind every address; a failed `[::]` after another socket is only

@@ -261,8 +261,10 @@ iprop update log (`<database_name>.ulog`); `krb5-rs-kdb dump -i1 [-c]`,
 `acl_file`, full resyncs through `krb5-rs-kdb dump -i1 -c` and
 `krb5-rs-kprop`). Without `-proponly` it also serves kpasswd (RFC 3244,
 `kpasswd_port`/`kpasswd_listen`, default 464 on UDP and TCP) for MIT
-`kpasswd` and `krb5_set_password`; the kadm5 admin RPC service is not
-implemented.
+`kpasswd` and `krb5_set_password`, and MIT's kadm5 admin RPC (program 2112,
+`kadmind_port`, default 749) for remote MIT `kadmin`. Only the read-only calls
+(`getprinc`, `listprincs`, `getpol`, `listpols`, `getstrs`, `getprivs`) are
+implemented so far.
 
 With `iprop_enable = true` in the replica's kdc.conf, `krb5-rs-kpropd` also
 polls the primary's iprop service like MIT kpropd: every `iprop_replica_poll`
