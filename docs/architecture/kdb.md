@@ -360,9 +360,9 @@ Deliberate iprop-service deviations from MIT `ipropd_svc.c`:
   and the first 8 bytes of the host's SHA-256 in hex, so concurrent resyncs
   never share one file and long hostnames stay within filename limits.
 - `iprop_listen` entries may also be separated by tabs.
-- Not yet changed: LMDB reads for service keys and ulog entries still run on
-  the event-loop thread, as in MIT's single-threaded kadmind; moving them off
-  needs a `Send` key source for the GSS acceptor.
+- RPCSEC_GSS handling and each iprop call (service-key and ulog reads from
+  LMDB) run on Tokio's blocking pool, so a slow read never stalls other
+  connections or the kpasswd service; MIT's kadmind is single-threaded.
 
 ### kpasswd service
 

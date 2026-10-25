@@ -5,7 +5,7 @@ use super::*;
 /// Acceptor-side context establishment (accept_sec_context.c
 /// kg_accept_krb5).
 pub struct Krb5Acceptor {
-    keys: Box<dyn KeySource>,
+    keys: Box<dyn KeySource + Send>,
     server: Option<PrincipalName>,
     cb: Option<ChannelBindings>,
     ctx: Option<Krb5Context>,
@@ -18,7 +18,7 @@ impl Krb5Acceptor {
     /// `server` restricts the accepted service principal (rd_req's
     /// `server` argument).
     pub fn new(
-        keys: Box<dyn KeySource>,
+        keys: Box<dyn KeySource + Send>,
         server: Option<PrincipalName>,
         cb: Option<ChannelBindings>,
     ) -> Self {
