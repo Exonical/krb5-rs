@@ -211,6 +211,17 @@ fn init_is_idempotent_and_reads_secrets_only_from_files() {
     assert_eq!(out.matches("already exists").count(), 2, "{out}");
     assert_eq!(env.ok(&["getprinc", "kprop/primary"], ""), before);
 
+    // A database without the kadm5 service principals (as made by earlier
+    // releases) gets them back from init.
+    env.ok(&["delprinc", "kadmin/changepw"], "");
+    assert!(!env.ok(&["listprincs"], "").contains("kadmin/changepw"));
+    env.ok(&args, "");
+    let listed = env.ok(&["listprincs"], "");
+    assert!(
+        listed.contains(&format!("kadmin/changepw@{REALM}")),
+        "{listed}"
+    );
+
     // A different master password cannot open the existing database.
     std::fs::write(&master, "other\n").expect("master file");
     assert_eq!(env.run(&args, "").status.code(), Some(1));

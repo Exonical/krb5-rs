@@ -10,6 +10,8 @@ pub mod admin;
 mod file;
 mod format;
 #[cfg(feature = "tokio")]
+pub mod kpasswd;
+#[cfg(feature = "tokio")]
 pub mod kprop;
 pub mod master;
 pub mod mit;

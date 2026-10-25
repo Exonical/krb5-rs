@@ -256,7 +256,10 @@ iprop update log (`<database_name>.ulog`); `krb5-rs-kdb dump -i1 [-c]`,
 `krb5-rs-kadmind -proponly` serves that log to MIT kpropd in iprop mode
 (iprop RPC over RPCSEC_GSS as `kiprop/<host>`, the `p` permission in
 `acl_file`, full resyncs through `krb5-rs-kdb dump -i1 -c` and
-`krb5-rs-kprop`); it supports no other kadmind mode.
+`krb5-rs-kprop`). Without `-proponly` it also serves kpasswd (RFC 3244,
+`kpasswd_port`/`kpasswd_listen`, default 464 on UDP and TCP) for MIT
+`kpasswd` and `krb5_set_password`; the kadm5 admin RPC service is not
+implemented.
 
 With `iprop_enable = true` in the replica's kdc.conf, `krb5-rs-kpropd` also
 polls the primary's iprop service like MIT kpropd: every `iprop_replica_poll`
