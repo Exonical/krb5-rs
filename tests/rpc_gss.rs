@@ -264,14 +264,38 @@ fn server_rejects_bad_credentials_like_mit() {
         header: header(7, 1, &cred(proc_::INIT, 0)),
         args: Vec::new(),
     };
+    // A second INIT on an established connection is refused.
     assert_eq!(
         sent(server.handle(&init)),
-        Reply::AuthError(AuthStat::Failed)
+        Reply::AuthError(AuthStat::BadCred)
     );
+    let mut wrong_handle = cred(proc_::DATA, 8);
+    wrong_handle.handle = b"yyyy".to_vec();
+    let call = data_call(&mut ctx, 8, &wrong_handle, b"");
+    assert_eq!(
+        sent(server.handle(&call)),
+        Reply::AuthError(AuthStat::BadCred)
+    );
+    let mut other_service = cred(proc_::DATA, 9);
+    other_service.service = Service::Privacy as u32;
+    let call = data_call(&mut ctx, 9, &other_service, b"");
+    assert_eq!(
+        sent(server.handle(&call)),
+        Reply::AuthError(AuthStat::BadCred)
+    );
+    // A forged call with a high sequence number must not move the window.
+    let mut forged = data_call(&mut ctx, 10, &cred(proc_::DATA, 200), b"");
+    forged.header.verf.body[0] ^= 1;
+    assert_eq!(
+        sent(server.handle(&forged)),
+        Reply::AuthError(AuthStat::GssCredProblem)
+    );
+    let call = data_call(&mut ctx, 11, &cred(proc_::DATA, 20), b"");
+    assert!(matches!(server.handle(&call), ServerStep::Dispatch { .. }));
     init.header.proc_ = 0;
     assert_eq!(
         sent(server.handle(&init)),
-        Reply::AuthError(AuthStat::GssCtxProblem)
+        Reply::AuthError(AuthStat::BadCred)
     );
     let (_, mut fresh) = pair();
     init.args = vec![0, 0, 0, 1, 0x60, 0, 0, 0];
@@ -307,6 +331,18 @@ fn server_enforces_the_sequence_window() {
     assert_eq!(
         sent(server.handle(&huge)),
         Reply::AuthError(AuthStat::GssCtxProblem)
+    );
+    // A second INIT is refused as BadCred even when its sequence number has
+    // fallen out of the replay window.
+    let mut again = cred(proc_::INIT, 0);
+    again.handle.clear();
+    let reinit = Call {
+        header: header(6, 0, &again),
+        args: Vec::new(),
+    };
+    assert_eq!(
+        sent(server.handle(&reinit)),
+        Reply::AuthError(AuthStat::BadCred)
     );
 }
 
