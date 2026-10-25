@@ -17,6 +17,7 @@ use krb5_rs::kdc::kdb::kprop::ReplayCache;
 use krb5_rs::kdc::kdb::mit::parse_name_with_default;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
 use krb5_rs::kdc::kdb::read_stash;
+use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
 use krb5_rs::kdc::{default_realm, RealmConfig};
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::ap::{ApError, KeySource};
@@ -126,12 +127,12 @@ const ACL_OPS: [(char, u32); 11] = [
     ('e', ACL_EXTRACT),
 ];
 
-/// One parsed ACL line (`auth_acl.c` `struct acl_entry`), without the
-/// restrictions.
+/// One parsed ACL line (`auth_acl.c` `struct acl_entry`).
 struct AclEntry {
     client: Option<(PrincipalName, String)>,
     ops: u32,
     target: Option<(PrincipalName, String)>,
+    restrictions: Option<AclRestrictions>,
 }
 
 /// `get_line` (`auth_acl.c:103-151`): logical lines with `\` continuations,
@@ -164,16 +165,25 @@ fn acl_lines(text: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// `parse_line` and `parse_entry` (`auth_acl.c:261-372`).
-/// Deviation: the restrictions field is not validated, since neither
-/// kpasswd nor iprop applies restrictions.
+/// `parse_line` and `parse_entry` (`auth_acl.c:261-372`): client,
+/// operations, optional target, and the rest of the line as restrictions.
 fn parse_acl_line(line: &str, realm: &str) -> Option<AclEntry> {
     let ws = |c: char| matches!(c, '\t' | '\n' | '\x0c' | '\x0b' | '\r' | ' ' | ',');
     let line = line.trim_end_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
-    let mut fields = line.split(ws).filter(|f| !f.is_empty());
-    let client = fields.next()?;
-    let op_str = fields.next()?;
-    let target = fields.next();
+    fn field(s: &str) -> (&str, &str) {
+        let ws = |c: char| matches!(c, '\t' | '\n' | '\x0c' | '\x0b' | '\r' | ' ' | ',');
+        let s = s.trim_start_matches(ws);
+        let end = s.find(ws).unwrap_or(s.len());
+        (&s[..end], &s[end..])
+    }
+    let (client, rest) = field(line);
+    let (op_str, rest) = field(rest);
+    let (target, rest) = field(rest);
+    let rs = rest.trim_start_matches(ws);
+    if client.is_empty() || op_str.is_empty() {
+        return None;
+    }
+    let target = (!target.is_empty()).then_some(target);
     let mut ops = 0;
     for op in op_str.chars() {
         let lower = op.to_ascii_lowercase();
@@ -202,10 +212,18 @@ fn parse_acl_line(line: &str, realm: &str) -> Option<AclEntry> {
         None | Some("*") => None,
         Some(t) => Some(parse(t, "target")?),
     };
+    let restrictions = match rs {
+        "" => None,
+        rs => Some(AclRestrictions::parse(rs).or_else(|| {
+            eprintln!("krb5-rs-kadmind: invalid restrictions: {rs}");
+            None
+        })?),
+    };
     Some(AclEntry {
         client,
         ops,
         target,
+        restrictions,
     })
 }
 
@@ -261,13 +279,14 @@ fn match_princ(
 }
 
 /// `find_entry` and `acl_check` (`auth_acl.c:492-545`): the first entry
-/// matching the client and target decides.
-fn acl_check(
-    acl: &[AclEntry],
+/// matching the client and target decides. `Some` grants `op`, with that
+/// entry's restrictions.
+fn acl_check<'a>(
+    acl: &'a [AclEntry],
     op: u32,
     (client, crealm): (&PrincipalName, &str),
     target: Option<(&PrincipalName, &str)>,
-) -> bool {
+) -> Option<Option<&'a AclRestrictions>> {
     acl.iter()
         .find(|e| {
             let mut ws = Vec::new();
@@ -282,12 +301,13 @@ fn acl_check(
                 (Some(p), Some((t, trealm))) => match_princ(p, t, trealm, true, &mut ws),
             }
         })
-        .is_some_and(|e| e.ops & op != 0)
+        .filter(|e| e.ops & op != 0)
+        .map(|e| e.restrictions.as_ref())
 }
 
 /// `acl_check(ACL_IPROP)` with no target.
 fn acl_permits_iprop(acl: &[AclEntry], client: &PrincipalName, realm: &str) -> bool {
-    acl_check(acl, ACL_IPROP, (client, realm), None)
+    acl_check(acl, ACL_IPROP, (client, realm), None).is_some()
 }
 
 /// Service keys read from the database (MIT's `KDB:` keytab).
@@ -783,7 +803,7 @@ struct Kpasswd {
 impl Kpasswd {
     async fn handle(&self, local: &SocketAddr, remote: &SocketAddr, req: &[u8]) -> Option<Vec<u8>> {
         let authorize = |c: &PrincipalName, cr: &str, t: &PrincipalName, tr: &str| {
-            acl_check(&self.acl, ACL_CHANGEPW, (c, cr), Some((t, tr)))
+            acl_check(&self.acl, ACL_CHANGEPW, (c, cr), Some((t, tr))).is_some()
         };
         let svc = Service {
             realm: &self.realm,
@@ -940,7 +960,7 @@ mod tests {
             .collect();
         let (c, cr) = princ(client);
         let (t, tr) = princ(target);
-        acl_check(&entries, ACL_CHANGEPW, (&c, &cr), Some((&t, &tr)))
+        acl_check(&entries, ACL_CHANGEPW, (&c, &cr), Some((&t, &tr))).is_some()
     }
 
     #[test]
@@ -1004,6 +1024,20 @@ mod tests {
         assert!(parse_acl_line("kiprop/replica@R q", "R").is_none());
         assert!(parse_acl_line("kiprop/replica@R", "R").is_none());
         assert!(parse_acl_line("a@R c b@R@", "R").is_none());
+        let e = parse_acl_line(
+            "admin@R ac *@R -policy std,+requires_preauth\t-maxlife 1h ",
+            "R",
+        )
+        .expect("line");
+        let rs = e.restrictions.as_ref().expect("restrictions");
+        assert_eq!(rs.policy.as_deref(), Some("std"));
+        assert_eq!(rs.max_life, 3_600);
+        assert!(parse_acl_line("admin@R a * -policy", "R").is_none());
+        assert!(parse_acl_line("admin@R a * -frobnicate 1h", "R").is_none());
+        assert!(parse_acl_line("admin@R a *", "R")
+            .expect("line")
+            .restrictions
+            .is_none());
         assert_eq!(acl_lines("a p\\\n b\n# x\n  \nc d").len(), 3);
     }
 }

@@ -15,6 +15,7 @@ pub mod kpasswd;
 pub mod kprop;
 pub mod master;
 pub mod mit;
+pub mod restrictions;
 
 pub use crate::kdc::store::PrincipalRecord;
 pub use file::FileStore;
