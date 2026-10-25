@@ -265,6 +265,15 @@ kpropd only receives kprop pushes, the default.
 Deviations: kpropd requires `iprop_port` instead of looking the service up
 with the portmapper; `-x` is accepted and ignored; klmdb only.
 
+Known MIT behaviors kept for parity (not yet changed):
+
+- A failed `IPROP_GET_UPDATES` call reconnects at once, getting a new ticket,
+  with no backoff (`kpropd.c:784-797`); backoff applies only when
+  reconnecting fails and to busy replies.
+- The full-resync timestamp is set before `IPROP_FULL_RESYNC[_EXT]` is sent
+  and is kept after a busy reply or a failed call (`kpropd.c:815-849`), so
+  no new resync is requested until `iprop_resync_timeout` passes.
+
 ### kadmind iprop service
 
 `krb5-rs-kadmind -proponly` serves the log like MIT `kadmind -proponly`
@@ -290,6 +299,24 @@ is implied) and `-P` writes its pid; `-x`, the kadmin and kpasswd services
 and ACL restrictions are not supported (restrictions are parsed and ignored,
 as they never apply to iprop); `-port` is accepted and ignored because it
 sets only the kadmin port; klmdb only.
+
+Known MIT behaviors kept for parity (not yet changed):
+
+- Concurrent full resyncs share one dump file (`ipropd_svc.c:329-400`); the
+  only locks are dump's on `.dump_ok` (`dump.c:170-217`) and kprop's shared
+  lock on the dump (`kprop.c:356`), so one replica can be sent a snapshot
+  dumped for another. It carries its own serial, and the replica catches up
+  through `IPROP_GET_UPDATES` or asks for another resync.
+- Any client with the `p` permission can request a full resync, which kprop
+  sends to the host named in its second component (`getclhoststr`,
+  `ipropd_svc.c:245-255, 312-327`); the client need not be `kiprop/`. Here
+  the client must have exactly two components.
+- Service keys for each new connection are read from LMDB synchronously on
+  the single-threaded event loop, as MIT kadmind reads the KDB within its
+  verto loop.
+- `iprop_listen` is split only on `ADDRESSES_DELIM` (`,; `,
+  `include/net-server.h:36`); a tab is not a separator. With no addresses
+  bound kadmind exits with `no sockets set up?` (`net-server.c:1075-1079`).
 
 ### ONC RPC and RPCSEC_GSS
 
