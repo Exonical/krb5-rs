@@ -317,6 +317,12 @@ kpropd only receives kprop pushes, the default.
 
 Deviations: kpropd requires `iprop_port` instead of looking the service up
 with the portmapper; `-x` is accepted and ignored; klmdb only.
+Deliberate retry deviations from MIT `do_iprop`: a failed
+`IPROP_GET_UPDATES` or `IPROP_FULL_RESYNC[_EXT]` call waits the same
+`2 << n` backoff before reconnecting instead of reconnecting at once, and a
+Busy reply to a resync request clears the resync timer, so the next
+`UPDATE_FULL_RESYNC_NEEDED` asks again after the backoff rather than after
+`iprop_resync_timeout`.
 
 ### kadmind iprop service
 

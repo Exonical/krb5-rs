@@ -544,6 +544,8 @@ impl Server {
                     Err(e) => {
                         eprintln!("kpropd: iprop_get_updates call failed: {e}");
                         self.debug("Reinitializing iprop because get updates failed");
+                        backoff_cnt += 1;
+                        tokio::time::sleep(backoff_from_primary(&mut backoff_cnt)).await;
                         continue 'reinit;
                     }
                 };
@@ -558,6 +560,9 @@ impl Server {
                             match self.full_resync(&mut clnt).await {
                                 Err(e) => {
                                     eprintln!("kpropd: iprop_full_resync call failed: {e}");
+                                    backoff_cnt += 1;
+                                    tokio::time::sleep(backoff_from_primary(&mut backoff_cnt))
+                                        .await;
                                     continue 'reinit;
                                 }
                                 Ok(Some(UpdateStatus::Ok)) => {
@@ -568,6 +573,9 @@ impl Server {
                                 Ok(Some(UpdateStatus::Busy)) => {
                                     self.debug("Exponential backoff");
                                     backoff_cnt += 1;
+                                    // Busy: ask again after the backoff, not
+                                    // after iprop_resync_timeout.
+                                    frrequested = None;
                                 }
                                 Ok(Some(UpdateStatus::PermDenied)) => {
                                     return Err("Full resync, permission denied.".into())
