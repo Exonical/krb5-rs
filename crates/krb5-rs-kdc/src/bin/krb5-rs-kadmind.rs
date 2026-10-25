@@ -397,12 +397,20 @@ impl State {
             UpdateStatus::PermDenied
         } else if vers > 1 {
             UpdateStatus::Error
-        } else if let [_, host] = client.name_string.as_slice() {
+        } else if let [kiprop, host] = client.name_string.as_slice() {
+            // Only kiprop/<host> clients may trigger a resync to <host>.
+            if kiprop.as_slice() != b"kiprop" {
+                return Self::resync_reply(UpdateStatus::PermDenied);
+            }
             self.spawn_resync(String::from_utf8_lossy(host.as_ref()).into_owned(), vers);
             UpdateStatus::Ok
         } else {
             UpdateStatus::PermDenied
         };
+        Self::resync_reply(status)
+    }
+
+    fn resync_reply(status: UpdateStatus) -> Vec<u8> {
         let mut w = XdrWriter::default();
         w.last(Last::default());
         w.u32(status as u32);
@@ -414,7 +422,7 @@ impl State {
         let kdb_util = self.kdb_util.clone();
         let kprop = self.kprop.clone();
         let port = self.kprop_port.clone();
-        let dump = self.dump_file.clone();
+        let dump = replica_dump_file(&self.dump_file, &host);
         tokio::task::spawn_blocking(move || {
             let flag = if vers == 0 { "-i" } else { "-i1" };
             let dumped = Command::new(&kdb_util)
@@ -521,6 +529,25 @@ async fn serve(state: Arc<State>, mut stream: TcpStream) -> Result<(), String> {
     Ok(())
 }
 
+/// The resync dump file for one replica, so concurrent resyncs to different
+/// hosts never share a file.
+fn replica_dump_file(base: &std::path::Path, host: &str) -> PathBuf {
+    let safe: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut name = base.as_os_str().to_os_string();
+    name.push(".");
+    name.push(safe);
+    PathBuf::from(name)
+}
+
 /// `iprop_listen`, else the wildcard addresses on `iprop_port`
 /// (`loop_add_rpc_service`).
 fn listen_addrs(listen: Option<String>, port: u16) -> Vec<SocketAddr> {
@@ -534,7 +561,10 @@ fn listen_addrs(listen: Option<String>, port: u16) -> Vec<SocketAddr> {
         return wild(port);
     };
     let mut out = Vec::new();
-    for tok in listen.split([',', ';', ' ']).filter(|t| !t.is_empty()) {
+    for tok in listen
+        .split([',', ';', ' ', '\t'])
+        .filter(|t| !t.is_empty())
+    {
         if let Ok(p) = tok.parse::<u16>() {
             out.extend(wild(p));
         } else if let Ok(a) = tok.parse::<SocketAddr>() {
@@ -834,6 +864,19 @@ mod tests {
             .collect();
         let (name, realm) = princ(client);
         acl_permits_iprop(&entries, &name, &realm)
+    }
+
+    #[test]
+    fn each_replica_gets_its_own_resync_dump_file() {
+        let base = std::path::Path::new("/var/krb5kdc/slave_datatrans");
+        assert_eq!(
+            replica_dump_file(base, "replica-1.example.com"),
+            PathBuf::from("/var/krb5kdc/slave_datatrans.replica-1.example.com")
+        );
+        assert_eq!(
+            replica_dump_file(base, "../evil/x"),
+            PathBuf::from("/var/krb5kdc/slave_datatrans..._evil_x")
+        );
     }
 
     #[test]
