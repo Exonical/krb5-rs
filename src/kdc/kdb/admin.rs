@@ -23,10 +23,10 @@ fn err(msg: impl Into<String>) -> StoreError {
 }
 
 /// kadm5 error texts (`lib/kadm5/kadm_err.et:29-37`).
-const PASS_Q_TOOSHORT: &str = "Password is too short";
-const PASS_Q_CLASS: &str = "Password does not contain enough character classes";
-const PASS_REUSE: &str = "Cannot reuse password";
-const PROTECT_PRINCIPAL: &str = "Cannot change protected principal";
+pub(crate) const PASS_Q_TOOSHORT: &str = "Password is too short";
+pub(crate) const PASS_Q_CLASS: &str = "Password does not contain enough character classes";
+pub(crate) const PASS_REUSE: &str = "Cannot reuse password";
+pub(crate) const PROTECT_PRINCIPAL: &str = "Cannot change protected principal";
 
 /// `aes256-cts-hmac-sha1-96`, MIT's default `master_key_type`.
 const DEFAULT_HISTORY_ENCTYPE: i32 = 18;
