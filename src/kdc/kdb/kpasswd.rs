@@ -335,7 +335,7 @@ async fn chpass_util<S: AdminStore>(
 /// `schpw_util_wrapper` (`misc.c:13-57`).
 async fn schpw_util_wrapper<S: AdminStore>(
     admin: &AdminOps<S>,
-    svc: &Service<'_>,
+    authorize: &Authorize<'_>,
     (client, crealm): (&PrincipalName, &str),
     (target, trealm): (&PrincipalName, &str),
     initial: bool,
@@ -353,7 +353,7 @@ async fn schpw_util_wrapper<S: AdminStore>(
             return e;
         }
     }
-    if !is_self && !(svc.authorize)(client, crealm, target, trealm) {
+    if !is_self && !authorize(client, crealm, target, trealm) {
         return (KPASSWD_ACCESSDENIED, "Unauthorized request".into());
     }
     chpass_util(admin, target, trealm, password).await
@@ -515,7 +515,7 @@ async fn change<S: AdminStore>(
                 });
             schpw_util_wrapper(
                 admin,
-                svc,
+                svc.authorize,
                 (&auth.client, &auth.crealm),
                 (tname, trealm),
                 auth.initial,
@@ -547,6 +547,101 @@ async fn change<S: AdminStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::SaltType;
+    use crate::kdc::kdb::admin::PrincipalOptions;
+    use crate::kdc::kdb::file::FileStore;
+    use crate::kdc::kdb::master_key_from_password;
+    use crate::kdc::store::Policy;
+
+    fn file_admin(tag: &str) -> AdminOps<FileStore> {
+        let dir = std::env::temp_dir().join(format!("krb5rs_kpasswd_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = FileStore::create(&dir.join("principal"), "R", &master).expect("create");
+        AdminOps::new(store, vec![(18, SaltType::Normal)])
+    }
+
+    #[tokio::test]
+    async fn schpw_util_wrapper_maps_status_like_mit() {
+        let admin = file_admin("wrapper");
+        admin
+            .add_policy(Policy {
+                name: "p".into(),
+                pw_min_life: 86_400,
+                pw_min_length: 8,
+                ..Policy::default()
+            })
+            .await
+            .expect("policy");
+        let with_policy = PrincipalOptions {
+            policy: Some(Some("p".into())),
+            ..PrincipalOptions::default()
+        };
+        let alice = PrincipalName::new_principal("alice");
+        let bob = PrincipalName::new_principal("bob");
+        let carol = PrincipalName::new_principal("carol");
+        let ghost = PrincipalName::new_principal("ghost");
+        admin
+            .add_principal(&alice, "R", Some("alice-pw-1"), &with_policy)
+            .await
+            .expect("alice");
+        admin
+            .add_principal(&bob, "R", Some("bob-pw-1"), &PrincipalOptions::default())
+            .await
+            .expect("bob");
+        let allow = |_: &PrincipalName, _: &str, _: &PrincipalName, _: &str| true;
+        let deny = |_: &PrincipalName, _: &str, _: &PrincipalName, _: &str| false;
+        let run = |client, target, initial, pw, authorize: &'static Authorize<'static>| {
+            let admin = &admin;
+            async move {
+                schpw_util_wrapper(admin, authorize, (client, "R"), (target, "R"), initial, pw)
+                    .await
+            }
+        };
+        let allow: &'static Authorize<'static> = Box::leak(Box::new(allow));
+        let deny: &'static Authorize<'static> = Box::leak(Box::new(deny));
+
+        let (code, text) = run(&alice, &alice, false, "alice-pw-2", deny).await;
+        assert_eq!(
+            (code, text.as_str()),
+            (
+                KPASSWD_INITIAL_FLAG_NEEDED,
+                "Ticket must be derived from a password"
+            )
+        );
+        let (code, text) = run(&alice, &alice, true, "alice-pw-2", deny).await;
+        assert_eq!(code, KPASSWD_SOFTERROR);
+        assert!(
+            text.starts_with("Password cannot be changed because it was changed too recently"),
+            "{text}"
+        );
+        let (code, text) = run(&bob, &alice, true, "alice-pw-2", deny).await;
+        assert_eq!(
+            (code, text.as_str()),
+            (KPASSWD_ACCESSDENIED, "Unauthorized request")
+        );
+        let (code, text) = run(&bob, &alice, true, "short", allow).await;
+        assert_eq!((code, text), (KPASSWD_SOFTERROR, too_short(8)));
+        assert_eq!(
+            run(&bob, &alice, false, "alice-pw-2", allow).await.0,
+            KPASSWD_SUCCESS
+        );
+        assert_eq!(
+            run(&bob, &bob, true, "bob-pw-2", deny).await.0,
+            KPASSWD_SUCCESS
+        );
+        let (code, text) = run(&bob, &alice, true, "alice-pw-2", allow).await;
+        assert_eq!((code, text.as_str()), (KPASSWD_SOFTERROR, PASSWORD_REUSE));
+        assert_eq!(
+            run(&bob, &carol, true, "carol-pw", allow).await.0,
+            KPASSWD_HARDERROR
+        );
+        assert_eq!(
+            run(&ghost, &ghost, true, "ghost-pw", deny).await.0,
+            KPASSWD_HARDERROR
+        );
+    }
 
     fn framed(version: u16, ap_req: &[u8], rest: &[u8]) -> Vec<u8> {
         let total = u16::try_from(6 + ap_req.len() + rest.len()).expect("len");
