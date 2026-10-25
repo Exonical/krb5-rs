@@ -143,6 +143,7 @@ propagation:
   # runs krb5-rs-kadmind -proponly instead of the kprop sidecar, and each
   # replica's kpropd polls it every `pollInterval` as kiprop/<pod FQDN>,
   # falling back to a full kprop push when it falls behind the update log.
+  # File (klmdb) mode only; CockroachDB mode rejects it.
   iprop:
     enabled: false
     port: 7550
