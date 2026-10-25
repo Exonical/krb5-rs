@@ -1780,6 +1780,7 @@ dependencies = [
  "krb5-rs-kdb-cockroach",
  "krb5-rs-kdb-lmdb",
  "krb5-rs-kdb-turso",
+ "libc",
  "prometheus-client",
  "regex",
  "tempfile",

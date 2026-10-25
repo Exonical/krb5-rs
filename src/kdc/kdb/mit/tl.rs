@@ -9,6 +9,7 @@ use chrono::Utc;
 use rasn::types::GeneralString;
 
 use super::codec::{KeyData, MitEntry, MitPolicy, TlData};
+use super::mkey::{entry_mkvno as mkvno, rewrap_key_data, MasterKeys};
 use super::name::parse_name;
 #[cfg(test)]
 use super::name::unparse_name;
@@ -279,18 +280,6 @@ pub fn history_key_matches(
         })
 }
 
-fn mkvno(entry: &MitEntry) -> Result<u16, StoreError> {
-    match bytes_tl(entry, MKVNO) {
-        None => Ok(1),
-        Some(bytes) => {
-            let bytes: [u8; 2] = bytes
-                .try_into()
-                .map_err(|_| corrupt("MIT MKVNO tl-data must be 2 bytes"))?;
-            Ok(u16::from_le_bytes(bytes))
-        }
-    }
-}
-
 /// Map MIT's key-data salt rules (`lib/kdb/kdb5.c:2345-2376`).
 ///
 /// MIT computes NORMAL, NOREALM, and ONLYREALM salts from the principal.
@@ -395,24 +384,50 @@ fn reusable_key_data(
 fn update_keys(
     entry: &mut MitEntry,
     record: &PrincipalRecord,
-    master: &EncryptionKey,
+    keys: &MasterKeys,
 ) -> Result<bool, StoreError> {
+    let (active_kvno, active) = keys.active()?;
+    let old_mkvno = mkvno(entry)?;
+    let old_master = keys.get(old_mkvno);
     let mut remaining = entry.key_data.clone();
     let mut updated = Vec::with_capacity(record.entry.keys.len());
     let mut reencrypted = false;
+    let mut retained = Vec::new();
     for key in &record.entry.keys {
-        if let Some(index) = remaining
-            .iter()
-            .position(|old| reusable_key_data(old, key, &record.entry, master))
-        {
+        let reused = old_master.and_then(|master| {
+            remaining
+                .iter()
+                .position(|old| reusable_key_data(old, key, &record.entry, master))
+        });
+        if let Some(index) = reused {
+            retained.push(updated.len());
             updated.push(remaining.remove(index));
         } else {
             reencrypted = true;
-            updated.push(key_data_from_entry(&record.entry, key, master)?);
+            updated.push(key_data_from_entry(&record.entry, key, active)?);
+        }
+    }
+    if reencrypted && old_mkvno != active_kvno {
+        // Every key must be wrapped by the master key named in MKVNO; retained
+        // key data keeps its version and salt field (`master_key_convert`).
+        if let Some(old) = old_master {
+            for at in retained {
+                rewrap_key_data(&mut updated[at], old, active)?;
+            }
         }
     }
     entry.key_data = updated;
     Ok(reencrypted)
+}
+
+/// `krb5_dbe_update_mod_princ_data`: set `KRB5_TL_MOD_PRINC`.
+pub fn set_mod_princ(entry: &mut MitEntry, seconds: u32, mod_by: &[u8]) -> Result<(), StoreError> {
+    update_mod_principal(
+        entry,
+        Some(kerberos_time(i64::from(seconds))),
+        Some(mod_by),
+        None,
+    )
 }
 
 fn update_mod_principal(
@@ -464,9 +479,14 @@ fn update_mod_principal(
 /// return zero and `None`; lockout values come from the separate lockout record.
 pub fn record_from_entry(
     entry: &MitEntry,
-    master: &EncryptionKey,
+    keys: &MasterKeys,
 ) -> Result<PrincipalRecord, StoreError> {
-    let _ = mkvno(entry)?;
+    let mkvno = mkvno(entry)?;
+    let master = keys.get(mkvno).ok_or_else(|| {
+        StoreError::backend(format!(
+            "No matching key in entry (master key version {mkvno})"
+        ))
+    })?;
     let keys = entry
         .key_data
         .iter()
@@ -583,7 +603,7 @@ fn update_string_attrs(entry: &mut MitEntry, names: &[String]) -> Result<(), Sto
 pub fn merge_record(
     entry: &mut MitEntry,
     record: &PrincipalRecord,
-    master: &EncryptionKey,
+    keys: &MasterKeys,
     new_record_creator: Option<&[u8]>,
 ) -> Result<(), StoreError> {
     entry.principal = record.entry.name.clone();
@@ -642,9 +662,10 @@ pub fn merge_record(
         record.entry.policy.as_deref(),
         record.password_history.as_ref(),
     )?;
-    let reencrypted_keys = update_keys(entry, record, master)?;
+    let reencrypted_keys = update_keys(entry, record, keys)?;
     if reencrypted_keys {
-        set_tl(entry, MKVNO, Some(1u16.to_le_bytes().to_vec()));
+        let (active_kvno, _) = keys.active()?;
+        set_tl(entry, MKVNO, Some(active_kvno.to_le_bytes().to_vec()));
     } else {
         let _ = mkvno(entry)?;
     }
@@ -654,7 +675,7 @@ pub fn merge_record(
 /// Make a new MIT entry from a store record.
 pub fn new_entry(
     record: &PrincipalRecord,
-    master: &EncryptionKey,
+    keys: &MasterKeys,
     creator: &[u8],
 ) -> Result<MitEntry, StoreError> {
     let mut entry = MitEntry {
@@ -671,7 +692,7 @@ pub fn new_entry(
         tl_data: Vec::new(),
         key_data: Vec::new(),
     };
-    merge_record(&mut entry, record, master, Some(creator))?;
+    merge_record(&mut entry, record, keys, Some(creator))?;
     Ok(entry)
 }
 
@@ -860,7 +881,8 @@ mod tests {
         let original_osa =
             OsaPrincipalData::decode(bytes_tl(&entry, KADM_DATA).expect("KADM_DATA")).expect("OSA");
 
-        let mut record = record_from_entry(&entry, &master).expect("map record");
+        let mut record =
+            record_from_entry(&entry, &MasterKeys::single(master.clone())).expect("map record");
         assert_eq!(record.entry.attributes.bits(), 0x4000_0040);
         assert_eq!(record.entry.policy.as_deref(), Some("old-policy"));
         assert_eq!(record.entry.keys[0].key.key_bytes(), &[0x45; 32]);
@@ -880,7 +902,13 @@ mod tests {
         record.entry.max_life = Some(Duration::from_secs(123));
         record.entry.policy = Some("new-policy".into());
         record.mod_time = Some(kerberos_time(99));
-        merge_record(&mut entry, &record, &master, None).expect("merge");
+        merge_record(
+            &mut entry,
+            &record,
+            &MasterKeys::single(master.clone()),
+            None,
+        )
+        .expect("merge");
 
         assert_eq!(entry.attributes, 0x4080_0040);
         assert_eq!(entry.max_life, 123);
@@ -932,9 +960,52 @@ mod tests {
     fn mapping_documents_the_non_persisted_extensions() {
         let master = master_key_from_password("R", "master", 18).expect("master key");
         let entry = test_entry(&master);
-        let record = record_from_entry(&entry, &master).expect("map record");
+        let record =
+            record_from_entry(&entry, &MasterKeys::single(master.clone())).expect("map record");
         assert_eq!(record.entry.security_epoch, 0);
         assert!(record.entry.keys.iter().all(|key| key.s2kparams.is_none()));
+    }
+
+    #[test]
+    fn retained_keys_keep_their_salt_fields_when_the_master_key_changes() {
+        use crate::kdc::kdb::mit::mkey::ActKvno;
+        let m1 = master_key_from_password("R", "master", 18).expect("m1");
+        let m2 = master_key_from_password("R", "second", 18).expect("m2");
+        let keys = MasterKeys {
+            keys: vec![(2, m2.clone()), (1, m1.clone())],
+            actkvno: vec![
+                ActKvno {
+                    kvno: 1,
+                    act_time: 0,
+                },
+                ActKvno {
+                    kvno: 2,
+                    act_time: 0,
+                },
+            ],
+        };
+        let mut entry = test_entry(&m1);
+        entry.key_data = vec![encrypted_key_data(
+            &m1,
+            &EncryptionKey::new(18, vec![0x5a; 32]),
+            2,
+            5,
+            b"x",
+        )];
+        let mut record = record_from_entry(&entry, &keys).expect("record");
+        let mut added = record.entry.keys[0].clone();
+        added.kvno += 1;
+        added.key = EncryptionKey::new(18, vec![0x6b; 32]);
+        record.entry.keys.insert(0, added);
+        merge_record(&mut entry, &record, &keys, None).expect("merge");
+        assert_eq!(mkvno(&entry).expect("mkvno"), 2);
+        let retained = entry
+            .key_data
+            .iter()
+            .find(|k| k.fields.get(1) == Some(&(5, b"x".to_vec())))
+            .expect("salt type 5 kept");
+        let key = decrypt_key(&m2, 18, &retained.fields[0].1).expect("rewrapped");
+        assert_eq!(key.key_bytes(), &[0x5a; 32][..]);
     }
 
     #[test]
@@ -1030,7 +1101,8 @@ mod tests {
             password_history: None,
         };
         let creator = unparse_name(&name(b"db_creation"), "R");
-        let entry = new_entry(&record, &master, &creator).expect("new entry");
+        let entry =
+            new_entry(&record, &MasterKeys::single(master.clone()), &creator).expect("new entry");
         assert_eq!(entry.key_data[0].ver, 2);
         assert_eq!(entry.key_data[0].fields[1].0, 2);
         assert_eq!(

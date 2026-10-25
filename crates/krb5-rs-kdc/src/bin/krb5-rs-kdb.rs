@@ -16,6 +16,8 @@ use krb5_rs::kdc::kdb::admin::{
     format_policy, format_principal, parse_lifetime, parse_principal, parse_time, AdminOps,
     AttrChange, PolicyChange, PrincipalOptions,
 };
+#[cfg(feature = "klmdb")]
+use krb5_rs::kdc::kdb::master::{read_stash_kvno, write_stash_list};
 use krb5_rs::kdc::kdb::mit::dump::{
     policy_record, principal_record, read_dump, read_records, DumpVersion, IpropHeader,
     LoadFailure, Record,
@@ -33,7 +35,7 @@ use krb5_rs_kdb_lmdb::LmdbStore;
 fn print_usage() {
     eprintln!(
         "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] [--master-password-file PATH] [-r REALM] [-d DATABASE] <command>\n\
-         commands:\n  init [--master-password-file F] [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash\n  \
+         commands:\n  init [--master-password-file F] [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash\n  add_mkey [-e ENCTYPE] [-s]\n  use_mkey KVNO [TIME]\n  list_mkeys\n  purge_mkeys [-f] [-n] [-v]\n  update_princ_encryption [-f] [-n] [-v] [PRINC-PATTERN]\n  \
          addprinc [-randkey] [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
          delprinc NAME\n  cpw [-randkey] [-keepold] NAME\n  \
          modprinc [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] [-allow_delegate_to P]... [-allow_delegate_from P]... [-clear_delegate_to] [-clear_delegate_from] [-policy P | -clearpolicy] [-unlock] NAME\n  \
@@ -752,8 +754,12 @@ fn klmdb_command(
         }
         "stash" => {
             let master = master_key_or_prompt(cfg, realm, global_master_password_file);
-            ok(LmdbStore::open(cfg, &master));
-            ok(write_stash(&cfg.key_stash_file, realm, &master));
+            let store = ok(LmdbStore::open(cfg, &master));
+            let keys = ok(store.master_key_list());
+            ok(write_stash_list(&cfg.key_stash_file, realm, &keys.keys));
+        }
+        "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
+            mkey_command(cmd, args, cfg, realm, global_master_password_file);
         }
         "dump" => dump_command(args, iprop, || {
             let master = master_key(cfg, realm, global_master_password_file);
@@ -1418,4 +1424,397 @@ fn cockroach_command(
     _global_master_password_file: Option<&str>,
 ) {
     fail("db_library krb5-rs-cockroach needs a krb5-rs-kdb built with the `cockroach` feature");
+}
+
+#[cfg(feature = "klmdb")]
+fn km_principal() -> krb5_rs::types::PrincipalName {
+    krb5_rs::types::PrincipalName {
+        name_type: 1,
+        name_string: [b"K", b"M"]
+            .iter()
+            .map(|s| ok(krb5_rs::types::KerberosString::from_bytes(*s)))
+            .collect(),
+    }
+}
+
+/// MIT `strdate` (`kdb5_mkey.c:29-40`).
+#[cfg(feature = "klmdb")]
+#[allow(deprecated)] // libc::time_t on musl
+fn strdate(when: u32) -> String {
+    let t = libc::time_t::from(when);
+    let mut out = [0u8; 40];
+    // SAFETY: `tm` is plain data filled by `localtime_r`; `strftime` writes at
+    // most `out.len()` bytes and the format is NUL-terminated.
+    let n = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            0
+        } else {
+            libc::strftime(
+                out.as_mut_ptr().cast(),
+                out.len(),
+                c"%a %b %d %H:%M:%S %Z %Y".as_ptr(),
+                &tm,
+            )
+        }
+    };
+    if n == 0 {
+        "(error)".to_string()
+    } else {
+        String::from_utf8_lossy(&out[..n]).into_owned()
+    }
+}
+
+/// MIT `are_you_sure` (`kdb5_mkey.c:805-826`).
+#[cfg(feature = "klmdb")]
+fn confirm(question: &str) -> bool {
+    print!("{question}\n(type 'yes' to confirm)? ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).unwrap_or(0) > 0 && line == "yes\n"
+}
+
+/// Shell glob as MIT `glob_to_regexp` converts it: `?`, `*`, `[...]`
+/// (regex bracket syntax) and `\\` quoting.
+#[cfg(feature = "klmdb")]
+fn glob_match(p: &[u8], s: &[u8]) -> bool {
+    match p.first() {
+        None => s.is_empty(),
+        Some(b'*') => (0..=s.len()).any(|i| glob_match(&p[1..], &s[i..])),
+        Some(b'?') => !s.is_empty() && glob_match(&p[1..], &s[1..]),
+        Some(b'\\') if p.len() > 1 => s.first() == Some(&p[1]) && glob_match(&p[2..], &s[1..]),
+        Some(b'[') => {
+            let neg = p.get(1) == Some(&b'^');
+            let start = if neg { 2 } else { 1 };
+            let mut end = start;
+            if p.get(end) == Some(&b']') {
+                end += 1;
+            }
+            while end < p.len() && p[end] != b']' {
+                end += 1;
+            }
+            if end >= p.len() {
+                return s.first() == Some(&b'[') && glob_match(&p[1..], &s[1..]);
+            }
+            let Some(&c) = s.first() else {
+                return false;
+            };
+            let set = &p[start..end];
+            let mut hit = false;
+            let mut k = 0;
+            while k < set.len() {
+                if k + 2 < set.len() && set[k + 1] == b'-' {
+                    hit |= set[k] <= c && c <= set[k + 2];
+                    k += 3;
+                } else {
+                    hit |= set[k] == c;
+                    k += 1;
+                }
+            }
+            hit != neg && glob_match(&p[end + 1..], &s[1..])
+        }
+        Some(c) => s.first() == Some(c) && glob_match(&p[1..], &s[1..]),
+    }
+}
+
+#[cfg(feature = "klmdb")]
+fn entry_display_name(entry: &MitEntry) -> String {
+    let mut name = unparse_name(&entry.principal, &entry.realm);
+    if name.last() == Some(&0) {
+        name.pop();
+    }
+    String::from_utf8_lossy(&name).into_owned()
+}
+
+/// Single-letter getopt flags (`-fnv` style); returns the operands.
+#[cfg(feature = "klmdb")]
+fn mkey_flags(args: Vec<String>, allowed: &str, flags: &mut [bool]) -> Vec<String> {
+    let mut operands = Vec::new();
+    for a in args {
+        if operands.is_empty() && a.len() > 1 && a.starts_with('-') {
+            for c in a[1..].chars() {
+                match allowed.find(c) {
+                    Some(i) => flags[i] = true,
+                    None => usage(),
+                }
+            }
+        } else {
+            operands.push(a);
+        }
+    }
+    operands
+}
+
+/// MIT `kdb5_util` master-key commands (`kadmin/dbutil/kdb5_mkey.c`).
+#[cfg(feature = "klmdb")]
+fn mkey_command(
+    cmd: &str,
+    args: Vec<String>,
+    cfg: &RealmConfig,
+    realm: &str,
+    global_master_password_file: Option<&str>,
+) {
+    use krb5_rs::kdc::kdb::mit::mkey::{
+        add_new_mkey, convert_entry, entry_mkvno, lookup_actkvno, now, purge_mkeys, update_actkvno,
+        use_mkey,
+    };
+    use krb5_rs::kdc::kdb::mit::set_mod_princ;
+
+    let (master, stash_kvno) = match global_master_password_file {
+        Some(path) => (master_key(cfg, realm, Some(path)), None),
+        None => {
+            let (kvno, key) = ok(read_stash_kvno(&cfg.key_stash_file, realm));
+            (key, Some(kvno))
+        }
+    };
+    let store = ok(LmdbStore::open(cfg, &master));
+    let keys = ok(store.master_key_list());
+    let km = km_principal();
+    let fullname = format!("K/M@{realm}");
+    let modifier = fullname.clone().into_bytes();
+    let now = now();
+    match cmd {
+        "add_mkey" => {
+            let mut etype = cfg.master_key_type;
+            let mut stash = false;
+            let mut it = args.into_iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "-e" => {
+                        let name = next(&mut it);
+                        etype = krb5_rs::crypto::enctype_from_name(&name)
+                            .unwrap_or_else(|| fail(format!("{name} is an invalid enctype")));
+                    }
+                    "-s" => stash = true,
+                    _ => usage(),
+                }
+            }
+            println!("Creating new master key for master key principal '{fullname}'");
+            println!("You will be prompted for a new database Master Password.");
+            println!("It is important that you NOT FORGET this password.");
+            let _ = std::io::stdout().flush();
+            let password = read_line("Enter KDC database master key: ");
+            let again = read_line("Re-enter KDC database master key to verify: ");
+            if password != again {
+                fail("Password mismatch while reading new master key from keyboard");
+            }
+            let new = ok(master_key_from_password(realm, &password, etype));
+            let mut kvno = 0;
+            ok(store.update_raw(&km, realm, |entry, keys| {
+                kvno = add_new_mkey(entry, keys, &new)?;
+                set_mod_princ(entry, now, &modifier)?;
+                Ok(true)
+            }));
+            if stash {
+                if let Err(e) = write_stash_list(&cfg.key_stash_file, realm, &[(kvno, new)]) {
+                    eprintln!("krb5-rs-kdb: {e} while storing key");
+                    println!("Warning: couldn't stash master key.");
+                }
+            }
+        }
+        "use_mkey" => {
+            if args.is_empty() || args.len() > 2 {
+                usage();
+            }
+            let requested = args[0].trim().parse::<i64>().unwrap_or(0);
+            if requested == 0 {
+                fail("0 is an invalid KVNO value");
+            }
+            let kvno = u16::try_from(requested)
+                .ok()
+                .filter(|kvno| keys.get(*kvno).is_some())
+                .unwrap_or_else(|| fail(format!("{requested} is an invalid KVNO value")));
+            let start = match args.get(1) {
+                None => now,
+                Some(s) => parse_time(s)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| u32::try_from(t.timestamp()).ok())
+                    .unwrap_or_else(|| fail(format!("could not parse date-time string '{s}'"))),
+            };
+            ok(store.update_raw(&km, realm, |entry, _| {
+                let mut list = lookup_actkvno(entry)?;
+                use_mkey(&mut list, kvno, start, now)?;
+                update_actkvno(entry, &list);
+                set_mod_princ(entry, now, &modifier)?;
+                Ok(true)
+            }));
+        }
+        "list_mkeys" => {
+            if !args.is_empty() {
+                usage();
+            }
+            let active = keys.find_actkvno(now);
+            println!("Master keys for Principal: {fullname}");
+            for (kvno, key) in &keys.keys {
+                let enctype = krb5_rs::crypto::enctype_name(key.keytype)
+                    .unwrap_or_else(|| fail("while getting enctype description"));
+                let act = keys.actkvno.iter().find(|a| a.kvno == *kvno);
+                if Some(*kvno) == active {
+                    let when = strdate(act.map_or(u32::MAX, |a| a.act_time));
+                    println!("KVNO: {kvno}, Enctype: {enctype}, Active on: {when} *");
+                } else if let Some(act) = act {
+                    let when = strdate(act.act_time);
+                    println!("KVNO: {kvno}, Enctype: {enctype}, Active on: {when}");
+                } else {
+                    println!("KVNO: {kvno}, Enctype: {enctype}, No activate time set");
+                }
+            }
+        }
+        "update_princ_encryption" => {
+            let mut flags = [false; 3];
+            let operands = mkey_flags(args, "fnv", &mut flags);
+            let [force, dry_run, verbose] = flags;
+            if operands.len() > 1 {
+                usage();
+            }
+            let mut glob = operands.into_iter().next().unwrap_or_else(|| "*".into());
+            if glob.ends_with('\\') {
+                fail(format!(
+                    "converting glob pattern '{glob}' to regular expression"
+                ));
+            }
+            if !glob.contains('@') {
+                glob.push_str("@*");
+            }
+            let (new_kvno, new_key) = ok(keys.active());
+            let new_key = new_key.clone();
+            if !force
+                && !dry_run
+                && !confirm(&format!(
+                    "Re-encrypt all keys not using master key vno {new_kvno}?"
+                ))
+            {
+                println!("OK, doing nothing.");
+                std::process::exit(1);
+            }
+            if verbose {
+                if dry_run {
+                    println!(
+                        "Principals whose keys WOULD BE re-encrypted to master key vno {new_kvno}:"
+                    );
+                } else {
+                    println!(
+                        "Principals whose keys are being re-encrypted to master key vno \
+                         {new_kvno} if necessary:"
+                    );
+                }
+            }
+            let (mut matched, mut updated, mut current) = (0u32, 0u32, 0u32);
+            for entry in ok(store.raw_entries()) {
+                if entry.principal.name_string == km.name_string && entry.realm == realm {
+                    continue;
+                }
+                let name = entry_display_name(&entry);
+                if !glob_match(glob.as_bytes(), name.as_bytes()) {
+                    continue;
+                }
+                matched += 1;
+                let old = ok(entry_mkvno(&entry).map_err(|e| {
+                    format!("{e} determining master key used for principal '{name}'")
+                }));
+                if old == new_kvno {
+                    if dry_run && verbose {
+                        println!("would skip:   {name}");
+                    } else if verbose {
+                        println!("skipping: {name}");
+                    }
+                    current += 1;
+                    continue;
+                }
+                if dry_run {
+                    if verbose {
+                        println!("would update: {name}");
+                    }
+                    updated += 1;
+                    continue;
+                }
+                if verbose {
+                    println!("updating: {name}");
+                }
+                ok(store
+                    .update_raw(&entry.principal, &entry.realm, |e, keys| {
+                        convert_entry(e, keys, new_kvno, &new_key)?;
+                        set_mod_princ(e, now, &modifier)?;
+                        Ok(true)
+                    })
+                    .map_err(|e| format!("{e} error re-encrypting key for principal '{name}'")));
+                updated += 1;
+            }
+            if dry_run {
+                println!(
+                    "{matched} principals processed: {updated} would be updated, {current} already current"
+                );
+            } else {
+                println!(
+                    "{matched} principals processed: {updated} updated, {current} already current"
+                );
+            }
+        }
+        "purge_mkeys" => {
+            let mut flags = [false; 3];
+            if !mkey_flags(args, "fnv", &mut flags).is_empty() {
+                usage();
+            }
+            let [mut force, dry_run, verbose] = flags;
+            force |= dry_run;
+            if !force {
+                if !confirm(&format!(
+                    "Will purge all unused master keys stored in the '{fullname}' principal, are you sure?"
+                )) {
+                    std::process::exit(1);
+                }
+                println!("OK, purging unused master keys from '{fullname}'...");
+            }
+            let entries = ok(store.raw_entries());
+            let km_entry = entries
+                .iter()
+                .find(|e| e.principal.name_string == km.name_string && e.realm == realm)
+                .unwrap_or_else(|| fail(format!("while getting master key principal {fullname}")));
+            if km_entry.key_data.len() == 1 {
+                if verbose {
+                    println!("There is only one master key which can not be purged.");
+                }
+                return;
+            }
+            let master_kvno = stash_kvno.unwrap_or_else(|| u32::from(km_entry.key_data[0].kvno));
+            let in_use: Vec<u16> = entries
+                .iter()
+                .map(|e| {
+                    ok(entry_mkvno(e).map_err(|e| format!("{e} while finding master keys in use")))
+                })
+                .collect();
+            if dry_run {
+                println!("Would purge the following master key(s) from {fullname}:");
+            } else {
+                println!("Purging the following master key(s) from {fullname}:");
+            }
+            let mut purged = 0;
+            for data in &km_entry.key_data {
+                if in_use.contains(&data.kvno) {
+                    continue;
+                }
+                if u32::from(data.kvno) == master_kvno {
+                    fail("master key stash file needs updating, command aborting");
+                }
+                purged += 1;
+                println!("KVNO: {}", data.kvno);
+            }
+            if purged == 0 {
+                println!("All keys in use, nothing purged.");
+                return;
+            }
+            if dry_run {
+                println!("{purged} key(s) would be purged.");
+                return;
+            }
+            ok(store.update_raw(&km, realm, |entry, _| {
+                purge_mkeys(entry, &in_use)?;
+                set_mod_princ(entry, now, &modifier)?;
+                Ok(true)
+            }));
+            println!("{purged} key(s) purged.");
+        }
+        _ => usage(),
+    }
 }

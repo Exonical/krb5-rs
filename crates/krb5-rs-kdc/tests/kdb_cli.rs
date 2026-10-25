@@ -359,3 +359,123 @@ fn policy_commands_and_principal_policy_options() {
     assert_eq!(env.run(&["delpol", "strict"], "").status.code(), Some(1));
     assert!(!env.ok(&["listpols"], "").contains("strict"));
 }
+
+#[cfg(feature = "klmdb")]
+#[test]
+fn master_key_rotation_add_use_update_and_purge() {
+    let env = Env::new("mkey");
+    env.ok(&["create", "-s"], "master-password\n");
+    env.ok(&["addprinc", "alice"], "alice-password\n");
+
+    let out = env.ok(&["list_mkeys"], "");
+    assert!(
+        out.starts_with(&format!("Master keys for Principal: K/M@{REALM}\n")),
+        "{out}"
+    );
+    assert!(
+        out.contains("KVNO: 1, Enctype: aes256-cts-hmac-sha1-96, Active on: ")
+            && out.ends_with(" *\n"),
+        "{out}"
+    );
+
+    let out = env.ok(&["add_mkey", "-s"], "second-password\nsecond-password\n");
+    assert!(
+        out.contains(&format!(
+            "Creating new master key for master key principal 'K/M@{REALM}'"
+        )),
+        "{out}"
+    );
+    let out = env.ok(&["list_mkeys"], "");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[1], "KVNO: 2, Enctype: aes256-cts-hmac-sha1-96, No activate time set",
+        "{out}"
+    );
+    assert!(
+        lines[2].starts_with("KVNO: 1,") && lines[2].ends_with(" *"),
+        "{out}"
+    );
+    env.ok(&["getprinc", "alice"], "");
+
+    let bad = env.run(&["add_mkey"], "a\nb\n");
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("Password mismatch"));
+    for (kvno, message) in [
+        ("0", "0 is an invalid KVNO value"),
+        ("3", "3 is an invalid KVNO value"),
+    ] {
+        let out = env.run(&["use_mkey", kvno], "");
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains(message));
+    }
+
+    let out = env.ok(&["purge_mkeys", "-n"], "");
+    assert!(out.contains("All keys in use, nothing purged."), "{out}");
+
+    env.ok(&["use_mkey", "2"], "");
+    let out = env.ok(&["list_mkeys"], "");
+    assert!(
+        out.lines().nth(1).is_some_and(|l| l.ends_with(" *")),
+        "{out}"
+    );
+
+    let out = env.ok(&["update_princ_encryption", "-n", "-v", "alice"], "");
+    assert!(
+        out.contains(&format!("would update: alice@{REALM}")),
+        "{out}"
+    );
+    assert!(
+        out.ends_with("1 principals processed: 1 would be updated, 0 already current\n"),
+        "{out}"
+    );
+    let out = env.run(&["update_princ_encryption"], "no\n");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).ends_with("OK, doing nothing.\n"));
+
+    let out = env.ok(&["update_princ_encryption", "-f", "-v"], "");
+    assert!(out.contains(&format!("updating: alice@{REALM}")), "{out}");
+    let out = env.ok(&["update_princ_encryption", "-f"], "");
+    assert!(out.contains(": 0 updated,"), "{out}");
+    env.ok(&["getprinc", "alice"], "");
+
+    // The first master password still opens the database through MKEY_AUX.
+    let old = env.dir.join("old-master");
+    std::fs::write(&old, "master-password\n").expect("old master");
+    let old = old.to_string_lossy().into_owned();
+    env.ok(&["--master-password-file", &old, "list_mkeys"], "");
+
+    let out = env.ok(&["purge_mkeys", "-f", "-v"], "");
+    assert!(
+        out.contains("KVNO: 1\n") && out.ends_with("1 key(s) purged.\n"),
+        "{out}"
+    );
+    let out = env.ok(&["list_mkeys"], "");
+    assert_eq!(out.lines().count(), 2, "{out}");
+    env.ok(&["getprinc", "alice"], "");
+    let out = env.run(&["--master-password-file", &old, "list_mkeys"], "");
+    assert!(
+        !out.status.success(),
+        "purged master key must no longer open the database"
+    );
+}
+
+#[cfg(feature = "klmdb")]
+#[test]
+fn purge_mkeys_refuses_to_drop_the_stashed_key() {
+    let env = Env::new("mkey_stash");
+    env.ok(&["create", "-s"], "master-password\n");
+    env.ok(&["add_mkey"], "second-password\nsecond-password\n");
+    env.ok(&["use_mkey", "2"], "");
+    env.ok(&["update_princ_encryption", "-f"], "");
+    let out = env.run(&["purge_mkeys", "-f"], "");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("master key stash file needs updating, command aborting"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    env.ok(&["stash"], "master-password\n");
+    let out = env.ok(&["purge_mkeys", "-f"], "");
+    assert!(out.ends_with("1 key(s) purged.\n"), "{out}");
+}

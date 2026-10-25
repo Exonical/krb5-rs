@@ -138,12 +138,36 @@ async fn apply(db: &Db, version: i64, name: &str, sql: &str) -> Result<(), Store
             e => return Err(e.into_store()),
         }
     }
-    check_schema(db, version, sql).await?;
+    // A concurrent migrate's `CREATE INDEX` that `IF NOT EXISTS` skipped may
+    // still be backfilling; its index is not listed until the job finishes.
+    let mut waits = 0;
+    while let Err(error) = check_schema(db, version, sql).await {
+        if current_version(db).await? >= version {
+            return Ok(());
+        }
+        if waits >= 120 || !schema_change_running(db).await? {
+            return Err(error);
+        }
+        waits += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     db.simple(&format!(
         "INSERT INTO schema_migrations (version, name) VALUES ({version}, '{name}') \
          ON CONFLICT DO NOTHING"
     ))
     .await
+}
+
+/// Whether a schema-change job is still running or pending.
+async fn schema_change_running(db: &Db) -> Result<bool, StoreError> {
+    let rows = db
+        .rows(
+            "SELECT count(*) FROM [SHOW JOBS] WHERE job_type IN ('SCHEMA CHANGE', \
+             'NEW SCHEMA CHANGE') AND status IN ('running', 'pending')",
+            &[],
+        )
+        .await?;
+    Ok(rows.first().is_some_and(|r| r.get::<_, i64>(0) > 0))
 }
 
 /// A table a migration creates: its columns (name, type, nullable) and

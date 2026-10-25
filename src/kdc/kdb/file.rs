@@ -16,6 +16,7 @@ use rasn::types::{GeneralString, OctetString};
 
 use super::format::{KdbFile, KdbKey, KdbPolicy, KdbPrincipal, MAGIC, VERSION};
 use super::master::{decrypt_key, encrypt_key, master_principal};
+use super::mit::mkey::MasterKeys;
 use super::mit::{
     merge_policy, new_entry, policy_from_entry, record_from_entry, unparse_name, MitEntry,
     MitPolicy,
@@ -638,7 +639,7 @@ impl FileStore {
         let creator = unparse_name(&PrincipalName::new_principal("db_creation"), &self.realm);
         let mut entries = records
             .iter()
-            .map(|r| new_entry(r, &self.master, &creator))
+            .map(|r| new_entry(r, &MasterKeys::single(self.master.clone()), &creator))
             .collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_cached_key(|e| unparse_name(&e.principal, &e.realm));
         let policies = policies
@@ -690,7 +691,7 @@ impl FileStore {
         };
         let mut principals = Vec::with_capacity(entries.len());
         for entry in entries {
-            let record = record_from_entry(entry, master)?;
+            let record = record_from_entry(entry, &MasterKeys::single(master.clone()))?;
             principals.push((
                 store_key(&record.entry.name, &record.entry.realm),
                 store.to_record(&record.entry, record.last_pwd_change, record.mod_time)?,
