@@ -25,6 +25,7 @@ pub mod primary;
 
 /// Host-based service name canonicalization (MIT os/sn2princ.c).
 pub mod canonprinc;
+mod creds;
 mod s4u;
 
 use crate::protocol::{
@@ -35,6 +36,7 @@ use crate::types::PrincipalName;
 use crate::Krb5Error;
 
 pub use canonprinc::{CanonHost, HostCanonicalization};
+pub use creds::{CredsRequest, GcOptions};
 pub use primary::{get_tgt, is_unreach, with_primary_fallback};
 
 /// Maximum number of state machine steps before aborting.
@@ -60,6 +62,9 @@ pub struct KerberosClient<T: KdcTransport> {
     transport: T,
     /// `[libdefaults]` host name canonicalization for S4U2Proxy targets.
     host_canon: HostCanonicalization,
+    /// TGS options for [`KerberosClient::get_credentials`] and the S4U
+    /// calls.
+    tgs_options: TgsOptions,
 }
 
 impl<T: KdcTransport> KerberosClient<T> {
@@ -73,6 +78,7 @@ impl<T: KdcTransport> KerberosClient<T> {
             realm: realm.into(),
             transport,
             host_canon: HostCanonicalization::default(),
+            tgs_options: TgsOptions::default(),
         }
     }
 
@@ -80,6 +86,15 @@ impl<T: KdcTransport> KerberosClient<T> {
     /// otherwise; see [`HostCanonicalization::from_profile`]).
     pub fn with_host_canonicalization(mut self, settings: HostCanonicalization) -> Self {
         self.host_canon = settings;
+        self
+    }
+
+    /// Use these TGS options for [`KerberosClient::get_credentials`] and
+    /// the S4U calls; [`GcOptions`] flags add to them. Their `etypes` are
+    /// also the supported enctypes for ccache lookups
+    /// (`krb5_get_tgs_ktypes`).
+    pub fn with_tgs_options(mut self, options: TgsOptions) -> Self {
+        self.tgs_options = options;
         self
     }
 

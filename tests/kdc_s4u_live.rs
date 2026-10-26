@@ -280,6 +280,126 @@ fn mit_kvno_s4u2proxy_denied_target_is_refused_by_our_kdc() {
     assert!(out.contains("KDC can't fulfill requested option"), "{out}");
 }
 
+/// `kvno -F` input: a principal name as a fake PEM certificate (t_s4u.py
+/// `princ_cert`).
+const FAKE_CERT: &str = "-----BEGIN CERTIFICATE-----\nYWxpY2U=\n-----END y\n";
+
+#[test]
+#[ignore = "requires podman + MIT client container"]
+fn mit_kvno_s4u2self_by_certificate_fails_like_against_mits_db2() {
+    // Neither MIT db2 nor our MemoryStore maps certificates to principals
+    // (KRB5_PLUGIN_OP_NOTSUPP): the AS probe gets a generic error.
+    let (code, out) = run("cat > /tmp/s4u-cert", Some(FAKE_CERT));
+    assert_eq!(code, 0, "{out}");
+    let mit = "KRB5CCNAME=/tmp/cc_s4u_cert_mit";
+    let (code, out) = run(
+        &format!("{mit} kinit HTTP/server.test.realm@{REALM}"),
+        Some("httpsecret\n"),
+    );
+    assert_eq!(code, 0, "kinit against MIT: {out}");
+    let (mit_code, mit_out) = run(
+        &format!("{mit} kvno -F /tmp/s4u-cert HTTP/server.test.realm@{REALM}"),
+        None,
+    );
+    let e = setup("/tmp/cc_s4u_cert", "HTTP/s4u.test.realm");
+    let (code, out) = run(
+        &format!("{e} KRB5_TRACE=/dev/stderr kvno -F /tmp/s4u-cert HTTP/s4u.test.realm@{REALM}"),
+        None,
+    );
+    assert_ne!(mit_code, 0, "{mit_out}");
+    assert_ne!(code, 0, "{out}");
+    assert!(
+        out.contains("Getting initial credentials for @TEST.REALM"),
+        "{out}"
+    );
+    let want = "kvno: Generic error (see e-text) while getting credentials for";
+    assert!(mit_out.contains(want), "{mit_out}");
+    assert!(out.contains(want), "{out}");
+}
+
+/// Copy a ccache between the container and the host (`to_host`) or back.
+fn cp_ccache(container_path: &str, host_path: &std::path::Path, to_host: bool) {
+    let remote = format!("{KDC_CONTAINER}:{container_path}");
+    let local = host_path.to_string_lossy().into_owned();
+    if to_host {
+        let (code, out) = run(&format!("chmod 644 {container_path}"), None);
+        assert_eq!(code, 0, "chmod: {out}");
+    }
+    let (from, to) = if to_host {
+        (remote, local)
+    } else {
+        (local, remote)
+    };
+    let cp = Command::new(container_cli())
+        .args(["cp", &from, &to])
+        .output()
+        .expect("cp");
+    assert!(cp.status.success(), "cp ccache: {cp:?}");
+}
+
+#[cfg(feature = "client")]
+#[test]
+#[ignore = "requires podman + MIT client container"]
+fn mit_kvno_and_our_client_share_s4u_ccache_entries() {
+    use krb5_rs::ccache::FileCcache;
+    use krb5_rs::client::{CredsRequest, GcOptions, KerberosClient};
+    use krb5_rs::transport::TcpTransport;
+
+    let cc = "/tmp/cc_s4u_share";
+    let e = setup(cc, "HTTP/s4u.test.realm");
+    let (code, out) = run(
+        &format!("{e} kvno -I alice -P HTTP/target.test.realm@{REALM}"),
+        None,
+    );
+    assert_eq!(code, 0, "kvno -P target: {out}");
+    let local = common::kdc::tmp("cc_s4u_share");
+    let _ = std::fs::remove_file(&local);
+    cp_ccache(cc, &local, true);
+
+    let addr = format!("{}:{PORT}", host()).parse().expect("addr");
+    let client = KerberosClient::new(REALM, TcpTransport::new(addr));
+    let mut ccache = FileCcache::new(&local);
+    let alice = PrincipalName::new_principal("alice");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        // MIT's S4U2Self and S4U2Proxy entries satisfy cached-only lookups.
+        let self_req = CredsRequest::new(alice.clone(), REALM, svc("s4u"), REALM);
+        let evidence = client
+            .get_credentials_for_user(&mut ccache, GcOptions::CACHED, &self_req, None)
+            .await
+            .expect("MIT's S4U2Self entry");
+        assert_eq!(evidence.client, alice);
+        let target = CredsRequest::new(alice.clone(), REALM, svc("target"), REALM);
+        client
+            .get_credentials_for_proxy(&mut ccache, GcOptions::CACHED, &target, &evidence)
+            .await
+            .expect("MIT's S4U2Proxy entry");
+        // An S4U2Proxy credential we store, from MIT's evidence ticket.
+        let rbcd = CredsRequest::new(alice.clone(), REALM, svc("rbcdt"), REALM);
+        let r = client
+            .get_credentials_for_proxy(&mut ccache, GcOptions::CACHED, &rbcd, &evidence)
+            .await;
+        assert!(r.is_err(), "nothing cached for rbcdt yet");
+        client
+            .get_credentials_for_proxy(&mut ccache, GcOptions::empty(), &rbcd, &evidence)
+            .await
+            .expect("S4U2Proxy to rbcdt");
+    });
+
+    cp_ccache(cc, &local, false);
+    let (code, out) = run(
+        &format!(
+            "{e} KRB5_TRACE=/dev/stderr kvno --cached-only -I alice -P HTTP/rbcdt.test.realm@{REALM}"
+        ),
+        None,
+    );
+    assert_eq!(code, 0, "kvno --cached-only rbcdt: {out}");
+    assert!(!out.contains("Sending request"), "{out}");
+}
+
 // ----------------------------------------------- our client against MIT's KDC
 
 fn kdc_send(realm: &str, data: &[u8]) -> Vec<u8> {

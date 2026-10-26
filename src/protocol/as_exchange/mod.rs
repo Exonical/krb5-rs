@@ -82,6 +82,10 @@ pub struct AsExchangeConfig {
     /// `k5_identify_realm`): stop at PREAUTH_REQUIRED, KEY_EXP or any AS-REP.
     /// The realm is then [`AsExchange::client_realm`]. Default: false.
     pub identify_realm: bool,
+    /// Certificate sent as PA-S4U-X509-USER (MIT `ctx->subject_cert`,
+    /// get_in_tkt.c:1376-1384), to find the realm of the client it
+    /// identifies. Default: none.
+    pub subject_cert: Option<Vec<u8>>,
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -106,6 +110,7 @@ impl Default for AsExchangeConfig {
             #[cfg(feature = "pkinit")]
             pkinit: None,
             identify_realm: false,
+            subject_cert: None,
         }
     }
 }

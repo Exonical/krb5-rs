@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use krb5_rs::kdc::{
     Kdc, KdcConfig, MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, StoreError,
+    StoreErrorKind,
 };
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::ap::decrypt_ticket;
@@ -64,6 +65,8 @@ struct AliasStore {
     inner: MemoryStore,
     /// Alias, target name, target realm (another realm: a client referral).
     aliases: Vec<(PrincipalName, PrincipalName, Option<String>)>,
+    /// Whether `lookup_s4u_x509` is implemented (db2/LMDB: no).
+    x509: bool,
 }
 
 impl PrincipalStore for AliasStore {
@@ -85,6 +88,37 @@ impl PrincipalStore for AliasStore {
             None => self.inner.lookup(name, realm).await,
         }
     }
+
+    /// `test_get_s4u_x509_principal` (kdb_test.c:500-556): the
+    /// "certificate" is a principal name, parsed as an enterprise name.
+    async fn lookup_s4u_x509(
+        &self,
+        cert: &[u8],
+        name: &PrincipalName,
+        realm: &str,
+        referral_ok: bool,
+    ) -> Result<Option<PrincipalEntry>, StoreError> {
+        if !self.x509 {
+            return Err(StoreError::new(StoreErrorKind::Unsupported, "no x509"));
+        }
+        let text = String::from_utf8_lossy(cert);
+        let (n, r) = text.rsplit_once('@').unwrap_or((&text, realm));
+        let Some(entry) = self.lookup(&enterprise(n), r).await? else {
+            return Ok(None);
+        };
+        if referral_ok || name.name_string.is_empty() || entry.name.name_string == name.name_string
+        {
+            return Ok(Some(entry));
+        }
+        let alias = self.aliases.iter().any(|(a, t, _)| {
+            a.name_string == name.name_string && t.name_string == entry.name.name_string
+        });
+        if alias {
+            Ok(Some(entry))
+        } else {
+            Err(StoreError::new(StoreErrorKind::NameMismatch, "mismatch"))
+        }
+    }
 }
 
 fn key(store: &MemoryStore, name: &PrincipalName, realm: &str) -> EncryptionKey {
@@ -100,9 +134,19 @@ struct World {
 /// S.REALM holds the impersonating service, U.REALM the user and the
 /// delegation target; the realms trust each other both ways.
 fn world(enterprise_alias: bool, rbcd: bool) -> World {
+    world_x509(enterprise_alias, rbcd, true)
+}
+
+fn world_x509(enterprise_alias: bool, rbcd: bool, x509: bool) -> World {
     let none = PrincipalAttributes::empty();
-    let mut s = AliasStore::default();
-    let mut u = AliasStore::default();
+    let mut s = AliasStore {
+        x509,
+        ..AliasStore::default()
+    };
+    let mut u = AliasStore {
+        x509,
+        ..AliasStore::default()
+    };
     for (store, realm) in [(&mut s, SREALM), (&mut u, UREALM)] {
         store
             .inner
@@ -128,6 +172,16 @@ fn world(enterprise_alias: bool, rbcd: bool) -> World {
             none,
         )
         .expect("alice");
+    s.inner
+        .add_with_password(
+            PrincipalName::new_principal("other"),
+            SREALM,
+            PASSWORD,
+            1,
+            &[18, 17],
+            PrincipalAttributes::REQUIRES_PRE_AUTH,
+        )
+        .expect("other");
     let preauth = PrincipalAttributes::REQUIRES_PRE_AUTH;
     for (store, realm) in [(&mut u.inner, UREALM), (&mut s.inner, UREALM)] {
         store
@@ -357,30 +411,408 @@ async fn s4u2proxy_into_a_target_without_rbcd_entry_is_refused() {
 #[cfg(feature = "client")]
 mod client_layer {
     use super::*;
-    use krb5_rs::client::{HostCanonicalization, KerberosClient};
+    use krb5_rs::ccache::{CcCredential, CcError, Ccache, MatchCred, MatchFlags, MemoryCcache};
+    use krb5_rs::client::{CredsRequest, GcOptions, HostCanonicalization, KerberosClient};
     use krb5_rs::transport::KdcTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    struct Route(Arc<World>);
+    struct Route(Arc<World>, Arc<AtomicUsize>);
 
     impl KdcTransport for Route {
         async fn send_recv(&self, realm: &str, message: &[u8]) -> Result<Vec<u8>, Krb5Error> {
+            self.1.fetch_add(1, Ordering::SeqCst);
             Ok(self.0.send(realm, message).await)
         }
+    }
+
+    fn client(w: &Arc<World>) -> (KerberosClient<Route>, Arc<AtomicUsize>) {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let route = Route(Arc::clone(w), Arc::clone(&sends));
+        (KerberosClient::new(SREALM, route), sends)
+    }
+
+    /// The service's ccache, holding its TGT (as after `kinit -k`).
+    fn service_ccache(tgt: &Credential) -> MemoryCcache {
+        let mut cc = MemoryCcache::new();
+        cc.initialize(&service(), SREALM).expect("initialize");
+        cc.store(&CcCredential::from(tgt)).expect("store TGT");
+        cc
+    }
+
+    fn servers(cc: &MemoryCcache) -> Vec<(Vec<String>, String)> {
+        cc.creds()
+            .expect("creds")
+            .iter()
+            .map(|c| {
+                (
+                    c.server
+                        .name_string
+                        .iter()
+                        .map(|g| String::from_utf8_lossy(g.as_bytes()).into_owned())
+                        .collect(),
+                    c.srealm.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn xuser() -> CredsRequest {
+        CredsRequest::new(
+            PrincipalName::new_principal("xuser"),
+            UREALM,
+            service(),
+            SREALM,
+        )
+    }
+
+    #[tokio::test]
+    async fn s4u2self_stores_the_user_realm_tgt_and_the_ticket_then_hits_the_cache() {
+        let w = Arc::new(world(true, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, sends) = client(&w);
+        let cred = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &xuser(), None)
+            .await
+            .expect("S4U2Self");
+        assert_eq!(cred.client, PrincipalName::new_principal("xuser"));
+        assert_eq!(cred.crealm, UREALM);
+        let svc = |n: &PrincipalName| -> Vec<String> {
+            n.name_string
+                .iter()
+                .map(|g| String::from_utf8_lossy(g.as_bytes()).into_owned())
+                .collect()
+        };
+        assert_eq!(
+            servers(&cc),
+            [
+                (svc(&tgs_name(SREALM)), SREALM.to_string()),
+                (svc(&tgs_name(UREALM)), SREALM.to_string()),
+                (svc(&service()), SREALM.to_string()),
+            ]
+        );
+        let used = sends.load(Ordering::SeqCst);
+        let again = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &xuser(), None)
+            .await
+            .expect("cached S4U2Self");
+        assert_eq!(sends.load(Ordering::SeqCst), used);
+        assert_eq!(again.session_key.key_bytes(), cred.session_key.key_bytes());
+        assert_eq!(cc.creds().expect("creds").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn get_credentials_stores_the_cross_realm_tgt_and_hits_the_cache() {
+        let w = Arc::new(world(false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, sends) = client(&w);
+        let req = CredsRequest::new(service(), SREALM, target(), UREALM);
+        let r = client
+            .get_credentials(&mut cc, GcOptions::CACHED, &req)
+            .await;
+        assert!(
+            matches!(r, Err(Krb5Error::Ccache(CcError::NotFound))),
+            "{r:?}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        let cred = client
+            .get_credentials(&mut cc, GcOptions::empty(), &req)
+            .await
+            .expect("cross-realm service ticket");
+        assert_eq!(cred.srealm, UREALM);
+        let svc = |n: &PrincipalName| -> Vec<String> {
+            n.name_string
+                .iter()
+                .map(|g| String::from_utf8_lossy(g.as_bytes()).into_owned())
+                .collect()
+        };
+        // get_creds.c:951-954: the TGT for the server realm is cached.
+        assert_eq!(
+            servers(&cc),
+            [
+                (svc(&tgs_name(SREALM)), SREALM.to_string()),
+                (svc(&tgs_name(UREALM)), SREALM.to_string()),
+                (svc(&target()), UREALM.to_string()),
+            ]
+        );
+        let used = sends.load(Ordering::SeqCst);
+        let again = client
+            .get_credentials(&mut cc, GcOptions::CACHED, &req)
+            .await
+            .expect("cached service ticket");
+        assert_eq!(again.session_key.key_bytes(), cred.session_key.key_bytes());
+        // A second service in U.REALM reuses the cached cross-realm TGT.
+        let none = CredsRequest::new(service(), SREALM, target(), UREALM);
+        let mut no_store = MemoryCcache::new();
+        no_store.initialize(&service(), SREALM).expect("initialize");
+        for c in cc.creds().expect("creds").iter().take(2) {
+            no_store.store(c).expect("store");
+        }
+        client
+            .get_credentials(&mut no_store, GcOptions::NO_STORE, &none)
+            .await
+            .expect("from the cached cross-realm TGT");
+        assert_eq!(sends.load(Ordering::SeqCst), used + 1);
+        assert_eq!(no_store.creds().expect("creds").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_credentials_requests_authdata_and_matches_it_in_the_cache() {
+        use krb5_rs::types::AuthorizationDataElement;
+        let w = Arc::new(world(false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, sends) = client(&w);
+        let mut req = CredsRequest::new(service(), SREALM, target(), UREALM);
+        let ad = vec![AuthorizationDataElement {
+            ad_type: 1,
+            ad_data: vec![0x30, 0x00].into(),
+        }];
+        req.authdata = Some(ad);
+        let cred = client
+            .get_credentials(&mut cc, GcOptions::empty(), &req)
+            .await
+            .expect("service ticket with authdata");
+        assert_eq!(cred.authdata.as_ref().map(Vec::len), Some(1));
+        let used = sends.load(Ordering::SeqCst);
+        client
+            .get_credentials(&mut cc, GcOptions::CACHED, &req)
+            .await
+            .expect("matches the requested authdata");
+        let plain = CredsRequest::new(service(), SREALM, target(), UREALM);
+        let r = client
+            .get_credentials(&mut cc, GcOptions::CACHED, &plain)
+            .await;
+        assert!(
+            matches!(r, Err(Krb5Error::Ccache(CcError::NotFound))),
+            "{r:?}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), used);
+    }
+
+    #[tokio::test]
+    async fn s4u2self_cached_only_without_a_cached_ticket_is_not_found() {
+        let w = Arc::new(world(true, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, sends) = client(&w);
+        let r = client
+            .get_credentials_for_user(&mut cc, GcOptions::CACHED, &xuser(), None)
+            .await;
+        assert!(
+            matches!(r, Err(Krb5Error::Ccache(CcError::NotFound))),
+            "{r:?}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn s4u2self_no_store_leaves_the_ccache_unchanged() {
+        let w = Arc::new(world(true, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, _) = client(&w);
+        client
+            .get_credentials_for_user(&mut cc, GcOptions::NO_STORE, &xuser(), None)
+            .await
+            .expect("S4U2Self");
+        assert_eq!(cc.creds().expect("creds").len(), 1);
+    }
+
+    fn no_name() -> CredsRequest {
+        let mut r = CredsRequest::new(PrincipalName::new_principal(""), "", service(), SREALM);
+        r.client.name_string.clear();
+        r
+    }
+
+    // t_s4u.py "S4U2Self using X509 certificate".
+    #[tokio::test]
+    async fn s4u2self_by_certificate_alone_names_the_user_from_the_reply() {
+        let w = Arc::new(world(false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, sends) = client(&w);
+        let r = client
+            .get_credentials_for_user(&mut cc, GcOptions::CACHED, &no_name(), Some(b"other"))
+            .await;
+        assert!(
+            matches!(r, Err(Krb5Error::Ccache(CcError::NotFound))),
+            "{r:?}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        let cred = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &no_name(), Some(b"other"))
+            .await
+            .expect("S4U2Self by certificate");
+        assert_eq!(cred.client, PrincipalName::new_principal("other"));
+        assert_eq!(cred.crealm, SREALM);
+        let part = decrypt_ticket(&w.service_key, &cred.ticket).expect("decrypt");
+        assert_eq!(part.cname.name_string, cred.client.name_string);
+        // Stored under the user the certificate identified.
+        let named = CredsRequest::new(cred.client.clone(), SREALM, service(), SREALM);
+        let used = sends.load(Ordering::SeqCst);
+        client
+            .get_credentials_for_user(&mut cc, GcOptions::CACHED, &named, None)
+            .await
+            .expect("cached for other@S.REALM");
+        // The KDC is asked again, then the cached credential is returned.
+        let again = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &no_name(), Some(b"other"))
+            .await
+            .expect("again by certificate");
+        assert!(sends.load(Ordering::SeqCst) > used);
+        assert_eq!(again.session_key.key_bytes(), cred.session_key.key_bytes());
+        assert_eq!(cc.creds().expect("creds").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn s4u2self_with_a_name_and_a_certificate_checks_that_they_match() {
+        let w = Arc::new(world(false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, _) = client(&w);
+        let other = CredsRequest::new(
+            PrincipalName::new_principal("other"),
+            SREALM,
+            service(),
+            SREALM,
+        );
+        let cred = client
+            .get_credentials_for_user(&mut cc, GcOptions::NO_STORE, &other, Some(b"other"))
+            .await
+            .expect("matching name and certificate");
+        assert_eq!(cred.client, PrincipalName::new_principal("other"));
+        let alice = CredsRequest::new(
+            PrincipalName::new_principal("alice"),
+            SREALM,
+            service(),
+            SREALM,
+        );
+        let r = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &alice, Some(b"other"))
+            .await;
+        assert_eq!(kdc_code(&r), 75, "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn s4u2self_by_certificate_of_an_unknown_user_is_client_unknown() {
+        let w = Arc::new(world(false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, _) = client(&w);
+        let r = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &no_name(), Some(b"nobody"))
+            .await;
+        assert_eq!(kdc_code(&r), 6, "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn s4u2self_by_certificate_without_store_support_is_a_generic_error() {
+        let w = Arc::new(world_x509(false, false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, _) = client(&w);
+        let r = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &no_name(), Some(b"other"))
+            .await;
+        assert_eq!(kdc_code(&r), 60, "{r:?}");
+    }
+
+    // t_s4u.py "cross-realm S4U2Self using X509 certificate".
+    #[tokio::test]
+    async fn cross_realm_s4u2self_by_certificate_follows_the_client_referral() {
+        let w = Arc::new(world(true, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, _) = client(&w);
+        let cred = client
+            .get_credentials_for_user(
+                &mut cc,
+                GcOptions::empty(),
+                &no_name(),
+                Some(b"xuser@U.REALM"),
+            )
+            .await
+            .expect("cross-realm S4U2Self by certificate");
+        assert_eq!(cred.client, PrincipalName::new_principal("xuser"));
+        assert_eq!(cred.crealm, UREALM);
+        let part = decrypt_ticket(&w.service_key, &cred.ticket).expect("decrypt");
+        assert_eq!(part.crealm.as_bytes(), UREALM.as_bytes());
+        let named = CredsRequest::new(cred.client.clone(), UREALM, service(), SREALM);
+        client
+            .get_credentials_for_user(&mut cc, GcOptions::CACHED, &named, None)
+            .await
+            .expect("stored for xuser@U.REALM");
+    }
+
+    /// A ccache whose lookups fail with KRB5_CC_FORMAT.
+    struct Broken(MemoryCcache);
+
+    impl Ccache for Broken {
+        fn initialize(&mut self, client: &PrincipalName, realm: &str) -> Result<(), CcError> {
+            self.0.initialize(client, realm)
+        }
+        fn principal(&self) -> Result<(PrincipalName, String), CcError> {
+            self.0.principal()
+        }
+        fn store(&mut self, cred: &CcCredential) -> Result<(), CcError> {
+            self.0.store(cred)
+        }
+        fn creds(&self) -> Result<Vec<CcCredential>, CcError> {
+            self.0.creds()
+        }
+        fn remove_cred(&mut self, flags: MatchFlags, m: &MatchCred) -> Result<(), CcError> {
+            self.0.remove_cred(flags, m)
+        }
+        fn retrieve(
+            &self,
+            _: MatchFlags,
+            _: &MatchCred,
+            _: Option<&[i32]>,
+        ) -> Result<CcCredential, CcError> {
+            Err(CcError::Format)
+        }
+        fn set_config(
+            &mut self,
+            principal: Option<(&PrincipalName, &str)>,
+            key: &str,
+            data: Option<&[u8]>,
+        ) -> Result<(), CcError> {
+            self.0.set_config(principal, key, data)
+        }
+        fn get_config(
+            &self,
+            principal: Option<(&PrincipalName, &str)>,
+            key: &str,
+        ) -> Result<Option<Vec<u8>>, CcError> {
+            self.0.get_config(principal, key)
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_ccache_errors_stop_the_request() {
+        let w = Arc::new(world(true, false));
+        let mut cc = Broken(service_ccache(&w.login(service()).await));
+        let (client, sends) = client(&w);
+        let r = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &xuser(), None)
+            .await;
+        assert!(
+            matches!(r, Err(Krb5Error::Ccache(CcError::Format))),
+            "{r:?}"
+        );
+        let (_, evidence) = evidence(&w).await;
+        let req = CredsRequest::new(evidence.client.clone(), SREALM, target(), UREALM);
+        let r = client
+            .get_credentials_for_proxy(&mut cc, GcOptions::empty(), &req, &evidence)
+            .await;
+        assert!(
+            matches!(r, Err(Krb5Error::Ccache(CcError::Format))),
+            "{r:?}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn enterprise_user_realm_is_identified_by_client_referral() {
         let w = Arc::new(world(true, false));
-        let tgt = w.login(service()).await;
-        let client = KerberosClient::new(SREALM, Route(Arc::clone(&w)));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, _) = client(&w);
+        let req = CredsRequest::new(enterprise("enterprise@abc"), "NOREALM", service(), SREALM);
         let cred = client
-            .get_credentials_for_user(
-                &tgt,
-                &enterprise("enterprise@abc"),
-                "NOREALM",
-                TgsOptions::default(),
-            )
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &req, None)
             .await
             .expect("S4U2Self for an enterprise user");
         // As in t_s4u.py: "TGS reply is for enterprise\@abc@UREALM".
@@ -390,27 +822,72 @@ mod client_layer {
         );
         assert_eq!(cred.crealm, UREALM);
         assert_eq!(cred.server.name_string, service().name_string);
+        // The post-canonicalization check finds it without a TGS request.
+        let tgs_before = cc.creds().expect("creds").len();
+        let again = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &req, None)
+            .await
+            .expect("cached enterprise S4U2Self");
+        assert_eq!(again.session_key.key_bytes(), cred.session_key.key_bytes());
+        assert_eq!(cc.creds().expect("creds").len(), tgs_before);
     }
 
     #[tokio::test]
     async fn proxy_target_short_name_is_qualified_like_k5_canonprinc() {
         let w = Arc::new(world(false, true));
         let (tgt, evidence) = evidence(&w).await;
-        let client = KerberosClient::new(SREALM, Route(Arc::clone(&w))).with_host_canonicalization(
-            HostCanonicalization {
-                qualify_shortname: Some("u.realm".into()),
-                rdns: false,
-                ..Default::default()
-            },
-        );
+        let mut cc = service_ccache(&tgt);
+        let (client, sends) = client(&w);
+        let client = client.with_host_canonicalization(HostCanonicalization {
+            qualify_shortname: Some("u.realm".into()),
+            rdns: false,
+            ..Default::default()
+        });
         let short = PrincipalName::new_srv_hst("HTTP", "target");
+        let req = CredsRequest::new(evidence.client.clone(), SREALM, short.clone(), "");
         let cred = client
-            .get_credentials_for_proxy(&tgt, &evidence, &short, TgsOptions::default())
+            .get_credentials_for_proxy(&mut cc, GcOptions::empty(), &req, &evidence)
             .await
             .expect("S4U2Proxy to the qualified name");
         assert_eq!(cred.server, short);
-        assert_eq!(cred.srealm, UREALM);
+        assert_eq!(cred.srealm, "");
         let part = decrypt_ticket(&w.target_key, &cred.ticket).expect("decrypt");
         assert_eq!(part.crealm.as_bytes(), SREALM.as_bytes());
+        // Cached by server and evidence ticket (get_creds.c:96-111).
+        let used = sends.load(Ordering::SeqCst);
+        let again = client
+            .get_credentials_for_proxy(&mut cc, GcOptions::CACHED, &req, &evidence)
+            .await
+            .expect("cached S4U2Proxy");
+        assert_eq!(again.session_key.key_bytes(), cred.session_key.key_bytes());
+        assert_eq!(sends.load(Ordering::SeqCst), used);
+        // Another evidence ticket does not match.
+        let (_, other) = super::evidence(&w).await;
+        let r = client
+            .get_credentials_for_proxy(&mut cc, GcOptions::CACHED, &req, &other)
+            .await;
+        assert!(
+            matches!(r, Err(Krb5Error::Ccache(CcError::NotFound))),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_evidence_for_another_client_is_rejected() {
+        let w = Arc::new(world(false, true));
+        let (tgt, evidence) = evidence(&w).await;
+        let mut cc = service_ccache(&tgt);
+        let (client, sends) = client(&w);
+        let req = CredsRequest::new(
+            PrincipalName::new_principal("bob"),
+            SREALM,
+            target(),
+            UREALM,
+        );
+        let r = client
+            .get_credentials_for_proxy(&mut cc, GcOptions::empty(), &req, &evidence)
+            .await;
+        assert!(r.is_err());
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 }
