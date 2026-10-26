@@ -1100,6 +1100,12 @@ fn run_admin<S: AdminStore>(admin: &Blocking<S>, cmd: &str, args: Vec<String>, r
             let (opts, rest) = principal_options(args, &mut randkey);
             let [name] = rest.as_slice() else { usage() };
             let (name, r) = principal(name);
+            // kadmin.c:1271-1276: a missing policy is only a warning.
+            if let Some(Some(p)) = &opts.policy {
+                if admin.get_policy(p).is_err() {
+                    eprintln!("WARNING: policy \"{p}\" does not exist");
+                }
+            }
             let password = (!randkey)
                 .then(|| read_line(&format!("Enter password for principal \"{name}@{r}\": ")));
             ok(admin.add_principal(&name, &r, password.as_deref(), &opts));
@@ -1127,6 +1133,12 @@ fn run_admin<S: AdminStore>(admin: &Blocking<S>, cmd: &str, args: Vec<String>, r
             let (opts, rest) = principal_options(args, &mut randkey);
             let [name] = rest.as_slice() else { usage() };
             let (name, r) = principal(name);
+            // kadmin.c:1271-1276: a missing policy is only a warning.
+            if let Some(Some(p)) = &opts.policy {
+                if admin.get_policy(p).is_err() {
+                    eprintln!("WARNING: policy \"{p}\" does not exist");
+                }
+            }
             ok(admin.modify_principal(&name, &r, &opts));
             println!("Principal \"{name}@{r}\" modified.");
         }
@@ -1177,7 +1189,16 @@ fn run_admin<S: AdminStore>(admin: &Blocking<S>, cmd: &str, args: Vec<String>, r
         "getprinc" => {
             let [name] = args.as_slice() else { usage() };
             let (name, r) = principal(name);
-            print!("{}", format_principal(&ok(admin.get_principal(&name, &r))));
+            let rec = ok(admin.get_principal(&name, &r));
+            let mut out = format_principal(&rec);
+            // kadmin.c:1543-1546; the policy line is the last one.
+            if let Some(p) = &rec.entry.policy {
+                if admin.get_policy(p).is_err() {
+                    out.truncate(out.len() - 1);
+                    out += " [does not exist]\n";
+                }
+            }
+            print!("{out}");
         }
         "listprincs" => {
             for p in ok(admin.list_principals()) {
