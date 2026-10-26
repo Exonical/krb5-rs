@@ -463,8 +463,10 @@ them without counting them); and `-keepold` on one's own principal keeps at
 most four old key versions (`clamp_self_keepold`). Principals with
 `+lockdown_keys` refuse `get_principal_keys` with the `e` permission error and
 key changes other than random keys with `KADM5_PROTECT_KEYS`. Every change
-records the caller as the modifier and is written to the update log in the
-same transaction as the database, so iprop replicas follow. The live test
+records the caller as the modifier and is appended to the update log while the
+update-log lock taken for the database write is still held, so iprop replicas
+follow (a crash between the commit and the append leaves the log behind the
+database, which the next `kpropd` poll repairs with a full resync, as in MIT). The live test
 `crates/krb5-rs-kdc/tests/kadmin_write_live.rs` runs the same MIT 1.22.2
 `kadmin` session against MIT kadmind and against krb5-rs-kadmind (policies,
 principals with dates in `get_date` syntax, passwords, random keys with

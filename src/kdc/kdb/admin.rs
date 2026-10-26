@@ -660,7 +660,9 @@ impl<S: AdminStore> AdminOps<S> {
                 }
                 let mut last = None;
                 let mut changes = 0;
-                for k in rec.entry.keys.iter().filter(|_| keep_old > 0) {
+                let mut old = rec.entry.keys.clone();
+                old.sort_by(|a, b| b.kvno.cmp(&a.kvno));
+                for k in old.iter().filter(|_| keep_old > 0) {
                     if keep_old > 1 {
                         if last.is_some_and(|l| l != k.kvno) {
                             changes += 1;

@@ -1890,6 +1890,7 @@ impl Kadm5 {
             run(self.store.update_policy(name, move |p| {
                 change.apply(p);
                 apply_policy_v4(p, &rec, mask, api);
+                p.security_epoch += 1;
                 Ok(())
             }))
             .map(|_| ())
