@@ -121,10 +121,12 @@ jobs:
             --set database.mode=cockroach --set secrets.existingSecret=master \
             --set cockroach.url=postgresql://kdc_replica@crdb/krb5 \
             --set cockroach.region=california
-      - name: Remote kadmin requires file mode
+      - name: Remote kadmin and iprop require file mode
         run: |
-          ! helm lint deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/cockroach-values.yaml \
-            --set kadmin.enabled=true
+          ! helm template rel deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/cockroach-values.yaml \
+            --set kadmin.enabled=true >/dev/null
+          ! helm template rel deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/cockroach-values.yaml \
+            --set propagation.iprop.enabled=true >/dev/null
       - name: CockroachDB mode requires a region
         run: |
           ! helm lint deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM \
