@@ -422,17 +422,32 @@ impl<S: PrincipalStore> Kdc<S> {
         } else {
             None
         };
+        // A cross-realm S4U2Proxy evidence ticket is a cross-realm TGT naming
+        // the requested client in its PAC (do_tgs_req.c:734-746).
+        let stkt_pac_client = match &stkt {
+            Some(e) if is_crossrealm => {
+                let (n, r, _) = e
+                    .pac
+                    .as_ref()
+                    .and_then(super::s4u::pac_princ_with_realm)
+                    .ok_or_else(|| KdcError::new(KDC_ERR_BADOPTION, "RBCD_PAC_PRINC"))?;
+                Some((n, r))
+            }
+            _ => None,
+        };
         let subject_tkt: &crate::types::EncTicketPart = stkt.as_ref().map_or(&header, |e| &e.part);
-        let (tkt_cname, tkt_crealm) = match (&s4u2self, &stkt) {
-            (Some(s), _) if !is_referral => (s.user.clone(), general_string(&s.user_realm)?),
-            (None, Some(e)) if !is_referral => (e.part.cname.clone(), e.part.crealm.clone()),
+        let (tkt_cname, tkt_crealm) = match (&s4u2self, &stkt, &stkt_pac_client) {
+            (Some(s), _, _) if !is_referral => (s.user.clone(), general_string(&s.user_realm)?),
+            (None, Some(_), Some((n, r))) if !is_referral => (n.clone(), general_string(r)?),
+            (None, Some(e), None) if !is_referral => (e.part.cname.clone(), e.part.crealm.clone()),
             _ => (header.cname.clone(), header.crealm.clone()),
         };
         let tkt_realm_str = realm_string(&tkt_crealm);
         let subject_realm = realm_string(&subject_tkt.crealm);
-        let (subject_client_name, subject_client_realm) = match &s4u2self {
-            Some(s) => (s.user.clone(), s.user_realm.clone()),
-            None => (subject_tkt.cname.clone(), subject_realm.clone()),
+        let (subject_client_name, subject_client_realm) = match (&s4u2self, &stkt_pac_client) {
+            (Some(s), _) => (s.user.clone(), s.user_realm.clone()),
+            (None, Some((n, r))) => (n.clone(), r.clone()),
+            (None, None) => (subject_tkt.cname.clone(), subject_realm.clone()),
         };
 
         // The client is looked up only when it belongs to this realm, and
@@ -737,10 +752,15 @@ impl<S: PrincipalStore> Kdc<S> {
             stkt.as_ref()
                 .map_or(header_pac.as_ref(), |e| e.pac.as_ref()),
             match (&s4u2self, &stkt) {
-                (Some(_), _) => S4uPac::SelfReq,
+                (Some(s), _) => S4uPac::SelfReq {
+                    referral_subject: is_referral.then_some((&s.user, s.user_realm.as_str())),
+                },
                 (None, Some(e)) => S4uPac::Proxy {
                     target: sname,
                     impersonator: impersonator_string(&e.sname, &e.realm),
+                    crossrealm: is_crossrealm,
+                    referral_subject: is_referral
+                        .then_some((&e.part.cname, subject_realm.as_str())),
                 },
                 (None, None) => S4uPac::None,
             },

@@ -80,13 +80,21 @@ pub(super) enum S4uPac<'a> {
     /// An ordinary TGS request.
     None,
     /// S4U2Self: a new PAC for the impersonated user.
-    SelfReq,
+    SelfReq {
+        /// The subject (with realm) when issuing a referral.
+        referral_subject: Option<(&'a PrincipalName, &'a str)>,
+    },
     /// S4U2Proxy: the evidence PAC with its delegation info extended.
     Proxy {
         /// The requested target service.
         target: &'a PrincipalName,
         /// The impersonating service, unparsed with realm.
         impersonator: String,
+        /// A final cross-realm request: the evidence is a cross-realm TGT
+        /// whose delegation info is copied, not extended.
+        crossrealm: bool,
+        /// The subject (with realm) when issuing a referral.
+        referral_subject: Option<(&'a PrincipalName, &'a str)>,
     },
 }
 
@@ -222,6 +230,8 @@ impl<S: PrincipalStore> super::Kdc<S> {
         if let S4uPac::Proxy {
             target,
             impersonator,
+            crossrealm: false,
+            ..
         } = &s4u
         {
             // update_delegation_info (kdc_authdata.c:355-420).
@@ -246,18 +256,26 @@ impl<S: PrincipalStore> super::Kdc<S> {
                 Err(e) => return Err(pac_failure(e)),
             }
         }
-        // Client info: for either S4U kind the ticket client is added new
-        // (without realm); otherwise the subject's is copied
-        // (kdc_authdata.c:526-557).
+        // Client info (kdc_authdata.c:534-557): an S4U referral names the
+        // subject with realm; a final S4U ticket names the ticket client
+        // without realm; otherwise the subject's is copied.
         let crealm = String::from_utf8_lossy(part.crealm.as_bytes()).to_string();
         let cname = part.cname.clone();
-        let pac_client = if matches!(s4u, S4uPac::None) {
-            let client_info = subject.get_buffer(PAC_CLIENT_INFO).map_err(pac_failure)?;
-            pac.add_buffer(PAC_CLIENT_INFO, client_info)
-                .map_err(pac_failure)?;
-            None
-        } else {
-            Some((&cname, crealm.as_str()))
+        let (pac_client, with_realm) = match s4u {
+            S4uPac::None => {
+                let client_info = subject.get_buffer(PAC_CLIENT_INFO).map_err(pac_failure)?;
+                pac.add_buffer(PAC_CLIENT_INFO, client_info)
+                    .map_err(pac_failure)?;
+                (None, false)
+            }
+            S4uPac::SelfReq {
+                referral_subject: Some(subject),
+            }
+            | S4uPac::Proxy {
+                referral_subject: Some(subject),
+                ..
+            } => (Some(subject), true),
+            _ => (Some((&cname, crealm.as_str())), false),
         };
         let privsvr = self.privsvr_key(local_tgt)?;
         kdc_sign_ticket(
@@ -267,7 +285,7 @@ impl<S: PrincipalStore> super::Kdc<S> {
             pac_client,
             server_key,
             &privsvr,
-            false,
+            with_realm,
         )
         .map_err(pac_failure)
     }

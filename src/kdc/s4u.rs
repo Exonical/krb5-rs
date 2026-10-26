@@ -2,10 +2,10 @@
 //! kdc/tgs_policy.c:296-572, kdc/do_tgs_req.c `decrypt_2ndtkt` and the S4U
 //! parts of `gather_tgs_req_info`).
 //!
-//! Scope: S4U2Self for a local user and S4U2Proxy (traditional and
-//! resource-based) within one realm. Cross-realm S4U2Self/S4U2Proxy (referral
-//! chains, PAC `verify_deleg_pac`) and certificate-only S4U2Self return the
-//! MIT error for the unsupported situation, as noted on each check.
+//! Scope: S4U2Self and S4U2Proxy (traditional and resource-based), within one
+//! realm and across realms (referral chains, PAC `verify_deleg_pac`).
+//! Certificate-only S4U2Self returns the MIT error for a database without
+//! certificate lookup.
 
 use std::str::FromStr;
 
@@ -304,10 +304,8 @@ impl<S: PrincipalStore> Kdc<S> {
         }))
     }
 
-    /// `check_tgs_s4u2self` (tgs_policy.c:262-340). Cross-realm S4U2Self
-    /// (cases 2-4 of the MIT comment) is not supported and returns
-    /// `KDC_ERR_POLICY`, the code MIT uses when the KDC cannot handle the
-    /// client realm.
+    /// `check_tgs_s4u2self` (tgs_policy.c:262-355), including the
+    /// cross-realm cases 2-4 of the MIT comment.
     #[expect(clippy::too_many_arguments, reason = "mirrors check_tgs_s4u2self")]
     pub(super) fn check_tgs_s4u2self(
         &self,
@@ -345,11 +343,26 @@ impl<S: PrincipalStore> Kdc<S> {
         if s4u.client.is_none() && !is_crossrealm {
             return Err(KdcError::new(KDC_ERR_POLICY, "S4U2SELF_CLIENT_NOT_OURS"));
         }
-        if is_crossrealm || is_referral || s4u.client.is_none() {
-            return Err(KdcError::new(KDC_ERR_POLICY, "S4U2SELF_XREALM_UNSUPPORTED"));
+        if s4u.client.is_none() && s4u.user.name_string.is_empty() {
+            return Err(KdcError::new(
+                KDC_ERR_POLICY,
+                "INVALID_XREALM_S4U2SELF_REQUEST",
+            ));
         }
         let pac =
             header_pac.ok_or_else(|| KdcError::new(KDC_ERR_TGT_REVOKED, "S4U2SELF_NO_PAC"))?;
+        let Some(client) = s4u.client.as_ref() else {
+            // The header ticket PAC is for the subject, with realm.
+            return pac
+                .verify_ext(
+                    header.authtime.timestamp(),
+                    Some((&s4u.user, &s4u.user_realm)),
+                    true,
+                    None,
+                    None,
+                )
+                .map_err(|_| KdcError::new(KDC_ERR_BADOPTION, "S4U2SELF_FOREIGN_PAC_CLIENT"));
+        };
         if pac
             .verify(
                 header.authtime.timestamp(),
@@ -383,7 +396,6 @@ impl<S: PrincipalStore> Kdc<S> {
             security_epoch: 0,
             last_admin_unlock: None,
         };
-        let client = s4u.client.as_ref().expect("checked above");
         validate_as_request(opts, client, &empty, kdc_time)
     }
 
@@ -494,10 +506,7 @@ impl<S: PrincipalStore> Kdc<S> {
         })
     }
 
-    /// `check_tgs_s4u2proxy` (tgs_policy.c:395-512), same-realm requests.
-    /// A cross-realm or referral S4U2Proxy request returns
-    /// `KDC_ERR_BADOPTION` (MIT's code for a mismatched cross-realm evidence
-    /// ticket) since the cross-realm chain is not implemented.
+    /// `check_tgs_s4u2proxy` (tgs_policy.c:418-518).
     #[expect(clippy::too_many_arguments, reason = "mirrors check_tgs_s4u2proxy")]
     pub(super) fn check_tgs_s4u2proxy(
         &self,
@@ -543,11 +552,27 @@ impl<S: PrincipalStore> Kdc<S> {
             .pac
             .as_ref()
             .ok_or_else(|| KdcError::new(KRB_AP_ERR_MODIFIED, "S4U2PROXY_NO_STKT_PAC"))?;
-        if is_crossrealm || is_referral {
-            return Err(KdcError::new(
-                KDC_ERR_BADOPTION,
-                "XREALM_EVIDENCE_TICKET_MISMATCH",
-            ));
+        if is_crossrealm {
+            // The evidence ticket is a cross-realm TGT to this realm with the
+            // impersonator as client, and the target is local.
+            let sn = &stkt.server.name;
+            let cross_to_us = is_tgs_principal(sn)
+                && sn.name_string[1].as_bytes() != stkt.server.realm.as_bytes()
+                && sn.name_string[1].as_bytes() == self.config.realm.as_bytes();
+            if is_referral
+                || !cross_to_us
+                || !names_equal(&stkt.part.cname, &header.cname)
+                || stkt.part.crealm != header.crealm
+            {
+                return Err(KdcError::new(
+                    KDC_ERR_BADOPTION,
+                    "XREALM_EVIDENCE_TICKET_MISMATCH",
+                ));
+            }
+            if verify_deleg_pac(stkt_pac, &stkt.part, Some(req_server)).is_err() {
+                return Err(KdcError::new(KDC_ERR_BADOPTION, "S4U2PROXY_CROSS_STKT_PAC"));
+            }
+            return Ok(());
         }
         if !is_client_db_alias(&stkt.server, &header.cname, &crealm) {
             return Err(KdcError::new(
@@ -589,10 +614,16 @@ impl<S: PrincipalStore> Kdc<S> {
     ) -> Result<(), KdcError> {
         let rbcd = supports_rbcd(req.padata.as_deref())?;
         if is_referral {
-            return Err(KdcError::new(
-                KDC_ERR_BADOPTION,
-                "UNSUPPORTED_S4U2PROXY_REQUEST",
-            ));
+            // Policy is checked in the resource realm; a referral is only
+            // useful to an RBCD client.
+            return if rbcd {
+                Ok(())
+            } else {
+                Err(KdcError::new(
+                    KDC_ERR_BADOPTION,
+                    "UNSUPPORTED_S4U2PROXY_REQUEST",
+                ))
+            };
         }
         let mut denied = false;
         if rbcd {
@@ -640,6 +671,41 @@ fn bits_to_u32(b: &rasn::types::BitString) -> u32 {
 /// transited-services list.
 pub(super) fn impersonator_string(name: &PrincipalName, realm: &str) -> String {
     unparse_name(name, realm, false, true)
+}
+
+/// `get_pac_princ_with_realm` (kdc_util.c): the PAC client info name, which
+/// must carry a realm, and its authtime.
+pub(super) fn pac_princ_with_realm(pac: &Pac) -> Option<(PrincipalName, String, i64)> {
+    let info = pac.client_info().ok()?;
+    let (name, realm) = crate::kdc::kdb::mit::parse_name(info.name.as_bytes()).ok()?;
+    (!realm.is_empty() && info.name.contains('@')).then_some((name, realm, info.authtime))
+}
+
+/// `verify_deleg_pac` (tgs_policy.c:357-416): `pac` is an S4U2Proxy subject
+/// PAC inside a cross-realm TGT, naming `target_server` (when given) as its
+/// proxy target and the TGT client as its last transited service.
+pub(super) fn verify_deleg_pac(
+    pac: &Pac,
+    enc_tkt: &EncTicketPart,
+    target_server: Option<&PrincipalName>,
+) -> Result<(), ()> {
+    let (_, _, authtime) = pac_princ_with_realm(pac).ok_or(())?;
+    if authtime != enc_tkt.authtime.timestamp() {
+        return Err(());
+    }
+    let di = crate::pac::DelegationInfo::decode(
+        pac.get_buffer(crate::pac::PAC_DELEGATION_INFO)
+            .map_err(|_| ())?,
+    )
+    .map_err(|_| ())?;
+    if target_server.is_some_and(|t| proxy_target_string(t) != di.proxy_target) {
+        return Err(());
+    }
+    let client = impersonator_string(&enc_tkt.cname, &text(&enc_tkt.crealm));
+    match di.transited_services.last() {
+        Some(last) if *last == client => Ok(()),
+        _ => Err(()),
+    }
 }
 
 /// The S4U2Proxy target without realm (`KRB5_PRINCIPAL_UNPARSE_DISPLAY |
@@ -719,5 +785,86 @@ mod tests {
             verify_for_user(&key, &unkeyed).expect_err("inapp").code,
             KRB_AP_ERR_INAPP_CKSUM
         );
+    }
+
+    fn client_info(name: &str, authtime: i64) -> Vec<u8> {
+        let nt = (u64::try_from(authtime).expect("time") + 11_644_473_600) * 10_000_000;
+        let utf16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut b = nt.to_le_bytes().to_vec();
+        b.extend_from_slice(&u16::try_from(utf16.len()).expect("len").to_le_bytes());
+        b.extend(utf16);
+        b
+    }
+
+    fn deleg_pac(client: &str, authtime: i64, deleg: Option<(&str, &[&str])>) -> Pac {
+        let mut pac = Pac::new();
+        pac.add_buffer(crate::pac::PAC_CLIENT_INFO, &client_info(client, authtime))
+            .expect("client info");
+        if let Some((target, transited)) = deleg {
+            let di = crate::pac::DelegationInfo {
+                proxy_target: target.into(),
+                transited_services: transited.iter().map(|s| s.to_string()).collect(),
+            };
+            pac.add_buffer(crate::pac::PAC_DELEGATION_INFO, &di.encode())
+                .expect("delegation info");
+        }
+        pac
+    }
+
+    fn cross_tgt(cname: PrincipalName, crealm: &str, authtime: i64) -> EncTicketPart {
+        let t = chrono::DateTime::from_timestamp(authtime, 0)
+            .expect("time")
+            .fixed_offset();
+        EncTicketPart {
+            flags: crate::types::KerberosFlags::new(TicketFlags::empty()),
+            key: EncryptionKey::new(18, vec![1; 32]),
+            crealm: gs(crealm),
+            cname,
+            transited: crate::types::TransitedEncoding {
+                tr_type: 1,
+                contents: Vec::new().into(),
+            },
+            authtime: t,
+            starttime: None,
+            endtime: t,
+            renew_till: None,
+            caddr: None,
+            authorization_data: None,
+        }
+    }
+
+    #[test]
+    fn pac_client_must_carry_a_realm() {
+        let (name, realm, t) =
+            pac_princ_with_realm(&deleg_pac("alice@R1", 100, None)).expect("with realm");
+        assert_eq!(
+            name.name_string,
+            PrincipalName::new_principal("alice").name_string
+        );
+        assert_eq!((realm.as_str(), t), ("R1", 100));
+        assert!(pac_princ_with_realm(&deleg_pac("alice", 100, None)).is_none());
+    }
+
+    #[test]
+    fn verify_deleg_pac_checks_authtime_target_and_last_transited_service() {
+        let imp = PrincipalName::new_srv_hst("HTTP", "imp.example.com");
+        let target = PrincipalName::new_srv_hst("HTTP", "rbcd.example.com");
+        let good: &[&str] = &["svc/a@R0", "HTTP/imp.example.com@R2"];
+        let tkt = cross_tgt(imp.clone(), "R2", 100);
+        let pac = deleg_pac("alice@R1", 100, Some(("HTTP/rbcd.example.com", good)));
+        assert!(verify_deleg_pac(&pac, &tkt, Some(&target)).is_ok());
+        assert!(verify_deleg_pac(&pac, &tkt, None).is_ok());
+        let other = PrincipalName::new_srv_hst("HTTP", "other.example.com");
+        assert!(verify_deleg_pac(&pac, &tkt, Some(&other)).is_err());
+        assert!(verify_deleg_pac(&pac, &cross_tgt(imp.clone(), "R2", 101), None).is_err());
+        assert!(verify_deleg_pac(&pac, &cross_tgt(imp.clone(), "R3", 100), None).is_err());
+        let stale: &[&str] = &["HTTP/imp.example.com@R2", "svc/a@R0"];
+        let pac = deleg_pac("alice@R1", 100, Some(("HTTP/rbcd.example.com", stale)));
+        assert!(verify_deleg_pac(&pac, &tkt, None).is_err());
+        let pac = deleg_pac("alice@R1", 100, Some(("HTTP/rbcd.example.com", &[])));
+        assert!(verify_deleg_pac(&pac, &tkt, None).is_err());
+        assert!(verify_deleg_pac(&deleg_pac("alice@R1", 100, None), &tkt, None).is_err());
+        let pac = deleg_pac("alice", 100, Some(("HTTP/rbcd.example.com", good)));
+        assert!(verify_deleg_pac(&pac, &tkt, None).is_err());
     }
 }
