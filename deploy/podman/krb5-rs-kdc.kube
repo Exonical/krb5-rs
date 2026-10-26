@@ -11,6 +11,10 @@ Yaml=krb5-rs-kdc.yaml
 # Host port 88 -> the unprivileged port the container listens on.
 PublishPort=88:8888/udp
 PublishPort=88:8888/tcp
+# Remote kadmin (TCP 749) and kpasswd (UDP/TCP 464) from the kadmind container.
+PublishPort=749:7490/tcp
+PublishPort=464:4640/udp
+PublishPort=464:4640/tcp
 
 [Service]
 Restart=always
