@@ -31,6 +31,8 @@ use super::error_codes::ErrorCode;
 
 /// KDC error codes used in match patterns (derived from ErrorCode enum).
 const KDC_ERR_PREAUTH_REQUIRED: i32 = ErrorCode::PreauthRequired as i32;
+const KDC_ERR_C_PRINCIPAL_UNKNOWN: i32 = ErrorCode::CPrincipalUnknown as i32;
+const KDC_ERR_KEY_EXP: i32 = ErrorCode::KeyExpired as i32;
 const KRB_ERR_RESPONSE_TOO_BIG: i32 = ErrorCode::ResponseTooBig as i32;
 const KDC_ERR_WRONG_REALM: i32 = ErrorCode::WrongRealm as i32;
 const KDC_ERR_PREAUTH_FAILED: i32 = ErrorCode::PreauthFailed as i32;
@@ -76,6 +78,10 @@ pub struct AsExchangeConfig {
     /// offers it; the password may then be empty. Default: none.
     #[cfg(feature = "pkinit")]
     pub pkinit: Option<std::sync::Arc<crate::pkinit::client::ClientConfig>>,
+    /// Only find the client's realm (MIT `ctx->identify_realm`,
+    /// `k5_identify_realm`): stop at PREAUTH_REQUIRED, KEY_EXP or any AS-REP.
+    /// The realm is then [`AsExchange::client_realm`]. Default: false.
+    pub identify_realm: bool,
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -99,6 +105,7 @@ impl Default for AsExchangeConfig {
             server: None,
             #[cfg(feature = "pkinit")]
             pkinit: None,
+            identify_realm: false,
         }
     }
 }
@@ -350,6 +357,12 @@ impl AsExchange {
         }
     }
 
+    /// The client realm, after any client referrals (the identified realm
+    /// with [`AsExchangeConfig::identify_realm`]).
+    pub fn client_realm(&self) -> &str {
+        &self.config.realm
+    }
+
     /// Extract the credential after successful completion.
     pub fn credential(&self) -> Result<&Credential, Krb5Error> {
         self.credential
@@ -396,6 +409,11 @@ impl AsExchange {
             if as_rep.0.pvno != 5 || as_rep.0.msg_type != 11 {
                 return Err(Krb5Error::ReplyValidation("invalid AS-REP pvno/msg_type"));
             }
+            // get_in_tkt.c:1786-1789: any reply means the client exists here.
+            if self.config.identify_realm {
+                self.state = AsState::Complete;
+                return Ok(StepResult::Complete);
+            }
             return self.process_as_rep(as_rep);
         }
 
@@ -428,6 +446,11 @@ impl AsExchange {
         }
 
         match krb_error.error_code {
+            // get_in_tkt.c:1721-1726: the client exists in this realm.
+            KDC_ERR_PREAUTH_REQUIRED | KDC_ERR_KEY_EXP if self.config.identify_realm => {
+                self.state = AsState::Complete;
+                Ok(StepResult::Complete)
+            }
             // MORE_PREAUTH_DATA_REQUIRED (91) is handled like PREAUTH_REQUIRED
             // (MIT get_in_tkt.c:1742): its e-data may lack ETYPE-INFO2, in
             // which case the previously saved etype/salt/s2kparams hint is
@@ -487,16 +510,25 @@ impl AsExchange {
                 self.restarted = false;
                 self.restart(false)
             }
-            KDC_ERR_WRONG_REALM if self.config.kdc_options.contains(KdcOptions::CANONICALIZE) => {
-                // Realm referral — KDC tells us the correct realm.
-                // Use the server realm field (mandatory) rather than crealm (optional).
-                let new_realm = String::from_utf8_lossy(krb_error.realm.as_bytes()).to_string();
-                if new_realm != self.config.realm {
-                    self.config.realm = new_realm;
-                    return self.restart(false);
-                }
-                // If redirected to the same realm, propagate the original error
-                Err(Krb5Error::from_error_msg(krb_error))
+            // get_in_tkt.c:1745-1758 with is_referral (:1445-1458): follow a
+            // client referral to the realm of the error's client.
+            KDC_ERR_WRONG_REALM | KDC_ERR_C_PRINCIPAL_UNKNOWN
+                if (self.config.kdc_options.contains(KdcOptions::CANONICALIZE)
+                    || self.config.client.name_type == 10)
+                    && krb_error.cname.is_some()
+                    && krb_error
+                        .crealm
+                        .as_ref()
+                        .is_some_and(|r| r.as_bytes() != self.config.realm.as_bytes()) =>
+            {
+                let realm = krb_error
+                    .crealm
+                    .as_ref()
+                    .map(|r| r.as_bytes())
+                    .unwrap_or_default();
+                self.config.realm = String::from_utf8_lossy(realm).to_string();
+                self.restarted = false;
+                self.restart(false)
             }
             _ => {
                 if retry && self.selected_preauth_type.is_some() {

@@ -582,6 +582,25 @@ async fn s4u2self_unknown_user_is_c_principal_unknown() {
 async fn s4u2self_for_a_user_of_another_realm_is_refused_with_policy() {
     let f = fixture(Cfg::default()).await;
     let tgt = f.login(&front(), true).await;
+    let reply = f
+        .raw(
+            Raw::new(&tgt, front(), KdcOptions::CANONICALIZE).pa(for_user_pa(
+                &tgt,
+                &alice(),
+                "OTHER.REALM",
+                false,
+            )),
+        )
+        .await;
+    assert_eq!(reply.code(), 12);
+}
+
+#[tokio::test]
+async fn s4u2self_for_a_user_of_another_realm_first_gets_a_tgt_to_that_realm() {
+    // krb5_get_self_cred_from_kdc (s4u_creds.c:530-541): with no trust to
+    // OTHER.REALM the TGT request fails before any S4U2Self request.
+    let f = fixture(Cfg::default()).await;
+    let tgt = f.login(&front(), true).await;
     let r = f
         .run(TgsExchange::s4u2self(
             tgt,
@@ -590,7 +609,7 @@ async fn s4u2self_for_a_user_of_another_realm_is_refused_with_policy() {
             TgsOptions::default(),
         ))
         .await;
-    assert_eq!(kdc_err(r).0, 12);
+    assert_eq!(kdc_err(r).0, 7);
 }
 
 #[tokio::test]

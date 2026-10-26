@@ -130,6 +130,20 @@ impl<S: PrincipalStore> Kdc<S> {
             .lookup(sname, realm, "LOOKING_UP_SERVER")
             .await?
             .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "SERVER_NOT_FOUND"))?;
+        // The store returned a client from another realm (a KDB alias): a
+        // client referral if KRB5_KDB_FLAG_REFERRAL_OK (do_as_req.c:575-577,
+        // 609-616), with the canonical client in the error (:806).
+        if client.realm != server.realm {
+            if !(opts.contains(KdcOptions::CANONICALIZE) || cname.name_type == 10) {
+                return Err(KdcError::new(
+                    KDC_ERR_C_PRINCIPAL_UNKNOWN,
+                    "CLIENT_NOT_FOUND",
+                ));
+            }
+            ctx.crealm = Some(client.realm.clone());
+            ctx.cname = Some(client.name.clone());
+            return Err(KdcError::new(KDC_ERR_WRONG_REALM, "REFERRAL"));
+        }
         let local_tgt = self.require_local_tgt().await?;
         self.consistency_gate(&[
             GateSubject {
