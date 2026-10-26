@@ -229,8 +229,14 @@ priorityClassName: {{ . }}
   max_life = {{ $v.kdc.maxLife }}
   max_renewable_life = {{ $v.kdc.maxRenewableLife }}
   supported_enctypes = {{ $v.kdc.supportedEnctypes }}
-{{- if $v.propagation.iprop.enabled }}
+{{- if or $v.propagation.iprop.enabled (and $v.kadmin.enabled (eq .role "primary")) }}
   acl_file = /etc/krb5-rs/kadm5.acl
+{{- end }}
+{{- if and $v.kadmin.enabled (eq .role "primary") }}
+  kadmind_port = {{ $v.kadmin.containerPort }}
+  kpasswd_port = {{ $v.kadmin.kpasswdContainerPort }}
+{{- end }}
+{{- if $v.propagation.iprop.enabled }}
   iprop_enable = true
   iprop_port = {{ $v.propagation.iprop.port }}
   iprop_ulogsize = {{ $v.propagation.iprop.ulogSize }}

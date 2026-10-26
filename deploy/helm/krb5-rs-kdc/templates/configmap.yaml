@@ -28,10 +28,17 @@ data:
   {{- end }}
   kpropd.acl: |
     host/{{ include "krb5-rs-kdc.primaryHost" . }}@{{ .Values.realm }}
-  {{- if .Values.propagation.iprop.enabled }}
+  {{- if or .Values.propagation.iprop.enabled .Values.kadmin.enabled }}
   kadm5.acl: |
+    {{- if .Values.propagation.iprop.enabled }}
     {{- range $i := until (int .Values.replicas.replicaCount) }}
     kiprop/{{ include "krb5-rs-kdc.replicaHost" (dict "ctx" $ "i" $i) }}@{{ $.Values.realm }} p
+    {{- end }}
+    {{- end }}
+    {{- if .Values.kadmin.enabled }}
+    {{- range .Values.kadmin.acl }}
+    {{ . }}
+    {{- end }}
     {{- end }}
   {{- end }}
   kprop-krb5.conf: |

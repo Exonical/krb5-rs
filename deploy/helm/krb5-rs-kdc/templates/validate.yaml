@@ -24,3 +24,6 @@
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- if and .Values.kadmin.enabled (ne .Values.database.mode "file") -}}
+{{- fail "kadmin.enabled requires database.mode=file (kadmind is klmdb only)" -}}
+{{- end -}}

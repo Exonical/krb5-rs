@@ -5,7 +5,9 @@ replica pod (`krb5-rs-kdc-replica.yaml`, host `kdc2.example.com`). Each
 database lives in a named volume, so it survives restarts. The primary's
 `kprop` container pushes the database with MIT kprop to the replica's
 `krb5-rs-kpropd` (TCP 7540) after every admin change and every 60s; the
-replica's KDC starts once the first push is loaded.
+replica's KDC starts once the first push is loaded. The primary's `kadmind`
+container (`krb5-rs-kadmind`) serves remote MIT `kadmin` (host TCP 749) and
+`kpasswd` (host UDP and TCP 464).
 
 `krb5-rs-kdc.yaml` is a self-contained `podman kube play` file with a Secret
 (master and kprop passwords), a ConfigMap (`kdc.conf`, `krb5.conf`), a
@@ -84,12 +86,13 @@ To use MIT iprop instead of full pushes, add to the realm in both files'
 On the primary, add `kiprop/kdc1.example.com` and `kiprop/kdc2.example.com`
 to the `init-database` `--password` list (with `/secrets/kprop-password`),
 `kiprop/kdc1.example.com` to the `init-keytab` principals, a `kadm5.acl`
-entry `kiprop/kdc2.example.com@EXAMPLE.COM p` to the ConfigMap, and replace
-the `kprop` container with
-`krb5-rs-kadmind -proponly -nofork -r EXAMPLE.COM -p /usr/local/bin/krb5-rs-kdb
--K /usr/local/bin/krb5-rs-kprop -k 7540 -F /var/lib/krb5-rs/replica_datatrans`
-(environment `KRB5_KTNAME=FILE:/var/lib/krb5-rs/krb5.keytab` plus the kprop
-container's `KRB5_KDC_PROFILE`/`KRB5_CONFIG`; publish TCP 7550). On the
+entry `kiprop/kdc2.example.com@EXAMPLE.COM p` to the ConfigMap, drop the
+`kprop` container and add
+`-p /usr/local/bin/krb5-rs-kdb -K /usr/local/bin/krb5-rs-kprop -k 7540
+-F /var/lib/krb5-rs/replica_datatrans` to the `kadmind` arguments (with
+`KRB5_KTNAME=FILE:/var/lib/krb5-rs/krb5.keytab` and
+`KRB5_CONFIG=/etc/krb5-rs/kprop-krb5.conf` in its environment; publish TCP
+7550). On the
 replica, add `kiprop/kdc2.example.com` to its keytab database and keytab and
 `-A kdc1.example.com` to the kpropd arguments. kpropd authenticates to the primary's
 KDC, so the replica's `krb5.conf` needs
@@ -98,8 +101,9 @@ replica's `key_stash_file`, so write it before kpropd starts (`krb5-rs-kdb
 --master-password-file /secrets/master-password stash` with a config whose
 `database_name` is the keytab database and whose `key_stash_file` is the
 replica's). Set `shareProcessNamespace: true` in
-both pods: kadmind or kpropd and the KDC then open the LMDB database at the
-same time, and LMDB's reader locks need distinct process IDs. kpropd then polls for updates
+the replica pod as the primary already does: kpropd and the KDC then open the
+LMDB database at the same time, and LMDB's reader locks need distinct process
+IDs. kpropd then polls for updates
 and the primary pushes a full dump only when the replica falls behind the
 update log. The Helm chart does all of this with
 `propagation.iprop.enabled=true`.
@@ -122,6 +126,24 @@ Test with an MIT client (`/etc/krb5.conf` with `default_realm = MY.REALM` and
 ```sh
 kinit alice@MY.REALM && klist
 ```
+
+### Remote kadmin and kpasswd
+
+`kadm5.acl` in the ConfigMap grants every `*/admin` principal all permissions
+(MIT's sample ACL); edit it before playing the file. Create an admin principal
+inside the container, then administer from any MIT client whose `krb5.conf`
+realm has `admin_server = host:749` and `kpasswd_server = host:464`:
+
+```sh
+printf 'admin-password\n' | podman exec -i krb5-rs-kdc-kdc \
+  krb5-rs-kdb --config /etc/krb5-rs/kdc.conf --realm MY.REALM addprinc admin/admin
+kadmin -p admin/admin -q 'addprinc bob'
+kpasswd bob
+```
+
+The ports below 1024 need the same rootless setting as port 88 (lower
+`net.ipv4.ip_unprivileged_port_start` to 464) or `--publish` to higher host
+ports. Remove the `kadmind` container to run without remote administration.
 
 ## External CockroachDB
 
@@ -296,4 +318,7 @@ was not run here.
 the primary on one Podman network with the placeholder hostnames, and checks
 that the first push loads the replica, that a new principal reaches it through
 `--watch` before the 60 s interval, and that MIT `kinit` succeeds against the
-replica KDC. Host ports are not published in that test.
+replica KDC. It then creates a principal with MIT `kadmin` through the
+primary's kadmind, waits for it on the replica, changes its password with MIT
+`kpasswd` and logs in with the new one. Host ports are not published in that
+test.

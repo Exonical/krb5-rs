@@ -151,6 +151,31 @@ propagation:
     ulogSize: 1000
     resyncTimeout: 5m
 
+# Remote administration (file mode only), off by default. The primary runs
+# krb5-rs-kadmind, which serves MIT kadmin (kadm5 RPC over TCP) and kpasswd
+# (UDP and TCP) through the "<fullname>-kadmin" Service; with iprop enabled
+# the same kadmind also serves iprop. Grant permissions with `acl`, lines of
+# MIT kadm5.acl, e.g. "admin/admin@EXAMPLE.COM *", and create those principals
+# with krb5-rs-kdb addprinc on the primary. The kadmin/admin and
+# kadmin/changepw service principals are created with the database.
+kadmin:
+  enabled: false
+  # Container ports (MIT's 749 and 464 need root).
+  containerPort: 7490
+  kpasswdContainerPort: 4640
+  acl: []
+  service:
+    type: ClusterIP
+    port: 749
+    kpasswdPort: 464
+    annotations: {}
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: ""
+  networkPolicy:
+    # NetworkPolicy peers allowed to reach kadmin and kpasswd; empty allows all.
+    from: []
+
 # Cluster DNS domain, part of the pods' host/<FQDN> kprop principals.
 clusterDomain: cluster.local
 

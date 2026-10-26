@@ -29,6 +29,20 @@ krb5-rs KDC for realm {{ .Values.realm }}: one primary and {{ .Values.replicas.r
        krb5-rs-kdb --config /etc/krb5-rs/kdc.conf --krb5-config /etc/krb5-rs/krb5.conf --realm {{ .Values.realm }} addprinc alice
 
    Other commands: delprinc, cpw, modprinc, getprinc, listprincs, ktadd -k PATH NAME.
+{{- if .Values.kadmin.enabled }}
+
+4. Remote administration: MIT kadmin and kpasswd reach the primary's krb5-rs-kadmind through
+   Service "{{ include "krb5-rs-kdc.fullname" . }}-kadmin" (kadmin {{ .Values.kadmin.service.port }}/TCP, kpasswd {{ .Values.kadmin.service.kpasswdPort }} UDP+TCP). Add to the
+   client's realm section:
+
+         admin_server = <kadmin Service address>:{{ .Values.kadmin.service.port }}
+         kpasswd_server = <kadmin Service address>:{{ .Values.kadmin.service.kpasswdPort }}
+
+   Permissions come from kadmin.acl (MIT kadm5.acl lines); create the admin principals with
+   addprinc above, then for example:
+
+     kadmin -p admin/admin -q listprincs
+{{- end }}
 
 What HA means here: the replicas keep answering AS and TGS requests while the primary is down
 or restarting, using the last database they received. Administrative changes wait for the

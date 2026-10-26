@@ -12,11 +12,13 @@ REPLICA="$TEMP_DIR/replica.yaml"
 MASTER="$(openssl rand -hex 24)"
 KPROP="$(openssl rand -hex 24)"
 PASSWORD="E2e-$(openssl rand -hex 8)"
+ADMIN_PASSWORD="E2e-$(openssl rand -hex 8)"
+NEW_PASSWORD="E2e-$(openssl rand -hex 8)"
 
 cleanup() {
   local status=$?
   if [ "$status" -ne 0 ]; then
-    for c in krb5-rs-kdc-kprop krb5-rs-kdc-kdc krb5-rs-kdc-replica-kpropd krb5-rs-kdc-replica-kdc; do
+    for c in krb5-rs-kdc-kprop krb5-rs-kdc-kadmind krb5-rs-kdc-kdc krb5-rs-kdc-replica-kpropd krb5-rs-kdc-replica-kdc; do
       echo "--- logs $c"
       "$CLI" logs "$c" 2>&1 | tail -n 50 || true
     done
@@ -93,5 +95,37 @@ EOF
 echo "$PASSWORD" | "$CLI" run --rm -i --network "$NETWORK" \
   -v "$TEMP_DIR/krb5.conf:/etc/krb5.conf:ro" -e KRB5_CONFIG=/etc/krb5.conf \
   --entrypoint kinit "$MIT_IMAGE" e2e-user@EXAMPLE.COM
+
+step "MIT kadmin and kpasswd against the primary's kadmind"
+infra="$("$CLI" pod inspect krb5-rs-kdc --format '{{.InfraContainerID}}')"
+pip="$("$CLI" inspect "$infra" --format "{{(index .NetworkSettings.Networks \"$NETWORK\").IPAddress}}")"
+test -n "$pip"
+printf '%s\n%s\n' "$ADMIN_PASSWORD" "$ADMIN_PASSWORD" | kdb krb5-rs-kdc addprinc admin/admin
+cat > "$TEMP_DIR/admin-krb5.conf" <<EOF
+[libdefaults]
+ default_realm = EXAMPLE.COM
+ dns_lookup_kdc = false
+ dns_lookup_realm = false
+[realms]
+ EXAMPLE.COM = {
+  kdc = $pip:8888
+  admin_server = $pip:7490
+  kpasswd_server = $pip:4640
+ }
+EOF
+mit() { # tool args...
+  "$CLI" run --rm -i --network "$NETWORK" \
+    -v "$TEMP_DIR/admin-krb5.conf:/etc/krb5.conf:ro" -e KRB5_CONFIG=/etc/krb5.conf \
+    --entrypoint "$1" "$MIT_IMAGE" "${@:2}"
+}
+retry 30 mit kadmin -p admin/admin -w "$ADMIN_PASSWORD" -q "getprinc kadmin/admin"
+out="$(mit kadmin -p admin/admin -w "$ADMIN_PASSWORD" -q "addprinc -pw $PASSWORD e2e-remote" 2>&1)"
+echo "$out"
+grep -q 'Principal "e2e-remote@EXAMPLE.COM" created.' <<<"$out"
+retry 30 kdb krb5-rs-kdc-replica getprinc e2e-remote
+out="$(printf '%s\n%s\n%s\n' "$PASSWORD" "$NEW_PASSWORD" "$NEW_PASSWORD" | mit kpasswd e2e-remote@EXAMPLE.COM 2>&1)"
+echo "$out"
+grep -q "Password changed." <<<"$out"
+echo "$NEW_PASSWORD" | mit kinit e2e-remote@EXAMPLE.COM
 
 echo "podman replication e2e passed"
