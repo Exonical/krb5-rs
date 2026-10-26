@@ -446,6 +446,30 @@ impl<S: PrincipalStore> Kdc<S> {
             })
     }
 
+    /// `krb5_db_get_s4u_x509_principal` with the error mapping of
+    /// [`Kdc::lookup`]; a name mismatch is KDC_ERR_CLIENT_NAME_MISMATCH.
+    async fn lookup_s4u_x509(
+        &self,
+        cert: &[u8],
+        name: &PrincipalName,
+        realm: &str,
+        referral_ok: bool,
+        status: &str,
+    ) -> Result<Option<PrincipalEntry>, KdcError> {
+        self.measure_store(self.store.lookup_s4u_x509(cert, name, realm, referral_ok))
+            .await
+            .map_err(|e| match e.kind() {
+                StoreErrorKind::Unavailable | StoreErrorKind::Stale => {
+                    KdcError::new(KDC_ERR_SVC_UNAVAILABLE, status)
+                }
+                StoreErrorKind::NameMismatch => KdcError::new(
+                    crate::types::error_codes::KDC_ERR_CLIENT_NAME_MISMATCH,
+                    status,
+                ),
+                _ => KdcError::generic(status),
+            })
+    }
+
     /// Measure one store await in the current summarized request.
     pub(crate) async fn measure_store<F: Future>(&self, future: F) -> F::Output {
         #[cfg(feature = "tokio")]

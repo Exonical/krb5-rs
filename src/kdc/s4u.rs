@@ -233,17 +233,19 @@ impl<S: PrincipalStore> Kdc<S> {
     ) -> Result<Option<S4u2Self>, KdcError> {
         let padata = req.padata.as_deref();
         let find = |t: i32| padata.into_iter().flatten().find(|p| p.padata_type == t);
-        let (user, user_realm, nonce, options, cksum_type, x509, cert);
+        let (mut user, user_realm, nonce, options, cksum_type, x509, cert_bytes);
         if let Some(pa) = find(PA_S4U_X509_USER) {
             let raw = pa.padata_value.as_ref();
             let x: PaS4uX509User =
                 rasn::der::decode(raw).map_err(|_| KdcError::generic("DECODE_PA_S4U_X509_USER"))?;
             verify_s4u_x509_user(subkey.unwrap_or(session), raw, req.req_body.nonce, &x)?;
-            cert = x
+            cert_bytes = x
                 .user_id
                 .subject_certificate
                 .as_ref()
-                .is_some_and(|c| !c.is_empty());
+                .filter(|c| !c.is_empty())
+                .map(|c| c.to_vec());
+            let cert = cert_bytes.is_some();
             let name = x.user_id.cname.clone();
             if name.as_ref().is_none_or(|u| u.name_string.is_empty()) && !cert {
                 return Err(KdcError::new(
@@ -270,24 +272,28 @@ impl<S: PrincipalStore> Kdc<S> {
             options = 0;
             cksum_type = f.cksum.cksumtype;
             x509 = false;
-            cert = false;
+            cert_bytes = None;
         } else {
             return Ok(None);
         }
 
         let mut client = None;
         if user_realm == server.realm {
-            if cert {
-                // get_s4u_x509_principal is not provided by this database
-                // (KRB5_PLUGIN_OP_NOTSUPP, reported as a generic error).
-                return Err(KdcError::generic("LOOKING_UP_S4U2SELF_PRINCIPAL"));
+            let status = "LOOKING_UP_S4U2SELF_PRINCIPAL";
+            let found = match cert_bytes {
+                Some(c) => {
+                    self.lookup_s4u_x509(&c, &user, &user_realm, false, status)
+                        .await?
+                }
+                None => self.lookup(&user, &user_realm, status).await?,
+            };
+            let mut entry = found.ok_or_else(|| {
+                KdcError::new(KDC_ERR_C_PRINCIPAL_UNKNOWN, "UNKNOWN_S4U2SELF_PRINCIPAL")
+            })?;
+            // The certificate names the user (kdc_util.c:1592-1596).
+            if user.name_string.is_empty() {
+                user = entry.name.clone();
             }
-            let mut entry = self
-                .lookup(&user, &user_realm, "LOOKING_UP_S4U2SELF_PRINCIPAL")
-                .await?
-                .ok_or_else(|| {
-                    KdcError::new(KDC_ERR_C_PRINCIPAL_UNKNOWN, "UNKNOWN_S4U2SELF_PRINCIPAL")
-                })?;
             // S4U2Self is not password authentication (kdc_util.c:1634-1636).
             entry.pw_expiration = None;
             entry.attributes &= !PrincipalAttributes::REQUIRES_PWCHANGE;

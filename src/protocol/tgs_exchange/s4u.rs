@@ -69,6 +69,8 @@ pub(super) struct SelfState {
     user_tgt: Option<Box<TgsExchange>>,
     /// Servers of the referral TGTs received (`referral_tgts`).
     referrals: Vec<(PrincipalName, String)>,
+    /// `s4u_user.user_id.subject_cert`, sent in the first request only.
+    subject_cert: Option<Vec<u8>>,
 }
 
 /// Steps of `get_proxy_cred_from_kdc`.
@@ -319,8 +321,22 @@ impl TgsExchange {
             user_realm: user_realm.into(),
             user_tgt: None,
             referrals: Vec::new(),
+            subject_cert: None,
         }));
         ex
+    }
+
+    /// Identify the S4U2Self user by `cert` (`subject_cert`): it is sent in
+    /// PA-S4U-X509-USER of the first request to the user's realm only
+    /// (s4u_creds.c:592-593). With a user name without components the
+    /// certificate alone identifies the user, PA-FOR-USER is omitted
+    /// (s4u_creds.c:518-531) and the KDC's checksummed reply names it.
+    #[must_use]
+    pub fn with_subject_certificate(mut self, cert: Option<Vec<u8>>) -> Self {
+        if let S4uMode::SelfReq(st) = &mut self.s4u {
+            st.subject_cert = cert.filter(|c| !c.is_empty());
+        }
+        self
     }
 
     /// S4U2Proxy (`krb5_get_credentials_for_proxy`, s4u_creds.c:1195-1250):
@@ -476,7 +492,11 @@ impl TgsExchange {
                     nonce: self.nonce,
                     cname: Some(user.clone()),
                     crealm: crealm.clone(),
-                    subject_certificate: None,
+                    subject_certificate: st
+                        .subject_cert
+                        .as_ref()
+                        .filter(|_| st.referrals.is_empty())
+                        .map(|c| c.clone().into()),
                     options: Some(bits(S4U_OPTS_USE_REPLY_KEY_USAGE)),
                 };
                 let profile = find_etype(subkey.keytype)
@@ -495,6 +515,13 @@ impl TgsExchange {
                         checksum: sum.into(),
                     },
                 };
+                let x509 = PaData {
+                    padata_type: PA_S4U_X509_USER,
+                    padata_value: rasn::der::encode(&x509)?.into(),
+                };
+                if user.name_string.is_empty() {
+                    return Ok(vec![x509]);
+                }
 
                 // PA-FOR-USER: hmac-md5 over name type, components, realm
                 // and "Kerberos", keyed with the TGT session key
@@ -522,10 +549,7 @@ impl TgsExchange {
                     auth_package: package,
                 };
                 Ok(vec![
-                    PaData {
-                        padata_type: PA_S4U_X509_USER,
-                        padata_value: rasn::der::encode(&x509)?.into(),
-                    },
+                    x509,
                     PaData {
                         padata_type: PA_FOR_USER,
                         padata_value: rasn::der::encode(&for_user)?.into(),

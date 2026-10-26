@@ -496,3 +496,35 @@ fn test_requested_authdata_is_encrypted_in_the_subkey() {
     let req: TgsReq = rasn::der::decode(&data).expect("TGS-REQ");
     assert!(req.0.req_body.enc_authorization_data.is_none());
 }
+
+#[test]
+fn test_s4u2self_by_certificate_sends_it_without_pa_for_user() {
+    use crate::types::PaS4uX509User;
+    let user = PrincipalName {
+        name_type: 1,
+        name_string: Vec::new(),
+    };
+    let mut exchange = TgsExchange::s4u2self(
+        make_tgt("EXAMPLE.COM"),
+        user,
+        "EXAMPLE.COM",
+        TgsOptions::default(),
+    )
+    .with_subject_certificate(Some(b"cert".to_vec()));
+    let TgsStepResult::SendToKdc { data, .. } = exchange.step(&[]).expect("step") else {
+        panic!("expected SendToKdc");
+    };
+    let req: TgsReq = rasn::der::decode(&data).expect("TGS-REQ");
+    let padata = req.0.padata.expect("padata");
+    assert!(!padata.iter().any(|p| p.padata_type == 129), "PA-FOR-USER");
+    let pa = padata
+        .iter()
+        .find(|p| p.padata_type == 130)
+        .expect("PA-S4U-X509-USER");
+    let x: PaS4uX509User = rasn::der::decode(pa.padata_value.as_ref()).expect("decode");
+    assert_eq!(
+        x.user_id.subject_certificate.as_deref(),
+        Some(b"cert".as_slice())
+    );
+    assert!(x.user_id.cname.expect("cname").name_string.is_empty());
+}

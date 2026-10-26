@@ -28,6 +28,9 @@ use crate::types::{
     PrincipalName, TicketFlags, TransitedEncoding, ANONYMOUS_REALM,
 };
 
+/// `KRB5_NT_X500_PRINCIPAL`.
+const NT_X500_PRINCIPAL: i32 = 6;
+
 /// `KRB5_PADATA_PKINIT_KX`.
 const PA_PKINIT_KX: i32 = 147;
 
@@ -121,10 +124,24 @@ impl<S: PrincipalStore> Kdc<S> {
             .as_ref()
             .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "NULL_SERVER"))?;
 
-        let client = self
-            .lookup(cname, realm, "LOOKING_UP_CLIENT")
-            .await?
-            .ok_or_else(|| KdcError::new(KDC_ERR_C_PRINCIPAL_UNKNOWN, "CLIENT_NOT_FOUND"))?;
+        // lookup_client (do_as_req.c:133-151): a certificate in
+        // PA-S4U-X509-USER identifies an X.500 client, and may refer it.
+        let cert = request
+            .padata
+            .iter()
+            .flatten()
+            .find(|p| p.padata_type == super::s4u::PA_S4U_X509_USER)
+            .map(|p| p.padata_value.as_ref())
+            .filter(|c| !c.is_empty() && cname.name_type == NT_X500_PRINCIPAL);
+        let found = match cert {
+            Some(c) => {
+                self.lookup_s4u_x509(c, cname, realm, true, "LOOKING_UP_CLIENT")
+                    .await?
+            }
+            None => self.lookup(cname, realm, "LOOKING_UP_CLIENT").await?,
+        };
+        let client =
+            found.ok_or_else(|| KdcError::new(KDC_ERR_C_PRINCIPAL_UNKNOWN, "CLIENT_NOT_FOUND"))?;
         *audited = Some(client.clone());
         let server = self
             .lookup(sname, realm, "LOOKING_UP_SERVER")
@@ -134,7 +151,8 @@ impl<S: PrincipalStore> Kdc<S> {
         // client referral if KRB5_KDB_FLAG_REFERRAL_OK (do_as_req.c:575-577,
         // 609-616), with the canonical client in the error (:806).
         if client.realm != server.realm {
-            if !(opts.contains(KdcOptions::CANONICALIZE) || cname.name_type == 10) {
+            if !(opts.contains(KdcOptions::CANONICALIZE) || cname.name_type == 10 || cert.is_some())
+            {
                 return Err(KdcError::new(
                     KDC_ERR_C_PRINCIPAL_UNKNOWN,
                     "CLIENT_NOT_FOUND",
