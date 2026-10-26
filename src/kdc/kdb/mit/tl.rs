@@ -150,7 +150,9 @@ fn put_attr_pairs(entry: &mut MitEntry, pairs: &[(Vec<u8>, Vec<u8>)]) {
     }
 }
 
-fn set_string_attr(
+/// Set (`Some`) or remove (`None`) one string attribute
+/// (`krb5_dbe_set_string`).
+pub fn set_string_attr(
     entry: &mut MitEntry,
     key: &[u8],
     value: Option<&[u8]>,

@@ -11,21 +11,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use krb5_rs::gssapi::krb5::Krb5Acceptor;
-use krb5_rs::kdc::kdb::admin::AdminOps;
+use krb5_rs::kdc::kdb::admin::{AdminOps, PolicyChange};
+use krb5_rs::kdc::kdb::kadm5::mask as kmask;
 use krb5_rs::kdc::kdb::kadm5::{self, code, PrincipalEnt, ReadArgs, KADM_PROG, KADM_VERS};
 use krb5_rs::kdc::kdb::kpasswd::{process_request, Service, KPASSWD_PORT};
 use krb5_rs::kdc::kdb::kprop::ReplayCache;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
 use krb5_rs::kdc::kdb::mit::{parse_name_with_default, MitEntry};
+use krb5_rs::kdc::kdb::mit::{set_mod_princ, set_string_attr};
 use krb5_rs::kdc::kdb::read_stash;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
+use krb5_rs::kdc::store::{AdminStore, Policy, StoreError, StoreErrorKind};
 use krb5_rs::kdc::{default_realm, RealmConfig};
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::ap::{ApError, KeySource};
 use krb5_rs::rpc::gss::{GssServer, ServerStep};
 use krb5_rs::rpc::{read_record, write_record, AcceptStat, AuthStat, Call, CallError, Reply};
 use krb5_rs::types::{EncryptionKey, PrincipalName};
-use krb5_rs_kdb_lmdb::LmdbStore;
+use krb5_rs_kdb_lmdb::{CallerStore, LmdbStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -777,6 +780,323 @@ impl Kadm5 {
     }
 }
 
+/// `KRB5_KDB_LOCKDOWN_KEYS` (`kdb.h`).
+const LOCKDOWN_KEYS: u32 = 0x0080_0000;
+
+fn run<F: std::future::Future>(f: F) -> F::Output {
+    // kadm5 calls run on the blocking pool (`serve`).
+    tokio::runtime::Handle::current().block_on(f)
+}
+
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
+}
+
+/// The kadm5 code for a store failure; `unknown` for a missing entry.
+fn store_code(e: &StoreError, unknown: u32) -> u32 {
+    const REJECTED: [(&str, u32); 4] = [
+        ("Password is too short", code::PASS_Q_TOOSHORT),
+        (
+            "Password does not contain enough character classes",
+            code::PASS_Q_CLASS,
+        ),
+        ("Cannot reuse password", code::PASS_REUSE),
+        ("Cannot change protected principal", code::PROTECT_PRINCIPAL),
+    ];
+    let c = match e.kind() {
+        StoreErrorKind::NotFound => unknown,
+        StoreErrorKind::Conflict => code::DUP,
+        StoreErrorKind::Rejected => REJECTED
+            .iter()
+            .find(|(t, _)| e.message().contains(t))
+            .map_or(code::FAILURE, |(_, c)| *c),
+        _ => code::FAILURE,
+    };
+    if c == code::FAILURE {
+        eprintln!("krb5-rs-kadmind: {e}");
+    }
+    c
+}
+
+fn policy_change(rec: &kadm5::PolicyEnt, mask: i32, api: u32) -> PolicyChange {
+    let on = |m: i32| mask & m != 0;
+    let u = |v: i32| v as u32;
+    let v3 = api >= kadm5::API_VERSION_3;
+    PolicyChange {
+        pw_max_life: on(kmask::PW_MAX_LIFE).then(|| u(rec.pw_max_life)),
+        pw_min_life: on(kmask::PW_MIN_LIFE).then(|| u(rec.pw_min_life)),
+        pw_min_length: on(kmask::PW_MIN_LENGTH).then(|| u(rec.pw_min_length)),
+        pw_min_classes: on(kmask::PW_MIN_CLASSES).then(|| u(rec.pw_min_classes)),
+        pw_history_num: on(kmask::PW_HISTORY_NUM).then(|| u(rec.pw_history_num)),
+        pw_max_fail: (v3 && on(kmask::PW_MAX_FAILURE)).then_some(rec.pw_max_fail),
+        pw_failcnt_interval: (v3 && on(kmask::PW_FAILURE_COUNT_INTERVAL))
+            .then(|| u(rec.pw_failcnt_interval)),
+        pw_lockout_duration: (v3 && on(kmask::PW_LOCKOUT_DURATION))
+            .then(|| u(rec.pw_lockout_duration)),
+        allowed_keysalts: (api >= kadm5::API_VERSION_4 && on(kmask::POLICY_ALLOWED_KEYSALTS))
+            .then(|| rec.allowed_keysalts.clone()),
+    }
+}
+
+/// The version 4 policy fields `PolicyChange` does not carry.
+fn apply_policy_v4(p: &mut Policy, rec: &kadm5::PolicyEnt, mask: i32, api: u32) {
+    if api < kadm5::API_VERSION_4 {
+        return;
+    }
+    if mask & kmask::POLICY_ATTRIBUTES != 0 {
+        p.attributes = rec.attributes;
+    }
+    if mask & kmask::POLICY_MAX_LIFE != 0 {
+        p.max_life = rec.max_life as u32;
+    }
+    if mask & kmask::POLICY_MAX_RLIFE != 0 {
+        p.max_renewable_life = rec.max_renewable_life as u32;
+    }
+}
+
+/// The value checks of `kadm5_create_policy`/`kadm5_modify_policy`
+/// (`svr_policy.c`), and `KADM5_BAD_TL_TYPE` for TL data below 256.
+fn check_policy(rec: &kadm5::PolicyEnt, mask: i32, max_life: Option<i32>) -> Result<(), u32> {
+    let on = |m: i32| mask & m != 0;
+    if on(kmask::PW_MIN_LIFE) {
+        if let Some(max) = max_life.filter(|&m| m != 0) {
+            if rec.pw_min_life > max {
+                return Err(code::BAD_MIN_PASS_LIFE);
+            }
+        }
+    }
+    if on(kmask::PW_MIN_LENGTH) && rec.pw_min_length < 1 {
+        return Err(code::BAD_LENGTH);
+    }
+    if on(kmask::PW_MIN_CLASSES) && !(1..=5).contains(&rec.pw_min_classes) {
+        return Err(code::BAD_CLASS);
+    }
+    if on(kmask::PW_HISTORY_NUM) && rec.pw_history_num < 1 {
+        return Err(code::BAD_HISTORY);
+    }
+    if on(kmask::POLICY_TL_DATA) && rec.tl_data.iter().any(|t| t.kind < 256) {
+        return Err(code::BAD_TL_TYPE);
+    }
+    Ok(())
+}
+
+impl Kadm5 {
+    /// Administration as `caller`, who is recorded as the modifier.
+    fn admin(&self, caller: &Caller<'_>) -> AdminOps<CallerStore> {
+        AdminOps::new(
+            self.store
+                .as_caller(caller.client_name.clone().into_bytes()),
+            self.keysalts.clone(),
+        )
+        .with_history_enctype(self.history_enctype)
+    }
+
+    fn name(&self, princ: Option<&str>) -> Result<(PrincipalName, String, String), u32> {
+        let (n, r) = princ
+            .and_then(|p| self.parse(p))
+            .ok_or(code::BAD_PRINCIPAL)?;
+        let t = unparse(&n, &r);
+        Ok((n, r, t))
+    }
+
+    /// `check_lockdown_by_princ`: whether `name` has `lockdown_keys`.
+    fn lockdown(&self, name: &PrincipalName, realm: &str) -> Result<bool, u32> {
+        match self.store.raw_entry(name, realm) {
+            Ok(Some(e)) => Ok(e.attributes & LOCKDOWN_KEYS != 0),
+            Ok(None) => Err(code::UNK_PRINC),
+            Err(e) => Err(store_code(&e, code::UNK_PRINC)),
+        }
+    }
+
+    /// The calls that change the database (`server_stubs.c`).
+    fn write(&self, caller: &Caller<'_>, args: kadm5::WriteArgs) -> Vec<u8> {
+        use kadm5::WriteArgs as W;
+        let api = args.api_version();
+        let c = kadm5::check_api_version(api);
+        if c != code::OK {
+            return match args {
+                W::ChrandPrincipal { .. } => kadm5::chrand_ret(0, c, &[]),
+                W::ExtractKeys { .. } => kadm5::getpkeys_ret(0, c, &[]),
+                _ => kadm5::generic_ret(0, c),
+            };
+        }
+        let c = match args {
+            W::DeletePrincipal { princ, .. } => self.delete_principal(caller, princ.as_deref()),
+            W::SetString {
+                princ, key, value, ..
+            } => self.set_string(caller, princ.as_deref(), key.as_deref(), value.as_deref()),
+            W::CreatePolicy { rec, mask, .. } => self.create_policy(caller, api, &rec, mask),
+            W::ModifyPolicy { rec, mask, .. } => self.modify_policy(caller, api, &rec, mask),
+            W::DeletePolicy { name, .. } => self.delete_policy(caller, name.as_deref()),
+            _ => code::FAILURE,
+        };
+        kadm5::generic_ret(api, c)
+    }
+
+    fn delete_principal(&self, caller: &Caller<'_>, princ: Option<&str>) -> u32 {
+        let op = "kadm5_delete_principal";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if caller.changepw || !self.acl(caller, ACL_DELETE, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return code::AUTH_DELETE;
+        }
+        let c = match self.lockdown(&name, &realm) {
+            Ok(true) => {
+                caller.log_unauth(op, &target);
+                return code::AUTH_DELETE;
+            }
+            Err(c) => c,
+            Ok(false) => match run(self.admin(caller).delete_principal(&name, &realm)) {
+                Ok(()) => code::OK,
+                Err(e) => store_code(&e, code::UNK_PRINC),
+            },
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    fn set_string(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        key: Option<&str>,
+        value: Option<&str>,
+    ) -> u32 {
+        let op = "kadm5_mod_strings";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if caller.changepw || !self.acl(caller, ACL_MODIFY, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return code::AUTH_MODIFY;
+        }
+        let c = match key {
+            None => code::EINVAL,
+            Some(key) => {
+                let modifier = caller.client_name.clone().into_bytes();
+                let key = key.as_bytes().to_vec();
+                let value = value.map(|v| v.as_bytes().to_vec());
+                let res = self.store.update_raw(&name, &realm, move |e, _| {
+                    set_string_attr(e, &key, value.as_deref())?;
+                    set_mod_princ(e, unix_now(), &modifier)?;
+                    Ok(true)
+                });
+                match res {
+                    Ok(true) => code::OK,
+                    Ok(false) => code::UNK_PRINC,
+                    Err(e) => store_code(&e, code::UNK_PRINC),
+                }
+            }
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    fn create_policy(
+        &self,
+        caller: &Caller<'_>,
+        api: u32,
+        rec: &kadm5::PolicyEnt,
+        mask: i32,
+    ) -> u32 {
+        let op = "kadm5_create_policy";
+        let target = rec.policy.as_deref().unwrap_or("(null)");
+        if caller.changepw || !self.acl(caller, ACL_ADD, None) {
+            caller.log_unauth(op, target);
+            return code::AUTH_ADD;
+        }
+        let c = (|| {
+            let name = rec.policy.as_deref().ok_or(code::EINVAL)?;
+            if name.is_empty() {
+                return Err(code::BAD_POLICY);
+            }
+            if mask & kmask::POLICY == 0 || mask & !kmask::ALL_POLICY_MASK != 0 {
+                return Err(code::BAD_MASK);
+            }
+            let max = (mask & kmask::PW_MAX_LIFE != 0).then_some(rec.pw_max_life);
+            check_policy(rec, mask, max)?;
+            let mut p = policy_change(rec, mask, api).into_policy(name);
+            apply_policy_v4(&mut p, rec, mask, api);
+            run(self.admin(caller).add_policy(p)).map_err(|e| store_code(&e, code::UNK_POLICY))
+        })()
+        .map_or_else(|c| c, |()| code::OK);
+        caller.log_done(op, target, c);
+        c
+    }
+
+    fn modify_policy(
+        &self,
+        caller: &Caller<'_>,
+        api: u32,
+        rec: &kadm5::PolicyEnt,
+        mask: i32,
+    ) -> u32 {
+        let op = "kadm5_modify_policy";
+        let target = rec.policy.as_deref().unwrap_or("(null)");
+        if caller.changepw || !self.acl(caller, ACL_MODIFY, None) {
+            caller.log_unauth(op, target);
+            return code::AUTH_MODIFY;
+        }
+        let c = (|| {
+            let name = rec.policy.as_deref().ok_or(code::EINVAL)?;
+            if name.is_empty() {
+                return Err(code::BAD_POLICY);
+            }
+            if mask & kmask::POLICY != 0 || mask & !kmask::ALL_POLICY_MASK != 0 {
+                return Err(code::BAD_MASK);
+            }
+            let current = match self.store.raw_policy(name) {
+                Ok(Some(p)) => p,
+                Ok(None) => return Err(code::UNK_POLICY),
+                Err(e) => return Err(store_code(&e, code::UNK_POLICY)),
+            };
+            let max = if mask & kmask::PW_MAX_LIFE != 0 {
+                rec.pw_max_life
+            } else {
+                current.pw_max_life as i32
+            };
+            check_policy(rec, mask, Some(max))?;
+            let change = policy_change(rec, mask, api);
+            let rec = rec.clone();
+            run(self.store.update_policy(name, move |p| {
+                change.apply(p);
+                apply_policy_v4(p, &rec, mask, api);
+                Ok(())
+            }))
+            .map(|_| ())
+            .map_err(|e| store_code(&e, code::UNK_POLICY))
+        })()
+        .map_or_else(|c| c, |()| code::OK);
+        caller.log_done(op, target, c);
+        c
+    }
+
+    fn delete_policy(&self, caller: &Caller<'_>, name: Option<&str>) -> u32 {
+        let op = "kadm5_delete_policy";
+        let target = name.unwrap_or("(null)");
+        if caller.changepw || !self.acl(caller, ACL_DELETE, None) {
+            caller.log_unauth(op, target);
+            return code::AUTH_DELETE;
+        }
+        let c = match name {
+            None => code::EINVAL,
+            Some("") => code::BAD_POLICY,
+            Some(n) => match run(self.admin(caller).delete_policy(n)) {
+                Ok(()) => code::OK,
+                Err(e) => store_code(&e, code::UNK_POLICY),
+            },
+        };
+        caller.log_done(op, target, c);
+        c
+    }
+}
+
 impl Program for Kadm5 {
     fn keys(&self) -> (Arc<LmdbStore>, String) {
         (self.store.clone(), self.realm.clone())
@@ -831,6 +1151,17 @@ impl Program for Kadm5 {
         };
         if proc_ == kadm5::proc_::NULL {
             return gss.reply(xid, seq, &[]).map_err(|e| e.to_string());
+        }
+        if let Some(parsed) = kadm5::WriteArgs::decode(proc_, args) {
+            let Ok(parsed) = parsed else {
+                return err(gss, AcceptStat::GarbageArgs);
+            };
+            // xdr_krb5_principal fails on names krb5_parse_name rejects.
+            if parsed.principals().iter().any(|p| self.parse(p).is_none()) {
+                return err(gss, AcceptStat::GarbageArgs);
+            }
+            let results = self.write(&caller, parsed);
+            return gss.reply(xid, seq, &results).map_err(|e| e.to_string());
         }
         let Some(parsed) = ReadArgs::decode(proc_, args) else {
             eprintln!(
