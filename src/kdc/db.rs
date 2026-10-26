@@ -121,7 +121,7 @@ pub(crate) enum KvnoSel {
 
 impl PrincipalEntry {
     /// The highest key version number (MIT `current_kvno`).
-    pub(crate) fn current_kvno(&self) -> Option<u32> {
+    pub fn current_kvno(&self) -> Option<u32> {
         self.keys.iter().map(|k| k.kvno).max()
     }
 

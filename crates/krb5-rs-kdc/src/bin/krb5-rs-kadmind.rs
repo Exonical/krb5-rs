@@ -22,7 +22,7 @@ use krb5_rs::kdc::kdb::mit::{set_mod_princ, set_string_attr};
 use krb5_rs::kdc::kdb::read_stash;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
 use krb5_rs::kdc::store::{AdminStore, Policy, StoreError, StoreErrorKind};
-use krb5_rs::kdc::{default_realm, RealmConfig};
+use krb5_rs::kdc::{default_realm, PrincipalAttributes, RealmConfig};
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::ap::{ApError, KeySource};
 use krb5_rs::rpc::gss::{GssServer, ServerStep};
@@ -923,6 +923,20 @@ impl Kadm5 {
             };
         }
         let c = match args {
+            W::ChrandPrincipal { princ, keepold, .. } => {
+                let (c, keys) = self.chrand(caller, princ.as_deref(), keepold);
+                return kadm5::chrand_ret(api, c, &keys);
+            }
+            W::ExtractKeys { princ, kvno, .. } => {
+                let (c, keys) = self.extract_keys(caller, princ.as_deref(), kvno);
+                return kadm5::getpkeys_ret(api, c, &keys);
+            }
+            W::ChpassPrincipal {
+                princ,
+                keepold,
+                pass,
+                ..
+            } => self.chpass(caller, princ.as_deref(), keepold, pass.as_deref()),
             W::DeletePrincipal { princ, .. } => self.delete_principal(caller, princ.as_deref()),
             W::SetString {
                 princ, key, value, ..
@@ -933,6 +947,201 @@ impl Kadm5 {
             _ => code::FAILURE,
         };
         kadm5::generic_ret(api, c)
+    }
+
+    /// `check_self_keychange` (`server_stubs.c`): a self change needs an
+    /// initial ticket and respects the policy's minimum password life.
+    fn check_self_keychange(&self, caller: &Caller<'_>, name: &PrincipalName, realm: &str) -> u32 {
+        if !caller.is(name, realm) {
+            return code::OK;
+        }
+        if !caller.initial {
+            return code::AUTH_INITIAL;
+        }
+        let admin = self.admin(caller);
+        let rec = match run(admin.get_principal(name, realm)) {
+            Ok(r) => r,
+            Err(e) => return store_code(&e, code::UNK_PRINC),
+        };
+        let Some(policy) = rec.entry.policy.as_deref() else {
+            return code::OK;
+        };
+        let policy = match run(admin.get_policy(policy)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == StoreErrorKind::NotFound => return code::OK,
+            Err(e) => return store_code(&e, code::UNK_POLICY),
+        };
+        let last = rec.last_pwd_change.map_or(0, |t| t.timestamp());
+        let now = i64::from(unix_now());
+        if now - last < i64::from(policy.pw_min_life)
+            && !rec
+                .entry
+                .attributes
+                .contains(PrincipalAttributes::REQUIRES_PWCHANGE)
+        {
+            return code::PASS_TOOSOON;
+        }
+        code::OK
+    }
+
+    /// The shared start of `chpass`/`chrand`: lookup, lockdown, then
+    /// `changepw_not_self` and `OP_CPW` (self always allowed).
+    fn keychange_auth(
+        &self,
+        caller: &Caller<'_>,
+        op: &str,
+        princ: Option<&str>,
+    ) -> Result<(PrincipalName, String, String, bool), u32> {
+        let (name, realm, target) = self.name(princ)?;
+        let locked = self.lockdown(&name, &realm)?;
+        let own = caller.is(&name, &realm);
+        if (caller.changepw && !own)
+            || !(own || self.acl(caller, ACL_CHANGEPW, Some((&name, &realm))))
+        {
+            caller.log_unauth(op, &target);
+            return Err(code::AUTH_CHANGEPW);
+        }
+        Ok((name, realm, target, locked))
+    }
+
+    fn chpass(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        keepold: bool,
+        pass: Option<&str>,
+    ) -> u32 {
+        let op = "kadm5_chpass_principal";
+        let (name, realm, target, locked) = match self.keychange_auth(caller, op, princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if locked {
+            caller.log_unauth(op, &target);
+            return code::AUTH_CHANGEPW;
+        }
+        let mut c = self.check_self_keychange(caller, &name, &realm);
+        if c == code::OK {
+            c = match pass {
+                None => code::EINVAL,
+                Some(pw) => {
+                    match run(self
+                        .admin(caller)
+                        .change_password(&name, &realm, Some(pw), keepold))
+                    {
+                        Ok(_) => code::OK,
+                        Err(e) => store_code(&e, code::UNK_PRINC),
+                    }
+                }
+            };
+        }
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    /// The current-kvno keys of `name` as kadm5 keyblocks.
+    fn current_keys(
+        &self,
+        caller: &Caller<'_>,
+        name: &PrincipalName,
+        realm: &str,
+        kvno: u32,
+    ) -> Result<Vec<krb5_rs::kdc::KeyEntry>, u32> {
+        let rec = run(self.admin(caller).get_principal(name, realm))
+            .map_err(|e| store_code(&e, code::UNK_PRINC))?;
+        let kvno = if kvno == 0 {
+            rec.entry.current_kvno().unwrap_or(0)
+        } else {
+            kvno
+        };
+        Ok(rec
+            .entry
+            .keys
+            .into_iter()
+            .filter(|k| k.kvno == kvno)
+            .collect())
+    }
+
+    fn chrand(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        keepold: bool,
+    ) -> (u32, Vec<kadm5::KeyBlock>) {
+        let op = "kadm5_randkey_principal";
+        let (name, realm, target, locked) = match self.keychange_auth(caller, op, princ) {
+            Ok(v) => v,
+            Err(c) => return (c, Vec::new()),
+        };
+        let mut c = self.check_self_keychange(caller, &name, &realm);
+        let mut keys = Vec::new();
+        if c == code::OK {
+            c = match run(self
+                .admin(caller)
+                .change_password(&name, &realm, None, keepold))
+            {
+                Ok(kvno) => match self.current_keys(caller, &name, &realm, kvno) {
+                    Ok(k) => {
+                        keys = k
+                            .iter()
+                            .map(|k| kadm5::KeyBlock {
+                                enctype: k.key.keytype,
+                                contents: k.key.key_bytes().to_vec(),
+                            })
+                            .collect();
+                        code::OK
+                    }
+                    Err(c) => c,
+                },
+                Err(e) => store_code(&e, code::UNK_PRINC),
+            };
+        }
+        // MIT randomizes a lockdown_keys principal but returns no keys.
+        if locked {
+            keys.clear();
+        }
+        caller.log_done(op, &target, c);
+        (c, keys)
+    }
+
+    fn extract_keys(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        kvno: u32,
+    ) -> (u32, Vec<kadm5::KeyData>) {
+        let op = "kadm5_get_principal_keys";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return (c, Vec::new()),
+        };
+        if caller.changepw || !self.acl(caller, ACL_EXTRACT, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return (code::AUTH_EXTRACT, Vec::new());
+        }
+        let (c, keys) = match self.lockdown(&name, &realm) {
+            Err(c) => (c, Vec::new()),
+            Ok(true) => (code::PROTECT_KEYS, Vec::new()),
+            Ok(false) => match self.current_keys(caller, &name, &realm, kvno) {
+                Ok(k) => (
+                    code::OK,
+                    k.into_iter()
+                        .map(|k| kadm5::KeyData {
+                            kvno: k.kvno,
+                            key: kadm5::KeyBlock {
+                                enctype: k.key.keytype,
+                                contents: k.key.key_bytes().to_vec(),
+                            },
+                            salt_type: if k.salt.is_some() { 4 } else { 0 },
+                            salt: k.salt.unwrap_or_default(),
+                        })
+                        .collect(),
+                ),
+                Err(c) => (c, Vec::new()),
+            },
+        };
+        caller.log_done(op, &target, c);
+        (c, keys)
     }
 
     fn delete_principal(&self, caller: &Caller<'_>, princ: Option<&str>) -> u32 {
