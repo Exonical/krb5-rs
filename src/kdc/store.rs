@@ -34,6 +34,12 @@ pub enum StoreErrorKind {
     Rejected,
     /// Any other backend failure.
     Backend,
+    /// The store does not implement the operation
+    /// (`KRB5_PLUGIN_OP_NOTSUPP`).
+    Unsupported,
+    /// The principal a certificate maps to is not the requested one
+    /// (`KRB5KDC_ERR_CLIENT_NAME_MISMATCH`).
+    NameMismatch,
 }
 
 /// Store error: a [`StoreErrorKind`] plus a message. No backend types.
@@ -296,6 +302,27 @@ pub trait PrincipalStore: Send + Sync {
         name: &PrincipalName,
         realm: &str,
     ) -> impl Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send;
+
+    /// The client a certificate identifies (MIT `get_s4u_x509_principal`,
+    /// kdb.h): `name@realm` is the requested client, with no components when
+    /// only the certificate identifies it. With `referral_ok` (AS requests)
+    /// the entry may be in another realm, a client referral; otherwise a
+    /// named client that is not the certificate's principal is
+    /// [`StoreErrorKind::NameMismatch`]. Stores without certificate lookup,
+    /// like MIT db2 and LMDB, return [`StoreErrorKind::Unsupported`].
+    fn lookup_s4u_x509(
+        &self,
+        cert: &[u8],
+        name: &PrincipalName,
+        realm: &str,
+        referral_ok: bool,
+    ) -> impl Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
+        let _ = (cert, name, realm, referral_ok);
+        std::future::ready(Err(StoreError::new(
+            StoreErrorKind::Unsupported,
+            "get_s4u_x509_principal is not supported",
+        )))
+    }
 }
 
 /// Read access to policies (MIT `krb5_db_get_policy`).
@@ -463,6 +490,16 @@ impl<T: PrincipalStore + ?Sized> PrincipalStore for Arc<T> {
         realm: &str,
     ) -> impl Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
         (**self).lookup(name, realm)
+    }
+
+    fn lookup_s4u_x509(
+        &self,
+        cert: &[u8],
+        name: &PrincipalName,
+        realm: &str,
+        referral_ok: bool,
+    ) -> impl Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
+        (**self).lookup_s4u_x509(cert, name, realm, referral_ok)
     }
 }
 

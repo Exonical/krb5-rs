@@ -1,6 +1,9 @@
 //! AS-REQ construction and preauth helpers (get_in_tkt.c, preauth2.c).
 
 use super::*;
+
+/// `KRB5_PADATA_S4U_X509_USER`.
+const PA_S4U_X509_USER: i32 = 130;
 use crate::types::is_anonymous_name;
 
 /// `KRB5_NT_WELLKNOWN`.
@@ -105,6 +108,13 @@ impl AsExchange {
         if self.info_pa_permitted {
             padata.push(build_empty_padata(PaDataType::AsFreshness as i32));
             padata.push(build_empty_padata(PaDataType::ReqEncPaRep as i32));
+        }
+
+        if let Some(cert) = &self.config.subject_cert {
+            padata.push(PaData {
+                padata_type: PA_S4U_X509_USER,
+                padata_value: cert.clone().into(),
+            });
         }
 
         // Always send PA-PAC-REQUEST; `request_pac` controls `include-pac` value

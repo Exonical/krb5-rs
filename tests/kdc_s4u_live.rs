@@ -280,6 +280,43 @@ fn mit_kvno_s4u2proxy_denied_target_is_refused_by_our_kdc() {
     assert!(out.contains("KDC can't fulfill requested option"), "{out}");
 }
 
+/// `kvno -F` input: a principal name as a fake PEM certificate (t_s4u.py
+/// `princ_cert`).
+const FAKE_CERT: &str = "-----BEGIN CERTIFICATE-----\nYWxpY2U=\n-----END y\n";
+
+#[test]
+#[ignore = "requires podman + MIT client container"]
+fn mit_kvno_s4u2self_by_certificate_fails_like_against_mits_db2() {
+    // Neither MIT db2 nor our MemoryStore maps certificates to principals
+    // (KRB5_PLUGIN_OP_NOTSUPP): the AS probe gets a generic error.
+    let (code, out) = run("cat > /tmp/s4u-cert", Some(FAKE_CERT));
+    assert_eq!(code, 0, "{out}");
+    let mit = "KRB5CCNAME=/tmp/cc_s4u_cert_mit";
+    let (code, out) = run(
+        &format!("{mit} kinit HTTP/server.test.realm@{REALM}"),
+        Some("httpsecret\n"),
+    );
+    assert_eq!(code, 0, "kinit against MIT: {out}");
+    let (mit_code, mit_out) = run(
+        &format!("{mit} kvno -F /tmp/s4u-cert HTTP/server.test.realm@{REALM}"),
+        None,
+    );
+    let e = setup("/tmp/cc_s4u_cert", "HTTP/s4u.test.realm");
+    let (code, out) = run(
+        &format!("{e} KRB5_TRACE=/dev/stderr kvno -F /tmp/s4u-cert HTTP/s4u.test.realm@{REALM}"),
+        None,
+    );
+    assert_ne!(mit_code, 0, "{mit_out}");
+    assert_ne!(code, 0, "{out}");
+    assert!(
+        out.contains("Getting initial credentials for @TEST.REALM"),
+        "{out}"
+    );
+    let want = "kvno: Generic error (see e-text) while getting credentials for";
+    assert!(mit_out.contains(want), "{mit_out}");
+    assert!(out.contains(want), "{out}");
+}
+
 /// Copy a ccache between the container and the host (`to_host`) or back.
 fn cp_ccache(container_path: &str, host_path: &std::path::Path, to_host: bool) {
     let remote = format!("{KDC_CONTAINER}:{container_path}");
@@ -331,7 +368,7 @@ fn mit_kvno_and_our_client_share_s4u_ccache_entries() {
         // MIT's S4U2Self and S4U2Proxy entries satisfy cached-only lookups.
         let self_req = CredsRequest::new(alice.clone(), REALM, svc("s4u"), REALM);
         let evidence = client
-            .get_credentials_for_user(&mut ccache, GcOptions::CACHED, &self_req)
+            .get_credentials_for_user(&mut ccache, GcOptions::CACHED, &self_req, None)
             .await
             .expect("MIT's S4U2Self entry");
         assert_eq!(evidence.client, alice);
