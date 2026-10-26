@@ -901,6 +901,100 @@ impl LmdbStore {
         self.log_held(held.as_ref(), update_from_entry(None, &raw))
     }
 
+    /// Store a new raw entry, such as an alias (`kdb_put_entry` of a fresh
+    /// `krb5_db_entry`), and log it; `Conflict` if the name is taken.
+    pub fn create_raw(&self, raw: &MitEntry) -> Result<(), StoreError> {
+        let (key, value) = raw.encode()?;
+        let held = self.lock_ulog()?;
+        let mut txn = self
+            .inner
+            .main_env
+            .write_txn()
+            .map_err(|e| backend("opening principal write transaction", e))?;
+        if self
+            .inner
+            .principal_db
+            .get(&txn, &key)
+            .map_err(|e| backend("checking principal", e))?
+            .is_some()
+        {
+            return Err(StoreError::conflict(format!(
+                "Principal or policy already exists: {}",
+                String::from_utf8_lossy(&key)
+            )));
+        }
+        self.inner
+            .principal_db
+            .put(&mut txn, &key, &value)
+            .map_err(|e| backend("writing principal", e))?;
+        txn.commit()
+            .map_err(|e| backend("committing principal", e))?;
+        self.log_held(held.as_ref(), update_from_entry(None, raw))
+    }
+
+    /// `krb5_db_def_rename_principal` (`lib/kdb/kdb_default.c:516-551`):
+    /// `f` turns the source entry into the renamed one, which is stored
+    /// before the source is deleted, in one transaction. Logged as an add
+    /// and a delete, the way MIT's default rename reaches the ulog.
+    pub fn rename_raw<F>(&self, name: &PrincipalName, realm: &str, f: F) -> Result<(), StoreError>
+    where
+        F: FnOnce(MitEntry, &MasterKeys) -> Result<MitEntry, StoreError>,
+    {
+        self.refresh_master()?;
+        let keys = self.master_keys().clone();
+        let src = unparse_name(name, realm);
+        let held = self.lock_ulog()?;
+        let mut txn = self
+            .inner
+            .main_env
+            .write_txn()
+            .map_err(|e| backend("opening principal write transaction", e))?;
+        let value = self
+            .inner
+            .principal_db
+            .get(&txn, &src)
+            .map_err(|e| backend("reading principal for rename", e))?
+            .ok_or_else(|| {
+                StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
+            })?
+            .to_vec();
+        let renamed = f(MitEntry::decode(&src, &value)?, &keys)?;
+        let (dest, value) = renamed.encode()?;
+        if self
+            .inner
+            .principal_db
+            .get(&txn, &dest)
+            .map_err(|e| backend("checking principal", e))?
+            .is_some()
+        {
+            return Err(StoreError::conflict(format!(
+                "Principal or policy already exists: {}",
+                String::from_utf8_lossy(&dest)
+            )));
+        }
+        self.inner
+            .principal_db
+            .put(&mut txn, &dest, &value)
+            .map_err(|e| backend("writing renamed principal", e))?;
+        self.inner
+            .principal_db
+            .delete(&mut txn, &src)
+            .map_err(|e| backend("deleting renamed principal", e))?;
+        txn.commit().map_err(|e| backend("committing rename", e))?;
+        if let Some((env, db)) = &self.inner.lockout {
+            let mut lockout_txn = env
+                .write_txn()
+                .map_err(|e| backend("opening lockout write transaction", e))?;
+            db.delete(&mut lockout_txn, &src)
+                .map_err(|e| backend("deleting lockout record", e))?;
+            lockout_txn
+                .commit()
+                .map_err(|e| backend("committing lockout record", e))?;
+        }
+        self.log_held(held.as_ref(), update_from_entry(None, &renamed))?;
+        self.log_held(held.as_ref(), Update::deletion(src))
+    }
+
     #[cfg(test)]
     fn check_lockout_fault(&self) -> Result<(), StoreError> {
         if self

@@ -18,11 +18,11 @@ use krb5_rs::kdc::kdb::kpasswd::{process_request, Service, KPASSWD_PORT};
 use krb5_rs::kdc::kdb::kprop::ReplayCache;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
 use krb5_rs::kdc::kdb::mit::{parse_name_with_default, MitEntry};
-use krb5_rs::kdc::kdb::mit::{set_mod_princ, set_string_attr};
+use krb5_rs::kdc::kdb::mit::{set_mod_princ, set_string_attr, TlData};
 use krb5_rs::kdc::kdb::read_stash;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
 use krb5_rs::kdc::store::{AdminStore, Policy, StoreError, StoreErrorKind};
-use krb5_rs::kdc::{default_realm, PrincipalAttributes, RealmConfig};
+use krb5_rs::kdc::{default_realm, salt_bytes, PrincipalAttributes, RealmConfig};
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::ap::{ApError, KeySource};
 use krb5_rs::rpc::gss::{GssServer, ServerStep};
@@ -780,6 +780,34 @@ impl Kadm5 {
     }
 }
 
+/// `KRB5_TL_ALIAS_TARGET` (`kdb.h`).
+const ALIAS_TARGET: u16 = 0x000c;
+
+fn tl_bytes(e: &MitEntry, kind: u16) -> Option<&[u8]> {
+    e.tl_data
+        .iter()
+        .find(|t| t.kind == kind)
+        .map(|t| t.data.as_slice())
+}
+
+/// `krb5_dbe_specialize_salt` (`lib/kdb/kdb5.c:2391-2421`): store every
+/// salt explicitly so it survives the rename.
+fn specialize_salt(e: &mut MitEntry) {
+    use krb5_rs::crypto::SaltType;
+    for k in &mut e.key_data {
+        let (stype, contents) = k.fields.get(1).cloned().unwrap_or((0, Vec::new()));
+        let salt = match (k.ver, stype) {
+            (1, _) | (_, 0) => salt_bytes(&e.principal, &e.realm, SaltType::Normal),
+            (_, 2) => salt_bytes(&e.principal, &e.realm, SaltType::NoRealm),
+            (_, 3) => e.realm.as_bytes().to_vec(),
+            _ => contents,
+        };
+        k.fields.truncate(1);
+        k.fields.push((4, salt));
+        k.ver = 2;
+    }
+}
+
 /// `KRB5_KDB_LOCKDOWN_KEYS` (`kdb.h`).
 const LOCKDOWN_KEYS: u32 = 0x0080_0000;
 
@@ -937,6 +965,12 @@ impl Kadm5 {
                 pass,
                 ..
             } => self.chpass(caller, princ.as_deref(), keepold, pass.as_deref()),
+            W::RenamePrincipal { src, dest, .. } => {
+                self.rename_principal(caller, src.as_deref(), dest.as_deref())
+            }
+            W::CreateAlias { alias, target, .. } => {
+                self.create_alias(caller, alias.as_deref(), target.as_deref())
+            }
             W::DeletePrincipal { princ, .. } => self.delete_principal(caller, princ.as_deref()),
             W::SetString {
                 princ, key, value, ..
@@ -1142,6 +1176,107 @@ impl Kadm5 {
         };
         caller.log_done(op, &target, c);
         (c, keys)
+    }
+
+    fn rename_principal(&self, caller: &Caller<'_>, src: Option<&str>, dest: Option<&str>) -> u32 {
+        let op = "kadm5_rename_principal";
+        let (sname, srealm, starget) = match self.name(src) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let (dname, drealm, dtarget) = match self.name(dest) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let prime = format!("{starget} to {dtarget}");
+        if caller.changepw
+            || !self.acl(caller, ACL_DELETE, Some((&sname, &srealm)))
+            || !self.acl(caller, ACL_ADD, Some((&dname, &drealm)))
+        {
+            caller.log_unauth(op, &prime);
+            return code::AUTH_INSUFFICIENT;
+        }
+        let c = match self.lockdown(&sname, &srealm) {
+            Ok(true) => {
+                caller.log_unauth(op, &prime);
+                return code::AUTH_INSUFFICIENT;
+            }
+            Err(c) => c,
+            Ok(false) if srealm != drealm => code::FAILURE,
+            Ok(false) => {
+                let modifier = caller.client_name.clone().into_bytes();
+                let res = self.store.rename_raw(&sname, &srealm, |mut e, _| {
+                    if tl_bytes(&e, ALIAS_TARGET).is_some() {
+                        return Err(StoreError::rejected(
+                            "Operation unsupported on alias principal name",
+                        ));
+                    }
+                    specialize_salt(&mut e);
+                    e.principal = dname.clone();
+                    e.realm = drealm.clone();
+                    set_mod_princ(&mut e, unix_now(), &modifier)?;
+                    Ok(e)
+                });
+                match res {
+                    Ok(()) => code::OK,
+                    Err(e) => store_code(&e, code::UNK_PRINC),
+                }
+            }
+        };
+        caller.log_done(op, &prime, c);
+        c
+    }
+
+    fn create_alias(&self, caller: &Caller<'_>, alias: Option<&str>, target: Option<&str>) -> u32 {
+        let op = "kadm5_create_alias";
+        let (aname, arealm, atarget) = match self.name(alias) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let (tname, trealm, ttarget) = match self.name(target) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let prime = format!("{atarget} to {ttarget}");
+        if caller.changepw
+            || !self.acl(caller, ACL_ADD, Some((&aname, &arealm)))
+            || !self.acl(caller, ACL_MODIFY, Some((&tname, &trealm)))
+        {
+            caller.log_unauth(op, &prime);
+            return code::AUTH_INSUFFICIENT;
+        }
+        let c = if arealm != trealm {
+            code::ALIAS_REALM
+        } else {
+            // krb5_dbe_make_alias_entry (lib/kdb/kdb5.c:2826-2870).
+            let mut data = ttarget.clone().into_bytes();
+            data.push(0);
+            let mut e = MitEntry {
+                principal: aname.clone(),
+                realm: arealm.clone(),
+                attributes: PrincipalAttributes::DISALLOW_ALL_TIX.bits(),
+                max_life: 0,
+                max_renewable_life: 0,
+                expiration: 0,
+                pw_expiration: 0,
+                last_success: 0,
+                last_failed: 0,
+                fail_auth_count: 0,
+                tl_data: vec![TlData {
+                    kind: ALIAS_TARGET,
+                    data,
+                }],
+                key_data: Vec::new(),
+            };
+            match set_mod_princ(&mut e, unix_now(), caller.client_name.as_bytes())
+                .and_then(|()| self.store.create_raw(&e))
+            {
+                Ok(()) => code::OK,
+                Err(e) => store_code(&e, code::UNK_PRINC),
+            }
+        };
+        caller.log_done(op, &prime, c);
+        c
     }
 
     fn delete_principal(&self, caller: &Caller<'_>, princ: Option<&str>) -> u32 {
