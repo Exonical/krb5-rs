@@ -148,6 +148,9 @@ pub struct RealmConfig {
     /// `default_principal_expiration` from the realm section
     /// (`lib/kadm5/alt_prof.c:580-594`, `include/k5-int.h:199`).
     pub default_principal_expiration: Option<KerberosTime>,
+    /// `max_renewable_life` as kadmind reads it for new principals: unlike
+    /// the KDC it defaults to zero (`lib/kadm5/alt_prof.c:577-578`).
+    pub admin_max_renewable_life: Duration,
     /// UDP listen addresses (`kdc_listen` / `kdc_ports`).
     pub udp_listen: Vec<SocketAddr>,
     /// TCP listen addresses (`kdc_tcp_listen` / `kdc_tcp_ports`, defaulting
@@ -263,6 +266,8 @@ impl RealmConfig {
             &["realms", realm, "max_renewable_life"],
             DEFAULT_MAX_RENEWABLE_LIFE,
         )?;
+        let admin_max_renewable_life =
+            deltat(kdc_conf, &["realms", realm, "max_renewable_life"], 0)?;
         let default_principal_expiration = r("default_principal_expiration")
             .map(|value| {
                 super::kdb::admin::parse_time(&value)
@@ -401,6 +406,9 @@ impl RealmConfig {
                 .unwrap_or(18),
             supported_keysalts,
             default_principal_expiration,
+            admin_max_renewable_life: Duration::from_secs(
+                u64::try_from(admin_max_renewable_life).unwrap_or(0),
+            ),
             udp_listen: parse_listen_addresses(&udp_str, DEFAULT_PORT)?,
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
             db_module,

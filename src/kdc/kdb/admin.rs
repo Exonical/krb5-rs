@@ -469,17 +469,6 @@ impl<S: AdminStore> AdminOps<S> {
         changed
     }
 
-    /// `KADM5_UNK_POLICY` for a `-policy` naming a policy that does not exist
-    /// (svr_principal.c:117).
-    async fn check_policy(&self, opts: &PrincipalOptions) -> Result<(), StoreError> {
-        if let Some(Some(name)) = &opts.policy {
-            if self.store.get_policy(name).await?.is_none() {
-                return Err(missing(format!("Policy \"{name}\"")));
-            }
-        }
-        Ok(())
-    }
-
     /// `addprinc` (`kadm5_create_principal`): kvno 1, keys from `password`
     /// or random (`-randkey`). Fails if the principal exists.
     pub async fn add_principal(
@@ -492,7 +481,6 @@ impl<S: AdminStore> AdminOps<S> {
         if self.store.get_record(name, realm).await?.is_some() {
             return Err(duplicate(format!("{name}@{realm}")));
         }
-        self.check_policy(opts).await?;
         // svr_principal.c:364-374: a password must satisfy the policy.
         let policy = match &opts.policy {
             Some(Some(name)) => self.policy_named(Some(name)).await?,
@@ -692,7 +680,6 @@ impl<S: AdminStore> AdminOps<S> {
         realm: &str,
         opts: &PrincipalOptions,
     ) -> Result<(), StoreError> {
-        self.check_policy(opts).await?;
         let new_policy = match &opts.policy {
             Some(Some(name)) => self.policy_named(Some(name)).await?,
             _ => None,

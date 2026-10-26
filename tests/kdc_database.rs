@@ -783,14 +783,15 @@ fn policies_persist_and_follow_mit_kadmin_rules() {
         vec!["strict".to_string()]
     );
 
-    // -policy needs an existing policy (KADM5_UNK_POLICY).
+    // A -policy naming no policy is kept and counts as no policy
+    // (get_policy, svr_principal.c:262-275).
     let missing = PrincipalOptions {
         policy: Some(Some("nope".into())),
         ..PrincipalOptions::default()
     };
-    assert!(admin
-        .add_principal(&name("x"), REALM, Some("pw"), &missing)
-        .is_err());
+    admin
+        .add_principal(&name("nopol"), REALM, Some("pw"), &missing)
+        .expect("addprinc with a missing policy");
     let under = PrincipalOptions {
         policy: Some(Some("strict".into())),
         ..PrincipalOptions::default()

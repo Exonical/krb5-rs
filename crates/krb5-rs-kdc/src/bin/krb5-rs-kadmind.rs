@@ -571,6 +571,12 @@ struct Kadm5 {
     acl: Arc<Vec<AclEntry>>,
     keysalts: Vec<(i32, krb5_rs::crypto::SaltType)>,
     history_enctype: i32,
+    /// Realm `max_life`, `max_renewable_life` and
+    /// `default_principal_expiration`, used by create when the mask omits
+    /// them (svr_principal.c:410-429).
+    max_life: Duration,
+    max_rlife: Duration,
+    expiration: Option<krb5_rs::types::KerberosTime>,
 }
 
 /// The authenticated caller of one kadm5 call (`stub_setup`).
@@ -1254,9 +1260,13 @@ impl Kadm5 {
             caller.log_unauth(op, &target);
             return (code::AUTH_EXTRACT, Vec::new());
         }
+        // server_stubs.c:1772-1778: lockdown is reported as unauthorized.
         let (c, keys) = match self.lockdown(&name, &realm) {
             Err(c) => (c, Vec::new()),
-            Ok(true) => (code::PROTECT_KEYS, Vec::new()),
+            Ok(true) => {
+                caller.log_unauth(op, &target);
+                return (code::AUTH_EXTRACT, Vec::new());
+            }
             Ok(false) => match self.current_keys(caller, &name, &realm, kvno) {
                 Ok(k) => (
                     code::OK,
@@ -1437,7 +1447,18 @@ impl Kadm5 {
         } else if mask & m::TL_DATA != 0 && rec.tl_data.iter().any(|t| t.kind < 256) {
             code::BAD_TL_TYPE
         } else {
-            let (opts, _) = principal_options(rec, mask, restr.as_ref());
+            let (mut opts, mask) = principal_options(rec, mask, restr.as_ref());
+            let mask = mask as i32;
+            if mask & m::MAX_LIFE == 0 {
+                opts.max_life = Some((!self.max_life.is_zero()).then_some(self.max_life));
+            }
+            if mask & m::MAX_RLIFE == 0 {
+                opts.max_renewable_life =
+                    Some((!self.max_rlife.is_zero()).then_some(self.max_rlife));
+            }
+            if mask & m::PRINC_EXPIRE_TIME == 0 {
+                opts.expiration = Some(self.expiration);
+            }
             match run(self
                 .admin(caller)
                 .add_principal(&name, &realm, passwd, &opts))
@@ -2177,6 +2198,9 @@ async fn main() {
         acl: acl.clone(),
         keysalts: cfg.supported_keysalts.clone(),
         history_enctype: cfg.master_key_type,
+        max_life: cfg.kdc.max_life,
+        max_rlife: cfg.admin_max_renewable_life,
+        expiration: cfg.default_principal_expiration,
     });
     spawn_rpc(&mut tasks, &local, &kadm5, kadm5_listeners);
     let kpasswd = Rc::new(Kpasswd {
