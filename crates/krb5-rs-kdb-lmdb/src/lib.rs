@@ -2,4 +2,4 @@
 
 mod store;
 
-pub use store::{LmdbOptions, LmdbStore};
+pub use store::{CallerStore, LmdbOptions, LmdbStore};

@@ -562,6 +562,8 @@ struct Kadm5 {
     realm: String,
     store: Arc<LmdbStore>,
     acl: Arc<Vec<AclEntry>>,
+    keysalts: Vec<(i32, krb5_rs::crypto::SaltType)>,
+    history_enctype: i32,
 }
 
 /// The authenticated caller of one kadm5 call (`stub_setup`).
@@ -571,6 +573,8 @@ struct Caller<'a> {
     client_name: String,
     service_name: String,
     changepw: bool,
+    /// The service ticket was an initial ticket (`ticket_is_initial`).
+    initial: bool,
     from: &'a SocketAddr,
 }
 
@@ -822,6 +826,7 @@ impl Program for Kadm5 {
             crealm,
             service_name,
             changepw,
+            initial: ctx.initial_ticket(),
             from,
         };
         if proc_ == kadm5::proc_::NULL {
@@ -1122,6 +1127,8 @@ async fn main() {
         realm: realm.clone(),
         store: store.clone(),
         acl: acl.clone(),
+        keysalts: cfg.supported_keysalts.clone(),
+        history_enctype: cfg.master_key_type,
     });
     spawn_rpc(&mut tasks, &local, &kadm5, kadm5_listeners);
     let kpasswd = Rc::new(Kpasswd {

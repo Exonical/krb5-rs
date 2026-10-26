@@ -61,6 +61,11 @@ impl<'a> XdrReader<'a> {
         Self { bytes, pos: 0 }
     }
 
+    /// Bytes left to read.
+    pub fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8], XdrError> {
         let end = self
             .pos

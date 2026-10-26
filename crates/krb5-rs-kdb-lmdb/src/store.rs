@@ -835,9 +835,18 @@ impl LmdbStore {
         entry: PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
+        let modifier = admin_name(&self.inner.realm);
+        self.create_principal_as(entry, last_pwd_change, modifier)
+    }
+
+    fn create_principal_as(
+        &self,
+        entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
+        modifier: Vec<u8>,
+    ) -> Result<(), StoreError> {
         self.refresh_master()?;
         let key = unparse_name(&entry.name, &entry.realm);
-        let modifier = admin_name(&self.inner.realm);
         let record = PrincipalRecord {
             mod_time: Some(now_time()),
             last_pwd_change,
@@ -913,6 +922,19 @@ impl LmdbStore {
         &self,
         name: &PrincipalName,
         realm: &str,
+        f: F,
+    ) -> Result<PrincipalRecord, StoreError>
+    where
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError>,
+    {
+        self.update_principal_as(name, realm, admin_name(realm), f)
+    }
+
+    fn update_principal_as<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        modifier: Vec<u8>,
         mut f: F,
     ) -> Result<PrincipalRecord, StoreError>
     where
@@ -940,7 +962,6 @@ impl LmdbStore {
         let mut record = record_from_entry(&raw, &self.master_keys())?;
         f(&mut record)?;
         record.mod_time = Some(now_time());
-        let modifier = admin_name(realm);
         record.mod_by = Some(modifier.clone());
         merge_record(&mut raw, &record, &self.master_keys(), Some(&modifier))?;
         let (_, value) = raw.encode()?;
@@ -1742,6 +1763,117 @@ impl AdminStore for LmdbStore {
 
     async fn list_policies(&self) -> Result<Vec<Policy>, StoreError> {
         self.list_policies_sync()
+    }
+}
+
+/// An [`LmdbStore`] view whose principal writes record `modifier` as the
+/// last modifier, as `kdb_put_entry` records `handle->current_caller`
+/// (`lib/kadm5/srv/server_kdb.c:364-405`).
+#[derive(Clone)]
+pub struct CallerStore {
+    store: LmdbStore,
+    modifier: Vec<u8>,
+}
+
+impl LmdbStore {
+    /// This store, recording `modifier` (an unparsed principal) on writes.
+    pub fn as_caller(&self, modifier: Vec<u8>) -> CallerStore {
+        CallerStore {
+            store: self.clone(),
+            modifier,
+        }
+    }
+}
+
+impl AdminStore for CallerStore {
+    fn get_record(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl std::future::Future<Output = Result<Option<PrincipalRecord>, StoreError>> + Send {
+        self.store.get_record(name, realm)
+    }
+
+    fn create_principal(
+        &self,
+        entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        let store = self.store.clone();
+        let modifier = self.modifier.clone();
+        spawn_write("principal create", move || {
+            store.create_principal_as(entry, last_pwd_change, modifier)
+        })
+    }
+
+    fn update_principal<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<PrincipalRecord, StoreError>> + Send
+    where
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send + 'static,
+    {
+        let store = self.store.clone();
+        let modifier = self.modifier.clone();
+        let name = name.clone();
+        let realm = realm.to_owned();
+        spawn_write("principal update", move || {
+            store.update_principal_as(&name, &realm, modifier, f)
+        })
+    }
+
+    fn delete_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+        self.store.delete_principal(name, realm)
+    }
+
+    fn list_principals(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<PrincipalRecord>, StoreError>> + Send {
+        self.store.list_principals()
+    }
+
+    fn get_policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Policy>, StoreError>> + Send {
+        self.store.get_policy(name)
+    }
+
+    fn create_policy(
+        &self,
+        policy: Policy,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        self.store.create_policy(policy)
+    }
+
+    fn update_policy<F>(
+        &self,
+        name: &str,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<Policy, StoreError>> + Send
+    where
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send + 'static,
+    {
+        self.store.update_policy(name, f)
+    }
+
+    fn delete_policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+        self.store.delete_policy(name)
+    }
+
+    fn list_policies(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<Policy>, StoreError>> + Send {
+        self.store.list_policies()
     }
 }
 
