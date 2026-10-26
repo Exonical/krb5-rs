@@ -20,7 +20,11 @@ use krb5_rs::kdc::{
 };
 use krb5_rs::keytab::{FileKeytab, Keytab, KeytabEntry};
 use krb5_rs::profile::Profile;
+use krb5_rs::protocol::{
+    AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
+};
 use krb5_rs::types::PrincipalName;
+use krb5_rs::Krb5Error;
 use tokio::net::{TcpListener, UdpSocket};
 
 #[path = "common/mod.rs"]
@@ -36,6 +40,8 @@ const OUR_KEYTAB: &str = "/tmp/xs4u-test.keytab";
 const OTHER_KEYTAB: &str = "/tmp/xs4u-other.keytab";
 const CONF: &str = "/tmp/xs4u-krb5.conf";
 /// The OTHER.REALM impersonator, as RBCD entries name it.
+/// Our client's impersonating service (TEST.REALM, known password).
+const CLIENT_SVC_PASSWORD: &str = "xs4u-client-svc-password";
 const OTHER_IMPERSONATOR: &str = "HTTP/xs4u.other.realm@OTHER.REALM";
 
 fn host() -> String {
@@ -94,6 +100,16 @@ fn live() -> &'static Live {
         );
         add("rbcd.test.realm", none, &[OTHER_IMPERSONATOR]);
         add("norbcd.test.realm", none, &[]);
+        store
+            .add_with_password(
+                svc("xs4uc.test.realm"),
+                REALM,
+                CLIENT_SVC_PASSWORD,
+                1,
+                &[18, 17],
+                PrincipalAttributes::OK_TO_AUTH_AS_DELEGATE,
+            )
+            .expect("client service");
 
         let keytab = common::kdc::tmp("xs4u_test.keytab");
         let _ = std::fs::remove_file(&keytab);
@@ -307,4 +323,79 @@ fn our_proxy_referral_passes_mits_cross_realm_evidence_checks() {
     ] {
         assert!(!log.contains(bad), "{log}");
     }
+}
+
+/// Our client's KDC routing: TEST.REALM is the in-process KDC, OTHER.REALM
+/// the MIT container.
+fn send(realm: &str, data: &[u8]) -> Vec<u8> {
+    let addr = if realm == REALM {
+        format!("127.0.0.1:{PORT}")
+    } else {
+        assert_eq!(realm, OTHER_REALM);
+        let out = Command::new(container_cli())
+            .args([
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                OTHER_CONTAINER,
+            ])
+            .output()
+            .expect("container inspect");
+        format!("{}:88", String::from_utf8_lossy(&out.stdout).trim())
+    };
+    common::kdc::kdc_send_to(&addr, data).expect("KDC reply")
+}
+
+fn run_tgs(mut ex: TgsExchange) -> Result<Credential, Krb5Error> {
+    let mut reply = Vec::new();
+    loop {
+        match ex.step(&reply)? {
+            TgsStepResult::SendToKdc { data, realm } | TgsStepResult::RetryTcp { data, realm } => {
+                reply = send(&realm, &data);
+            }
+            TgsStepResult::Complete => return Ok(ex.credential().expect("cred").clone()),
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires podman + both compose containers"]
+fn our_client_follows_cross_realm_s4u2self_referrals_through_mit() {
+    setup();
+    let mut ex = AsExchange::new(
+        AsExchangeConfig::new(svc("xs4uc.test.realm"), REALM),
+        CLIENT_SVC_PASSWORD,
+    );
+    let mut reply = Vec::new();
+    while let StepResult::SendToKdc { data, realm } | StepResult::RetryTcp { data, realm } =
+        ex.step(&reply).expect("AS step")
+    {
+        reply = send(&realm, &data);
+    }
+    let tgt = ex.credential().expect("TGT").clone();
+    // A TGT to the user's realm first, as krb5_get_self_cred_from_kdc does.
+    let cross = run_tgs(TgsExchange::new(
+        tgt,
+        tgs(OTHER_REALM),
+        TgsOptions::default(),
+    ))
+    .expect("cross-realm TGT");
+    let opts = TgsOptions {
+        canonicalize: true,
+        ..TgsOptions::default()
+    };
+    let cred = run_tgs(TgsExchange::s4u2self(
+        cross,
+        PrincipalName::new_principal("xuser"),
+        OTHER_REALM,
+        opts,
+    ))
+    .expect("cross-realm S4U2Self");
+    assert_eq!(
+        cred.client.name_string,
+        PrincipalName::new_principal("xuser").name_string
+    );
+    assert_eq!(cred.crealm, OTHER_REALM);
+    assert_eq!(cred.server.name_string, svc("xs4uc.test.realm").name_string);
+    assert_eq!(cred.srealm, REALM);
 }

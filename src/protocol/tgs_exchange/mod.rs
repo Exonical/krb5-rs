@@ -383,11 +383,11 @@ impl TgsExchange {
         self.validate_tgs_reply(rep, &enc_part)?;
 
         if self.is_s4u() {
-            // Only the single-realm flow is implemented; a referral TGT
-            // reply would need MIT's cross-realm S4U chains.
-            if self.is_referral_tgt(&enc_part) {
+            // S4U2Self referral hops are followed like krb5_get_self_cred_from_kdc
+            // (s4u_creds.c:89-200); the cross-realm S4U2Proxy chain is not.
+            if self.is_referral_tgt(&enc_part) && matches!(self.s4u, s4u::S4uMode::Proxy { .. }) {
                 return Err(Krb5Error::ReplyValidation(
-                    "cross-realm S4U referral is not supported",
+                    "cross-realm S4U2Proxy referral is not supported",
                 ));
             }
             self.verify_s4u2self_reply(rep.padata.as_deref(), &enc_part)?;
@@ -446,7 +446,12 @@ impl TgsExchange {
         enc_part: &EncKdcRepPart,
     ) -> Result<(), Krb5Error> {
         // Client principal must match the TGT holder
-        let (expected_name, expected_realm) = self.expected_client();
+        // An S4U referral TGT is issued to the requesting service itself.
+        let (expected_name, expected_realm) = if self.is_s4u() && self.is_referral_tgt(enc_part) {
+            (self.cur_tgt.client.clone(), self.cur_tgt.crealm.clone())
+        } else {
+            self.expected_client()
+        };
         let name_ok = if self.is_s4u() {
             rep.cname.name_string == expected_name.name_string
         } else {

@@ -1,9 +1,12 @@
 //! S4U2Self and S4U2Proxy client requests (MIT lib/krb5/krb/s4u_creds.c).
 //!
-//! Single-realm flows: the request goes to the realm of the supplied TGT and
-//! a referral reply is rejected. MIT's cross-realm chains
-//! (`krb5_get_self_cred_from_kdc` referral loop, the proxy-TGT dance in
-//! `get_proxy_cred_from_kdc`) are not implemented.
+//! S4U2Self follows referral TGTs from the supplied TGT's realm back to the
+//! service realm, as `krb5_get_self_cred_from_kdc` does (s4u_creds.c:89-200),
+//! when the exchange canonicalizes. Pass a TGT to the user's realm for a
+//! foreign user. Unlike MIT, the server name is sent as is rather than as an
+//! enterprise name: db2/LMDB KDCs only refer host-based names. The cross-realm
+//! S4U2Proxy chain (`get_proxy_cred_from_kdc`) is not implemented and a
+//! referral reply to S4U2Proxy is rejected.
 
 use super::*;
 use crate::crypto::hmac_md5_checksum;
