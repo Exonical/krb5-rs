@@ -45,7 +45,7 @@ The core library is pure Rust and cross-compiles to musl.
 
 **Feature `test-pki`** (TESTING ONLY): embeds fixed RSA private keys and a certificate issuer used by the PKINIT tests and `examples/gen_pkinit_pki.rs`. Never enable it in production builds.
 
-**Not yet supported:** cross-realm S4U2Self/S4U2Proxy, DES/RC4/Camellia enctypes. PKINIT RSA key transport is rejected, as in MIT 1.22, which removed it.
+**Not yet supported:** DES/RC4/Camellia enctypes. PKINIT RSA key transport is rejected, as in MIT 1.22, which removed it.
 
 ## Running the KDC
 
