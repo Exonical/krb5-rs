@@ -3,6 +3,9 @@
 {{- $_ := required "cockroach.url is required in CockroachDB mode" .Values.cockroach.url -}}
 {{- $_ := required "cockroach.tlsSecret is required in CockroachDB mode" .Values.cockroach.tlsSecret -}}
 {{- $_ := required "cockroach.region is required in CockroachDB mode" .Values.cockroach.region -}}
+{{- if .Values.propagation.iprop.enabled -}}
+{{- fail "propagation.iprop.enabled requires database.mode=file (iprop is klmdb only)" -}}
+{{- end -}}
 {{- if or .Values.cockroach.bootstrap.enabled .Values.cockroach.prune.enabled -}}
 {{- $_ := required "cockroach.admin.url is required for bootstrap or prune" .Values.cockroach.admin.url -}}
 {{- $_ := required "cockroach.admin.tlsSecret is required for bootstrap or prune" .Values.cockroach.admin.tlsSecret -}}
