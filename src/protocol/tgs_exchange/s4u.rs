@@ -726,3 +726,23 @@ impl TgsExchange {
         Ok(self.s4u_complete(rep, enc_part))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enterprise_name_holds_the_raw_components_like_mit() {
+        // MIT 1.22.2: unparse gives a\/b/h\@x\\y\tz@R, and the enterprise
+        // parse decodes it back to one raw component.
+        let gs = |s: &str| GeneralString::from_bytes(s.as_bytes()).expect("ascii");
+        let name = PrincipalName {
+            name_type: 3,
+            name_string: vec![gs("a/b"), gs("h@x\\y\tz")],
+        };
+        let e = convert_to_enterprise(&name, "R").expect("enterprise");
+        assert_eq!(e.name_type, NT_ENTERPRISE);
+        assert_eq!(e.name_string.len(), 1);
+        assert_eq!(e.name_string[0].as_bytes(), b"a/b/h@x\\y\tz@R");
+    }
+}

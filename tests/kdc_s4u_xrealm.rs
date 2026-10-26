@@ -62,7 +62,8 @@ fn enterprise(name: &str) -> PrincipalName {
 #[derive(Default)]
 struct AliasStore {
     inner: MemoryStore,
-    aliases: Vec<(PrincipalName, PrincipalName)>,
+    /// Alias, target name, target realm (another realm: a client referral).
+    aliases: Vec<(PrincipalName, PrincipalName, Option<String>)>,
 }
 
 impl PrincipalStore for AliasStore {
@@ -71,12 +72,18 @@ impl PrincipalStore for AliasStore {
         name: &PrincipalName,
         realm: &str,
     ) -> Result<Option<PrincipalEntry>, StoreError> {
-        let name = self
+        match self
             .aliases
             .iter()
-            .find(|(alias, _)| alias.name_string == name.name_string)
-            .map_or(name, |(_, target)| target);
-        self.inner.lookup(name, realm).await
+            .find(|(alias, _, _)| alias.name_string == name.name_string)
+        {
+            Some((_, target, r)) => {
+                self.inner
+                    .lookup(target, r.as_deref().unwrap_or(realm))
+                    .await
+            }
+            None => self.inner.lookup(name, realm).await,
+        }
     }
 }
 
@@ -121,16 +128,31 @@ fn world(enterprise_alias: bool, rbcd: bool) -> World {
             none,
         )
         .expect("alice");
-    u.inner
-        .add_with_password(
-            PrincipalName::new_principal("xuser"),
-            UREALM,
-            PASSWORD,
-            1,
-            &[18, 17],
-            none,
-        )
-        .expect("xuser");
+    let preauth = PrincipalAttributes::REQUIRES_PRE_AUTH;
+    for (store, realm) in [(&mut u.inner, UREALM), (&mut s.inner, UREALM)] {
+        store
+            .add_with_password(
+                PrincipalName::new_principal("xuser"),
+                realm,
+                PASSWORD,
+                1,
+                &[18, 17],
+                preauth,
+            )
+            .expect("xuser");
+    }
+    // t_s4u.py "cross-realm S4U2Self with enterprise name": S.REALM refers
+    // the enterprise user to U.REALM, which resolves it to xuser.
+    s.aliases.push((
+        enterprise("enterprise@abc"),
+        PrincipalName::new_principal("xuser"),
+        Some(UREALM.into()),
+    ));
+    u.aliases.push((
+        enterprise("enterprise@abc"),
+        PrincipalName::new_principal("xuser"),
+        None,
+    ));
     u.inner
         .add_random_key(target(), UREALM, 1, &[18, 17], none)
         .expect("target");
@@ -144,6 +166,7 @@ fn world(enterprise_alias: bool, rbcd: bool) -> World {
         u.aliases.push((
             enterprise(&format!("HTTP/svc.s.realm@{SREALM}")),
             tgs_name(SREALM),
+            None,
         ));
     }
     let service_key = key(&s.inner, &service(), SREALM);
@@ -329,4 +352,65 @@ async fn s4u2proxy_into_a_target_without_rbcd_entry_is_refused() {
         .await;
     assert_eq!(kdc_code(&r), 13);
     assert_eq!(realms, [SREALM, SREALM, UREALM, UREALM]);
+}
+
+#[cfg(feature = "client")]
+mod client_layer {
+    use super::*;
+    use krb5_rs::client::{HostCanonicalization, KerberosClient};
+    use krb5_rs::transport::KdcTransport;
+    use std::sync::Arc;
+
+    struct Route(Arc<World>);
+
+    impl KdcTransport for Route {
+        async fn send_recv(&self, realm: &str, message: &[u8]) -> Result<Vec<u8>, Krb5Error> {
+            Ok(self.0.send(realm, message).await)
+        }
+    }
+
+    #[tokio::test]
+    async fn enterprise_user_realm_is_identified_by_client_referral() {
+        let w = Arc::new(world(true, false));
+        let tgt = w.login(service()).await;
+        let client = KerberosClient::new(SREALM, Route(Arc::clone(&w)));
+        let cred = client
+            .get_credentials_for_user(
+                &tgt,
+                &enterprise("enterprise@abc"),
+                "NOREALM",
+                TgsOptions::default(),
+            )
+            .await
+            .expect("S4U2Self for an enterprise user");
+        // As in t_s4u.py: "TGS reply is for enterprise\@abc@UREALM".
+        assert_eq!(
+            cred.client.name_string,
+            enterprise("enterprise@abc").name_string
+        );
+        assert_eq!(cred.crealm, UREALM);
+        assert_eq!(cred.server.name_string, service().name_string);
+    }
+
+    #[tokio::test]
+    async fn proxy_target_short_name_is_qualified_like_k5_canonprinc() {
+        let w = Arc::new(world(false, true));
+        let (tgt, evidence) = evidence(&w).await;
+        let client = KerberosClient::new(SREALM, Route(Arc::clone(&w))).with_host_canonicalization(
+            HostCanonicalization {
+                qualify_shortname: Some("u.realm".into()),
+                rdns: false,
+                ..Default::default()
+            },
+        );
+        let short = PrincipalName::new_srv_hst("HTTP", "target");
+        let cred = client
+            .get_credentials_for_proxy(&tgt, &evidence, &short, TgsOptions::default())
+            .await
+            .expect("S4U2Proxy to the qualified name");
+        assert_eq!(cred.server, short);
+        assert_eq!(cred.srealm, UREALM);
+        let part = decrypt_ticket(&w.target_key, &cred.ticket).expect("decrypt");
+        assert_eq!(part.crealm.as_bytes(), SREALM.as_bytes());
+    }
 }

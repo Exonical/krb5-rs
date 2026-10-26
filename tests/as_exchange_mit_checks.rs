@@ -34,6 +34,15 @@ fn krb_error_realm(code: i32, realm: &str, e_data: Option<Vec<u8>>) -> Vec<u8> {
     krb_error_der(code, realm, Some(now()), e_data)
 }
 
+/// WRONG_REALM naming the client in `crealm` (get_in_tkt.c:1445-1458).
+fn client_referral(crealm: &str) -> Vec<u8> {
+    let mut e: krb5_rs::types::KrbErrorMsg =
+        rasn::der::decode(&krb_error(68, None)).expect("decode KRB-ERROR");
+    e.crealm = Some(GeneralString::from_bytes(crealm.as_bytes()).expect("realm"));
+    e.cname = Some(krb5_rs::types::PrincipalName::new_principal("user"));
+    rasn::der::encode(&e).expect("encode KRB-ERROR")
+}
+
 /// Build a DER-encoded KRB-ERROR for EXAMPLE.COM.
 fn krb_error(code: i32, e_data: Option<Vec<u8>>) -> Vec<u8> {
     krb_error_realm(code, REALM, e_data)
@@ -323,7 +332,7 @@ fn wrong_realm_restart_drops_cookie_and_preauth() {
     );
 
     let result = exchange
-        .step(&krb_error_realm(68, "OTHER.REALM", None))
+        .step(&client_referral("OTHER.REALM"))
         .expect("WRONG_REALM step");
     match result {
         StepResult::SendToKdc { data, realm } => {

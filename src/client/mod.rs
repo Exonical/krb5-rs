@@ -23,6 +23,10 @@
 /// MIT "retry with primary KDCs" rule (get_in_tkt.c:2005-2050).
 pub mod primary;
 
+/// Host-based service name canonicalization (MIT os/sn2princ.c).
+pub mod canonprinc;
+mod s4u;
+
 use crate::protocol::{
     AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
 };
@@ -30,6 +34,7 @@ use crate::transport::KdcTransport;
 use crate::types::PrincipalName;
 use crate::Krb5Error;
 
+pub use canonprinc::{CanonHost, HostCanonicalization};
 pub use primary::{get_tgt, is_unreach, with_primary_fallback};
 
 /// Maximum number of state machine steps before aborting.
@@ -53,6 +58,8 @@ pub struct KerberosClient<T: KdcTransport> {
     realm: String,
     /// Transport for communicating with the KDC.
     transport: T,
+    /// `[libdefaults]` host name canonicalization for S4U2Proxy targets.
+    host_canon: HostCanonicalization,
 }
 
 impl<T: KdcTransport> KerberosClient<T> {
@@ -65,7 +72,15 @@ impl<T: KdcTransport> KerberosClient<T> {
         Self {
             realm: realm.into(),
             transport,
+            host_canon: HostCanonicalization::default(),
         }
+    }
+
+    /// Use these host name canonicalization settings (MIT defaults
+    /// otherwise; see [`HostCanonicalization::from_profile`]).
+    pub fn with_host_canonicalization(mut self, settings: HostCanonicalization) -> Self {
+        self.host_canon = settings;
+        self
     }
 
     /// Get the realm this client is configured for.

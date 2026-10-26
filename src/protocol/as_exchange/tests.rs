@@ -136,7 +136,8 @@ fn test_exchange_wrong_realm_redirects() {
     let mut exchange = AsExchange::new(config, "password");
     let _result = exchange.step(&[]).expect("initial step");
 
-    let error_reply = build_krb_error(KDC_ERR_WRONG_REALM, Some("OTHER.REALM"));
+    // get_in_tkt.c:1445-1458: the error's client realm names the new realm.
+    let error_reply = build_referral_error(KDC_ERR_WRONG_REALM, "OTHER.REALM");
     let result = exchange.step(&error_reply).expect("should redirect");
     match result {
         StepResult::SendToKdc { realm, data } => {
@@ -206,6 +207,26 @@ fn build_krb_error(error_code: i32, server_realm: Option<&str>) -> Vec<u8> {
         e_data: None,
     };
     rasn::der::encode(&krb_error).expect("encode KRB-ERROR")
+}
+
+/// A client referral: KRB-ERROR naming the client in `crealm`.
+fn build_referral_error(error_code: i32, crealm: &str) -> Vec<u8> {
+    let mut e: KrbErrorMsg = rasn::der::decode(&build_krb_error(error_code, None)).expect("decode");
+    e.crealm = Some(GeneralString::from_bytes(crealm.as_bytes()).expect("realm"));
+    e.cname = Some(PrincipalName::new_principal("testuser"));
+    rasn::der::encode(&e).expect("encode KRB-ERROR")
+}
+
+#[test]
+fn test_exchange_wrong_realm_without_client_propagates() {
+    let config = AsExchangeConfig::new(PrincipalName::new_principal("testuser"), "EXAMPLE.COM");
+    let mut exchange = AsExchange::new(config, "password");
+    let _result = exchange.step(&[]).expect("initial step");
+    let error_reply = build_krb_error(KDC_ERR_WRONG_REALM, Some("OTHER.REALM"));
+    assert!(matches!(
+        exchange.step(&error_reply),
+        Err(Krb5Error::KdcError(_))
+    ));
 }
 
 /// Helper: build a DER-encoded KRB-ERROR with PREAUTH_REQUIRED and PA-ETYPE-INFO2.
