@@ -4,9 +4,10 @@
 //! OTHER.REALM (trust password "crosstrust", tests/kdc/setup-other.sh). MIT
 //! `kvno -I ... -P` runs in the other-realm container.
 //!
-//! Cross-realm S4U2Self is not exercised here: MIT's client asks the user's
-//! realm for an enterprise server name, which only MIT's test KDB module
-//! answers with a referral (db2 and LMDB do not).
+//! Cross-realm S4U2Self only fails here, for MIT's client and ours alike:
+//! both ask the user's realm for the service's enterprise name, which only
+//! MIT's test KDB module refers (db2 and LMDB do not). tests/kdc_s4u_xrealm.rs
+//! covers the full flow against such a KDB.
 //!
 //! Requires podman + both compose containers. Run with:
 //!   cargo test --all-features --test kdc_s4u_xrealm_live -- --ignored --test-threads=1
@@ -107,7 +108,8 @@ fn live() -> &'static Live {
                 CLIENT_SVC_PASSWORD,
                 1,
                 &[18, 17],
-                PrincipalAttributes::OK_TO_AUTH_AS_DELEGATE,
+                PrincipalAttributes::OK_TO_AUTH_AS_DELEGATE
+                    | PrincipalAttributes::REQUIRES_PRE_AUTH,
             )
             .expect("client service");
 
@@ -358,10 +360,7 @@ fn run_tgs(mut ex: TgsExchange) -> Result<Credential, Krb5Error> {
     }
 }
 
-#[test]
-#[ignore = "requires podman + both compose containers"]
-fn our_client_follows_cross_realm_s4u2self_referrals_through_mit() {
-    setup();
+fn login_client_service() -> Credential {
     let mut ex = AsExchange::new(
         AsExchangeConfig::new(svc("xs4uc.test.realm"), REALM),
         CLIENT_SVC_PASSWORD,
@@ -372,30 +371,87 @@ fn our_client_follows_cross_realm_s4u2self_referrals_through_mit() {
     {
         reply = send(&realm, &data);
     }
-    let tgt = ex.credential().expect("TGT").clone();
-    // A TGT to the user's realm first, as krb5_get_self_cred_from_kdc does.
-    let cross = run_tgs(TgsExchange::new(
-        tgt,
-        tgs(OTHER_REALM),
-        TgsOptions::default(),
-    ))
-    .expect("cross-realm TGT");
-    let opts = TgsOptions {
-        canonicalize: true,
-        ..TgsOptions::default()
-    };
-    let cred = run_tgs(TgsExchange::s4u2self(
-        cross,
+    ex.credential().expect("TGT").clone()
+}
+
+fn kdc_code(r: &Result<Credential, Krb5Error>) -> i32 {
+    match r {
+        Err(Krb5Error::KdcError(m)) => m.error_code,
+        other => panic!("expected KDC error, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires podman + both compose containers"]
+fn cross_realm_s4u2self_enterprise_request_is_unknown_to_mit_db_for_both_clients() {
+    setup();
+    let before = other_kdc_log().len();
+    let r = run_tgs(TgsExchange::s4u2self(
+        login_client_service(),
         PrincipalName::new_principal("xuser"),
         OTHER_REALM,
-        opts,
-    ))
-    .expect("cross-realm S4U2Self");
-    assert_eq!(
-        cred.client.name_string,
-        PrincipalName::new_principal("xuser").name_string
+        TgsOptions::default(),
+    ));
+    assert_eq!(kdc_code(&r), 7, "{r:?}");
+    let log = other_kdc_log();
+    let ours = &log[before.min(log.len())..];
+    let enterprise = format!("HTTP\\/xs4uc.test.realm\\@{REALM}@{OTHER_REALM}");
+    assert!(ours.contains(&enterprise), "{ours}");
+
+    // MIT's own client fails the same way.
+    let e = env("/tmp/cc_xs4u_self");
+    let (code, out) = run(
+        &format!("{e} kinit -k -t {OUR_KEYTAB} HTTP/xs4u.test.realm@{REALM}"),
+        None,
     );
-    assert_eq!(cred.crealm, OTHER_REALM);
-    assert_eq!(cred.server.name_string, svc("xs4uc.test.realm").name_string);
-    assert_eq!(cred.srealm, REALM);
+    assert_eq!(code, 0, "kinit -k: {out}");
+    let before = other_kdc_log().len();
+    let (code, out) = run(
+        &format!("{e} kvno -I xuser@{OTHER_REALM} HTTP/xs4u.test.realm@{REALM}"),
+        None,
+    );
+    assert_ne!(code, 0, "{out}");
+    assert!(out.contains("not found in Kerberos database"), "{out}");
+    let log = other_kdc_log();
+    let mit = &log[before.min(log.len())..];
+    let enterprise = format!("HTTP\\/xs4u.test.realm\\@{REALM}@{OTHER_REALM}");
+    assert!(mit.contains(&enterprise), "{mit}");
+}
+
+#[test]
+#[ignore = "requires podman + both compose containers"]
+fn our_client_follows_cross_realm_s4u2proxy_into_mit() {
+    setup();
+    let tgt = login_client_service();
+    let evidence = run_tgs(TgsExchange::s4u2self(
+        tgt.clone(),
+        PrincipalName::new_principal("tuser"),
+        REALM,
+        TgsOptions::default(),
+    ))
+    .expect("S4U2Self");
+    let before = other_kdc_log().len();
+    let r = run_tgs(TgsExchange::s4u2proxy(
+        tgt,
+        evidence,
+        svc("target.other.realm"),
+        TgsOptions::default(),
+    ));
+    // As with MIT's kvno -P above: MIT gets the final request with our
+    // proxy TGT and refuses at its policy stage, having no RBCD lists.
+    assert_eq!(kdc_code(&r), 13, "{r:?}");
+    let log = other_kdc_log();
+    let log = &log[before.min(log.len())..];
+    assert!(
+        log.contains(&format!("HTTP/target.other.realm@{OTHER_REALM}")),
+        "{log}"
+    );
+    assert!(log.contains("UNSUPPORTED_S4U2PROXY_REQUEST"), "{log}");
+    for bad in [
+        "S4U2PROXY_CROSS_STKT_PAC",
+        "XREALM_EVIDENCE_TICKET_MISMATCH",
+        "RBCD_PAC_PRINC",
+    ] {
+        assert!(!log.contains(bad), "{log}");
+    }
 }

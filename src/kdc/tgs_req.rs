@@ -219,7 +219,7 @@ impl<S: PrincipalStore> Kdc<S> {
 
     /// `search_sprinc` (do_tgs_req.c:541-581): the requested server, else a
     /// referral TGT, else an alternate cross-realm TGT. Returns whether a
-    /// referral/alternate TGT is being issued (:668-671).
+    /// referral/alternate TGT is being issued (:674-677).
     async fn search_sprinc(
         &self,
         opts: KdcOptions,
@@ -233,7 +233,11 @@ impl<S: PrincipalStore> Kdc<S> {
             .ok()
             .flatten()
         {
-            return Ok((found, false));
+            // A cross-realm TGT found for another name (a KDB alias) is a
+            // referral too (do_tgs_req.c:674-677).
+            let referral =
+                is_cross_tgs(&found.name, realm) && found.name.name_string != sname.name_string;
+            return Ok((found, referral));
         }
         if opts.intersects(NON_TGT_OPTION | KdcOptions::ENC_TKT_IN_SKEY) {
             return Err(unknown());

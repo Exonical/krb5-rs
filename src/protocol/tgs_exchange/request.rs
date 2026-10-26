@@ -31,17 +31,14 @@ impl TgsExchange {
         let realm = GeneralString::from_bytes(target_realm.as_bytes())
             .map_err(|_| Krb5Error::ReplyValidation("invalid realm string"))?;
 
-        let mut kdc_opts = KdcOptions::empty();
-        if self.options.renewable {
-            kdc_opts |= KdcOptions::RENEWABLE;
-        }
-        if self.options.forwardable {
-            kdc_opts |= KdcOptions::FORWARDABLE;
-        }
-        if canonicalize {
-            kdc_opts |= KdcOptions::CANONICALIZE;
-        }
-        kdc_opts |= self.s4u_kdc_options();
+        let kdc_opts = match self.s4u_kdc_options() {
+            Some(opts) => opts,
+            None => self.kdc_options(canonicalize),
+        };
+        let sname = match self.s4u_request_server()? {
+            Some(server) => server,
+            None => self.target_server.clone(),
+        };
 
         // Request 10h lifetime; KDC will cap to its policy maximum
         let till = now_kerberos()
@@ -52,7 +49,7 @@ impl TgsExchange {
             kdc_options: KerberosFlags::new(kdc_opts),
             cname: None, // TGS-REQ does not include cname in body
             realm,
-            sname: Some(self.target_server.clone()),
+            sname: Some(sname),
             from: None,
             till,
             rtime: None,
@@ -80,7 +77,7 @@ impl TgsExchange {
         let mut padata = vec![pa_tgs_req];
 
         // Add PA-PAC-OPTIONS if requested
-        if self.options.pac_options && !self.s4u_replaces_pac_options() {
+        if self.options.pac_options && !self.is_s4u() {
             padata.push(build_pa_pac_options()?);
         }
         padata.extend(self.s4u_request_padata(&subkey)?);
@@ -101,6 +98,21 @@ impl TgsExchange {
         self.last_req_bytes = der.clone();
 
         Ok(der)
+    }
+
+    /// KDC options for an ordinary request.
+    fn kdc_options(&self, canonicalize: bool) -> KdcOptions {
+        let mut kdc_opts = KdcOptions::empty();
+        if self.options.renewable {
+            kdc_opts |= KdcOptions::RENEWABLE;
+        }
+        if self.options.forwardable {
+            kdc_opts |= KdcOptions::FORWARDABLE;
+        }
+        if canonicalize {
+            kdc_opts |= KdcOptions::CANONICALIZE;
+        }
+        kdc_opts
     }
 
     /// Build PA-TGS-REQ padata: AP-REQ wrapping the TGT with keyed checksum.

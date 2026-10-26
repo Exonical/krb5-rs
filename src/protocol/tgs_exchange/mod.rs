@@ -216,6 +216,9 @@ impl TgsExchange {
     /// On the first call, pass an empty slice. On subsequent calls, pass
     /// the KDC's response bytes.
     pub fn step(&mut self, kdc_reply: &[u8]) -> Result<TgsStepResult, Krb5Error> {
+        if let Some(step) = self.s4u_user_tgt_step(kdc_reply)? {
+            return Ok(step);
+        }
         match &self.state {
             TgsState::Begin => self.begin(),
             TgsState::AwaitReply { .. } => self.process_reply(kdc_reply),
@@ -383,14 +386,7 @@ impl TgsExchange {
         self.validate_tgs_reply(rep, &enc_part)?;
 
         if self.is_s4u() {
-            // S4U2Self referral hops are followed like krb5_get_self_cred_from_kdc
-            // (s4u_creds.c:89-200); the cross-realm S4U2Proxy chain is not.
-            if self.is_referral_tgt(&enc_part) && matches!(self.s4u, s4u::S4uMode::Proxy { .. }) {
-                return Err(Krb5Error::ReplyValidation(
-                    "cross-realm S4U2Proxy referral is not supported",
-                ));
-            }
-            self.verify_s4u2self_reply(rep.padata.as_deref(), &enc_part)?;
+            return self.s4u_reply(rep, &enc_part);
         }
 
         // Check if this is a referral TGT or the actual service ticket
@@ -402,9 +398,6 @@ impl TgsExchange {
 
         // Service ticket — build credential and complete
         let cred = crate::protocol::kdc_rep::credential_from_rep(rep, &enc_part);
-        if self.is_s4u() {
-            self.s4u_check_credential(&cred)?;
-        }
         self.credential = Some(cred);
         self.state = TgsState::Complete;
         Ok(TgsStepResult::Complete)
@@ -445,23 +438,15 @@ impl TgsExchange {
         rep: &crate::types::KdcRep,
         enc_part: &EncKdcRepPart,
     ) -> Result<(), Krb5Error> {
-        // Client principal must match the TGT holder
-        // An S4U referral TGT is issued to the requesting service itself.
-        let (expected_name, expected_realm) = if self.is_s4u() && self.is_referral_tgt(enc_part) {
-            (self.cur_tgt.client.clone(), self.cur_tgt.crealm.clone())
-        } else {
-            self.expected_client()
-        };
-        let name_ok = if self.is_s4u() {
-            rep.cname.name_string == expected_name.name_string
-        } else {
-            rep.cname == expected_name
-        };
-        if !name_ok {
-            return Err(Krb5Error::ReplyValidation("client principal mismatch"));
-        }
-        if rep.crealm.as_bytes() != expected_realm.as_bytes() && !self.is_s4u() {
-            return Err(Krb5Error::ReplyValidation("client realm mismatch"));
+        // Client principal must match the TGT holder; S4U replies are
+        // checked per step (s4u.rs).
+        if !self.is_s4u() {
+            if rep.cname != self.cur_tgt.client {
+                return Err(Krb5Error::ReplyValidation("client principal mismatch"));
+            }
+            if rep.crealm.as_bytes() != self.cur_tgt.crealm.as_bytes() {
+                return Err(Krb5Error::ReplyValidation("client realm mismatch"));
+            }
         }
 
         // Nonce must match
@@ -484,7 +469,8 @@ impl TgsExchange {
         // For non-referral replies, the service principal must match what we requested
         // when canonicalization is not in use. With CANONICALIZE, the KDC may return
         // a canonicalized SPN. Referral TGTs are validated in handle_referral().
-        if !self.is_referral_tgt(enc_part)
+        if !self.is_s4u()
+            && !self.is_referral_tgt(enc_part)
             && !self.options.canonicalize
             && enc_part.sname.name_string != self.target_server.name_string
         {
