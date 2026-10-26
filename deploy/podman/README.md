@@ -303,8 +303,9 @@ loginctl enable-linger "$USER"        # keep it running without a login session
 
 System-wide, copy both files to `/etc/containers/systemd/` and use
 `systemctl daemon-reload && systemctl start krb5-rs-kdc.service`. The unit
-publishes host port 88 itself (`PublishPort=`), so the rootless port note above
-applies; edit `PublishPort=` to use another host port.
+publishes host ports 88, 749 and 464 itself (`PublishPort=`), so the rootless
+port notes above apply; edit `PublishPort=` to use other host ports, and drop
+the 749 and 464 lines if you remove the `kadmind` container.
 
 ## Verified
 
