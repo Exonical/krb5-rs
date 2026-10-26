@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use krb5_rs::gssapi::krb5::Krb5Acceptor;
-use krb5_rs::kdc::kdb::admin::{AdminOps, PolicyChange};
+use krb5_rs::kdc::kdb::admin::{AdminOps, AttrChange, PolicyChange, PrincipalOptions};
 use krb5_rs::kdc::kdb::kadm5::mask as kmask;
 use krb5_rs::kdc::kdb::kadm5::{self, code, PrincipalEnt, ReadArgs, KADM_PROG, KADM_VERS};
 use krb5_rs::kdc::kdb::kpasswd::{process_request, Service, KPASSWD_PORT};
@@ -21,6 +21,8 @@ use krb5_rs::kdc::kdb::mit::{parse_name_with_default, MitEntry};
 use krb5_rs::kdc::kdb::mit::{set_mod_princ, set_string_attr, TlData};
 use krb5_rs::kdc::kdb::read_stash;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
+use krb5_rs::kdc::kdb::restrictions::RestrictedEntry;
+use krb5_rs::kdc::kerberos_time;
 use krb5_rs::kdc::store::{AdminStore, Policy, StoreError, StoreErrorKind};
 use krb5_rs::kdc::{default_realm, salt_bytes, PrincipalAttributes, RealmConfig};
 use krb5_rs::profile::Profile;
@@ -780,6 +782,62 @@ impl Kadm5 {
     }
 }
 
+/// The `PrincipalOptions` for a kadm5 principal record and mask, after
+/// `impose_restrictions`; also returns the restricted mask.
+fn principal_options(
+    rec: &kadm5::PrincipalEnt,
+    mask: i32,
+    restr: Option<&AclRestrictions>,
+) -> (PrincipalOptions, u32) {
+    use kmask as m;
+    let mut ent = RestrictedEntry {
+        attributes: rec.attributes,
+        policy: rec
+            .policy
+            .as_deref()
+            .map(|p| String::from_utf8_lossy(p).into_owned()),
+        princ_expire_time: rec.princ_expire_time as i32,
+        pw_expiration: rec.pw_expiration as i32,
+        max_life: rec.max_life as i32,
+        max_renewable_life: rec.max_renewable_life as i32,
+    };
+    let mut mask = mask as u32;
+    if let Some(r) = restr {
+        r.impose(&mut ent, &mut mask, unix_now() as i32);
+    }
+    let on = |b: i32| mask & b as u32 != 0;
+    let time = |t: i32| (t != 0).then(|| kerberos_time(i64::from(t as u32)));
+    let life = |t: i32| (t != 0).then(|| Duration::from_secs(u64::from(t as u32)));
+    let mut opts = PrincipalOptions::default();
+    if on(m::ATTRIBUTES) {
+        opts.attributes = AttrChange {
+            set: ent.attributes,
+            clear: !ent.attributes,
+        };
+    }
+    if on(m::MAX_LIFE) {
+        opts.max_life = Some(life(ent.max_life));
+    }
+    if on(m::MAX_RLIFE) {
+        opts.max_renewable_life = Some(life(ent.max_renewable_life));
+    }
+    if on(m::PRINC_EXPIRE_TIME) {
+        opts.expiration = Some(time(ent.princ_expire_time));
+    }
+    if on(m::PW_EXPIRATION) {
+        opts.pw_expiration = Some(time(ent.pw_expiration));
+    }
+    if on(m::POLICY) {
+        opts.policy = Some(ent.policy.clone());
+    } else if on(m::POLICY_CLR) {
+        opts.policy = Some(None);
+    }
+    if on(m::FAIL_AUTH_COUNT) {
+        opts.unlock = true;
+    }
+    (opts, mask)
+}
+
 /// `KRB5_TL_ALIAS_TARGET` (`kdb.h`).
 const ALIAS_TARGET: u16 = 0x000c;
 
@@ -971,6 +1029,10 @@ impl Kadm5 {
             W::CreateAlias { alias, target, .. } => {
                 self.create_alias(caller, alias.as_deref(), target.as_deref())
             }
+            W::CreatePrincipal {
+                rec, mask, passwd, ..
+            } => self.create_principal(caller, &rec, mask, passwd.as_deref()),
+            W::ModifyPrincipal { rec, mask, .. } => self.modify_principal(caller, &rec, mask),
             W::DeletePrincipal { princ, .. } => self.delete_principal(caller, princ.as_deref()),
             W::SetString {
                 princ, key, value, ..
@@ -1276,6 +1338,134 @@ impl Kadm5 {
             }
         };
         caller.log_done(op, &prime, c);
+        c
+    }
+
+    /// `stub_auth_restr`: the ACL check that also yields restrictions.
+    fn acl_restr(
+        &self,
+        caller: &Caller<'_>,
+        op: u32,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Option<Option<AclRestrictions>> {
+        acl_check(
+            &self.acl,
+            op,
+            (&caller.client, &caller.crealm),
+            Some((name, realm)),
+        )
+        .map(|r| r.cloned())
+    }
+
+    fn create_principal(
+        &self,
+        caller: &Caller<'_>,
+        rec: &kadm5::PrincipalEnt,
+        mask: i32,
+        passwd: Option<&str>,
+    ) -> u32 {
+        use kmask as m;
+        let op = "kadm5_create_principal";
+        let princ = rec.principal.as_deref().map(String::from_utf8_lossy);
+        let (name, realm, target) = match self.name(princ.as_deref()) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let restr = match self.acl_restr(caller, ACL_ADD, &name, &realm) {
+            Some(r) if !caller.changepw => r,
+            _ => {
+                caller.log_unauth(op, &target);
+                return code::AUTH_ADD;
+            }
+        };
+        let forbidden = m::MOD_NAME
+            | m::MOD_TIME
+            | m::LAST_PWD_CHANGE
+            | m::MKVNO
+            | m::AUX_ATTRIBUTES
+            | m::LAST_SUCCESS
+            | m::LAST_FAILED
+            | m::FAIL_AUTH_COUNT;
+        let c = if mask & m::PRINCIPAL == 0
+            || mask & forbidden != 0
+            || (mask & m::KEY_DATA != 0 && !rec.key_data.is_empty())
+            || (mask & m::POLICY != 0 && rec.policy.is_none())
+            || (mask & m::POLICY != 0 && mask & m::POLICY_CLR != 0)
+            || mask & !m::ALL_PRINC_MASK != 0
+        {
+            code::BAD_MASK
+        } else if mask & m::TL_DATA != 0 && rec.tl_data.iter().any(|t| t.kind < 256) {
+            code::BAD_TL_TYPE
+        } else {
+            let (opts, _) = principal_options(rec, mask, restr.as_ref());
+            match run(self
+                .admin(caller)
+                .add_principal(&name, &realm, passwd, &opts))
+            {
+                Ok(()) => code::OK,
+                Err(e) => store_code(&e, code::UNK_POLICY),
+            }
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    fn modify_principal(&self, caller: &Caller<'_>, rec: &kadm5::PrincipalEnt, mask: i32) -> u32 {
+        use kmask as m;
+        let op = "kadm5_modify_principal";
+        let princ = rec.principal.as_deref().map(String::from_utf8_lossy);
+        let (name, realm, target) = match self.name(princ.as_deref()) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let restr = match self.acl_restr(caller, ACL_MODIFY, &name, &realm) {
+            Some(r) if !caller.changepw => r,
+            _ => {
+                caller.log_unauth(op, &target);
+                return code::AUTH_MODIFY;
+            }
+        };
+        if mask & m::ATTRIBUTES != 0 && rec.attributes & LOCKDOWN_KEYS == 0 {
+            match self.lockdown(&name, &realm) {
+                Ok(true) => {
+                    caller.log_unauth(op, &target);
+                    return code::AUTH_MODIFY;
+                }
+                Ok(false) => {}
+                Err(c) => {
+                    caller.log_done(op, &target, c);
+                    return c;
+                }
+            }
+        }
+        let forbidden = m::PRINCIPAL
+            | m::LAST_PWD_CHANGE
+            | m::MOD_TIME
+            | m::MOD_NAME
+            | m::MKVNO
+            | m::AUX_ATTRIBUTES
+            | m::KEY_DATA
+            | m::LAST_SUCCESS
+            | m::LAST_FAILED;
+        let c = if mask & forbidden != 0
+            || mask & !m::ALL_PRINC_MASK != 0
+            || (mask & m::POLICY != 0 && rec.policy.is_none())
+            || (mask & m::POLICY != 0 && mask & m::POLICY_CLR != 0)
+        {
+            code::BAD_MASK
+        } else if mask & m::TL_DATA != 0 && rec.tl_data.iter().any(|t| t.kind < 256) {
+            code::BAD_TL_TYPE
+        } else if mask & m::FAIL_AUTH_COUNT != 0 && rec.fail_auth_count != 0 {
+            code::BAD_SERVER_PARAMS
+        } else {
+            let (opts, _) = principal_options(rec, mask, restr.as_ref());
+            match run(self.admin(caller).modify_principal(&name, &realm, &opts)) {
+                Ok(()) => code::OK,
+                Err(e) => store_code(&e, code::UNK_PRINC),
+            }
+        };
+        caller.log_done(op, &target, c);
         c
     }
 
