@@ -148,6 +148,13 @@ pub struct RealmConfig {
     /// `default_principal_expiration` from the realm section
     /// (`lib/kadm5/alt_prof.c:580-594`, `include/k5-int.h:199`).
     pub default_principal_expiration: Option<KerberosTime>,
+    /// `max_renewable_life` as kadmind reads it for new principals: unlike
+    /// the KDC it defaults to zero (`lib/kadm5/alt_prof.c:577-578`).
+    pub admin_max_renewable_life: Duration,
+    /// `default_principal_flags`, parsed like `alt_prof.c:596-632`: flag
+    /// specs separated by commas or whitespace, stopping at the first
+    /// invalid one.
+    pub default_principal_flags: u32,
     /// UDP listen addresses (`kdc_listen` / `kdc_ports`).
     pub udp_listen: Vec<SocketAddr>,
     /// TCP listen addresses (`kdc_tcp_listen` / `kdc_tcp_ports`, defaulting
@@ -263,6 +270,16 @@ impl RealmConfig {
             &["realms", realm, "max_renewable_life"],
             DEFAULT_MAX_RENEWABLE_LIFE,
         )?;
+        let admin_max_renewable_life =
+            deltat(kdc_conf, &["realms", realm, "max_renewable_life"], 0)?;
+        let mut default_principal_flags = super::kdb::admin::AttrChange::default();
+        if let Some(value) = r("default_principal_flags") {
+            for spec in value.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+                if default_principal_flags.add_spec(spec).is_err() {
+                    break;
+                }
+            }
+        }
         let default_principal_expiration = r("default_principal_expiration")
             .map(|value| {
                 super::kdb::admin::parse_time(&value)
@@ -401,6 +418,10 @@ impl RealmConfig {
                 .unwrap_or(18),
             supported_keysalts,
             default_principal_expiration,
+            default_principal_flags: default_principal_flags.set,
+            admin_max_renewable_life: Duration::from_secs(
+                u64::try_from(admin_max_renewable_life).unwrap_or(0),
+            ),
             udp_listen: parse_listen_addresses(&udp_str, DEFAULT_PORT)?,
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
             db_module,
@@ -530,6 +551,7 @@ default_principal_flags = +preauth\n    }\n";
             PathBuf::from("/var/lib/krb5kdc/principal")
         );
         assert_eq!(cfg.key_stash_file, PathBuf::from("/etc/krb5kdc/stash"));
+        assert_eq!(cfg.default_principal_flags, 0x80);
         assert_eq!(cfg.kdc.max_life, Duration::from_secs(24 * 3600));
         assert_eq!(
             cfg.kdc.max_renewable_life,

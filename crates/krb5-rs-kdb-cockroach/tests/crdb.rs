@@ -2117,18 +2117,19 @@ async fn the_same_admin_scenario_gives_the_same_entries_on_file_and_cockroach() 
             .await
             .expect_err("gone");
         log.push(format!("missing: {:?}", missing.kind()));
-        let bad = o
-            .modify_principal(
-                &name("alice"),
-                REALM,
-                &PrincipalOptions {
-                    policy: Some(Some("nope".into())),
-                    ..PrincipalOptions::default()
-                },
-            )
-            .await
-            .expect_err("policy");
-        log.push(format!("badpol: {:?}", bad.kind()));
+        // As in MIT, a missing policy is stored and counts as no policy.
+        o.modify_principal(
+            &name("alice"),
+            REALM,
+            &PrincipalOptions {
+                policy: Some(Some("nope".into())),
+                ..PrincipalOptions::default()
+            },
+        )
+        .await
+        .expect("missing policy");
+        let rec = o.get_principal(&name("alice"), REALM).await.expect("get");
+        log.push(format!("badpol: {:?}", rec.entry.policy));
         for p in o.list_principals().await.expect("list") {
             if p.starts_with("alice") {
                 let rec = o.get_principal(&name("alice"), REALM).await.expect("get");

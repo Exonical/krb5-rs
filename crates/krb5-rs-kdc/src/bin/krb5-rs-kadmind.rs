@@ -11,21 +11,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use krb5_rs::gssapi::krb5::Krb5Acceptor;
-use krb5_rs::kdc::kdb::admin::AdminOps;
+use krb5_rs::kdc::kdb::admin::{AdminOps, AttrChange, PolicyChange, PrincipalOptions};
+use krb5_rs::kdc::kdb::kadm5::mask as kmask;
 use krb5_rs::kdc::kdb::kadm5::{self, code, PrincipalEnt, ReadArgs, KADM_PROG, KADM_VERS};
 use krb5_rs::kdc::kdb::kpasswd::{process_request, Service, KPASSWD_PORT};
 use krb5_rs::kdc::kdb::kprop::ReplayCache;
+use krb5_rs::kdc::kdb::master::encrypt_key;
+use krb5_rs::kdc::kdb::mit::mkey::entry_mkvno;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
 use krb5_rs::kdc::kdb::mit::{parse_name_with_default, MitEntry};
+use krb5_rs::kdc::kdb::mit::{
+    set_key_change, set_mod_princ, set_string_attr, KeyData as MitKeyData, TlData,
+};
 use krb5_rs::kdc::kdb::read_stash;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
-use krb5_rs::kdc::{default_realm, RealmConfig};
+use krb5_rs::kdc::kdb::restrictions::RestrictedEntry;
+use krb5_rs::kdc::kerberos_time;
+use krb5_rs::kdc::store::{AdminStore, Policy, StoreError, StoreErrorKind};
+use krb5_rs::kdc::{default_realm, salt_bytes, PrincipalAttributes, RealmConfig};
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::ap::{ApError, KeySource};
 use krb5_rs::rpc::gss::{GssServer, ServerStep};
 use krb5_rs::rpc::{read_record, write_record, AcceptStat, AuthStat, Call, CallError, Reply};
 use krb5_rs::types::{EncryptionKey, PrincipalName};
-use krb5_rs_kdb_lmdb::LmdbStore;
+use krb5_rs_kdb_lmdb::{CallerStore, LmdbStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -562,6 +571,16 @@ struct Kadm5 {
     realm: String,
     store: Arc<LmdbStore>,
     acl: Arc<Vec<AclEntry>>,
+    keysalts: Vec<(i32, krb5_rs::crypto::SaltType)>,
+    history_enctype: i32,
+    /// Realm `max_life`, `max_renewable_life` and
+    /// `default_principal_expiration`, used by create when the mask omits
+    /// them (svr_principal.c:410-429).
+    max_life: Duration,
+    max_rlife: Duration,
+    expiration: Option<krb5_rs::types::KerberosTime>,
+    /// `default_principal_flags`.
+    flags: u32,
 }
 
 /// The authenticated caller of one kadm5 call (`stub_setup`).
@@ -571,6 +590,8 @@ struct Caller<'a> {
     client_name: String,
     service_name: String,
     changepw: bool,
+    /// The service ticket was an initial ticket (`ticket_is_initial`).
+    initial: bool,
     from: &'a SocketAddr,
 }
 
@@ -600,6 +621,17 @@ impl Caller<'_> {
 
     fn is(&self, name: &PrincipalName, realm: &str) -> bool {
         self.client == *name && self.crealm == realm
+    }
+}
+
+/// `clamp_self_keepold` (`server_stubs.c:391-399`): changing one's own keys
+/// keeps at most `MAX_SELF_KEEPOLD` key versions.
+fn clamp_keepold(caller: &Caller<'_>, name: &PrincipalName, realm: &str, keepold: bool) -> u32 {
+    const MAX_SELF_KEEPOLD: u32 = 5;
+    match (keepold, caller.is(name, realm)) {
+        (false, _) => 0,
+        (true, true) => MAX_SELF_KEEPOLD,
+        (true, false) => 1,
     }
 }
 
@@ -773,6 +805,1217 @@ impl Kadm5 {
     }
 }
 
+/// The `PrincipalOptions` for a kadm5 principal record and mask, after
+/// `impose_restrictions`; also returns the restricted mask.
+fn principal_options(
+    rec: &kadm5::PrincipalEnt,
+    mask: i32,
+    restr: Option<&AclRestrictions>,
+) -> (PrincipalOptions, u32) {
+    use kmask as m;
+    let mut ent = RestrictedEntry {
+        attributes: rec.attributes,
+        policy: rec
+            .policy
+            .as_deref()
+            .map(|p| String::from_utf8_lossy(p).into_owned()),
+        princ_expire_time: rec.princ_expire_time as i32,
+        pw_expiration: rec.pw_expiration as i32,
+        max_life: rec.max_life as i32,
+        max_renewable_life: rec.max_renewable_life as i32,
+    };
+    let mut mask = mask as u32;
+    if let Some(r) = restr {
+        r.impose(&mut ent, &mut mask, unix_now() as i32);
+    }
+    let on = |b: i32| mask & b as u32 != 0;
+    let time = |t: i32| (t != 0).then(|| kerberos_time(i64::from(t as u32)));
+    let life = |t: i32| (t != 0).then(|| Duration::from_secs(u64::from(t as u32)));
+    let mut opts = PrincipalOptions::default();
+    if on(m::ATTRIBUTES) {
+        opts.attributes = AttrChange {
+            set: ent.attributes,
+            clear: !ent.attributes,
+        };
+    }
+    if on(m::MAX_LIFE) {
+        opts.max_life = Some(life(ent.max_life));
+    }
+    if on(m::MAX_RLIFE) {
+        opts.max_renewable_life = Some(life(ent.max_renewable_life));
+    }
+    if on(m::PRINC_EXPIRE_TIME) {
+        opts.expiration = Some(time(ent.princ_expire_time));
+    }
+    if on(m::PW_EXPIRATION) {
+        opts.pw_expiration = Some(time(ent.pw_expiration));
+    }
+    if on(m::POLICY) {
+        opts.policy = Some(ent.policy.clone());
+    } else if on(m::POLICY_CLR) {
+        opts.policy = Some(None);
+    }
+    if on(m::FAIL_AUTH_COUNT) {
+        opts.unlock = true;
+    }
+    (opts, mask)
+}
+
+/// Normalize the three setkey argument forms to `kadm5_key_data`
+/// (`setkey_principal{,3}` in `svr_principal.c` pass kvno 0 and the
+/// default or tuple salt type).
+fn setkey_data(keys: kadm5::SetKeys) -> Result<Vec<kadm5::KeyData>, u32> {
+    let block = |key: kadm5::KeyBlock, salt_type: i16| kadm5::KeyData {
+        kvno: 0,
+        key,
+        salt_type,
+        salt: Vec::new(),
+    };
+    match keys {
+        kadm5::SetKeys::V1(blocks) => Ok(blocks.into_iter().map(|b| block(b, 0)).collect()),
+        kadm5::SetKeys::V3(ks, blocks) => {
+            if ks.len() != blocks.len() || ks.iter().zip(&blocks).any(|(t, b)| t.0 != b.enctype) {
+                return Err(code::SETKEY3_ETYPE_MISMATCH);
+            }
+            ks.iter()
+                .zip(blocks)
+                .map(|(t, b)| {
+                    i16::try_from(t.1)
+                        .map(|st| block(b, st))
+                        .map_err(|_| code::BAD_KEYSALTS)
+                })
+                .collect()
+        }
+        kadm5::SetKeys::V4(data) => Ok(data),
+    }
+}
+
+/// `KRB5_TL_ALIAS_TARGET` (`kdb.h`).
+const ALIAS_TARGET: u16 = 0x000c;
+
+fn tl_bytes(e: &MitEntry, kind: u16) -> Option<&[u8]> {
+    e.tl_data
+        .iter()
+        .find(|t| t.kind == kind)
+        .map(|t| t.data.as_slice())
+}
+
+/// `krb5_dbe_specialize_salt` (`lib/kdb/kdb5.c:2391-2421`): store every
+/// salt explicitly so it survives the rename.
+fn specialize_salt(e: &mut MitEntry) {
+    use krb5_rs::crypto::SaltType;
+    for k in &mut e.key_data {
+        let (stype, contents) = k.fields.get(1).cloned().unwrap_or((0, Vec::new()));
+        let salt = match (k.ver, stype) {
+            (1, _) | (_, 0) => salt_bytes(&e.principal, &e.realm, SaltType::Normal),
+            (_, 2) => salt_bytes(&e.principal, &e.realm, SaltType::NoRealm),
+            (_, 3) => e.realm.as_bytes().to_vec(),
+            _ => contents,
+        };
+        k.fields.truncate(1);
+        k.fields.push((4, salt));
+        k.ver = 2;
+    }
+}
+
+/// `KRB5_KDB_LOCKDOWN_KEYS` (`kdb.h`).
+const LOCKDOWN_KEYS: u32 = 0x0080_0000;
+
+fn run<F: std::future::Future>(f: F) -> F::Output {
+    // kadm5 calls run on the blocking pool (`serve`).
+    tokio::runtime::Handle::current().block_on(f)
+}
+
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
+}
+
+/// The kadm5 code for a store failure; `unknown` for a missing entry.
+fn store_code(e: &StoreError, unknown: u32) -> u32 {
+    const REJECTED: [(&str, u32); 4] = [
+        ("Password is too short", code::PASS_Q_TOOSHORT),
+        (
+            "Password does not contain enough character classes",
+            code::PASS_Q_CLASS,
+        ),
+        ("Cannot reuse password", code::PASS_REUSE),
+        ("Cannot change protected principal", code::PROTECT_PRINCIPAL),
+    ];
+    let c = match e.kind() {
+        StoreErrorKind::NotFound => unknown,
+        StoreErrorKind::Conflict => code::DUP,
+        StoreErrorKind::Rejected => REJECTED
+            .iter()
+            .find(|(t, _)| e.message().contains(t))
+            .map_or(code::FAILURE, |(_, c)| *c),
+        _ => code::FAILURE,
+    };
+    if c == code::FAILURE {
+        eprintln!("krb5-rs-kadmind: {e}");
+    }
+    c
+}
+
+fn policy_change(rec: &kadm5::PolicyEnt, mask: i32, api: u32) -> PolicyChange {
+    let on = |m: i32| mask & m != 0;
+    let u = |v: i32| v as u32;
+    let v3 = api >= kadm5::API_VERSION_3;
+    PolicyChange {
+        pw_max_life: on(kmask::PW_MAX_LIFE).then(|| u(rec.pw_max_life)),
+        pw_min_life: on(kmask::PW_MIN_LIFE).then(|| u(rec.pw_min_life)),
+        pw_min_length: on(kmask::PW_MIN_LENGTH).then(|| u(rec.pw_min_length)),
+        pw_min_classes: on(kmask::PW_MIN_CLASSES).then(|| u(rec.pw_min_classes)),
+        pw_history_num: on(kmask::PW_HISTORY_NUM).then(|| u(rec.pw_history_num)),
+        pw_max_fail: (v3 && on(kmask::PW_MAX_FAILURE)).then_some(rec.pw_max_fail),
+        pw_failcnt_interval: (v3 && on(kmask::PW_FAILURE_COUNT_INTERVAL))
+            .then(|| u(rec.pw_failcnt_interval)),
+        pw_lockout_duration: (v3 && on(kmask::PW_LOCKOUT_DURATION))
+            .then(|| u(rec.pw_lockout_duration)),
+        allowed_keysalts: (api >= kadm5::API_VERSION_4 && on(kmask::POLICY_ALLOWED_KEYSALTS))
+            .then(|| rec.allowed_keysalts.clone()),
+    }
+}
+
+/// The version 4 policy fields `PolicyChange` does not carry.
+fn apply_policy_v4(p: &mut Policy, rec: &kadm5::PolicyEnt, mask: i32, api: u32) {
+    if api < kadm5::API_VERSION_4 {
+        return;
+    }
+    if mask & kmask::POLICY_ATTRIBUTES != 0 {
+        p.attributes = rec.attributes;
+    }
+    if mask & kmask::POLICY_MAX_LIFE != 0 {
+        p.max_life = rec.max_life as u32;
+    }
+    if mask & kmask::POLICY_MAX_RLIFE != 0 {
+        p.max_renewable_life = rec.max_renewable_life as u32;
+    }
+}
+
+/// The value checks of `kadm5_create_policy`/`kadm5_modify_policy`
+/// (`svr_policy.c`), and `KADM5_BAD_TL_TYPE` for TL data below 256.
+fn check_policy(rec: &kadm5::PolicyEnt, mask: i32, max_life: Option<i32>) -> Result<(), u32> {
+    let on = |m: i32| mask & m != 0;
+    if on(kmask::PW_MIN_LIFE) {
+        if let Some(max) = max_life.filter(|&m| m != 0) {
+            if rec.pw_min_life > max {
+                return Err(code::BAD_MIN_PASS_LIFE);
+            }
+        }
+    }
+    if on(kmask::PW_MIN_LENGTH) && rec.pw_min_length < 1 {
+        return Err(code::BAD_LENGTH);
+    }
+    if on(kmask::PW_MIN_CLASSES) && !(1..=5).contains(&rec.pw_min_classes) {
+        return Err(code::BAD_CLASS);
+    }
+    if on(kmask::PW_HISTORY_NUM) && rec.pw_history_num < 1 {
+        return Err(code::BAD_HISTORY);
+    }
+    if on(kmask::POLICY_TL_DATA) && rec.tl_data.iter().any(|t| t.kind < 256) {
+        return Err(code::BAD_TL_TYPE);
+    }
+    Ok(())
+}
+
+/// MIT `krb5_int32` salt types (`kdb.h` `KRB5_KDB_SALTTYPE_*`) krb5-rs
+/// generates keys for.
+fn ks_salt(t: i32) -> Option<krb5_rs::crypto::SaltType> {
+    use krb5_rs::crypto::SaltType as S;
+    match t {
+        0 => Some(S::Normal),
+        2 => Some(S::NoRealm),
+        3 => Some(S::OnlyRealm),
+        _ => None,
+    }
+}
+
+impl Kadm5 {
+    /// [`Self::admin`] generating the client's `ks_tuple` keys instead of
+    /// the realm's `supported_enctypes` when it sent any.
+    fn admin_ks(
+        &self,
+        caller: &Caller<'_>,
+        ks: &[kadm5::KeySalt],
+    ) -> Result<AdminOps<CallerStore>, u32> {
+        self.admin_with(caller, ks, Vec::new())
+    }
+
+    /// [`Self::admin_ks`] that also stores the client's `KADM5_TL_DATA`
+    /// in the same write, as `kadm5_create_principal_3` and
+    /// `kadm5_modify_principal` do (`svr_principal.c:429-437`, `650-665`).
+    fn admin_with(
+        &self,
+        caller: &Caller<'_>,
+        ks: &[kadm5::KeySalt],
+        tl: Vec<TlData>,
+    ) -> Result<AdminOps<CallerStore>, u32> {
+        let keysalts = if ks.is_empty() {
+            self.keysalts.clone()
+        } else {
+            ks.iter()
+                .map(|&(e, t)| ks_salt(t).map(|t| (e, t)))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(code::BAD_KEYSALTS)?
+        };
+        Ok(AdminOps::new(
+            self.store
+                .as_caller(caller.client_name.clone().into_bytes())
+                .with_tl_data(tl),
+            keysalts,
+        )
+        .with_history_enctype(self.history_enctype))
+    }
+
+    /// Administration as `caller`, who is recorded as the modifier.
+    fn admin(&self, caller: &Caller<'_>) -> AdminOps<CallerStore> {
+        AdminOps::new(
+            self.store
+                .as_caller(caller.client_name.clone().into_bytes()),
+            self.keysalts.clone(),
+        )
+        .with_history_enctype(self.history_enctype)
+    }
+
+    fn name(&self, princ: Option<&str>) -> Result<(PrincipalName, String, String), u32> {
+        let (n, r) = princ
+            .and_then(|p| self.parse(p))
+            .ok_or(code::BAD_PRINCIPAL)?;
+        let t = unparse(&n, &r);
+        Ok((n, r, t))
+    }
+
+    /// `check_lockdown_by_princ`: whether `name` has `lockdown_keys`.
+    /// `stub_setup` with `rec_out`: `KADM5_UNK_PRINC` for a missing target.
+    fn stub_rec(&self, princ: Option<&str>) -> u32 {
+        match self.name(princ) {
+            Ok((name, realm, _)) => match self.lockdown(&name, &realm) {
+                Ok(_) => code::OK,
+                Err(c) => c,
+            },
+            Err(c) => c,
+        }
+    }
+
+    fn lockdown(&self, name: &PrincipalName, realm: &str) -> Result<bool, u32> {
+        match self.store.raw_entry(name, realm) {
+            Ok(Some(e)) => Ok(e.attributes & LOCKDOWN_KEYS != 0),
+            Ok(None) => Err(code::UNK_PRINC),
+            Err(e) => Err(store_code(&e, code::UNK_PRINC)),
+        }
+    }
+
+    /// The calls that change the database (`server_stubs.c`).
+    fn write(&self, caller: &Caller<'_>, args: kadm5::WriteArgs) -> Vec<u8> {
+        use kadm5::WriteArgs as W;
+        let api = args.api_version();
+        let c = kadm5::check_api_version(api);
+        if c != code::OK {
+            return match args {
+                W::ChrandPrincipal { .. } => kadm5::chrand_ret(0, c, &[]),
+                W::ExtractKeys { .. } => kadm5::getpkeys_ret(0, c, &[]),
+                _ => kadm5::generic_ret(0, c),
+            };
+        }
+        // stub_setup fetches the target of these calls before any
+        // authorization check (server_stubs.c:stub_setup `rec_out`).
+        let target = match &args {
+            W::ChrandPrincipal { princ, .. }
+            | W::ExtractKeys { princ, .. }
+            | W::ChpassPrincipal { princ, .. }
+            | W::SetkeyPrincipal { princ, .. }
+            | W::Purgekeys { princ, .. }
+            | W::SetString { princ, .. } => Some(princ.clone()),
+            W::ModifyPrincipal { rec, .. } => Some(
+                rec.principal
+                    .as_deref()
+                    .map(|p| String::from_utf8_lossy(p).into_owned()),
+            ),
+            _ => None,
+        };
+        if let Some(princ) = target {
+            let c = self.stub_rec(princ.as_deref());
+            if c != code::OK {
+                return match args {
+                    W::ChrandPrincipal { .. } => kadm5::chrand_ret(api, c, &[]),
+                    W::ExtractKeys { .. } => kadm5::getpkeys_ret(api, c, &[]),
+                    _ => kadm5::generic_ret(api, c),
+                };
+            }
+        }
+        let c = match args {
+            W::ChrandPrincipal {
+                princ,
+                keepold,
+                ks_tuple,
+                ..
+            } => {
+                let (c, keys) = self.chrand(caller, princ.as_deref(), keepold, &ks_tuple);
+                return kadm5::chrand_ret(api, c, &keys);
+            }
+            W::ExtractKeys { princ, kvno, .. } => {
+                let (c, keys) = self.extract_keys(caller, princ.as_deref(), kvno);
+                return kadm5::getpkeys_ret(api, c, &keys);
+            }
+            W::ChpassPrincipal {
+                princ,
+                keepold,
+                pass,
+                ks_tuple,
+                ..
+            } => self.chpass(
+                caller,
+                princ.as_deref(),
+                keepold,
+                pass.as_deref(),
+                &ks_tuple,
+            ),
+            W::RenamePrincipal { src, dest, .. } => {
+                self.rename_principal(caller, src.as_deref(), dest.as_deref())
+            }
+            W::CreateAlias { alias, target, .. } => {
+                self.create_alias(caller, alias.as_deref(), target.as_deref())
+            }
+            W::CreatePrincipal {
+                rec,
+                mask,
+                passwd,
+                ks_tuple,
+                ..
+            } => self.create_principal(
+                caller,
+                &rec,
+                mask,
+                passwd.as_deref(),
+                ks_tuple.as_deref().unwrap_or(&[]),
+            ),
+            W::ModifyPrincipal { rec, mask, .. } => self.modify_principal(caller, &rec, mask),
+            W::SetkeyPrincipal {
+                princ,
+                keepold,
+                keys,
+                ..
+            } => self.setkey(caller, princ.as_deref(), keepold, keys),
+            W::Purgekeys {
+                princ, keepkvno, ..
+            } => self.purgekeys(caller, princ.as_deref(), keepkvno),
+            W::DeletePrincipal { princ, .. } => self.delete_principal(caller, princ.as_deref()),
+            W::SetString {
+                princ, key, value, ..
+            } => self.set_string(caller, princ.as_deref(), key.as_deref(), value.as_deref()),
+            W::CreatePolicy { rec, mask, .. } => self.create_policy(caller, api, &rec, mask),
+            W::ModifyPolicy { rec, mask, .. } => self.modify_policy(caller, api, &rec, mask),
+            W::DeletePolicy { name, .. } => self.delete_policy(caller, name.as_deref()),
+        };
+        kadm5::generic_ret(api, c)
+    }
+
+    /// `check_self_keychange` (`server_stubs.c`): a self change needs an
+    /// initial ticket and respects the policy's minimum password life.
+    fn check_self_keychange(&self, caller: &Caller<'_>, name: &PrincipalName, realm: &str) -> u32 {
+        if !caller.is(name, realm) {
+            return code::OK;
+        }
+        if !caller.initial {
+            return code::AUTH_INITIAL;
+        }
+        let admin = self.admin(caller);
+        let rec = match run(admin.get_principal(name, realm)) {
+            Ok(r) => r,
+            Err(e) => return store_code(&e, code::UNK_PRINC),
+        };
+        let Some(policy) = rec.entry.policy.as_deref() else {
+            return code::OK;
+        };
+        let policy = match run(admin.get_policy(policy)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == StoreErrorKind::NotFound => return code::OK,
+            Err(e) => return store_code(&e, code::UNK_POLICY),
+        };
+        let last = rec.last_pwd_change.map_or(0, |t| t.timestamp());
+        let now = i64::from(unix_now());
+        if now - last < i64::from(policy.pw_min_life)
+            && !rec
+                .entry
+                .attributes
+                .contains(PrincipalAttributes::REQUIRES_PWCHANGE)
+        {
+            return code::PASS_TOOSOON;
+        }
+        code::OK
+    }
+
+    /// The shared start of `chpass`/`chrand`: lookup, lockdown, then
+    /// `changepw_not_self` and `OP_CPW` (self always allowed).
+    fn keychange_auth(
+        &self,
+        caller: &Caller<'_>,
+        op: &str,
+        princ: Option<&str>,
+    ) -> Result<(PrincipalName, String, String, bool), u32> {
+        let (name, realm, target) = self.name(princ)?;
+        let locked = self.lockdown(&name, &realm)?;
+        let own = caller.is(&name, &realm);
+        if (caller.changepw && !own)
+            || !(own || self.acl(caller, ACL_CHANGEPW, Some((&name, &realm))))
+        {
+            caller.log_unauth(op, &target);
+            return Err(code::AUTH_CHANGEPW);
+        }
+        Ok((name, realm, target, locked))
+    }
+
+    fn chpass(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        keepold: bool,
+        pass: Option<&str>,
+        ks: &[kadm5::KeySalt],
+    ) -> u32 {
+        let op = "kadm5_chpass_principal";
+        let (name, realm, target, locked) = match self.keychange_auth(caller, op, princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if locked {
+            caller.log_unauth(op, &target);
+            return code::AUTH_CHANGEPW;
+        }
+        let mut c = self.check_self_keychange(caller, &name, &realm);
+        if c == code::OK {
+            c = match pass {
+                None => code::EINVAL,
+                Some(pw) => {
+                    match run(match self.admin_ks(caller, ks) {
+                        Ok(a) => a,
+                        Err(c) => return c,
+                    }
+                    .change_password_keeping(
+                        &name,
+                        &realm,
+                        Some(pw),
+                        clamp_keepold(caller, &name, &realm, keepold),
+                    )) {
+                        Ok(_) => code::OK,
+                        Err(e) => store_code(&e, code::UNK_PRINC),
+                    }
+                }
+            };
+        }
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    /// The current-kvno keys of `name` as kadm5 keyblocks.
+    fn current_keys(
+        &self,
+        caller: &Caller<'_>,
+        name: &PrincipalName,
+        realm: &str,
+        kvno: u32,
+    ) -> Result<Vec<krb5_rs::kdc::KeyEntry>, u32> {
+        let rec = run(self.admin(caller).get_principal(name, realm))
+            .map_err(|e| store_code(&e, code::UNK_PRINC))?;
+        let kvno = if kvno == 0 {
+            rec.entry.current_kvno().unwrap_or(0)
+        } else {
+            kvno
+        };
+        Ok(rec
+            .entry
+            .keys
+            .into_iter()
+            .filter(|k| k.kvno == kvno)
+            .collect())
+    }
+
+    fn chrand(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        keepold: bool,
+        ks: &[kadm5::KeySalt],
+    ) -> (u32, Vec<kadm5::KeyBlock>) {
+        let op = "kadm5_randkey_principal";
+        let (name, realm, target, locked) = match self.keychange_auth(caller, op, princ) {
+            Ok(v) => v,
+            Err(c) => return (c, Vec::new()),
+        };
+        let mut c = self.check_self_keychange(caller, &name, &realm);
+        let mut keys = Vec::new();
+        if c == code::OK {
+            c = match run(match self.admin_ks(caller, ks) {
+                Ok(a) => a,
+                Err(c) => return (c, Vec::new()),
+            }
+            .change_password_keeping(
+                &name,
+                &realm,
+                None,
+                clamp_keepold(caller, &name, &realm, keepold),
+            )) {
+                Ok(kvno) => match self.current_keys(caller, &name, &realm, kvno) {
+                    Ok(k) => {
+                        keys = k
+                            .iter()
+                            .map(|k| kadm5::KeyBlock {
+                                enctype: k.key.keytype,
+                                contents: k.key.key_bytes().to_vec(),
+                            })
+                            .collect();
+                        code::OK
+                    }
+                    Err(c) => c,
+                },
+                Err(e) => store_code(&e, code::UNK_PRINC),
+            };
+        }
+        // MIT randomizes a lockdown_keys principal but returns no keys.
+        if locked {
+            keys.clear();
+        }
+        caller.log_done(op, &target, c);
+        (c, keys)
+    }
+
+    fn extract_keys(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        kvno: u32,
+    ) -> (u32, Vec<kadm5::KeyData>) {
+        let op = "kadm5_get_principal_keys";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return (c, Vec::new()),
+        };
+        if caller.changepw || !self.acl(caller, ACL_EXTRACT, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return (code::AUTH_EXTRACT, Vec::new());
+        }
+        // server_stubs.c:1772-1778: lockdown is reported as unauthorized.
+        let (c, keys) = match self.lockdown(&name, &realm) {
+            Err(c) => (c, Vec::new()),
+            Ok(true) => {
+                caller.log_unauth(op, &target);
+                return (code::AUTH_EXTRACT, Vec::new());
+            }
+            Ok(false) => match self.current_keys(caller, &name, &realm, kvno) {
+                Ok(k) => (
+                    code::OK,
+                    k.into_iter()
+                        .map(|k| kadm5::KeyData {
+                            kvno: k.kvno,
+                            key: kadm5::KeyBlock {
+                                enctype: k.key.keytype,
+                                contents: k.key.key_bytes().to_vec(),
+                            },
+                            salt_type: if k.salt.is_some() { 4 } else { 0 },
+                            salt: k.salt.unwrap_or_default(),
+                        })
+                        .collect(),
+                ),
+                Err(c) => (c, Vec::new()),
+            },
+        };
+        caller.log_done(op, &target, c);
+        (c, keys)
+    }
+
+    fn rename_principal(&self, caller: &Caller<'_>, src: Option<&str>, dest: Option<&str>) -> u32 {
+        let op = "kadm5_rename_principal";
+        let (sname, srealm, starget) = match self.name(src) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let (dname, drealm, dtarget) = match self.name(dest) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let prime = format!("{starget} to {dtarget}");
+        if caller.changepw
+            || !self.acl(caller, ACL_DELETE, Some((&sname, &srealm)))
+            || !self.acl(caller, ACL_ADD, Some((&dname, &drealm)))
+        {
+            caller.log_unauth(op, &prime);
+            return code::AUTH_INSUFFICIENT;
+        }
+        let c = match self.lockdown(&sname, &srealm) {
+            Ok(true) => {
+                caller.log_unauth(op, &prime);
+                return code::AUTH_INSUFFICIENT;
+            }
+            Err(c) => c,
+            Ok(false) if srealm != drealm => code::FAILURE,
+            Ok(false) => {
+                let modifier = caller.client_name.clone().into_bytes();
+                let res = self.store.rename_raw(&sname, &srealm, |mut e, _| {
+                    if tl_bytes(&e, ALIAS_TARGET).is_some() {
+                        return Err(StoreError::rejected(
+                            "Operation unsupported on alias principal name",
+                        ));
+                    }
+                    specialize_salt(&mut e);
+                    e.principal = dname.clone();
+                    e.realm = drealm.clone();
+                    set_mod_princ(&mut e, unix_now(), &modifier)?;
+                    Ok(e)
+                });
+                match res {
+                    Ok(()) => code::OK,
+                    Err(e) => store_code(&e, code::UNK_PRINC),
+                }
+            }
+        };
+        caller.log_done(op, &prime, c);
+        c
+    }
+
+    fn create_alias(&self, caller: &Caller<'_>, alias: Option<&str>, target: Option<&str>) -> u32 {
+        let op = "kadm5_create_alias";
+        let (aname, arealm, atarget) = match self.name(alias) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let (tname, trealm, ttarget) = match self.name(target) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let prime = format!("{atarget} to {ttarget}");
+        if caller.changepw
+            || !self.acl(caller, ACL_ADD, Some((&aname, &arealm)))
+            || !self.acl(caller, ACL_MODIFY, Some((&tname, &trealm)))
+        {
+            caller.log_unauth(op, &prime);
+            return code::AUTH_INSUFFICIENT;
+        }
+        let c = if arealm != trealm {
+            code::ALIAS_REALM
+        } else {
+            // krb5_dbe_make_alias_entry (lib/kdb/kdb5.c:2826-2870).
+            let mut data = ttarget.clone().into_bytes();
+            data.push(0);
+            let mut e = MitEntry {
+                principal: aname.clone(),
+                realm: arealm.clone(),
+                attributes: PrincipalAttributes::DISALLOW_ALL_TIX.bits(),
+                max_life: 0,
+                max_renewable_life: 0,
+                expiration: 0,
+                pw_expiration: 0,
+                last_success: 0,
+                last_failed: 0,
+                fail_auth_count: 0,
+                tl_data: vec![TlData {
+                    kind: ALIAS_TARGET,
+                    data,
+                }],
+                key_data: Vec::new(),
+            };
+            match set_mod_princ(&mut e, unix_now(), caller.client_name.as_bytes())
+                .and_then(|()| self.store.create_raw(&e))
+            {
+                Ok(()) => code::OK,
+                Err(e) => store_code(&e, code::UNK_PRINC),
+            }
+        };
+        caller.log_done(op, &prime, c);
+        c
+    }
+
+    /// `stub_auth_restr`: the ACL check that also yields restrictions.
+    fn acl_restr(
+        &self,
+        caller: &Caller<'_>,
+        op: u32,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Option<Option<AclRestrictions>> {
+        acl_check(
+            &self.acl,
+            op,
+            (&caller.client, &caller.crealm),
+            Some((name, realm)),
+        )
+        .map(|r| r.cloned())
+    }
+
+    fn create_principal(
+        &self,
+        caller: &Caller<'_>,
+        rec: &kadm5::PrincipalEnt,
+        mask: i32,
+        passwd: Option<&str>,
+        ks: &[kadm5::KeySalt],
+    ) -> u32 {
+        use kmask as m;
+        let op = "kadm5_create_principal";
+        let princ = rec.principal.as_deref().map(String::from_utf8_lossy);
+        let (name, realm, target) = match self.name(princ.as_deref()) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let restr = match self.acl_restr(caller, ACL_ADD, &name, &realm) {
+            Some(r) if !caller.changepw => r,
+            _ => {
+                caller.log_unauth(op, &target);
+                return code::AUTH_ADD;
+            }
+        };
+        let forbidden = m::MOD_NAME
+            | m::MOD_TIME
+            | m::LAST_PWD_CHANGE
+            | m::MKVNO
+            | m::AUX_ATTRIBUTES
+            | m::LAST_SUCCESS
+            | m::LAST_FAILED
+            | m::FAIL_AUTH_COUNT;
+        let c = if mask & m::PRINCIPAL == 0
+            || mask & forbidden != 0
+            || (mask & m::KEY_DATA != 0 && !rec.key_data.is_empty())
+            || (mask & m::POLICY != 0 && rec.policy.is_none())
+            || (mask & m::POLICY != 0 && mask & m::POLICY_CLR != 0)
+            || mask & !m::ALL_PRINC_MASK != 0
+        {
+            code::BAD_MASK
+        } else if mask & m::TL_DATA != 0 && rec.tl_data.iter().any(|t| t.kind < 256) {
+            code::BAD_TL_TYPE
+        } else {
+            let tl = if mask & m::TL_DATA != 0 {
+                rec.tl_data.clone()
+            } else {
+                Vec::new()
+            };
+            let (mut opts, mask) = principal_options(rec, mask, restr.as_ref());
+            let mask = mask as i32;
+            if mask & m::ATTRIBUTES == 0 {
+                opts.attributes = AttrChange {
+                    set: self.flags,
+                    clear: !self.flags,
+                };
+            }
+            if mask & m::MAX_LIFE == 0 {
+                opts.max_life = Some((!self.max_life.is_zero()).then_some(self.max_life));
+            }
+            if mask & m::MAX_RLIFE == 0 {
+                opts.max_renewable_life =
+                    Some((!self.max_rlife.is_zero()).then_some(self.max_rlife));
+            }
+            if mask & m::PRINC_EXPIRE_TIME == 0 {
+                opts.expiration = Some(self.expiration);
+            }
+            match self.admin_with(caller, ks, tl) {
+                Err(c) => c,
+                Ok(a) => match run(a.add_principal(&name, &realm, passwd, &opts)) {
+                    Ok(()) => code::OK,
+                    Err(e) => store_code(&e, code::UNK_POLICY),
+                },
+            }
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    fn modify_principal(&self, caller: &Caller<'_>, rec: &kadm5::PrincipalEnt, mask: i32) -> u32 {
+        use kmask as m;
+        let op = "kadm5_modify_principal";
+        let princ = rec.principal.as_deref().map(String::from_utf8_lossy);
+        let (name, realm, target) = match self.name(princ.as_deref()) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        let restr = match self.acl_restr(caller, ACL_MODIFY, &name, &realm) {
+            Some(r) if !caller.changepw => r,
+            _ => {
+                caller.log_unauth(op, &target);
+                return code::AUTH_MODIFY;
+            }
+        };
+        if mask & m::ATTRIBUTES != 0 && rec.attributes & LOCKDOWN_KEYS == 0 {
+            match self.lockdown(&name, &realm) {
+                Ok(true) => {
+                    caller.log_unauth(op, &target);
+                    return code::AUTH_MODIFY;
+                }
+                Ok(false) => {}
+                Err(c) => {
+                    caller.log_done(op, &target, c);
+                    return c;
+                }
+            }
+        }
+        let forbidden = m::PRINCIPAL
+            | m::LAST_PWD_CHANGE
+            | m::MOD_TIME
+            | m::MOD_NAME
+            | m::MKVNO
+            | m::AUX_ATTRIBUTES
+            | m::KEY_DATA
+            | m::LAST_SUCCESS
+            | m::LAST_FAILED;
+        let c = if mask & forbidden != 0
+            || mask & !m::ALL_PRINC_MASK != 0
+            || (mask & m::POLICY != 0 && rec.policy.is_none())
+            || (mask & m::POLICY != 0 && mask & m::POLICY_CLR != 0)
+        {
+            code::BAD_MASK
+        } else if mask & m::TL_DATA != 0 && rec.tl_data.iter().any(|t| t.kind < 256) {
+            code::BAD_TL_TYPE
+        } else if mask & m::FAIL_AUTH_COUNT != 0 && rec.fail_auth_count != 0 {
+            code::BAD_SERVER_PARAMS
+        } else {
+            let tl = if mask & m::TL_DATA != 0 {
+                rec.tl_data.clone()
+            } else {
+                Vec::new()
+            };
+            let (opts, _) = principal_options(rec, mask, restr.as_ref());
+            let admin = match self.admin_with(caller, &[], tl) {
+                Ok(a) => a,
+                Err(c) => return c,
+            };
+            match run(admin.modify_principal(&name, &realm, &opts)) {
+                Ok(()) => code::OK,
+                Err(e) => store_code(&e, code::UNK_PRINC),
+            }
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    fn setkey(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        keepold: bool,
+        keys: kadm5::SetKeys,
+    ) -> u32 {
+        let op = "kadm5_setkey_principal";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if caller.changepw || !self.acl(caller, ACL_SETKEY, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return code::AUTH_SETKEY;
+        }
+        match self.lockdown(&name, &realm) {
+            Ok(false) => {}
+            Ok(true) => {
+                caller.log_unauth(op, &target);
+                return code::AUTH_SETKEY;
+            }
+            Err(c) => {
+                caller.log_done(op, &target, c);
+                return c;
+            }
+        }
+        let c = match setkey_data(keys) {
+            _ if target == format!("kadmin/history@{realm}") => code::PROTECT_PRINCIPAL,
+            Err(c) => c,
+            Ok(keys) => self.setkey_data(caller, &name, &realm, keepold, &keys),
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    /// `kadm5_setkey_principal_4` (`svr_principal.c:2073-2196`).
+    fn setkey_data(
+        &self,
+        caller: &Caller<'_>,
+        name: &PrincipalName,
+        realm: &str,
+        keepold: bool,
+        keys: &[kadm5::KeyData],
+    ) -> u32 {
+        if keys.is_empty() {
+            return code::EINVAL;
+        }
+        let kvno = keys[0].kvno;
+        if keys.iter().any(|k| k.kvno != kvno) {
+            return code::SETKEY_BAD_KVNO;
+        }
+        for (i, a) in keys.iter().enumerate() {
+            if keys[i + 1..]
+                .iter()
+                .any(|b| b.key.enctype == a.key.enctype && b.salt_type == a.salt_type)
+            {
+                return code::SETKEY_DUP_ENCTYPES;
+            }
+        }
+        // svr_principal.c:2177-2183: the password expiration restarts from
+        // the policy's pw_max_life.
+        let pw_max_life = match run(self.admin(caller).get_principal(name, realm)) {
+            Ok(rec) => match rec
+                .entry
+                .policy
+                .as_deref()
+                .map(|p| self.store.raw_policy(p))
+            {
+                Some(Ok(Some(p))) => p.pw_max_life,
+                Some(Err(e)) => return store_code(&e, code::UNK_PRINC),
+                _ => 0,
+            },
+            Err(e) => return store_code(&e, code::UNK_PRINC),
+        };
+        let modifier = caller.client_name.clone().into_bytes();
+        let mut outcome = None;
+        let res = self.store.update_raw(name, realm, |e, mk| {
+            let kvno = if kvno == 0 {
+                e.key_data
+                    .iter()
+                    .map(|k| u32::from(k.kvno))
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            } else if keepold && e.key_data.iter().any(|k| u32::from(k.kvno) == kvno) {
+                outcome = Some(code::SETKEY_BAD_KVNO);
+                return Ok(false);
+            } else {
+                kvno
+            };
+            let kvno = u16::try_from(kvno)
+                .map_err(|_| StoreError::backend("MIT key version exceeds u16"))?;
+            let mkvno = entry_mkvno(e)?;
+            let master = mk
+                .keys
+                .iter()
+                .find(|(v, _)| *v == mkvno)
+                .map(|(_, k)| k)
+                .ok_or_else(|| StoreError::backend("master key version not found"))?;
+            let mut data = Vec::with_capacity(keys.len() + e.key_data.len());
+            for k in keys {
+                let etype = i16::try_from(k.key.enctype)
+                    .map_err(|_| StoreError::backend("MIT enctype exceeds i16"))?;
+                let key = EncryptionKey::new(k.key.enctype, k.key.contents.clone());
+                data.push(MitKeyData {
+                    ver: 2,
+                    kvno,
+                    fields: vec![
+                        (etype, encrypt_key(master, &key)?),
+                        (k.salt_type, k.salt.clone()),
+                    ],
+                });
+            }
+            // MIT copies the old keys after the new ones without counting
+            // them (svr_principal.c:2146-2160), so keepold only checks the
+            // kvno and the old keys are dropped.
+            e.key_data = data;
+            e.attributes &= !PrincipalAttributes::REQUIRES_PWCHANGE.bits();
+            let now = unix_now();
+            e.pw_expiration = if pw_max_life == 0 {
+                0
+            } else {
+                now.saturating_add(pw_max_life)
+            };
+            set_key_change(e, now);
+            set_mod_princ(e, now, &modifier)?;
+            Ok(true)
+        });
+        match (res, outcome) {
+            (_, Some(c)) => c,
+            (Ok(true), None) => code::OK,
+            (Ok(false), None) => code::UNK_PRINC,
+            (Err(e), None) => store_code(&e, code::UNK_PRINC),
+        }
+    }
+
+    /// `kadm5_purgekeys` (`svr_principal.c:2008-2071`).
+    fn purgekeys(&self, caller: &Caller<'_>, princ: Option<&str>, keepkvno: i32) -> u32 {
+        let op = "kadm5_purgekeys";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if caller.changepw || !self.acl(caller, ACL_MODIFY, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return code::AUTH_MODIFY;
+        }
+        let modifier = caller.client_name.clone().into_bytes();
+        let res = self.store.update_raw(&name, &realm, |e, _| {
+            let keep = match u16::try_from(keepkvno) {
+                Ok(k) if k > 0 => k,
+                _ => e.key_data.iter().map(|k| k.kvno).max().unwrap_or(0),
+            };
+            e.key_data.retain(|k| k.kvno >= keep);
+            set_mod_princ(e, unix_now(), &modifier)?;
+            Ok(true)
+        });
+        let c = match res {
+            Ok(true) => code::OK,
+            Ok(false) => code::UNK_PRINC,
+            Err(e) => store_code(&e, code::UNK_PRINC),
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    fn delete_principal(&self, caller: &Caller<'_>, princ: Option<&str>) -> u32 {
+        let op = "kadm5_delete_principal";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if caller.changepw || !self.acl(caller, ACL_DELETE, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return code::AUTH_DELETE;
+        }
+        let c = match self.lockdown(&name, &realm) {
+            Ok(true) => {
+                caller.log_unauth(op, &target);
+                return code::AUTH_DELETE;
+            }
+            Err(c) => c,
+            Ok(false) => match run(self.admin(caller).delete_principal(&name, &realm)) {
+                Ok(()) => code::OK,
+                Err(e) => store_code(&e, code::UNK_PRINC),
+            },
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    fn set_string(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        key: Option<&str>,
+        value: Option<&str>,
+    ) -> u32 {
+        let op = "kadm5_mod_strings";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if caller.changepw || !self.acl(caller, ACL_MODIFY, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return code::AUTH_MODIFY;
+        }
+        let c = match key {
+            None => code::EINVAL,
+            Some(key) => {
+                let modifier = caller.client_name.clone().into_bytes();
+                let key = key.as_bytes().to_vec();
+                let value = value.map(|v| v.as_bytes().to_vec());
+                let res = self.store.update_raw(&name, &realm, move |e, _| {
+                    set_string_attr(e, &key, value.as_deref())?;
+                    set_mod_princ(e, unix_now(), &modifier)?;
+                    Ok(true)
+                });
+                match res {
+                    Ok(true) => code::OK,
+                    Ok(false) => code::UNK_PRINC,
+                    Err(e) => store_code(&e, code::UNK_PRINC),
+                }
+            }
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    fn create_policy(
+        &self,
+        caller: &Caller<'_>,
+        api: u32,
+        rec: &kadm5::PolicyEnt,
+        mask: i32,
+    ) -> u32 {
+        let op = "kadm5_create_policy";
+        let target = rec.policy.as_deref().unwrap_or("(null)");
+        if caller.changepw || !self.acl(caller, ACL_ADD, None) {
+            caller.log_unauth(op, target);
+            return code::AUTH_ADD;
+        }
+        let c = (|| {
+            let name = rec.policy.as_deref().ok_or(code::EINVAL)?;
+            if name.is_empty() {
+                return Err(code::BAD_POLICY);
+            }
+            if mask & kmask::POLICY == 0 || mask & !kmask::ALL_POLICY_MASK != 0 {
+                return Err(code::BAD_MASK);
+            }
+            let max = (mask & kmask::PW_MAX_LIFE != 0).then_some(rec.pw_max_life);
+            check_policy(rec, mask, max)?;
+            let mut p = policy_change(rec, mask, api).into_policy(name);
+            apply_policy_v4(&mut p, rec, mask, api);
+            run(self.admin(caller).add_policy(p)).map_err(|e| store_code(&e, code::UNK_POLICY))
+        })()
+        .map_or_else(|c| c, |()| code::OK);
+        caller.log_done(op, target, c);
+        c
+    }
+
+    fn modify_policy(
+        &self,
+        caller: &Caller<'_>,
+        api: u32,
+        rec: &kadm5::PolicyEnt,
+        mask: i32,
+    ) -> u32 {
+        let op = "kadm5_modify_policy";
+        let target = rec.policy.as_deref().unwrap_or("(null)");
+        if caller.changepw || !self.acl(caller, ACL_MODIFY, None) {
+            caller.log_unauth(op, target);
+            return code::AUTH_MODIFY;
+        }
+        let c = (|| {
+            let name = rec.policy.as_deref().ok_or(code::EINVAL)?;
+            if name.is_empty() {
+                return Err(code::BAD_POLICY);
+            }
+            if mask & kmask::POLICY != 0 || mask & !kmask::ALL_POLICY_MASK != 0 {
+                return Err(code::BAD_MASK);
+            }
+            let current = match self.store.raw_policy(name) {
+                Ok(Some(p)) => p,
+                Ok(None) => return Err(code::UNK_POLICY),
+                Err(e) => return Err(store_code(&e, code::UNK_POLICY)),
+            };
+            let max = if mask & kmask::PW_MAX_LIFE != 0 {
+                rec.pw_max_life
+            } else {
+                current.pw_max_life as i32
+            };
+            check_policy(rec, mask, Some(max))?;
+            let change = policy_change(rec, mask, api);
+            let rec = rec.clone();
+            run(self.store.update_policy(name, move |p| {
+                change.apply(p);
+                apply_policy_v4(p, &rec, mask, api);
+                p.security_epoch += 1;
+                Ok(())
+            }))
+            .map(|_| ())
+            .map_err(|e| store_code(&e, code::UNK_POLICY))
+        })()
+        .map_or_else(|c| c, |()| code::OK);
+        caller.log_done(op, target, c);
+        c
+    }
+
+    fn delete_policy(&self, caller: &Caller<'_>, name: Option<&str>) -> u32 {
+        let op = "kadm5_delete_policy";
+        let target = name.unwrap_or("(null)");
+        if caller.changepw || !self.acl(caller, ACL_DELETE, None) {
+            caller.log_unauth(op, target);
+            return code::AUTH_DELETE;
+        }
+        let c = match name {
+            None => code::EINVAL,
+            Some("") => code::BAD_POLICY,
+            Some(n) => match run(self.admin(caller).delete_policy(n)) {
+                Ok(()) => code::OK,
+                Err(e) => store_code(&e, code::UNK_POLICY),
+            },
+        };
+        caller.log_done(op, target, c);
+        c
+    }
+}
+
 impl Program for Kadm5 {
     fn keys(&self) -> (Arc<LmdbStore>, String) {
         (self.store.clone(), self.realm.clone())
@@ -822,10 +2065,22 @@ impl Program for Kadm5 {
             crealm,
             service_name,
             changepw,
+            initial: ctx.initial_ticket(),
             from,
         };
         if proc_ == kadm5::proc_::NULL {
             return gss.reply(xid, seq, &[]).map_err(|e| e.to_string());
+        }
+        if let Some(parsed) = kadm5::WriteArgs::decode(proc_, args) {
+            let Ok(parsed) = parsed else {
+                return err(gss, AcceptStat::GarbageArgs);
+            };
+            // xdr_krb5_principal fails on names krb5_parse_name rejects.
+            if parsed.principals().iter().any(|p| self.parse(p).is_none()) {
+                return err(gss, AcceptStat::GarbageArgs);
+            }
+            let results = self.write(&caller, parsed);
+            return gss.reply(xid, seq, &results).map_err(|e| e.to_string());
         }
         let Some(parsed) = ReadArgs::decode(proc_, args) else {
             eprintln!(
@@ -1122,6 +2377,12 @@ async fn main() {
         realm: realm.clone(),
         store: store.clone(),
         acl: acl.clone(),
+        keysalts: cfg.supported_keysalts.clone(),
+        history_enctype: cfg.master_key_type,
+        max_life: cfg.kdc.max_life,
+        max_rlife: cfg.admin_max_renewable_life,
+        expiration: cfg.default_principal_expiration,
+        flags: cfg.default_principal_flags,
     });
     spawn_rpc(&mut tasks, &local, &kadm5, kadm5_listeners);
     let kpasswd = Rc::new(Kpasswd {

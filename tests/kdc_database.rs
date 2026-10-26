@@ -323,6 +323,29 @@ impl CurrentKvno for krb5_rs::kdc::PrincipalEntry {
 }
 
 #[tokio::test]
+async fn admin_change_password_keeping_limits_old_key_versions() {
+    let (_dir, store) = setup();
+    let ops = krb5_rs::kdc::kdb::admin::AdminOps::new(&store, keysalts());
+    ops.add_principal(&name("k"), REALM, None, &PrincipalOptions::default())
+        .await
+        .expect("addprinc");
+    // keep_old 3 keeps the two newest old versions (preserve_old_keys).
+    for _ in 0..3 {
+        ops.change_password_keeping(&name("k"), REALM, None, 3)
+            .await
+            .expect("randkey");
+    }
+    let e = store
+        .lookup(&name("k"), REALM)
+        .await
+        .expect("lookup")
+        .expect("present");
+    let mut kvnos: Vec<u32> = e.keys.iter().map(|k| k.kvno).collect();
+    kvnos.dedup();
+    assert_eq!(kvnos, vec![4, 3, 2]);
+}
+
+#[tokio::test]
 async fn admin_change_password_clears_requires_pwchange() {
     let (_dir, store) = setup();
     let admin = Admin::new(&store, keysalts());
@@ -783,14 +806,15 @@ fn policies_persist_and_follow_mit_kadmin_rules() {
         vec!["strict".to_string()]
     );
 
-    // -policy needs an existing policy (KADM5_UNK_POLICY).
+    // A -policy naming no policy is kept and counts as no policy
+    // (get_policy, svr_principal.c:262-275).
     let missing = PrincipalOptions {
         policy: Some(Some("nope".into())),
         ..PrincipalOptions::default()
     };
-    assert!(admin
-        .add_principal(&name("x"), REALM, Some("pw"), &missing)
-        .is_err());
+    admin
+        .add_principal(&name("nopol"), REALM, Some("pw"), &missing)
+        .expect("addprinc with a missing policy");
     let under = PrincipalOptions {
         policy: Some(Some("strict".into())),
         ..PrincipalOptions::default()

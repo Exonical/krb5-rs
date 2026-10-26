@@ -62,6 +62,7 @@ pub mod code {
     #![allow(missing_docs)]
     const BASE: u32 = 43_787_520;
     pub const OK: u32 = 0;
+    pub const ENOMEM: u32 = 12;
     pub const EINVAL: u32 = 22;
     pub const FAILURE: u32 = BASE;
     pub const AUTH_GET: u32 = BASE + 1;
@@ -69,32 +70,141 @@ pub mod code {
     pub const AUTH_MODIFY: u32 = BASE + 3;
     pub const AUTH_DELETE: u32 = BASE + 4;
     pub const AUTH_INSUFFICIENT: u32 = BASE + 5;
+    pub const BAD_DB: u32 = BASE + 6;
     pub const DUP: u32 = BASE + 7;
+    pub const RPC_ERROR: u32 = BASE + 8;
+    pub const NO_SRV: u32 = BASE + 9;
+    pub const BAD_HIST_KEY: u32 = BASE + 10;
+    pub const NOT_INIT: u32 = BASE + 11;
     pub const UNK_PRINC: u32 = BASE + 12;
     pub const UNK_POLICY: u32 = BASE + 13;
     pub const BAD_MASK: u32 = BASE + 14;
+    pub const BAD_CLASS: u32 = BASE + 15;
+    pub const BAD_LENGTH: u32 = BASE + 16;
     pub const BAD_POLICY: u32 = BASE + 17;
     pub const BAD_PRINCIPAL: u32 = BASE + 18;
+    pub const BAD_AUX_ATTR: u32 = BASE + 19;
+    pub const BAD_HISTORY: u32 = BASE + 20;
+    pub const BAD_MIN_PASS_LIFE: u32 = BASE + 21;
+    pub const PASS_Q_TOOSHORT: u32 = BASE + 22;
+    pub const PASS_Q_CLASS: u32 = BASE + 23;
+    pub const PASS_Q_DICT: u32 = BASE + 24;
+    pub const PASS_REUSE: u32 = BASE + 25;
+    pub const PASS_TOOSOON: u32 = BASE + 26;
+    pub const POLICY_REF: u32 = BASE + 27;
+    pub const INIT: u32 = BASE + 28;
+    pub const BAD_PASSWORD: u32 = BASE + 29;
+    pub const PROTECT_PRINCIPAL: u32 = BASE + 30;
+    pub const BAD_SERVER_HANDLE: u32 = BASE + 31;
+    pub const BAD_STRUCT_VERSION: u32 = BASE + 32;
+    pub const OLD_STRUCT_VERSION: u32 = BASE + 33;
+    pub const NEW_STRUCT_VERSION: u32 = BASE + 34;
     pub const BAD_API_VERSION: u32 = BASE + 35;
+    pub const OLD_LIB_API_VERSION: u32 = BASE + 36;
     pub const OLD_SERVER_API_VERSION: u32 = BASE + 37;
+    pub const NEW_LIB_API_VERSION: u32 = BASE + 38;
     pub const NEW_SERVER_API_VERSION: u32 = BASE + 39;
+    pub const SECURE_PRINC_MISSING: u32 = BASE + 40;
+    pub const NO_RENAME_SALT: u32 = BASE + 41;
+    pub const BAD_CLIENT_PARAMS: u32 = BASE + 42;
+    pub const BAD_SERVER_PARAMS: u32 = BASE + 43;
     pub const AUTH_LIST: u32 = BASE + 44;
     pub const AUTH_CHANGEPW: u32 = BASE + 45;
+    pub const GSS_ERROR: u32 = BASE + 46;
+    pub const BAD_TL_TYPE: u32 = BASE + 47;
+    pub const MISSING_CONF_PARAMS: u32 = BASE + 48;
+    pub const BAD_SERVER_NAME: u32 = BASE + 49;
     pub const AUTH_SETKEY: u32 = BASE + 50;
+    pub const SETKEY_DUP_ENCTYPES: u32 = BASE + 51;
+    pub const SETV4KEY_INVAL_ENCTYPE: u32 = BASE + 52;
+    pub const SETKEY3_ETYPE_MISMATCH: u32 = BASE + 53;
+    pub const MISSING_KRB5_CONF_PARAMS: u32 = BASE + 54;
+    pub const XDR_FAILURE: u32 = BASE + 55;
+    pub const CANT_RESOLVE: u32 = BASE + 56;
+    pub const PASS_Q_GENERIC: u32 = BASE + 57;
+    pub const BAD_KEYSALTS: u32 = BASE + 58;
+    pub const SETKEY_BAD_KVNO: u32 = BASE + 59;
     pub const AUTH_EXTRACT: u32 = BASE + 60;
     pub const PROTECT_KEYS: u32 = BASE + 61;
+    pub const AUTH_INITIAL: u32 = BASE + 62;
     pub const ALIAS_REALM: u32 = BASE + 63;
+
+    const MESSAGES: [&str; 64] = [
+        "Operation failed for unspecified reason",
+        "Operation requires ``get'' privilege",
+        "Operation requires ``add'' privilege",
+        "Operation requires ``modify'' privilege",
+        "Operation requires ``delete'' privilege",
+        "Insufficient authorization for operation",
+        "Database inconsistency detected",
+        "Principal or policy already exists",
+        "Communication failure with server",
+        "No administration server found for realm",
+        "Password history entry (kadmin/history) contains unsupported key type",
+        "Connection to server not initialized",
+        "Principal does not exist",
+        "Policy does not exist",
+        "Invalid field mask for operation",
+        "Invalid number of character classes",
+        "Invalid password length",
+        "Illegal policy name",
+        "Illegal principal name",
+        "Invalid auxiliary attributes",
+        "Invalid password history count",
+        "Password minimum life is greater than password maximum life",
+        "Password is too short",
+        "Password does not contain enough character classes",
+        "Password is in the password dictionary",
+        "Cannot reuse password",
+        "Current password's minimum life has not expired",
+        "Policy is in use",
+        "Connection to server already initialized",
+        "Incorrect password",
+        "Cannot change protected principal",
+        "Programmer error!  Bad Admin server handle",
+        "Programmer error!  Bad API structure version",
+        "API structure version specified by application is no longer supported (to fix, recompile application against current KADM5 API header files and libraries)",
+        "API structure version specified by application is unknown to libraries (to fix, obtain current KADM5 API header files and libraries and recompile application)",
+        "Programmer error!  Bad API version",
+        "API version specified by application is no longer supported by libraries (to fix, update application to adhere to current API version and recompile)",
+        "API version specified by application is no longer supported by server (to fix, update application to adhere to current API version and recompile)",
+        "API version specified by application is unknown to libraries (to fix, obtain current KADM5 API header files and libraries and recompile application)",
+        "API version specified by application is unknown to server (to fix, obtain and install newest KADM5 Admin Server)",
+        "Database error! Required KADM5 principal missing",
+        "The salt type of the specified principal does not support renaming",
+        "Illegal configuration parameter for remote KADM5 client",
+        "Illegal configuration parameter for local KADM5 client",
+        "Operation requires ``list'' privilege",
+        "Operation requires ``change-password'' privilege",
+        "GSS-API (or Kerberos) error",
+        "Programmer error!  Illegal tagged data list type",
+        "Required parameters in kdc.conf missing",
+        "Bad krb5 admin server hostname",
+        "Operation requires ``set-key'' privilege",
+        "Multiple values for single or folded enctype",
+        "Invalid enctype for setv4key",
+        "Mismatched enctypes for setkey3",
+        "Missing parameters in krb5.conf required for kadmin client",
+        "XDR encoding error",
+        "Cannot resolve network address for admin server in requested realm",
+        "Unspecified password quality failure",
+        "Invalid key/salt tuples",
+        "Invalid multiple or duplicate kvnos in setkey operation",
+        "Operation requires ``extract-keys'' privilege",
+        "Principal keys are locked down",
+        "Operation requires initial ticket",
+        "Alias target must be within the same realm",
+    ];
 
     /// The `kadm_err.et` text for `code`, as kadmind logs it.
     pub fn message(code: u32) -> String {
         match code {
+            ENOMEM => "Cannot allocate memory".into(),
             EINVAL => "Invalid argument".into(),
-            FAILURE => "Operation failed for unspecified reason".into(),
-            UNK_PRINC => "Principal does not exist".into(),
-            UNK_POLICY => "Policy does not exist".into(),
-            BAD_POLICY => "Illegal policy name".into(),
-            BAD_PRINCIPAL => "Illegal principal name".into(),
-            _ => format!("error {code}"),
+            _ => code
+                .checked_sub(BASE)
+                .and_then(|i| MESSAGES.get(i as usize))
+                .map_or_else(|| format!("error {code}"), |m| (*m).to_string()),
         }
     }
 }
@@ -121,6 +231,56 @@ pub mod mask {
     pub const KEY_DATA: i32 = 0x02_0000;
     pub const TL_DATA: i32 = 0x04_0000;
     pub const PRINCIPAL_NORMAL_MASK: i32 = 0x41_ffff;
+    pub const POLICY_CLR: i32 = 0x00_1000;
+    pub const KEY_HIST: i32 = 0x40_0000;
+    /// `ALL_PRINC_MASK` (`server_internal.h`).
+    pub const ALL_PRINC_MASK: i32 = PRINCIPAL
+        | PRINC_EXPIRE_TIME
+        | PW_EXPIRATION
+        | LAST_PWD_CHANGE
+        | ATTRIBUTES
+        | MAX_LIFE
+        | MOD_TIME
+        | MOD_NAME
+        | KVNO
+        | MKVNO
+        | AUX_ATTRIBUTES
+        | POLICY_CLR
+        | POLICY
+        | MAX_RLIFE
+        | TL_DATA
+        | KEY_DATA
+        | FAIL_AUTH_COUNT;
+    pub const PW_MAX_LIFE: i32 = 0x0000_4000;
+    pub const PW_MIN_LIFE: i32 = 0x0000_8000;
+    pub const PW_MIN_LENGTH: i32 = 0x0001_0000;
+    pub const PW_MIN_CLASSES: i32 = 0x0002_0000;
+    pub const PW_HISTORY_NUM: i32 = 0x0004_0000;
+    pub const REF_COUNT: i32 = 0x0008_0000;
+    pub const PW_MAX_FAILURE: i32 = 0x0010_0000;
+    pub const PW_FAILURE_COUNT_INTERVAL: i32 = 0x0020_0000;
+    pub const PW_LOCKOUT_DURATION: i32 = 0x0040_0000;
+    pub const POLICY_ATTRIBUTES: i32 = 0x0080_0000;
+    pub const POLICY_MAX_LIFE: i32 = 0x0100_0000;
+    pub const POLICY_MAX_RLIFE: i32 = 0x0200_0000;
+    pub const POLICY_ALLOWED_KEYSALTS: i32 = 0x0400_0000;
+    pub const POLICY_TL_DATA: i32 = 0x0800_0000;
+    /// `ALL_POLICY_MASK` (`server_internal.h`).
+    pub const ALL_POLICY_MASK: i32 = POLICY
+        | PW_MAX_LIFE
+        | PW_MIN_LIFE
+        | PW_MIN_LENGTH
+        | PW_MIN_CLASSES
+        | PW_HISTORY_NUM
+        | REF_COUNT
+        | PW_MAX_FAILURE
+        | PW_FAILURE_COUNT_INTERVAL
+        | PW_LOCKOUT_DURATION
+        | POLICY_ATTRIBUTES
+        | POLICY_MAX_LIFE
+        | POLICY_MAX_RLIFE
+        | POLICY_ALLOWED_KEYSALTS
+        | POLICY_TL_DATA;
 }
 
 /// `CHECK_VERSIONS` (`admin_internal.h`) for a client's API version.
@@ -742,6 +902,587 @@ impl Glob {
     }
 }
 
+fn read_count(r: &mut XdrReader<'_>) -> Result<usize, XdrError> {
+    let n = usize::try_from(r.u32()?).map_err(|_| XdrError("length"))?;
+    // Every element takes at least four bytes.
+    if n > r.remaining() / 4 {
+        return Err(XdrError("array length"));
+    }
+    Ok(n)
+}
+
+fn read_array<T>(
+    r: &mut XdrReader<'_>,
+    mut f: impl FnMut(&mut XdrReader<'_>) -> Result<T, XdrError>,
+) -> Result<Vec<T>, XdrError> {
+    let n = read_count(r)?;
+    (0..n).map(|_| f(r)).collect()
+}
+
+/// `xdr_krb5_int16`: an XDR int that must fit in 16 bits.
+fn read_i16(r: &mut XdrReader<'_>) -> Result<i16, XdrError> {
+    i16::try_from(r.i32()?).map_err(|_| XdrError("int16"))
+}
+
+/// `xdr_krb5_tl_data` behind `xdr_nulltype`.
+fn read_tl_list(r: &mut XdrReader<'_>) -> Result<Vec<TlData>, XdrError> {
+    let mut out = Vec::new();
+    if r.bool()? {
+        return Ok(out);
+    }
+    while r.bool()? {
+        let kind = read_i16(r)? as u16;
+        let data = r.opaque()?.to_vec();
+        out.push(TlData { kind, data });
+    }
+    Ok(out)
+}
+
+impl PrincipalEnt {
+    /// `_xdr_kadm5_principal_ent_rec` decoding.
+    pub fn decode(r: &mut XdrReader<'_>) -> Result<Self, XdrError> {
+        let principal = read_nullstring(r)?.map(String::into_bytes);
+        let princ_expire_time = r.u32()?;
+        let last_pwd_change = r.u32()?;
+        let pw_expiration = r.u32()?;
+        let max_life = r.u32()?;
+        let mod_name = if r.bool()? {
+            None
+        } else {
+            read_nullstring(r)?.map(String::into_bytes)
+        };
+        let mod_date = r.u32()?;
+        let attributes = r.u32()?;
+        let kvno = r.u32()?;
+        let mkvno = r.u32()?;
+        let policy = read_nullstring(r)?.map(String::into_bytes);
+        let aux_attributes = r.i32()?;
+        let max_renewable_life = r.u32()?;
+        let last_success = r.u32()?;
+        let last_failed = r.u32()?;
+        let fail_auth_count = r.u32()?;
+        let n_key_data = read_i16(r)?;
+        if n_key_data < 0 {
+            return Err(XdrError("n_key_data"));
+        }
+        let _n_tl_data = read_i16(r)?;
+        let tl_data = read_tl_list(r)?;
+        let key_data = read_array(r, |r| {
+            let ver = read_i16(r)?;
+            let kvno = u16::try_from(r.u32()?).map_err(|_| XdrError("ui_2"))?;
+            let t0 = read_i16(r)?;
+            let t1 = if ver > 1 { read_i16(r)? } else { 0 };
+            Ok((ver as u16, kvno, t0, t1))
+        })?;
+        if key_data.len() != n_key_data as usize {
+            return Err(XdrError("key_data count"));
+        }
+        Ok(Self {
+            principal,
+            princ_expire_time,
+            last_pwd_change,
+            pw_expiration,
+            max_life,
+            mod_name,
+            mod_date,
+            attributes,
+            kvno,
+            mkvno,
+            policy,
+            aux_attributes,
+            max_renewable_life,
+            last_success,
+            last_failed,
+            fail_auth_count,
+            tl_data,
+            key_data,
+        })
+    }
+
+    /// The principal as a string (decoding already checked it is UTF-8).
+    pub fn principal_str(&self) -> Option<&str> {
+        self.principal
+            .as_deref()
+            .and_then(|p| std::str::from_utf8(p).ok())
+    }
+
+    /// The policy as a string.
+    pub fn policy_str(&self) -> Option<&str> {
+        self.policy
+            .as_deref()
+            .and_then(|p| std::str::from_utf8(p).ok())
+    }
+}
+
+/// A `kadm5_policy_ent_rec` as the client sends it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct PolicyEnt {
+    pub policy: Option<String>,
+    pub pw_min_life: i32,
+    pub pw_max_life: i32,
+    pub pw_min_length: i32,
+    pub pw_min_classes: i32,
+    pub pw_history_num: i32,
+    pub policy_refcnt: i32,
+    pub pw_max_fail: u32,
+    pub pw_failcnt_interval: i32,
+    pub pw_lockout_duration: i32,
+    pub attributes: u32,
+    pub max_life: i32,
+    pub max_renewable_life: i32,
+    pub allowed_keysalts: Option<String>,
+    pub tl_data: Vec<TlData>,
+}
+
+impl PolicyEnt {
+    /// `_xdr_kadm5_policy_ent_rec` decoding at `api_version`.
+    pub fn decode(r: &mut XdrReader<'_>, api_version: u32) -> Result<Self, XdrError> {
+        let mut p = Self {
+            policy: read_nullstring(r)?,
+            pw_min_life: r.i32()?,
+            pw_max_life: r.i32()?,
+            pw_min_length: r.i32()?,
+            pw_min_classes: r.i32()?,
+            pw_history_num: r.i32()?,
+            policy_refcnt: r.i32()?,
+            ..Self::default()
+        };
+        if api_version >= API_VERSION_3 {
+            p.pw_max_fail = r.u32()?;
+            p.pw_failcnt_interval = r.i32()?;
+            p.pw_lockout_duration = r.i32()?;
+        }
+        if api_version >= API_VERSION_4 {
+            p.attributes = r.u32()?;
+            p.max_life = r.i32()?;
+            p.max_renewable_life = r.i32()?;
+            p.allowed_keysalts = read_nullstring(r)?;
+            let _n_tl_data = read_i16(r)?;
+            p.tl_data = read_tl_list(r)?;
+        }
+        Ok(p)
+    }
+}
+
+/// `krb5_keyblock` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBlock {
+    /// `enctype`.
+    pub enctype: i32,
+    /// `contents`.
+    pub contents: Vec<u8>,
+}
+
+impl KeyBlock {
+    fn decode(r: &mut XdrReader<'_>) -> Result<Self, XdrError> {
+        Ok(Self {
+            enctype: r.i32()?,
+            contents: r.opaque()?.to_vec(),
+        })
+    }
+
+    fn encode(&self, w: &mut XdrWriter) {
+        w.i32(self.enctype);
+        w.opaque(&self.contents);
+    }
+}
+
+/// `kadm5_key_data` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyData {
+    /// `kvno`.
+    pub kvno: u32,
+    /// `key`.
+    pub key: KeyBlock,
+    /// `salt.type`.
+    pub salt_type: i16,
+    /// `salt.data`.
+    pub salt: Vec<u8>,
+}
+
+impl KeyData {
+    fn decode(r: &mut XdrReader<'_>) -> Result<Self, XdrError> {
+        Ok(Self {
+            kvno: r.u32()?,
+            key: KeyBlock::decode(r)?,
+            salt_type: read_i16(r)?,
+            salt: r.opaque()?.to_vec(),
+        })
+    }
+
+    fn encode(&self, w: &mut XdrWriter) {
+        w.u32(self.kvno);
+        self.key.encode(w);
+        w.i32(i32::from(self.salt_type));
+        w.opaque(&self.salt);
+    }
+}
+
+/// `krb5_key_salt_tuple`: (enctype, salttype).
+pub type KeySalt = (i32, i32);
+
+fn read_ks(r: &mut XdrReader<'_>) -> Result<Vec<KeySalt>, XdrError> {
+    read_array(r, |r| Ok((r.i32()?, r.i32()?)))
+}
+
+/// The keys of the three setkey calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetKeys {
+    /// `setkey_arg`: one keyblock per enctype, default salt.
+    V1(Vec<KeyBlock>),
+    /// `setkey3_arg`: keyblocks paired with key/salt tuples.
+    V3(Vec<KeySalt>, Vec<KeyBlock>),
+    /// `setkey4_arg`: full key data.
+    V4(Vec<KeyData>),
+}
+
+/// The arguments of the calls that change the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum WriteArgs {
+    /// `cprinc_arg` (`ks_tuple` `None`) and `cprinc3_arg`.
+    CreatePrincipal {
+        api_version: u32,
+        rec: Box<PrincipalEnt>,
+        mask: i32,
+        ks_tuple: Option<Vec<KeySalt>>,
+        passwd: Option<String>,
+    },
+    /// `dprinc_arg`.
+    DeletePrincipal {
+        api_version: u32,
+        princ: Option<String>,
+    },
+    /// `mprinc_arg`.
+    ModifyPrincipal {
+        api_version: u32,
+        rec: Box<PrincipalEnt>,
+        mask: i32,
+    },
+    /// `rprinc_arg`.
+    RenamePrincipal {
+        api_version: u32,
+        src: Option<String>,
+        dest: Option<String>,
+    },
+    /// `chpass_arg` (`v3` false) and `chpass3_arg`.
+    ChpassPrincipal {
+        api_version: u32,
+        princ: Option<String>,
+        v3: bool,
+        keepold: bool,
+        ks_tuple: Vec<KeySalt>,
+        pass: Option<String>,
+    },
+    /// `chrand_arg` (`v3` false) and `chrand3_arg`.
+    ChrandPrincipal {
+        api_version: u32,
+        princ: Option<String>,
+        v3: bool,
+        keepold: bool,
+        ks_tuple: Vec<KeySalt>,
+    },
+    /// `setkey_arg`, `setkey3_arg`, `setkey4_arg`.
+    SetkeyPrincipal {
+        api_version: u32,
+        princ: Option<String>,
+        keepold: bool,
+        keys: SetKeys,
+    },
+    /// `cpol_arg`.
+    CreatePolicy {
+        api_version: u32,
+        rec: Box<PolicyEnt>,
+        mask: i32,
+    },
+    /// `dpol_arg`.
+    DeletePolicy {
+        api_version: u32,
+        name: Option<String>,
+    },
+    /// `mpol_arg`.
+    ModifyPolicy {
+        api_version: u32,
+        rec: Box<PolicyEnt>,
+        mask: i32,
+    },
+    /// `purgekeys_arg`.
+    Purgekeys {
+        api_version: u32,
+        princ: Option<String>,
+        keepkvno: i32,
+    },
+    /// `sstring_arg`.
+    SetString {
+        api_version: u32,
+        princ: Option<String>,
+        key: Option<String>,
+        value: Option<String>,
+    },
+    /// `getpkeys_arg`.
+    ExtractKeys {
+        api_version: u32,
+        princ: Option<String>,
+        kvno: u32,
+    },
+    /// `calias_arg`.
+    CreateAlias {
+        api_version: u32,
+        alias: Option<String>,
+        target: Option<String>,
+    },
+}
+
+impl WriteArgs {
+    /// Decode the arguments of `proc_`; `None` for other procedures.
+    pub fn decode(proc_: u32, args: &[u8]) -> Option<Result<Self, XdrError>> {
+        if !Self::handles(proc_) {
+            return None;
+        }
+        let mut r = XdrReader::new(args);
+        Some(Self::decode_body(proc_, &mut r).and_then(|a| r.finish().map(|()| a)))
+    }
+
+    fn decode_body(proc_: u32, r: &mut XdrReader<'_>) -> Result<Self, XdrError> {
+        let ns = read_nullstring;
+        let v = r.u32()?;
+        {
+            Ok(match proc_ {
+                proc_::CREATE_PRINCIPAL | proc_::CREATE_PRINCIPAL3 => {
+                    let rec = Box::new(PrincipalEnt::decode(r)?);
+                    let mask = r.i32()?;
+                    let ks_tuple = if proc_ == proc_::CREATE_PRINCIPAL3 {
+                        Some(read_ks(r)?)
+                    } else {
+                        None
+                    };
+                    Self::CreatePrincipal {
+                        api_version: v,
+                        rec,
+                        mask,
+                        ks_tuple,
+                        passwd: ns(r)?,
+                    }
+                }
+                proc_::DELETE_PRINCIPAL => Self::DeletePrincipal {
+                    api_version: v,
+                    princ: ns(r)?,
+                },
+                proc_::MODIFY_PRINCIPAL => Self::ModifyPrincipal {
+                    api_version: v,
+                    rec: Box::new(PrincipalEnt::decode(r)?),
+                    mask: r.i32()?,
+                },
+                proc_::RENAME_PRINCIPAL => Self::RenamePrincipal {
+                    api_version: v,
+                    src: ns(r)?,
+                    dest: ns(r)?,
+                },
+                proc_::CHPASS_PRINCIPAL => Self::ChpassPrincipal {
+                    api_version: v,
+                    princ: ns(r)?,
+                    v3: false,
+                    keepold: false,
+                    ks_tuple: Vec::new(),
+                    pass: ns(r)?,
+                },
+                proc_::CHPASS_PRINCIPAL3 => Self::ChpassPrincipal {
+                    api_version: v,
+                    princ: ns(r)?,
+                    v3: true,
+                    keepold: r.bool()?,
+                    ks_tuple: read_ks(r)?,
+                    pass: ns(r)?,
+                },
+                proc_::CHRAND_PRINCIPAL => Self::ChrandPrincipal {
+                    api_version: v,
+                    princ: ns(r)?,
+                    v3: false,
+                    keepold: false,
+                    ks_tuple: Vec::new(),
+                },
+                proc_::CHRAND_PRINCIPAL3 => Self::ChrandPrincipal {
+                    api_version: v,
+                    princ: ns(r)?,
+                    v3: true,
+                    keepold: r.bool()?,
+                    ks_tuple: read_ks(r)?,
+                },
+                proc_::SETKEY_PRINCIPAL => Self::SetkeyPrincipal {
+                    api_version: v,
+                    princ: ns(r)?,
+                    keepold: false,
+                    keys: SetKeys::V1(read_array(r, KeyBlock::decode)?),
+                },
+                proc_::SETKEY_PRINCIPAL3 => {
+                    let princ = ns(r)?;
+                    let keepold = r.bool()?;
+                    let ks = read_ks(r)?;
+                    Self::SetkeyPrincipal {
+                        api_version: v,
+                        princ,
+                        keepold,
+                        keys: SetKeys::V3(ks, read_array(r, KeyBlock::decode)?),
+                    }
+                }
+                proc_::SETKEY_PRINCIPAL4 => Self::SetkeyPrincipal {
+                    api_version: v,
+                    princ: ns(r)?,
+                    keepold: r.bool()?,
+                    keys: SetKeys::V4(read_array(r, KeyData::decode)?),
+                },
+                proc_::CREATE_POLICY | proc_::MODIFY_POLICY => {
+                    let rec = Box::new(PolicyEnt::decode(r, v)?);
+                    let mask = r.i32()?;
+                    if proc_ == proc_::CREATE_POLICY {
+                        Self::CreatePolicy {
+                            api_version: v,
+                            rec,
+                            mask,
+                        }
+                    } else {
+                        Self::ModifyPolicy {
+                            api_version: v,
+                            rec,
+                            mask,
+                        }
+                    }
+                }
+                proc_::DELETE_POLICY => Self::DeletePolicy {
+                    api_version: v,
+                    name: ns(r)?,
+                },
+                proc_::PURGEKEYS => Self::Purgekeys {
+                    api_version: v,
+                    princ: ns(r)?,
+                    keepkvno: r.i32()?,
+                },
+                proc_::SET_STRING => Self::SetString {
+                    api_version: v,
+                    princ: ns(r)?,
+                    key: ns(r)?,
+                    value: ns(r)?,
+                },
+                proc_::EXTRACT_KEYS => Self::ExtractKeys {
+                    api_version: v,
+                    princ: ns(r)?,
+                    kvno: r.u32()?,
+                },
+                proc_::CREATE_ALIAS => Self::CreateAlias {
+                    api_version: v,
+                    alias: ns(r)?,
+                    target: ns(r)?,
+                },
+                _ => return Err(XdrError("unknown")),
+            })
+        }
+    }
+
+    /// Whether `proc_` is one of these calls.
+    pub fn handles(proc_: u32) -> bool {
+        matches!(
+            proc_,
+            proc_::CREATE_PRINCIPAL
+                | proc_::DELETE_PRINCIPAL
+                | proc_::MODIFY_PRINCIPAL
+                | proc_::RENAME_PRINCIPAL
+                | proc_::CHPASS_PRINCIPAL
+                | proc_::CHRAND_PRINCIPAL
+                | proc_::CREATE_POLICY
+                | proc_::DELETE_POLICY
+                | proc_::MODIFY_POLICY
+                | proc_::SETKEY_PRINCIPAL
+                | proc_::CREATE_PRINCIPAL3
+                | proc_::CHPASS_PRINCIPAL3
+                | proc_::CHRAND_PRINCIPAL3
+                | proc_::SETKEY_PRINCIPAL3
+                | proc_::PURGEKEYS
+                | proc_::SET_STRING
+                | proc_::SETKEY_PRINCIPAL4
+                | proc_::EXTRACT_KEYS
+                | proc_::CREATE_ALIAS
+        )
+    }
+
+    /// The principal names the arguments carry, which `xdr_krb5_principal`
+    /// parses (a name `krb5_parse_name` rejects fails decoding).
+    pub fn principals(&self) -> Vec<&str> {
+        let mut v: Vec<Option<&str>> = Vec::new();
+        match self {
+            Self::CreatePrincipal { rec, .. } | Self::ModifyPrincipal { rec, .. } => {
+                v.push(rec.principal_str());
+                if let Some(m) = rec.mod_name.as_deref() {
+                    v.push(std::str::from_utf8(m).ok());
+                }
+            }
+            Self::RenamePrincipal { src, dest, .. } => {
+                v.extend([src.as_deref(), dest.as_deref()]);
+            }
+            Self::CreateAlias { alias, target, .. } => {
+                v.extend([alias.as_deref(), target.as_deref()]);
+            }
+            Self::DeletePrincipal { princ, .. }
+            | Self::ChpassPrincipal { princ, .. }
+            | Self::ChrandPrincipal { princ, .. }
+            | Self::SetkeyPrincipal { princ, .. }
+            | Self::Purgekeys { princ, .. }
+            | Self::SetString { princ, .. }
+            | Self::ExtractKeys { princ, .. } => v.push(princ.as_deref()),
+            Self::CreatePolicy { .. } | Self::DeletePolicy { .. } | Self::ModifyPolicy { .. } => {}
+        }
+        v.into_iter().flatten().collect()
+    }
+
+    /// `api_version`.
+    pub fn api_version(&self) -> u32 {
+        match self {
+            Self::CreatePrincipal { api_version, .. }
+            | Self::DeletePrincipal { api_version, .. }
+            | Self::ModifyPrincipal { api_version, .. }
+            | Self::RenamePrincipal { api_version, .. }
+            | Self::ChpassPrincipal { api_version, .. }
+            | Self::ChrandPrincipal { api_version, .. }
+            | Self::SetkeyPrincipal { api_version, .. }
+            | Self::CreatePolicy { api_version, .. }
+            | Self::DeletePolicy { api_version, .. }
+            | Self::ModifyPolicy { api_version, .. }
+            | Self::Purgekeys { api_version, .. }
+            | Self::SetString { api_version, .. }
+            | Self::ExtractKeys { api_version, .. }
+            | Self::CreateAlias { api_version, .. } => *api_version,
+        }
+    }
+}
+
+/// `chrand_ret`: the new keys follow only on success.
+pub fn chrand_ret(api_version: u32, code: u32, keys: &[KeyBlock]) -> Vec<u8> {
+    let mut w = XdrWriter::default();
+    w.u32(api_version);
+    w.u32(code);
+    if code == code::OK {
+        w.u32(u32::try_from(keys.len()).unwrap_or(u32::MAX));
+        for k in keys {
+            k.encode(&mut w);
+        }
+    }
+    w.0
+}
+
+/// `getpkeys_ret`: the key data follows only on success.
+pub fn getpkeys_ret(api_version: u32, code: u32, keys: &[KeyData]) -> Vec<u8> {
+    let mut w = XdrWriter::default();
+    w.u32(api_version);
+    w.u32(code);
+    if code == code::OK {
+        w.u32(u32::try_from(keys.len()).unwrap_or(u32::MAX));
+        for k in keys {
+            k.encode(&mut w);
+        }
+    }
+    w.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +1553,70 @@ mod tests {
             .expect("known")
             .is_err());
         assert!(ReadArgs::decode(proc_::CREATE_PRINCIPAL, &[]).is_none());
+    }
+
+    #[test]
+    fn write_args_reject_malformed_xdr() {
+        assert!(WriteArgs::decode(proc_::GET_PRINCIPAL, &[]).is_none());
+        let mut w = XdrWriter::default();
+        w.u32(API_VERSION_4);
+        write_nullstring(&mut w, Some(b"old"));
+        write_nullstring(&mut w, Some(b"new"));
+        let args = WriteArgs::decode(proc_::RENAME_PRINCIPAL, &w.0)
+            .expect("known")
+            .expect("ok");
+        assert_eq!(
+            args,
+            WriteArgs::RenamePrincipal {
+                api_version: API_VERSION_4,
+                src: Some("old".into()),
+                dest: Some("new".into()),
+            }
+        );
+        let mut trailing = w.0.clone();
+        trailing.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(WriteArgs::decode(proc_::RENAME_PRINCIPAL, &trailing)
+            .expect("known")
+            .is_err());
+        for len in 0..w.0.len() {
+            assert!(
+                WriteArgs::decode(proc_::RENAME_PRINCIPAL, &w.0[..len])
+                    .expect("known")
+                    .is_err(),
+                "truncated to {len}"
+            );
+        }
+        for p in [
+            proc_::CREATE_PRINCIPAL,
+            proc_::CREATE_PRINCIPAL3,
+            proc_::MODIFY_PRINCIPAL,
+            proc_::CHPASS_PRINCIPAL3,
+            proc_::CHRAND_PRINCIPAL3,
+            proc_::SETKEY_PRINCIPAL,
+            proc_::SETKEY_PRINCIPAL3,
+            proc_::SETKEY_PRINCIPAL4,
+            proc_::CREATE_POLICY,
+            proc_::MODIFY_POLICY,
+            proc_::PURGEKEYS,
+            proc_::SET_STRING,
+            proc_::EXTRACT_KEYS,
+            proc_::CREATE_ALIAS,
+        ] {
+            let mut w = XdrWriter::default();
+            w.u32(API_VERSION_4);
+            assert!(
+                WriteArgs::decode(p, &w.0).expect("known").is_err(),
+                "proc {p}"
+            );
+        }
+        // A key array longer than the remaining bytes is refused.
+        let mut w = XdrWriter::default();
+        w.u32(API_VERSION_4);
+        write_nullstring(&mut w, Some(b"p"));
+        w.u32(0x7fff_ffff);
+        assert!(WriteArgs::decode(proc_::SETKEY_PRINCIPAL, &w.0)
+            .expect("known")
+            .is_err());
     }
 
     #[test]

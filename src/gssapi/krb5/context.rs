@@ -29,6 +29,9 @@ pub struct Krb5Context {
     pub(super) acceptor_subkey: Option<EncryptionKey>,
     pub(super) seq_send: u64,
     pub(super) seqstate: SeqState,
+    /// Acceptor side: the service ticket carried `TKT_FLG_INITIAL`
+    /// (`gss_krb5_get_tkt_flags`).
+    pub(super) initial_ticket: bool,
 }
 
 impl Krb5Context {
@@ -54,7 +57,13 @@ impl Krb5Context {
             acceptor_subkey: None,
             seq_send,
             seqstate: SeqState::new(0, false, false, true),
+            initial_ticket: false,
         }
+    }
+
+    /// Whether the acceptor's service ticket had the INITIAL flag.
+    pub fn initial_ticket(&self) -> bool {
+        self.initial_ticket
     }
 
     /// Established context flags (incl. TRANS and PROT_READY).

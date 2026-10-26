@@ -336,12 +336,14 @@ fn policy_commands_and_principal_policy_options() {
     assert_eq!(env.run(&["getpol", "nope"], "").status.code(), Some(1));
 
     // -policy / -clearpolicy / -unlock.
-    assert_eq!(
-        env.run(&["addprinc", "-policy", "nope", "bob"], "pw\n")
-            .status
-            .code(),
-        Some(1)
-    );
+    // A missing policy is stored with a warning, as in MIT.
+    let missing = env.run(&["addprinc", "-policy", "nope", "carol"], "pw\n");
+    assert_eq!(missing.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&missing.stderr)
+        .contains("WARNING: policy \"nope\" does not exist"));
+    assert!(env
+        .ok(&["getprinc", "carol"], "")
+        .contains("Policy: nope [does not exist]\n"));
     // The policy's -minlength 8 applies, with MIT's message.
     let short = env.run(&["addprinc", "-policy", "strict", "bob"], "pw\n");
     assert_eq!(short.status.code(), Some(1));

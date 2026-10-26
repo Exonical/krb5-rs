@@ -87,6 +87,10 @@ impl Krb5Acceptor {
             // (accept_sec_context.c:1107-1109).
             seq_recv,
         );
+        ctx.initial_ticket = result
+            .ticket
+            .flags
+            .contains(crate::types::TicketFlags::INITIAL);
         ctx.seqstate = SeqState::new(
             seq_recv,
             flags.contains(GssFlags::REPLAY),

@@ -469,17 +469,6 @@ impl<S: AdminStore> AdminOps<S> {
         changed
     }
 
-    /// `KADM5_UNK_POLICY` for a `-policy` naming a policy that does not exist
-    /// (svr_principal.c:117).
-    async fn check_policy(&self, opts: &PrincipalOptions) -> Result<(), StoreError> {
-        if let Some(Some(name)) = &opts.policy {
-            if self.store.get_policy(name).await?.is_none() {
-                return Err(missing(format!("Policy \"{name}\"")));
-            }
-        }
-        Ok(())
-    }
-
     /// `addprinc` (`kadm5_create_principal`): kvno 1, keys from `password`
     /// or random (`-randkey`). Fails if the principal exists.
     pub async fn add_principal(
@@ -492,7 +481,6 @@ impl<S: AdminStore> AdminOps<S> {
         if self.store.get_record(name, realm).await?.is_some() {
             return Err(duplicate(format!("{name}@{realm}")));
         }
-        self.check_policy(opts).await?;
         // svr_principal.c:364-374: a password must satisfy the policy.
         let policy = match &opts.policy {
             Some(Some(name)) => self.policy_named(Some(name)).await?,
@@ -576,9 +564,23 @@ impl<S: AdminStore> AdminOps<S> {
         password: Option<&str>,
         keep_old: bool,
     ) -> Result<u32, StoreError> {
+        self.change_password_keeping(name, realm, password, u32::from(keep_old))
+            .await
+    }
+
+    /// [`Self::change_password`] keeping old keys like `preserve_old_keys`
+    /// (`kdb_cpw.c:117-145`): none for 0, all for 1, otherwise the newest
+    /// `keep_old - 1` old key versions.
+    pub async fn change_password_keeping(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        password: Option<&str>,
+        keep_old: u32,
+    ) -> Result<u32, StoreError> {
         let history_target = is_history_principal(name);
         // svr_principal.c:1247-1249, 1430-1438.
-        if history_target && (password.is_some() || keep_old) {
+        if history_target && (password.is_some() || keep_old > 0) {
             return Err(StoreError::rejected(PROTECT_PRINCIPAL));
         }
         let current = self.require(name, realm).await?;
@@ -656,8 +658,21 @@ impl<S: AdminStore> AdminOps<S> {
                         }
                     }
                 }
-                if keep_old {
-                    keys.extend(rec.entry.keys.iter().cloned());
+                let mut last = None;
+                let mut changes = 0;
+                let mut old = rec.entry.keys.clone();
+                old.sort_by_key(|k| std::cmp::Reverse(k.kvno));
+                for k in old.iter().filter(|_| keep_old > 0) {
+                    if keep_old > 1 {
+                        if last.is_some_and(|l| l != k.kvno) {
+                            changes += 1;
+                        }
+                        if changes >= keep_old - 1 {
+                            break;
+                        }
+                        last = Some(k.kvno);
+                    }
+                    keys.push(k.clone());
                 }
                 rec.entry.keys = keys;
                 rec.entry
@@ -692,7 +707,6 @@ impl<S: AdminStore> AdminOps<S> {
         realm: &str,
         opts: &PrincipalOptions,
     ) -> Result<(), StoreError> {
-        self.check_policy(opts).await?;
         let new_policy = match &opts.policy {
             Some(Some(name)) => self.policy_named(Some(name)).await?,
             _ => None,
