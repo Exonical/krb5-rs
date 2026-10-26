@@ -15,7 +15,7 @@ use super::cms::{self, Identity, PkinitError};
 use super::kex::{self, decode_spki, Group, Kdf, KeyPair, DEFAULT_DH_MIN_BITS};
 use super::x509::{Cert, San, TrustStore};
 use crate::types::error_codes::*;
-use crate::types::{EncryptionKey, PrincipalName};
+use crate::types::{is_anonymous_name, EncryptionKey, PrincipalName, ANONYMOUS_REALM};
 
 /// PA-DATA types and TD (typed data) types used by PKINIT.
 pub const PA_PK_AS_REQ: i32 = 16;
@@ -100,6 +100,9 @@ pub struct RequestInfo<'a> {
     pub as_req_der: &'a [u8],
     /// Request client name and realm.
     pub client: &'a PrincipalName,
+    /// Client realm: the request realm, or `WELLKNOWN:ANONYMOUS` once an
+    /// anonymous request's client has been replaced (do_as_req.c:716-733).
+    pub client_realm: &'a str,
     /// Request realm (server and client realm in an AS-REQ).
     pub realm: &'a str,
     /// Request server name.
@@ -134,8 +137,8 @@ impl Failure {
 /// A verified PA-PK-AS-REQ.
 #[derive(Debug)]
 pub struct Verified {
-    /// The authenticated client certificate.
-    pub client_cert: Cert,
+    /// The authenticated client certificate (`None` for anonymous PKINIT).
+    pub client_cert: Option<Cert>,
     /// The client's key agreement group and public value (`None` for the
     /// unsupported RSA mode).
     pub client_dh: Option<(Group, Vec<u8>)>,
@@ -334,16 +337,20 @@ pub fn verify(
         message: e.message,
     })?;
 
-    let Some(signer) = verified.signer else {
-        return Err(preauth(
-            "Pkinit request not signed, but client not anonymous.",
-        ));
-    };
-    authorize_cert(cfg, &signer, req.client, req.realm).map_err(|e| Failure {
-        e_data: edata_for(cfg, e.code, Some(&signer)),
-        code: e.code,
-        message: e.message,
-    })?;
+    let signer = verified.signer;
+    match &signer {
+        Some(cert) => authorize_cert(cfg, cert, req.client, req.realm).map_err(|e| Failure {
+            e_data: edata_for(cfg, e.code, Some(cert)),
+            code: e.code,
+            message: e.message,
+        })?,
+        None if !(is_anonymous_name(req.client) && req.client_realm == ANONYMOUS_REALM) => {
+            return Err(preauth(
+                "Pkinit request not signed, but client not anonymous.",
+            ))
+        }
+        None => {}
+    }
 
     let auth_pack: AuthPack =
         rasn::der::decode(&verified.data).map_err(|_| preauth("decode of AuthPack failed"))?;
@@ -362,6 +369,11 @@ pub fn verify(
         }
         None => None,
     };
+    if client_dh.is_none() && signer.is_none() {
+        return Err(preauth(
+            "Anonymous pkinit without DH public value not supported.",
+        ));
+    }
 
     // crypto_verify_checksums (:5791-5818): SHA-1 paChecksum, and the
     // optional paChecksum2 in the algorithm it names.
@@ -389,7 +401,8 @@ pub fn verify(
     }
     // kdcPkId mismatches are ignored (:566-584).
 
-    if cfg.require_freshness && !valid_freshness {
+    // check_log_freshness applies only to signed requests (:584-589).
+    if cfg.require_freshness && signer.is_some() && !valid_freshness {
         return Err(preauth("no freshness token, rejecting auth"));
     }
 
@@ -469,7 +482,7 @@ pub fn reply(
         &secret,
         kdf,
         etype,
-        (req.client, req.realm),
+        (req.client, req.client_realm),
         (req.server, req.realm),
         req.as_req_der,
         &rep_der,

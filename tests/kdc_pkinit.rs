@@ -60,6 +60,18 @@ fn store() -> MemoryStore {
             PrincipalAttributes::empty(),
         )
         .expect("krbtgt");
+    store
+        .add_random_key(anon(), REALM, 1, &[18, 17], PrincipalAttributes::empty())
+        .expect("anonymous");
+    store
+        .add_random_key(
+            PrincipalName::new_srv_inst("host", "svc.example.com"),
+            REALM,
+            1,
+            &[18, 17],
+            PrincipalAttributes::empty(),
+        )
+        .expect("service");
     for user in ["alice", "bob", "armoruser", "upnuser"] {
         store
             .add_with_password(
@@ -803,4 +815,83 @@ async fn realm_config_reads_the_pkinit_relations_with_mit_defaults_and_overrides
     .expect("conf");
     assert!(RealmConfig::from_profiles(&no_anchors, None, REALM).is_err());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ------------------------------------------------------------ anonymous PKINIT
+
+fn anon() -> PrincipalName {
+    let mut n = PrincipalName::new_srv_inst("WELLKNOWN", "ANONYMOUS");
+    n.name_type = 11;
+    n
+}
+
+fn anon_config(w: &World) -> AsExchangeConfig {
+    let mut c = AsExchangeConfig::new(anon(), REALM);
+    c.pkinit = Some(Arc::new(ClientConfig::anonymous(w.ca.store())));
+    c
+}
+
+fn anon_kdc(w: &World, restrict: bool) -> Kdc<MemoryStore> {
+    let server = ServerConfig::new(w.ca.kdc(100, REALM, &w.kdc_key), w.ca.store());
+    let mut config = KdcConfig::new(REALM);
+    config.pkinit = Some(Arc::new(server));
+    config.restrict_anonymous_to_tgt = restrict;
+    Kdc::new(config, store())
+}
+
+#[tokio::test]
+async fn anonymous_pkinit_issues_an_anonymous_ticket_in_the_anonymous_realm() {
+    let w = world();
+    for restrict in [false, true] {
+        let cred = run(&anon_kdc(&w, restrict), anon_config(&w)).await.ok();
+        assert_eq!(cred.client, anon());
+        assert_eq!(cred.crealm, "WELLKNOWN:ANONYMOUS");
+        assert!(cred.flags.contains(TicketFlags::ANONYMOUS));
+        assert!(cred.flags.contains(TicketFlags::INITIAL));
+    }
+}
+
+#[tokio::test]
+async fn anonymous_pkinit_works_with_every_group() {
+    let w = world();
+    for group in Group::ALL.into_iter().filter(|g| *g != Group::Modp1024) {
+        let mut pk = ClientConfig::anonymous(w.ca.store());
+        pk.dh_group = group;
+        let mut cfg = AsExchangeConfig::new(anon(), REALM);
+        cfg.pkinit = Some(Arc::new(pk));
+        let r = run(&anon_kdc(&w, false), cfg).await;
+        assert!(r.result.is_ok(), "{}: {:?}", group.name(), r.result.err());
+    }
+}
+
+#[tokio::test]
+async fn restrict_anonymous_to_tgt_refuses_other_services() {
+    let w = world();
+    let mut cfg = anon_config(&w);
+    cfg.server = Some(PrincipalName::new_srv_inst("host", "svc.example.com"));
+    assert_eq!(run(&anon_kdc(&w, true), cfg).await.code(), 12);
+    let mut cfg = anon_config(&w);
+    cfg.server = Some(PrincipalName::new_srv_inst("host", "svc.example.com"));
+    let cred = run(&anon_kdc(&w, false), cfg).await.ok();
+    assert!(cred.flags.contains(TicketFlags::ANONYMOUS));
+}
+
+#[tokio::test]
+async fn request_anonymous_for_a_named_client_is_badoption() {
+    let w = world();
+    let mut cfg = AsExchangeConfig::new(name("alice"), REALM);
+    cfg.kdc_options = KerberosFlags::new(*cfg.kdc_options | KdcOptions::REQUEST_ANONYMOUS);
+    assert_eq!(
+        run_with(&anon_kdc(&w, false), cfg, PW, None).await.code(),
+        13
+    );
+}
+
+#[tokio::test]
+async fn named_pkinit_is_unaffected_by_the_anonymous_principal() {
+    let w = world();
+    let cfg = as_config("alice", pkinit_cfg(client_identity(&w, "alice", 10), &w));
+    let cred = run(&anon_kdc(&w, true), cfg).await.ok();
+    assert!(!cred.flags.contains(TicketFlags::ANONYMOUS));
+    assert_eq!(cred.crealm, REALM);
 }

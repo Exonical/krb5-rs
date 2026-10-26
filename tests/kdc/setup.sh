@@ -80,6 +80,9 @@ SHA2USER_PASSWORD="${KDC_SHA2USER_PASSWORD:-sha2pass}"
 printf '%s\n%s\n' "$SHA2USER_PASSWORD" "$SHA2USER_PASSWORD" | \
     kadmin.local -q "addprinc -e aes256-cts-hmac-sha384-192:normal,aes128-cts-hmac-sha256-128:normal sha2user@TEST.REALM"
 
+# Anonymous PKINIT (kinit -n) needs the anonymous principal.
+kadmin.local -q "addprinc -randkey WELLKNOWN/ANONYMOUS@TEST.REALM"
+
 # Cross-realm trust: both KDCs need both krbtgt principals with matching keys.
 # TEST.REALM uses krbtgt/OTHER.REALM@TEST.REALM to issue cross-realm TGTs;
 # OTHER.REALM uses the same key to verify them (and vice versa).

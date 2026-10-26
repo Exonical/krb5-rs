@@ -16,7 +16,9 @@ use super::kex::{Group, Kdf, KeyPair, DEFAULT_DH_MIN_BITS};
 use super::server::{identifiers_of, TD_DH_PARAMETERS};
 use super::x509::{Hash, San, TrustStore};
 use crate::types::error_codes::*;
-use crate::types::{EncryptionKey, KerberosTime, PrincipalName};
+use crate::types::{
+    is_anonymous_name, EncryptionKey, KerberosTime, PrincipalName, ANONYMOUS_REALM,
+};
 
 /// Client-side PKINIT settings (`X509_user_identity`, `pkinit_anchors`,
 /// `pkinit_pool`, `pkinit_revoke`, `pkinit_eku_checking`,
@@ -24,7 +26,7 @@ use crate::types::{EncryptionKey, KerberosTime, PrincipalName};
 /// `pkinit_require_crl_checking`).
 pub struct ClientConfig {
     /// The user's certificate chain and key.
-    pub identity: Identity,
+    pub identity: Option<Identity>,
     /// Anchors (required), pool and CRLs.
     pub store: TrustStore,
     /// Initial key exchange group (`pkinit_dh_min_bits`, default 2048-bit DH).
@@ -53,7 +55,16 @@ impl ClientConfig {
     /// MIT defaults (`pkinit_init_req_opts`, pkinit_lib.c).
     pub fn new(identity: Identity, store: TrustStore) -> Self {
         Self {
-            identity,
+            identity: Some(identity),
+            ..Self::anonymous(store)
+        }
+    }
+
+    /// Anonymous PKINIT (`kinit -n`): no client certificate; the AuthPack is
+    /// sent unsigned and the client must be `WELLKNOWN/ANONYMOUS`.
+    pub fn anonymous(store: TrustStore) -> Self {
+        Self {
+            identity: None,
             store,
             dh_group: Group::from_bits(DEFAULT_DH_MIN_BITS).unwrap_or(Group::Modp2048),
             require_crl_checking: false,
@@ -134,7 +145,10 @@ pub fn build_request(
         }),
     };
     let auth_der = rasn::der::encode(&auth_pack).map_err(|e| fail(e.to_string()))?;
-    let signed = cms::sign(&cfg.identity, asn1::ID_PKINIT_AUTHDATA, &auth_der)?;
+    let signed = match &cfg.identity {
+        Some(identity) => cms::sign(identity, asn1::ID_PKINIT_AUTHDATA, &auth_der)?,
+        None => cms::sign_anonymous(asn1::ID_PKINIT_AUTHDATA, &auth_der),
+    };
     let anchors: Vec<_> = cfg.store.anchors.iter().collect();
     let req = PaPkAsReq {
         signed_auth_pack: OctetString::from(signed),
@@ -243,7 +257,16 @@ pub fn process_reply(
         &secret,
         kdf,
         etype,
-        (client, realm),
+        // Anonymous PKINIT uses the anonymous realm for party U
+        // (pkinit_crypto_openssl.c:2815-2821).
+        (
+            client,
+            if is_anonymous_name(client) {
+                ANONYMOUS_REALM
+            } else {
+                realm
+            },
+        ),
         (server, realm),
         as_req_der,
         padata,

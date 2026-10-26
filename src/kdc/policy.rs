@@ -34,8 +34,7 @@ pub(crate) const UNSUPPORTED_OPTIONS: KdcOptions = KdcOptions::ALLOW_POSTDATE
     .union(KdcOptions::POSTDATED)
     .union(KdcOptions::VALIDATE)
     .union(KdcOptions::ENC_TKT_IN_SKEY)
-    .union(KdcOptions::PROXY)
-    .union(KdcOptions::REQUEST_ANONYMOUS);
+    .union(KdcOptions::PROXY);
 
 /// Realm-wide lifetime limits (MIT `realm_maxlife` / `realm_maxrlife`).
 #[derive(Debug, Clone, Copy)]
@@ -277,6 +276,7 @@ pub(crate) fn get_ticket_flags(
         (KdcOptions::PROXY, TicketFlags::PROXY),
         (KdcOptions::ALLOW_POSTDATE, TicketFlags::MAY_POSTDATE),
         (KdcOptions::POSTDATED, TicketFlags::POSTDATED),
+        (KdcOptions::REQUEST_ANONYMOUS, TicketFlags::ANONYMOUS),
     ] {
         if opts.contains(opt) {
             flags |= flag;
@@ -311,6 +311,11 @@ pub(crate) fn get_ticket_flags(
         || header.is_some_and(|h| !h.contains(TicketFlags::FORWARDABLE))
     {
         flags.remove(TicketFlags::FORWARDABLE);
+    }
+    // Anonymous tickets are not issued from non-anonymous ones
+    // (kdc_util.c:852-855).
+    if header.is_some_and(|h| !h.contains(TicketFlags::ANONYMOUS)) {
+        flags.remove(TicketFlags::ANONYMOUS);
     }
     flags
 }

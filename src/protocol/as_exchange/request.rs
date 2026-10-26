@@ -1,6 +1,10 @@
 //! AS-REQ construction and preauth helpers (get_in_tkt.c, preauth2.c).
 
 use super::*;
+use crate::types::is_anonymous_name;
+
+/// `KRB5_NT_WELLKNOWN`.
+const NT_WELLKNOWN: i32 = 11;
 
 impl AsExchange {
     /// Build an AS-REQ message. Returns (DER bytes, request body for validation).
@@ -49,9 +53,20 @@ impl AsExchange {
             None
         };
 
+        // krb5_init_creds_init (get_in_tkt.c:1038-1044): the anonymous
+        // principal requests an anonymous ticket.
+        let anonymous = is_anonymous_name(&self.config.client);
+        let mut cname = self.config.client.clone();
+        if anonymous {
+            cname.name_type = NT_WELLKNOWN;
+        }
         let req_body = KdcReqBody {
-            kdc_options: self.config.kdc_options,
-            cname: Some(self.config.client.clone()),
+            kdc_options: if anonymous {
+                KerberosFlags::new(*self.config.kdc_options | KdcOptions::REQUEST_ANONYMOUS)
+            } else {
+                self.config.kdc_options
+            },
+            cname: Some(cname),
             realm: realm.clone(),
             sname: Some(sname),
             from: None,

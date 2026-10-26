@@ -85,7 +85,12 @@ impl AsExchange {
                 "PA-PK-AS-REP without a PKINIT request",
             ));
         };
-        let server = PrincipalName::new_srv_inst("krbtgt", &self.config.realm);
+        // Party V is the requested server (pkinit_clnt.c pa_pkinit_parse_rep).
+        let server = self
+            .config
+            .server
+            .clone()
+            .unwrap_or_else(|| PrincipalName::new_srv_inst("krbtgt", &self.config.realm));
         client::process_reply(
             cfg,
             keypair,

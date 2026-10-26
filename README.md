@@ -41,10 +41,11 @@ The core library is pure Rust and cross-compiles to musl.
 | [RFC 4556](https://www.rfc-editor.org/rfc/rfc4556) | PKINIT (Diffie-Hellman and ECDH) | Client + KDC |
 | [RFC 8636](https://www.rfc-editor.org/rfc/rfc8636) | PKINIT algorithm agility (KDFs, ECDH groups) | Client + KDC |
 | [RFC 8070](https://www.rfc-editor.org/rfc/rfc8070) | PKINIT freshness | Client + KDC |
+| [RFC 8062](https://www.rfc-editor.org/rfc/rfc8062) | Anonymous PKINIT (DH/ECDH only, PA-PKINIT-KX) | Client + KDC |
 
 **Feature `test-pki`** (TESTING ONLY): embeds fixed RSA private keys and a certificate issuer used by the PKINIT tests and `examples/gen_pkinit_pki.rs`. Never enable it in production builds.
 
-**Not yet supported:** PAC/authorization data, S4U, PKINIT RSA key transport and anonymous PKINIT, DES/RC4/Camellia enctypes.
+**Not yet supported:** cross-realm S4U2Self/S4U2Proxy, DES/RC4/Camellia enctypes. PKINIT RSA key transport is rejected, as in MIT 1.22, which removed it.
 
 ## Running the KDC
 

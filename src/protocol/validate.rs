@@ -61,7 +61,13 @@ pub(crate) fn validate_as_reply(
 
     // 4. Realm checks: request realm must match reply crealm,
     //    and ticket realm must match enc-part srealm
-    if request_body.realm != reply.crealm {
+    // An anonymous reply's client is in the anonymous realm (RFC 8062 §4.1).
+    let anonymous_reply = request_body
+        .cname
+        .as_ref()
+        .is_some_and(crate::types::is_anonymous_name)
+        && reply.crealm.as_bytes() == crate::types::ANONYMOUS_REALM.as_bytes();
+    if request_body.realm != reply.crealm && !anonymous_reply {
         return Err(Krb5Error::ReplyValidation("realm mismatch"));
     }
     if reply.ticket.realm != enc_part.srealm {

@@ -134,6 +134,9 @@ pub struct KdcConfig {
     /// ticket's client): re-check a local client at TGS time and refuse it
     /// when it is now disabled, expired or locked out. Default true.
     pub tgs_recheck_client: bool,
+    /// MIT `restrict_anonymous_to_tgt` (kdc.conf realm relation,
+    /// kdc_util.c:701-712): anonymous clients may only get local TGTs.
+    pub restrict_anonymous_to_tgt: bool,
     /// PKINIT settings; `None` leaves PKINIT off (MIT: no `pkinit_identity`).
     #[cfg(feature = "pkinit")]
     pub pkinit: Option<std::sync::Arc<crate::pkinit::server::ServerConfig>>,
@@ -160,6 +163,7 @@ impl KdcConfig {
             disable_lockout: false,
             disable_last_success: false,
             tgs_recheck_client: true,
+            restrict_anonymous_to_tgt: false,
             #[cfg(feature = "pkinit")]
             pkinit: None,
         }

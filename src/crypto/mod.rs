@@ -72,6 +72,8 @@ pub mod key_usage {
     pub const ENC_CHALLENGE_CLIENT: i32 = 54;
     /// KDC-direction encrypted challenge (RFC 6113 §5.4.5).
     pub const ENC_CHALLENGE_KDC: i32 = 55;
+    /// `KRB5_KEYUSAGE_PA_PKINIT_KX` (RFC 6112 PA-PKINIT-KX).
+    pub const PA_PKINIT_KX: i32 = 44;
 }
 
 /// Errors from cryptographic operations.

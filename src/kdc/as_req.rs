@@ -19,13 +19,17 @@ use super::preauth::{
 };
 use super::reqbody::raw_req_body;
 use super::{is_tgs_principal, random_key, GateSubject, Kdc, PrincipalRole, PrincipalStore};
-use crate::crypto::{find_etype, key_usage};
+use crate::crypto::{find_etype, fx_cf2, key_usage};
 use crate::protocol::ap::encrypt_ticket_part;
 use crate::types::error_codes::*;
 use crate::types::{
-    AsRep, EncAsRepPart, EncKdcRepPart, EncTicketPart, EncryptedData, KdcOptions, KdcRep, KdcReq,
-    KerberosFlags, LastReqEntry, PaDataType, TicketFlags, TransitedEncoding,
+    is_anonymous_name, AsRep, EncAsRepPart, EncKdcRepPart, EncTicketPart, EncryptedData,
+    EncryptionKey, KdcOptions, KdcRep, KdcReq, KerberosFlags, LastReqEntry, PaData, PaDataType,
+    PrincipalName, TicketFlags, TransitedEncoding, ANONYMOUS_REALM,
 };
+
+/// `KRB5_PADATA_PKINIT_KX`.
+const PA_PKINIT_KX: i32 = 147;
 
 /// MIT `get_key_exp` (do_as_req.c:83-91).
 fn key_expiration(entry: &PrincipalEntry) -> Option<i64> {
@@ -140,6 +144,29 @@ impl<S: PrincipalStore> Kdc<S> {
         .await?;
 
         validate_as_request(opts, &client, &server, kdc_time)?;
+        // check_anon (kdc_util.c:701-712, :795-798).
+        if self.config.restrict_anonymous_to_tgt
+            && is_anonymous_name(&client.name)
+            && !is_local_tgs(sname, realm)
+        {
+            return Err(KdcError::new(KDC_ERR_POLICY, "ANONYMOUS NOT ALLOWED"));
+        }
+        // Anonymous requests (do_as_req.c:716-733): the client becomes
+        // WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS and must preauthenticate.
+        let anonymous = opts.contains(KdcOptions::REQUEST_ANONYMOUS);
+        if anonymous && !is_anonymous_name(cname) {
+            return Err(KdcError::new(
+                KDC_ERR_BADOPTION,
+                "VALIDATE_ANONYMOUS_PRINCIPAL",
+            ));
+        }
+        let client = if anonymous {
+            let mut c = client;
+            c.attributes |= PrincipalAttributes::REQUIRES_PRE_AUTH;
+            c
+        } else {
+            client
+        };
         // krb5_db_check_policy_as, the last step of validate_as_request
         // (kdc_util.c:801).
         self.check_lockout(&client, kdc_time).await?;
@@ -156,7 +183,9 @@ impl<S: PrincipalStore> Kdc<S> {
         } else {
             sname.clone()
         };
-        let tkt_cname = if canonicalize {
+        let tkt_cname = if anonymous {
+            anonymous_client()?.1
+        } else if canonicalize {
             client.name.clone()
         } else {
             cname.clone()
@@ -322,11 +351,27 @@ impl<S: PrincipalStore> Kdc<S> {
             reply_padata.push(etype_info2_padata(&client, ck)?);
         }
 
+        // return_pkinit_kx (pkinit_srv.c:626-680): an anonymous reply carries
+        // the KDC's contribution to the session key, which becomes
+        // KRB-FX-CF2(session, "PKINIT", reply key, "KEYEXCHANGE").
+        let session_key = if anonymous {
+            reply_padata.push(pkinit_kx_padata(&session_key, &base_key)?);
+            fx_cf2(&session_key, b"PKINIT", &base_key, b"KEYEXCHANGE")
+                .map_err(|_| KdcError::generic("PKINIT_KX"))?
+        } else {
+            session_key
+        };
+        let tkt_crealm = if anonymous {
+            general_string(ANONYMOUS_REALM)?
+        } else {
+            body.realm.clone()
+        };
+
         let tkt_flags = KerberosFlags::new(flags);
         let mut part = EncTicketPart {
             flags: tkt_flags,
             key: session_key.clone(),
-            crealm: body.realm.clone(),
+            crealm: tkt_crealm.clone(),
             cname: tkt_cname.clone(),
             transited: TransitedEncoding {
                 tr_type: 1,
@@ -354,11 +399,16 @@ impl<S: PrincipalStore> Kdc<S> {
         // kdc_fast_response_handle_padata / kdc_fast_handle_reply_key
         // (do_as_req.c:301-313).
         let mut outer_cname = tkt_cname.clone();
-        let mut outer_crealm = body.realm.clone();
+        let mut outer_crealm = tkt_crealm.clone();
         let (outer_padata, reply_key) = match ctx.fast.as_mut().filter(|f| f.armor_key.is_some()) {
             Some(fast) => {
-                let outer =
-                    fast.wrap_reply(reply_padata, &ticket, (realm, &tkt_cname), reply_etype, now)?;
+                let outer = fast.wrap_reply(
+                    reply_padata,
+                    &ticket,
+                    (if anonymous { ANONYMOUS_REALM } else { realm }, &tkt_cname),
+                    reply_etype,
+                    now,
+                )?;
                 if fast.hide_client() {
                     let (r, n) = anonymous_client()?;
                     outer_crealm = general_string(&r)?;
@@ -423,4 +473,36 @@ impl<S: PrincipalStore> Kdc<S> {
         });
         Ok(rasn::der::encode(&rep)?)
     }
+}
+
+/// `is_local_tgs_principal`: `krbtgt/REALM` for the served realm.
+pub(crate) fn is_local_tgs(name: &PrincipalName, realm: &str) -> bool {
+    name.name_string.len() == 2
+        && name.name_string[0].as_bytes() == b"krbtgt"
+        && name.name_string[1].as_bytes() == realm.as_bytes()
+}
+
+/// PA-PKINIT-KX (RFC 6112 section 5.4): the KDC contribution key `session`
+/// encrypted in the reply key.
+fn pkinit_kx_padata(
+    session: &EncryptionKey,
+    reply_key: &EncryptionKey,
+) -> Result<PaData, KdcError> {
+    let profile = find_etype(reply_key.keytype).map_err(|_| KdcError::generic("PKINIT_KX"))?;
+    let cipher = profile
+        .encrypt(
+            reply_key.key_bytes(),
+            key_usage::PA_PKINIT_KX,
+            &rasn::der::encode(session)?,
+        )
+        .map_err(|_| KdcError::generic("PKINIT_KX"))?;
+    let enc = EncryptedData {
+        etype: reply_key.keytype,
+        kvno: None,
+        cipher: OctetString::from(cipher),
+    };
+    Ok(PaData {
+        padata_type: PA_PKINIT_KX,
+        padata_value: OctetString::from(rasn::der::encode(&enc)?),
+    })
 }
