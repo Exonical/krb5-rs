@@ -16,9 +16,11 @@ use krb5_rs::kdc::kdb::kadm5::mask as kmask;
 use krb5_rs::kdc::kdb::kadm5::{self, code, PrincipalEnt, ReadArgs, KADM_PROG, KADM_VERS};
 use krb5_rs::kdc::kdb::kpasswd::{process_request, Service, KPASSWD_PORT};
 use krb5_rs::kdc::kdb::kprop::ReplayCache;
+use krb5_rs::kdc::kdb::master::encrypt_key;
+use krb5_rs::kdc::kdb::mit::mkey::entry_mkvno;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
 use krb5_rs::kdc::kdb::mit::{parse_name_with_default, MitEntry};
-use krb5_rs::kdc::kdb::mit::{set_mod_princ, set_string_attr, TlData};
+use krb5_rs::kdc::kdb::mit::{set_mod_princ, set_string_attr, KeyData as MitKeyData, TlData};
 use krb5_rs::kdc::kdb::read_stash;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
 use krb5_rs::kdc::kdb::restrictions::RestrictedEntry;
@@ -838,6 +840,35 @@ fn principal_options(
     (opts, mask)
 }
 
+/// Normalize the three setkey argument forms to `kadm5_key_data`
+/// (`setkey_principal{,3}` in `svr_principal.c` pass kvno 0 and the
+/// default or tuple salt type).
+fn setkey_data(keys: kadm5::SetKeys) -> Result<Vec<kadm5::KeyData>, u32> {
+    let block = |key: kadm5::KeyBlock, salt_type: i16| kadm5::KeyData {
+        kvno: 0,
+        key,
+        salt_type,
+        salt: Vec::new(),
+    };
+    match keys {
+        kadm5::SetKeys::V1(blocks) => Ok(blocks.into_iter().map(|b| block(b, 0)).collect()),
+        kadm5::SetKeys::V3(ks, blocks) => {
+            if ks.len() != blocks.len() || ks.iter().zip(&blocks).any(|(t, b)| t.0 != b.enctype) {
+                return Err(code::SETKEY3_ETYPE_MISMATCH);
+            }
+            ks.iter()
+                .zip(blocks)
+                .map(|(t, b)| {
+                    i16::try_from(t.1)
+                        .map(|st| block(b, st))
+                        .map_err(|_| code::BAD_KEYSALTS)
+                })
+                .collect()
+        }
+        kadm5::SetKeys::V4(data) => Ok(data),
+    }
+}
+
 /// `KRB5_TL_ALIAS_TARGET` (`kdb.h`).
 const ALIAS_TARGET: u16 = 0x000c;
 
@@ -1033,6 +1064,15 @@ impl Kadm5 {
                 rec, mask, passwd, ..
             } => self.create_principal(caller, &rec, mask, passwd.as_deref()),
             W::ModifyPrincipal { rec, mask, .. } => self.modify_principal(caller, &rec, mask),
+            W::SetkeyPrincipal {
+                princ,
+                keepold,
+                keys,
+                ..
+            } => self.setkey(caller, princ.as_deref(), keepold, keys),
+            W::Purgekeys {
+                princ, keepkvno, ..
+            } => self.purgekeys(caller, princ.as_deref(), keepkvno),
             W::DeletePrincipal { princ, .. } => self.delete_principal(caller, princ.as_deref()),
             W::SetString {
                 princ, key, value, ..
@@ -1040,7 +1080,6 @@ impl Kadm5 {
             W::CreatePolicy { rec, mask, .. } => self.create_policy(caller, api, &rec, mask),
             W::ModifyPolicy { rec, mask, .. } => self.modify_policy(caller, api, &rec, mask),
             W::DeletePolicy { name, .. } => self.delete_policy(caller, name.as_deref()),
-            _ => code::FAILURE,
         };
         kadm5::generic_ret(api, c)
     }
@@ -1464,6 +1503,150 @@ impl Kadm5 {
                 Ok(()) => code::OK,
                 Err(e) => store_code(&e, code::UNK_PRINC),
             }
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    fn setkey(
+        &self,
+        caller: &Caller<'_>,
+        princ: Option<&str>,
+        keepold: bool,
+        keys: kadm5::SetKeys,
+    ) -> u32 {
+        let op = "kadm5_setkey_principal";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if caller.changepw || !self.acl(caller, ACL_SETKEY, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return code::AUTH_SETKEY;
+        }
+        match self.lockdown(&name, &realm) {
+            Ok(false) => {}
+            Ok(true) => {
+                caller.log_unauth(op, &target);
+                return code::AUTH_SETKEY;
+            }
+            Err(c) => {
+                caller.log_done(op, &target, c);
+                return c;
+            }
+        }
+        let c = match setkey_data(keys) {
+            _ if target == format!("kadmin/history@{realm}") => code::PROTECT_PRINCIPAL,
+            Err(c) => c,
+            Ok(keys) => self.setkey_data(caller, &name, &realm, keepold, &keys),
+        };
+        caller.log_done(op, &target, c);
+        c
+    }
+
+    /// `kadm5_setkey_principal_4` (`svr_principal.c:2073-2196`).
+    fn setkey_data(
+        &self,
+        caller: &Caller<'_>,
+        name: &PrincipalName,
+        realm: &str,
+        keepold: bool,
+        keys: &[kadm5::KeyData],
+    ) -> u32 {
+        if keys.is_empty() {
+            return code::EINVAL;
+        }
+        let kvno = keys[0].kvno;
+        if keys.iter().any(|k| k.kvno != kvno) {
+            return code::SETKEY_BAD_KVNO;
+        }
+        for (i, a) in keys.iter().enumerate() {
+            if keys[i + 1..]
+                .iter()
+                .any(|b| b.key.enctype == a.key.enctype && b.salt_type == a.salt_type)
+            {
+                return code::SETKEY_DUP_ENCTYPES;
+            }
+        }
+        let modifier = caller.client_name.clone().into_bytes();
+        let mut outcome = None;
+        let res = self.store.update_raw(name, realm, |e, mk| {
+            let kvno = if kvno == 0 {
+                e.key_data
+                    .iter()
+                    .map(|k| u32::from(k.kvno))
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            } else if keepold && e.key_data.iter().any(|k| u32::from(k.kvno) == kvno) {
+                outcome = Some(code::SETKEY_BAD_KVNO);
+                return Ok(false);
+            } else {
+                kvno
+            };
+            let kvno = u16::try_from(kvno)
+                .map_err(|_| StoreError::backend("MIT key version exceeds u16"))?;
+            let mkvno = entry_mkvno(e)?;
+            let master = mk
+                .keys
+                .iter()
+                .find(|(v, _)| *v == mkvno)
+                .map(|(_, k)| k)
+                .ok_or_else(|| StoreError::backend("master key version not found"))?;
+            let mut data = Vec::with_capacity(keys.len() + e.key_data.len());
+            for k in keys {
+                let etype = i16::try_from(k.key.enctype)
+                    .map_err(|_| StoreError::backend("MIT enctype exceeds i16"))?;
+                let key = EncryptionKey::new(k.key.enctype, k.key.contents.clone());
+                data.push(MitKeyData {
+                    ver: 2,
+                    kvno,
+                    fields: vec![
+                        (etype, encrypt_key(master, &key)?),
+                        (k.salt_type, k.salt.clone()),
+                    ],
+                });
+            }
+            if keepold {
+                data.append(&mut e.key_data);
+            }
+            e.key_data = data;
+            set_mod_princ(e, unix_now(), &modifier)?;
+            Ok(true)
+        });
+        match (res, outcome) {
+            (_, Some(c)) => c,
+            (Ok(true), None) => code::OK,
+            (Ok(false), None) => code::UNK_PRINC,
+            (Err(e), None) => store_code(&e, code::UNK_PRINC),
+        }
+    }
+
+    /// `kadm5_purgekeys` (`svr_principal.c:2008-2071`).
+    fn purgekeys(&self, caller: &Caller<'_>, princ: Option<&str>, keepkvno: i32) -> u32 {
+        let op = "kadm5_purgekeys";
+        let (name, realm, target) = match self.name(princ) {
+            Ok(v) => v,
+            Err(c) => return c,
+        };
+        if caller.changepw || !self.acl(caller, ACL_MODIFY, Some((&name, &realm))) {
+            caller.log_unauth(op, &target);
+            return code::AUTH_MODIFY;
+        }
+        let modifier = caller.client_name.clone().into_bytes();
+        let res = self.store.update_raw(&name, &realm, |e, _| {
+            let keep = match u16::try_from(keepkvno) {
+                Ok(k) if k > 0 => k,
+                _ => e.key_data.iter().map(|k| k.kvno).max().unwrap_or(0),
+            };
+            e.key_data.retain(|k| k.kvno >= keep);
+            set_mod_princ(e, unix_now(), &modifier)?;
+            Ok(true)
+        });
+        let c = match res {
+            Ok(true) => code::OK,
+            Ok(false) => code::UNK_PRINC,
+            Err(e) => store_code(&e, code::UNK_PRINC),
         };
         caller.log_done(op, &target, c);
         c
