@@ -1,0 +1,42 @@
+{{- if and (eq .Values.database.mode "file") .Values.kadmin.enabled }}
+{{- $svc := .Values.kadmin.service }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-kadmin
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: primary
+  {{- with $svc.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $svc.type }}
+  {{- if and (eq $svc.type "LoadBalancer") $svc.loadBalancerIP }}
+  loadBalancerIP: {{ $svc.loadBalancerIP }}
+  {{- end }}
+  {{- if and (eq $svc.type "LoadBalancer") $svc.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml $svc.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  {{- if and (ne $svc.type "ClusterIP") $svc.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ $svc.externalTrafficPolicy }}
+  {{- end }}
+  ports:
+    - name: kadmin
+      port: {{ $svc.port }}
+      targetPort: kadmin
+      protocol: TCP
+    - name: kpasswd-udp
+      port: {{ $svc.kpasswdPort }}
+      targetPort: kpasswd-udp
+      protocol: UDP
+    - name: kpasswd-tcp
+      port: {{ $svc.kpasswdPort }}
+      targetPort: kpasswd-tcp
+      protocol: TCP
+  selector:
+    {{- include "krb5-rs-kdc.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: primary
+{{- end }}

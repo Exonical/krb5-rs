@@ -305,10 +305,16 @@ CockroachDB mode for bounded staleness.
   StatefulSet uses a PVC per pod for its local Turso replica. Enable the prune
   CronJob in exactly one release, and give administration a separate
   `kdc_admin` URL and TLS Secret. When NetworkPolicy is enabled, set
-  `metrics.networkPolicy.from` to admit Prometheus scrapes. See
+  `metrics.networkPolicy.from` to admit Prometheus scrapes.
+  `kadmin.enabled=true` (file mode) runs `krb5-rs-kadmind` on the primary
+  for remote MIT `kadmin` and `kpasswd` through the `<release>-kadmin`
+  Service (TCP 749, UDP/TCP 464), with `kadmin.acl` as its `kadm5.acl`. See
   [`deploy/helm/krb5-rs-kdc/examples/multi-region`](deploy/helm/krb5-rs-kdc/examples/multi-region)
   for three regional values files.
-- **Podman** (`deploy/podman`): a single pod via `podman kube play` or a Quadlet unit (no replicas). See `deploy/podman/README.md`.
+- **Podman** (`deploy/podman`): a primary pod (KDC, kprop and a
+  `krb5-rs-kadmind` for remote `kadmin` on 749 and `kpasswd` on 464) and an
+  optional kpropd replica pod via `podman kube play`, or a Quadlet unit. See
+  `deploy/podman/README.md`.
 - **Image**: `ghcr.io/exonical/krb5-rs-kdc:<tag>` is the pure Rust image;
   `ghcr.io/exonical/krb5-rs-kdc:<tag>-cockroach` includes the CockroachDB and
   Turso modules. Both are built from `deploy/docker/Dockerfile` and published

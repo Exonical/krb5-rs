@@ -929,7 +929,14 @@ epoch.
   then exit. The checkpoint is durable with the data, so a restart resumes
   exactly.
 - **Kubernetes.** The Helm chart supports file mode (one primary whose kprop
-  sidecar pushes to kpropd replicas) and CockroachDB mode. In CockroachDB mode, each region runs a KDC
+  sidecar pushes to kpropd replicas) and CockroachDB mode. In file mode,
+  `kadmin.enabled` runs `krb5-rs-kadmind` beside the primary KDC (without
+  `-proponly`; it also serves iprop when `propagation.iprop.enabled` is set)
+  for remote MIT `kadmin` and `kpasswd` through the `<release>-kadmin`
+  Service, port 749 and 464 mapped to unprivileged container ports, with
+  `kadmin.acl` as its `kadm5.acl`; `krb5-rs-kdb init` creates `kadmin/admin`
+  and `kadmin/changepw`, whose keys kadmind reads from the database, so no
+  keytab is needed. Replicas run no kadmind, as with MIT. In CockroachDB mode, each region runs a KDC
   StatefulSet with a PVC per pod, an idempotent bootstrap Job as a
   pre-install/pre-upgrade hook, and an optional prune CronJob; startup,
   readiness and liveness use the HTTP probes. Use the `-cockroach` image

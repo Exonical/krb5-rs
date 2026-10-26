@@ -47,5 +47,19 @@ spec:
         - port: {{ .Values.propagation.iprop.port }}
           protocol: TCP
     {{- end }}
+    {{- if .Values.kadmin.enabled }}
+    # Remote kadmin and kpasswd to the primary's kadmind.
+    - ports:
+        - port: {{ .Values.kadmin.containerPort }}
+          protocol: TCP
+        - port: {{ .Values.kadmin.kpasswdContainerPort }}
+          protocol: UDP
+        - port: {{ .Values.kadmin.kpasswdContainerPort }}
+          protocol: TCP
+      {{- with .Values.kadmin.networkPolicy.from }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
 {{- end }}
 {{- end }}

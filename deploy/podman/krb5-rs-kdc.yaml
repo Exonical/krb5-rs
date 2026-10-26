@@ -1,6 +1,7 @@
 # Primary krb5-rs KDC for `podman kube play`. Its kprop container pushes the
 # database (MIT kprop) to the kpropd of krb5-rs-kdc-replica.yaml on
-# kdc2.example.com after each admin change and every 60s.
+# kdc2.example.com after each admin change and every 60s. Its kadmind
+# container serves MIT kadmin (host TCP 749) and kpasswd (host UDP/TCP 464).
 #
 # Before use replace EXAMPLE.COM, kdc1/kdc2.example.com and both CHANGE-ME
 # passwords (README.md shows how) and set the image if you do not use the
@@ -31,7 +32,12 @@ data:
       max_life = 24h
       max_renewable_life = 7d
       supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal
+      acl_file = /etc/krb5-rs/kadm5.acl
+      kadmind_port = 7490
+      kpasswd_port = 4640
      }
+  kadm5.acl: |
+    */admin@EXAMPLE.COM *
   krb5.conf: |
     [libdefaults]
      default_realm = EXAMPLE.COM
@@ -68,6 +74,9 @@ metadata:
 spec:
   hostname: kdc1.example.com
   restartPolicy: Always
+  # kadmind and the KDC open the LMDB database at the same time; LMDB's reader
+  # locks need distinct process IDs.
+  shareProcessNamespace: true
   securityContext:
     runAsNonRoot: true
     runAsUser: 65532
@@ -144,6 +153,44 @@ spec:
           value: /etc/krb5-rs/kdc.conf
         - name: KRB5_CONFIG
           value: /etc/krb5-rs/kprop-krb5.conf
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/krb5-rs
+        - name: config
+          mountPath: /etc/krb5-rs
+          readOnly: true
+    # Remote kadmin (kadm5 RPC) and kpasswd, checked against kadm5.acl.
+    - name: kadmind
+      image: ghcr.io/exonical/krb5-rs-kdc:latest
+      command: ["/usr/local/bin/krb5-rs-kadmind"]
+      args:
+        - -nofork
+        - -r
+        - EXAMPLE.COM
+      ports:
+        - name: kadmin
+          containerPort: 7490
+          hostPort: 749
+          protocol: TCP
+        - name: kpasswd-udp
+          containerPort: 4640
+          hostPort: 464
+          protocol: UDP
+        - name: kpasswd-tcp
+          containerPort: 4640
+          hostPort: 464
+          protocol: TCP
+      env:
+        - name: KRB5_KDC_PROFILE
+          value: /etc/krb5-rs/kdc.conf
+        - name: KRB5_CONFIG
+          value: /etc/krb5-rs/krb5.conf
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true

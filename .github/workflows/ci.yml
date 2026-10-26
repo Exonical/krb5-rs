@@ -88,6 +88,12 @@ jobs:
         run: |
           helm template rel deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/alt-values.yaml \
             | docker run --rm -i "$KUBECONFORM" -strict -summary -kubernetes-version 1.30.0 -
+      - name: Render and validate (remote kadmin with iprop)
+        run: |
+          helm template rel deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM \
+            --set kadmin.enabled=true --set "kadmin.acl[0]=admin/admin@EXAMPLE.COM *" \
+            --set propagation.iprop.enabled=true --set networkPolicy.enabled=true \
+            | docker run --rm -i "$KUBECONFORM" -strict -summary -kubernetes-version 1.30.0 -
       - name: Render and validate (CockroachDB)
         run: |
           helm template rel deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/cockroach-values.yaml \
@@ -115,6 +121,10 @@ jobs:
             --set database.mode=cockroach --set secrets.existingSecret=master \
             --set cockroach.url=postgresql://kdc_replica@crdb/krb5 \
             --set cockroach.region=california
+      - name: Remote kadmin requires file mode
+        run: |
+          ! helm lint deploy/helm/krb5-rs-kdc -f deploy/helm/krb5-rs-kdc/ci/cockroach-values.yaml \
+            --set kadmin.enabled=true
       - name: CockroachDB mode requires a region
         run: |
           ! helm lint deploy/helm/krb5-rs-kdc --set realm=EXAMPLE.COM \

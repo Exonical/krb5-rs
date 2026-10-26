@@ -31,7 +31,7 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- if .Values.propagation.iprop.enabled }}
+      {{- if or .Values.propagation.iprop.enabled .Values.kadmin.enabled }}
       shareProcessNamespace: true
       {{- end }}
       {{- include "krb5-rs-kdc.scheduling" (dict "ctx" . "cfg" .Values.primary) | nindent 6 }}
@@ -155,18 +155,22 @@ spec:
             - name: secrets
               mountPath: /secrets
               readOnly: true
-        {{- if gt (int .Values.replicas.replicaCount) 0 }}
-        {{- if .Values.propagation.iprop.enabled }}
-        # MIT iprop service; full resyncs are pushed with krb5-rs-kprop.
+        {{- $iprop := and .Values.propagation.iprop.enabled (gt (int .Values.replicas.replicaCount) 0) }}
+        {{- if or $iprop .Values.kadmin.enabled }}
+        # MIT kadmind: remote kadmin and kpasswd with kadmin.enabled, iprop
+        # with propagation.iprop.enabled (full resyncs pushed with krb5-rs-kprop).
         - name: kadmind
           image: {{ include "krb5-rs-kdc.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/krb5-rs-kadmind"]
           args:
+            {{- if not .Values.kadmin.enabled }}
             - -proponly
+            {{- end }}
             - -nofork
             - -r
             - {{ .Values.realm }}
+            {{- if $iprop }}
             - -p
             - /usr/local/bin/krb5-rs-kdb
             - -K
@@ -175,10 +179,24 @@ spec:
             - {{ .Values.propagation.port | quote }}
             - -F
             - /var/lib/krb5-rs/replica_datatrans
+            {{- end }}
           ports:
+            {{- if $iprop }}
             - name: iprop
               containerPort: {{ .Values.propagation.iprop.port }}
               protocol: TCP
+            {{- end }}
+            {{- if .Values.kadmin.enabled }}
+            - name: kadmin
+              containerPort: {{ .Values.kadmin.containerPort }}
+              protocol: TCP
+            - name: kpasswd-udp
+              containerPort: {{ .Values.kadmin.kpasswdContainerPort }}
+              protocol: UDP
+            - name: kpasswd-tcp
+              containerPort: {{ .Values.kadmin.kpasswdContainerPort }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: KRB5_KDC_PROFILE
               value: /etc/krb5-rs/kdc.conf
@@ -197,7 +215,8 @@ spec:
             - name: keytab
               mountPath: /keytab
               readOnly: true
-        {{- else }}
+        {{- end }}
+        {{- if and (gt (int .Values.replicas.replicaCount) 0) (not .Values.propagation.iprop.enabled) }}
         # Push the database to every replica's kpropd (MIT kprop).
         - name: kprop
           image: {{ include "krb5-rs-kdc.image" . | quote }}
@@ -238,7 +257,6 @@ spec:
               mountPath: /keytab
               readOnly: true
         {{- end }}
-        {{- end }}
       volumes:
         - name: config
           configMap:
@@ -250,7 +268,7 @@ spec:
                 path: krb5.conf
               - key: kprop-krb5.conf
                 path: kprop-krb5.conf
-              {{- if .Values.propagation.iprop.enabled }}
+              {{- if or .Values.propagation.iprop.enabled .Values.kadmin.enabled }}
               - key: kadm5.acl
                 path: kadm5.acl
               {{- end }}
