@@ -661,7 +661,7 @@ impl<S: AdminStore> AdminOps<S> {
                 let mut last = None;
                 let mut changes = 0;
                 let mut old = rec.entry.keys.clone();
-                old.sort_by(|a, b| b.kvno.cmp(&a.kvno));
+                old.sort_by_key(|k| std::cmp::Reverse(k.kvno));
                 for k in old.iter().filter(|_| keep_old > 0) {
                     if keep_old > 1 {
                         if last.is_some_and(|l| l != k.kvno) {
