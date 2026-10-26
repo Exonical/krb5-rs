@@ -1020,7 +1020,42 @@ fn check_policy(rec: &kadm5::PolicyEnt, mask: i32, max_life: Option<i32>) -> Res
     Ok(())
 }
 
+/// MIT `krb5_int32` salt types (`kdb.h` `KRB5_KDB_SALTTYPE_*`) krb5-rs
+/// generates keys for.
+fn ks_salt(t: i32) -> Option<krb5_rs::crypto::SaltType> {
+    use krb5_rs::crypto::SaltType as S;
+    match t {
+        0 => Some(S::Normal),
+        2 => Some(S::NoRealm),
+        3 => Some(S::OnlyRealm),
+        _ => None,
+    }
+}
+
 impl Kadm5 {
+    /// [`Self::admin`] generating the client's `ks_tuple` keys instead of
+    /// the realm's `supported_enctypes` when it sent any.
+    fn admin_ks(
+        &self,
+        caller: &Caller<'_>,
+        ks: &[kadm5::KeySalt],
+    ) -> Result<AdminOps<CallerStore>, u32> {
+        if ks.is_empty() {
+            return Ok(self.admin(caller));
+        }
+        let keysalts = ks
+            .iter()
+            .map(|&(e, t)| ks_salt(t).map(|t| (e, t)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(code::BAD_KEYSALTS)?;
+        Ok(AdminOps::new(
+            self.store
+                .as_caller(caller.client_name.clone().into_bytes()),
+            keysalts,
+        )
+        .with_history_enctype(self.history_enctype))
+    }
+
     /// Administration as `caller`, who is recorded as the modifier.
     fn admin(&self, caller: &Caller<'_>) -> AdminOps<CallerStore> {
         AdminOps::new(
@@ -1098,8 +1133,13 @@ impl Kadm5 {
             }
         }
         let c = match args {
-            W::ChrandPrincipal { princ, keepold, .. } => {
-                let (c, keys) = self.chrand(caller, princ.as_deref(), keepold);
+            W::ChrandPrincipal {
+                princ,
+                keepold,
+                ks_tuple,
+                ..
+            } => {
+                let (c, keys) = self.chrand(caller, princ.as_deref(), keepold, &ks_tuple);
                 return kadm5::chrand_ret(api, c, &keys);
             }
             W::ExtractKeys { princ, kvno, .. } => {
@@ -1110,8 +1150,15 @@ impl Kadm5 {
                 princ,
                 keepold,
                 pass,
+                ks_tuple,
                 ..
-            } => self.chpass(caller, princ.as_deref(), keepold, pass.as_deref()),
+            } => self.chpass(
+                caller,
+                princ.as_deref(),
+                keepold,
+                pass.as_deref(),
+                &ks_tuple,
+            ),
             W::RenamePrincipal { src, dest, .. } => {
                 self.rename_principal(caller, src.as_deref(), dest.as_deref())
             }
@@ -1119,8 +1166,18 @@ impl Kadm5 {
                 self.create_alias(caller, alias.as_deref(), target.as_deref())
             }
             W::CreatePrincipal {
-                rec, mask, passwd, ..
-            } => self.create_principal(caller, &rec, mask, passwd.as_deref()),
+                rec,
+                mask,
+                passwd,
+                ks_tuple,
+                ..
+            } => self.create_principal(
+                caller,
+                &rec,
+                mask,
+                passwd.as_deref(),
+                ks_tuple.as_deref().unwrap_or(&[]),
+            ),
             W::ModifyPrincipal { rec, mask, .. } => self.modify_principal(caller, &rec, mask),
             W::SetkeyPrincipal {
                 princ,
@@ -1203,6 +1260,7 @@ impl Kadm5 {
         princ: Option<&str>,
         keepold: bool,
         pass: Option<&str>,
+        ks: &[kadm5::KeySalt],
     ) -> u32 {
         let op = "kadm5_chpass_principal";
         let (name, realm, target, locked) = match self.keychange_auth(caller, op, princ) {
@@ -1218,7 +1276,11 @@ impl Kadm5 {
             c = match pass {
                 None => code::EINVAL,
                 Some(pw) => {
-                    match run(self.admin(caller).change_password_keeping(
+                    match run(match self.admin_ks(caller, ks) {
+                        Ok(a) => a,
+                        Err(c) => return c,
+                    }
+                    .change_password_keeping(
                         &name,
                         &realm,
                         Some(pw),
@@ -1262,6 +1324,7 @@ impl Kadm5 {
         caller: &Caller<'_>,
         princ: Option<&str>,
         keepold: bool,
+        ks: &[kadm5::KeySalt],
     ) -> (u32, Vec<kadm5::KeyBlock>) {
         let op = "kadm5_randkey_principal";
         let (name, realm, target, locked) = match self.keychange_auth(caller, op, princ) {
@@ -1271,7 +1334,11 @@ impl Kadm5 {
         let mut c = self.check_self_keychange(caller, &name, &realm);
         let mut keys = Vec::new();
         if c == code::OK {
-            c = match run(self.admin(caller).change_password_keeping(
+            c = match run(match self.admin_ks(caller, ks) {
+                Ok(a) => a,
+                Err(c) => return (c, Vec::new()),
+            }
+            .change_password_keeping(
                 &name,
                 &realm,
                 None,
@@ -1469,6 +1536,7 @@ impl Kadm5 {
         rec: &kadm5::PrincipalEnt,
         mask: i32,
         passwd: Option<&str>,
+        ks: &[kadm5::KeySalt],
     ) -> u32 {
         use kmask as m;
         let op = "kadm5_create_principal";
@@ -1521,12 +1589,12 @@ impl Kadm5 {
             if mask & m::PRINC_EXPIRE_TIME == 0 {
                 opts.expiration = Some(self.expiration);
             }
-            match run(self
-                .admin(caller)
-                .add_principal(&name, &realm, passwd, &opts))
-            {
-                Ok(()) => code::OK,
-                Err(e) => store_code(&e, code::UNK_POLICY),
+            match self.admin_ks(caller, ks) {
+                Err(c) => c,
+                Ok(a) => match run(a.add_principal(&name, &realm, passwd, &opts)) {
+                    Ok(()) => code::OK,
+                    Err(e) => store_code(&e, code::UNK_POLICY),
+                },
             }
         };
         caller.log_done(op, &target, c);

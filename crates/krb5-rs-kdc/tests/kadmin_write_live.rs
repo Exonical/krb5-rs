@@ -165,6 +165,11 @@ admin	modprinc -maxrenewlife 2d -allow_forwardable -pwexpire "2042-01-01 00:00:0
 admin	modprinc -policy nosuch carol
 admin	cpw -pw carol-pw-2 carol
 admin	cpw -randkey -keepold carol
+admin	addprinc -e aes128-cts-hmac-sha1-96:normal -pw ks-pw-1 kst
+admin	cpw -e aes256-cts-hmac-sha1-96:norealm -pw ks-pw-2 kst
+admin	cpw -randkey -keepold -e aes128-cts-hmac-sha1-96:onlyrealm kst
+admin	getprinc kst
+admin	cpw -e aes128-cts-hmac-sha1-96:afs3 -pw ks-pw-3 kst
 admin	getprinc carol
 admin	purgekeys -keepkvno 3 carol
 admin	getprinc carol
