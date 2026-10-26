@@ -51,6 +51,12 @@ fn name(n: &str) -> PrincipalName {
     PrincipalName::new_principal(n)
 }
 
+fn anon() -> PrincipalName {
+    let mut n = PrincipalName::new_srv_inst("WELLKNOWN", "ANONYMOUS");
+    n.name_type = 11;
+    n
+}
+
 fn pki_spec(cert: &str, key: &str) -> String {
     format!(
         "FILE:{0}/{cert}.pem,{0}/{key}.pem",
@@ -80,6 +86,15 @@ fn our_kdc(require_freshness: bool) -> Kdc<MemoryStore> {
             PrincipalAttributes::empty(),
         )
         .expect("krbtgt");
+    store
+        .add_random_key(
+            anon(),
+            PKI_REALM,
+            1,
+            &[18, 17],
+            PrincipalAttributes::empty(),
+        )
+        .expect("anonymous");
     for user in ["pkiuser", "armoruser"] {
         store
             .add_with_password(
@@ -312,6 +327,55 @@ fn mit_kinit_errors_when_our_kdc_rejects_the_certificate() {
     assert!(out.contains("Client name mismatch"), "{out}");
 }
 
+fn kinit_anonymous(env: &str, cc: &str) -> (i32, String) {
+    run(
+        &format!("{env} KRB5CCNAME={cc} KRB5_TRACE=/dev/stderr kinit -n @{PKI_REALM} < /dev/null"),
+        None,
+    )
+}
+
+#[test]
+#[ignore = "requires podman + MIT client container"]
+fn mit_kinit_anonymous_logs_in_to_our_kdc() {
+    let env = mit_conf(PORT, "ca", "");
+    let (code, out) = kinit_anonymous(&env, "/tmp/cc_pk_anon");
+    assert_eq!(code, 0, "kinit -n: {out}");
+    assert!(out.contains("PKINIT client verified DH reply"), "{out}");
+    let (_, klist) = run(&format!("{env} KRB5CCNAME=/tmp/cc_pk_anon klist -f"), None);
+    assert!(
+        klist.contains("Default principal: WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS"),
+        "{klist}"
+    );
+    assert!(
+        klist.contains(&format!("krbtgt/{PKI_REALM}@{PKI_REALM}")),
+        "{klist}"
+    );
+    // klist -f shows the anonymous ticket flag as `a`.
+    let flags = klist
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Flags: "))
+        .expect("flags line");
+    assert!(flags.contains('a'), "{klist}");
+}
+
+#[test]
+#[ignore = "requires podman + MIT client container"]
+fn mit_kinit_armors_with_an_anonymous_ticket_from_our_kdc() {
+    let env = mit_conf(PORT, "ca", "");
+    let (code, out) = kinit_anonymous(&env, "/tmp/cc_pk_anon_armor");
+    assert_eq!(code, 0, "kinit -n: {out}");
+    let (code, out) = run(
+        &format!(
+            "{env} KRB5CCNAME=/tmp/cc_pk_armored KRB5_TRACE=/dev/stderr \
+             kinit -T /tmp/cc_pk_anon_armor armoruser@{PKI_REALM}"
+        ),
+        Some(&format!("{PW}\n")),
+    );
+    assert_eq!(code, 0, "armored kinit: {out}");
+    assert!(out.contains("FAST armor ccache"), "{out}");
+    assert!(out.contains("encrypted_challenge (138)"), "{out}");
+}
+
 // ------------------------------------------------- our client -> MIT KDC
 
 fn mit_addr(port: u16) -> String {
@@ -344,6 +408,10 @@ fn run_as(
     if let Some(armor) = fast {
         config.fast = FastMode::Required(armor);
     }
+    run_config(port, config, password)
+}
+
+fn run_config(port: u16, config: AsExchangeConfig, password: &str) -> Run {
     let mut ex = AsExchange::new(config, password);
     let mut input = Vec::new();
     let mut error_codes = Vec::new();
@@ -472,4 +540,29 @@ fn mit_rejections_reach_our_client_with_mits_codes() {
         Err(Krb5Error::Crypto(m)) => assert!(m.contains("error 70"), "{m}"),
         other => panic!("expected a client-side PKINIT error, got {other:?}"),
     }
+}
+
+#[test]
+#[ignore = "requires podman + MIT KDC container"]
+fn our_client_anonymous_pkinit_against_mit() {
+    let mut config = AsExchangeConfig::new(anon(), "TEST.REALM");
+    config.pkinit = Some(Arc::new(ClientConfig::anonymous(anchors("ca"))));
+    let cred = run_config(MIT_PORT, config, "unused")
+        .result
+        .expect("anonymous PKINIT");
+    assert_eq!(cred.client, anon());
+    assert_eq!(cred.crealm, "WELLKNOWN:ANONYMOUS");
+    assert!(cred.flags.contains(krb5_rs::types::TicketFlags::ANONYMOUS));
+}
+
+#[test]
+#[ignore = "requires podman + MIT KDC container"]
+fn our_client_armors_with_an_anonymous_ticket_from_mit() {
+    let mut config = AsExchangeConfig::new(anon(), "TEST.REALM");
+    config.pkinit = Some(Arc::new(ClientConfig::anonymous(anchors("ca"))));
+    let armor = run_config(MIT_PORT, config, "unused")
+        .result
+        .expect("anonymous armor TGT");
+    let r = run_as(MIT_PORT, "testuser2", None, "password2", Some(armor));
+    assert!(r.result.is_ok(), "{:?}", r.result.err());
 }

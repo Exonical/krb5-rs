@@ -340,6 +340,8 @@ impl RealmConfig {
         kdc.reject_bad_transit =
             kdc_conf.get_boolean(&["realms", realm, "reject_bad_transit"], true)?;
         kdc.disable_pac = kdc_conf.get_boolean(&["realms", realm, "disable_pac"], false)?;
+        kdc.restrict_anonymous_to_tgt =
+            kdc_conf.get_boolean(&["realms", realm, "restrict_anonymous_to_tgt"], false)?;
         // The db2 module options live in `[dbmodules]` under the realm's
         // `database_module`, which defaults to the realm name (MIT
         // kdb5.c `get_conf_section`; kdb_db2.c:267-277).
@@ -668,7 +670,7 @@ default_principal_flags = +preauth\n    }\n";
         let kdc = profile(
             "[kdcdefaults]\n host_based_services = http\n[realms]\n R = {\n \
              host_based_services = ftp, imap\n no_host_referral = *\n \
-             reject_bad_transit = false\n disable_pac = true\n }\n",
+             reject_bad_transit = false\n disable_pac = true\n restrict_anonymous_to_tgt = true\n }\n",
         );
         let krb5 = profile("[domain_realm]\n .a.com = A.COM\n");
         let cfg = RealmConfig::from_profiles(&kdc, Some(&krb5), "R").expect("config");
@@ -676,6 +678,7 @@ default_principal_flags = +preauth\n    }\n";
         assert_eq!(cfg.kdc.no_host_referral, vec!["*"]);
         assert!(!cfg.kdc.reject_bad_transit);
         assert!(cfg.kdc.disable_pac);
+        assert!(cfg.kdc.restrict_anonymous_to_tgt);
         assert!(cfg.kdc.realm_profile.is_some());
         let plain = RealmConfig::from_profiles(&profile("[realms]\n R = {\n }\n"), None, "R")
             .expect("config");

@@ -34,8 +34,7 @@ pub(crate) const UNSUPPORTED_OPTIONS: KdcOptions = KdcOptions::ALLOW_POSTDATE
     .union(KdcOptions::POSTDATED)
     .union(KdcOptions::VALIDATE)
     .union(KdcOptions::ENC_TKT_IN_SKEY)
-    .union(KdcOptions::PROXY)
-    .union(KdcOptions::REQUEST_ANONYMOUS);
+    .union(KdcOptions::PROXY);
 
 /// Realm-wide lifetime limits (MIT `realm_maxlife` / `realm_maxrlife`).
 #[derive(Debug, Clone, Copy)]
@@ -277,6 +276,7 @@ pub(crate) fn get_ticket_flags(
         (KdcOptions::PROXY, TicketFlags::PROXY),
         (KdcOptions::ALLOW_POSTDATE, TicketFlags::MAY_POSTDATE),
         (KdcOptions::POSTDATED, TicketFlags::POSTDATED),
+        (KdcOptions::REQUEST_ANONYMOUS, TicketFlags::ANONYMOUS),
     ] {
         if opts.contains(opt) {
             flags |= flag;
@@ -288,7 +288,8 @@ pub(crate) fn get_ticket_flags(
                 & (TicketFlags::FORWARDED
                     | TicketFlags::PROXY
                     | TicketFlags::PRE_AUTHENT
-                    | TicketFlags::HW_AUTHENT);
+                    | TicketFlags::HW_AUTHENT
+                    | TicketFlags::ANONYMOUS);
             if server
                 .attributes
                 .contains(PrincipalAttributes::OK_AS_DELEGATE)
@@ -311,6 +312,11 @@ pub(crate) fn get_ticket_flags(
         || header.is_some_and(|h| !h.contains(TicketFlags::FORWARDABLE))
     {
         flags.remove(TicketFlags::FORWARDABLE);
+    }
+    // Anonymous tickets are not issued from non-anonymous ones
+    // (kdc_util.c:852-855).
+    if header.is_some_and(|h| !h.contains(TicketFlags::ANONYMOUS)) {
+        flags.remove(TicketFlags::ANONYMOUS);
     }
     flags
 }
@@ -666,6 +672,17 @@ mod tests {
         let f = get_ticket_flags(KdcOptions::FORWARDABLE, None, &entry(), Some(header));
         assert!(f.contains(TicketFlags::PRE_AUTHENT));
         assert!(!f.contains(TicketFlags::FORWARDABLE | TicketFlags::INITIAL));
+    }
+
+    #[test]
+    fn ticket_flags_tgs_copies_anonymous_only_from_an_anonymous_header() {
+        // TGS_COPIED_FLAGS_MASK (kdc_util.h:523-526), kdc_util.c:852-855.
+        let anon = Some(TicketFlags::ANONYMOUS | TicketFlags::PRE_AUTHENT);
+        let f = get_ticket_flags(KdcOptions::empty(), None, &entry(), anon);
+        assert!(f.contains(TicketFlags::ANONYMOUS));
+        let named = Some(TicketFlags::PRE_AUTHENT);
+        let f = get_ticket_flags(KdcOptions::REQUEST_ANONYMOUS, None, &entry(), named);
+        assert!(!f.contains(TicketFlags::ANONYMOUS));
     }
 
     #[test]

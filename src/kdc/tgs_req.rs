@@ -471,6 +471,13 @@ impl<S: PrincipalStore> Kdc<S> {
         if opts.intersects(UNSUPPORTED_OPTIONS) {
             return Err(KdcError::new(KDC_ERR_BADOPTION, "UNSUPPORTED OPTION"));
         }
+        // check_anon (tgs_policy.c:762-765).
+        if self.config.restrict_anonymous_to_tgt
+            && crate::types::is_anonymous_name(&header.cname)
+            && !super::as_req::is_local_tgs(sname, realm)
+        {
+            return Err(KdcError::new(KDC_ERR_POLICY, "ANONYMOUS NOT ALLOWED"));
+        }
         let header_flags: TicketFlags = *header.flags;
         let header_renew_till = header.renew_till.as_ref().map(ts).unwrap_or(0);
         check_tgs_opts(opts, header_flags)?;

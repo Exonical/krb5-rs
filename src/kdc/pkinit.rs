@@ -16,7 +16,7 @@ mod imp {
         self, RequestInfo, PA_AS_FRESHNESS, PA_PKINIT_KX, PA_PK_AS_REP, PA_PK_AS_REQ,
     };
     use crate::types::error_codes::*;
-    use crate::types::{EncryptionKey, KdcReq, PaData};
+    use crate::types::{EncryptionKey, KdcOptions, KdcReq, PaData, ANONYMOUS_REALM};
 
     /// `FRESHNESS_LIFETIME` (kdc_preauth.c:90).
     const FRESHNESS_LIFETIME: i64 = 600;
@@ -159,6 +159,11 @@ mod imp {
                 body_der,
                 as_req_der: raw,
                 client,
+                client_realm: if body.kdc_options.contains(KdcOptions::REQUEST_ANONYMOUS) {
+                    ANONYMOUS_REALM
+                } else {
+                    &self.config.realm
+                },
                 realm: &self.config.realm,
                 server: server_name,
                 nonce: body.nonce,
@@ -212,6 +217,11 @@ mod imp {
                 body_der,
                 as_req_der: raw,
                 client,
+                client_realm: if body.kdc_options.contains(KdcOptions::REQUEST_ANONYMOUS) {
+                    ANONYMOUS_REALM
+                } else {
+                    &self.config.realm
+                },
                 realm: &self.config.realm,
                 server: server_name,
                 nonce: body.nonce,

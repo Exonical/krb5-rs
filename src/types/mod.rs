@@ -49,3 +49,14 @@ pub type EtypeInfo = Vec<EtypeInfoEntry>;
 
 /// ETYPE-INFO2 — SEQUENCE OF ETYPE-INFO2-ENTRY (RFC 4120 §5.2.7.5).
 pub type EtypeInfo2 = Vec<EtypeInfo2Entry>;
+
+/// Realm of the anonymous principal (RFC 8062, `KRB5_ANONYMOUS_REALMSTR`).
+pub const ANONYMOUS_REALM: &str = "WELLKNOWN:ANONYMOUS";
+
+/// Whether `name` is `WELLKNOWN/ANONYMOUS`, in any realm
+/// (`krb5_principal_compare_any_realm` with `krb5_anonymous_principal`).
+pub fn is_anonymous_name(name: &PrincipalName) -> bool {
+    name.name_string.len() == 2
+        && name.name_string[0].as_bytes() == b"WELLKNOWN"
+        && name.name_string[1].as_bytes() == b"ANONYMOUS"
+}

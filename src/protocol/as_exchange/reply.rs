@@ -1,6 +1,7 @@
 //! AS-REP processing and reply validation (get_in_tkt.c process_response).
 
 use super::*;
+use crate::types::{is_anonymous_name, EncryptedData};
 
 impl AsExchange {
     /// Process a successful AS-REP: decrypt enc-part, validate, build credential.
@@ -69,7 +70,8 @@ impl AsExchange {
 
         // Validate the reply
         let now = now_kerberos();
-        let canonicalize = self.config.kdc_options.contains(KdcOptions::CANONICALIZE);
+        let anonymous = is_anonymous_name(&self.config.client);
+        let canonicalize = self.config.kdc_options.contains(KdcOptions::CANONICALIZE) || anonymous;
         let req_body = self
             .last_req_body
             .as_ref()
@@ -84,6 +86,10 @@ impl AsExchange {
             self.config.max_clock_skew,
             now,
         )?;
+
+        if anonymous {
+            verify_anonymous(rep, &as_key, &enc_part.key)?;
+        }
 
         // MIT fast.c:634-675 `krb5int_fast_verify_nego` — when the KDC sets
         // enc-pa-rep it MUST include a PA-REQ-ENC-PA-REP checksum over the
@@ -218,4 +224,37 @@ impl AsExchange {
             realm: self.config.realm.clone(),
         })
     }
+}
+
+/// `verify_anonymous` (get_in_tkt.c:147-205): an anonymous reply's session
+/// key must be KRB-FX-CF2 of the PA-PKINIT-KX key and the reply key.
+fn verify_anonymous(
+    rep: &KdcRep,
+    as_key: &EncryptionKey,
+    session: &EncryptionKey,
+) -> Result<(), Krb5Error> {
+    const BAD: Krb5Error =
+        Krb5Error::ReplyValidation("Reply has wrong form of session key for anonymous request");
+    let pa = rep
+        .padata
+        .iter()
+        .flatten()
+        .find(|p| p.padata_type == 147)
+        .ok_or(BAD)?;
+    let enc: EncryptedData = rasn::der::decode(pa.padata_value.as_ref())?;
+    let plain = find_etype(as_key.keytype)
+        .map_err(|_| Krb5Error::UnsupportedEtype(as_key.keytype))?
+        .decrypt(
+            as_key.key_bytes(),
+            key_usage::PA_PKINIT_KX,
+            enc.cipher.as_ref(),
+        )
+        .map_err(|_| Krb5Error::Crypto("PA-PKINIT-KX decryption failed".into()))?;
+    let kdc_key: EncryptionKey = rasn::der::decode(&plain)?;
+    let expected = crate::crypto::fx_cf2(&kdc_key, b"PKINIT", as_key, b"KEYEXCHANGE")
+        .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
+    if expected.keytype != session.keytype || expected.key_bytes() != session.key_bytes() {
+        return Err(BAD);
+    }
+    Ok(())
 }

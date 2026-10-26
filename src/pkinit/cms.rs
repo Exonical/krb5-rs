@@ -188,6 +188,20 @@ pub fn sign(
     Ok(tlv(0x30, &ci))
 }
 
+/// A SignedData ContentInfo over `data` without certificates or signers
+/// (`cms_signeddata_create` with no identity certificate: anonymous PKINIT).
+pub fn sign_anonymous(econtent_type: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut signed = der::uint(&[3]);
+    signed.extend(tlv(0x31, &[]));
+    let mut encap = tlv(0x06, econtent_type);
+    encap.extend(tlv(0xA0, &tlv(0x04, data)));
+    signed.extend(tlv(0x30, &encap));
+    signed.extend(tlv(0x31, &[]));
+    let mut ci = tlv(0x06, asn1::ID_SIGNED_DATA);
+    ci.extend(tlv(0xA0, &tlv(0x30, &signed)));
+    tlv(0x30, &ci)
+}
+
 /// The verified contents of a SignedData message.
 #[derive(Debug)]
 pub struct Verified {
