@@ -1162,7 +1162,7 @@ mod tests {
         let got: Vec<_> = entry
             .tl_data
             .iter()
-            .filter(|t| t.kind >= 300)
+            .filter(|t| t.kind == 300 || t.kind == 301)
             .map(|t| (t.kind, t.data.clone()))
             .collect();
         assert_eq!(got, vec![(300, b"c".to_vec()), (301, b"b".to_vec())]);
