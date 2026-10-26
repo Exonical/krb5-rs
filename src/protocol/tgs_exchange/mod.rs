@@ -61,6 +61,9 @@ pub struct TgsOptions {
     pub max_clock_skew: Duration,
     /// Whether to include PA-PAC-OPTIONS (Branch Aware flag). Default: true.
     pub pac_options: bool,
+    /// Whether to set DISABLE-TRANSITED-CHECK (`KRB5_GC_NO_TRANSIT_CHECK`).
+    /// Default: false.
+    pub disable_transited_check: bool,
 }
 
 impl Default for TgsOptions {
@@ -72,6 +75,7 @@ impl Default for TgsOptions {
             etypes: vec![18, 17, 20, 19], // AES-256-SHA1, AES-128-SHA1, AES-256-SHA2, AES-128-SHA2
             max_clock_skew: DEFAULT_MAX_CLOCK_SKEW,
             pac_options: true,
+            disable_transited_check: false,
         }
     }
 }
@@ -187,6 +191,9 @@ pub struct TgsExchange {
     fast_state: FastState,
     /// S4U2Self / S4U2Proxy mode.
     s4u: s4u::S4uMode,
+    /// Authorization data to request (`in_creds->authdata`); cleared once a
+    /// referral TGT carries it (get_creds.c:602-605).
+    authdata: Option<crate::types::AuthorizationData>,
 }
 
 impl TgsExchange {
@@ -208,7 +215,16 @@ impl TgsExchange {
             first_referral_attempt: true,
             fast_state: FastState::new(),
             s4u: s4u::S4uMode::None,
+            authdata: None,
         }
+    }
+
+    /// Request `authdata` in the TGS-REQ enc-authorization-data
+    /// (send_tgs.c:183-193).
+    #[must_use]
+    pub fn with_authdata(mut self, authdata: Option<crate::types::AuthorizationData>) -> Self {
+        self.authdata = authdata.filter(|a| !a.is_empty());
+        self
     }
 
     /// Advance the state machine.

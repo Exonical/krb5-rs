@@ -45,6 +45,26 @@ impl TgsExchange {
             .checked_add_signed(chrono::Duration::hours(10))
             .ok_or(Krb5Error::ReplyValidation("till overflow"))?;
 
+        let enc_authorization_data = match &self.authdata {
+            Some(ad) => {
+                let profile = find_etype(subkey.keytype)
+                    .map_err(|_| Krb5Error::UnsupportedEtype(subkey.keytype))?;
+                let cipher = profile
+                    .encrypt(
+                        subkey.key_bytes(),
+                        key_usage::TGS_REQ_AD_SUBKEY,
+                        &rasn::der::encode(ad)?,
+                    )
+                    .map_err(|e| Krb5Error::Crypto(e.to_string()))?;
+                Some(EncryptedData {
+                    etype: subkey.keytype,
+                    kvno: None,
+                    cipher: cipher.into(),
+                })
+            }
+            None => None,
+        };
+
         let req_body = KdcReqBody {
             kdc_options: KerberosFlags::new(kdc_opts),
             cname: None, // TGS-REQ does not include cname in body
@@ -56,7 +76,7 @@ impl TgsExchange {
             nonce: self.nonce,
             etype: self.options.etypes.clone(),
             addresses: None,
-            enc_authorization_data: None,
+            enc_authorization_data,
             additional_tickets: self.s4u_additional_tickets(),
         };
 
@@ -111,6 +131,9 @@ impl TgsExchange {
         }
         if canonicalize {
             kdc_opts |= KdcOptions::CANONICALIZE;
+        }
+        if self.options.disable_transited_check {
+            kdc_opts |= KdcOptions::DISABLE_TRANSITED_CHECK;
         }
         kdc_opts
     }
@@ -278,6 +301,7 @@ impl TgsExchange {
 
         // Use the referral TGT for the next request
         self.cur_tgt = referral_tgt;
+        self.authdata = None;
 
         // Send TGS-REQ to the referral realm
         let tgs_req = self.build_tgs_req(true)?;

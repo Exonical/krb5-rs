@@ -36,6 +36,8 @@ pub mod key_usage {
     pub const TICKET: i32 = 2;
     /// AS-REP encrypted part (client's key).
     pub const AS_REP_ENCPART: i32 = 3;
+    /// TGS-REQ enc-authorization-data (subkey).
+    pub const TGS_REQ_AD_SUBKEY: i32 = 5;
     /// TGS-REQ authenticator checksum (session key).
     pub const TGS_REQ_AUTH_CKSUM: i32 = 6;
     /// TGS-REQ authenticator (encrypted with session key).

@@ -421,6 +421,9 @@ impl TgsExchange {
         if self.options.canonicalize {
             opts |= KdcOptions::CANONICALIZE;
         }
+        if self.options.disable_transited_check {
+            opts |= KdcOptions::DISABLE_TRANSITED_CHECK;
+        }
         match &self.s4u {
             S4uMode::None => return None,
             S4uMode::SelfReq(_) => opts |= KdcOptions::CANONICALIZE,
@@ -622,6 +625,7 @@ impl TgsExchange {
             return Err(Krb5Error::ReferralLimitExceeded(MAX_REFERRAL_HOPS));
         }
         self.cur_tgt = crate::protocol::kdc_rep::credential_from_rep(rep, enc_part);
+        self.authdata = None;
         self.s4u_send()
     }
 
@@ -661,6 +665,7 @@ impl TgsExchange {
                 }
                 check_rbcd_support(enc_part)?;
                 st.proxy_tgt = Some(reply());
+                self.authdata = None;
                 st.phase = ProxyPhase::TargetTgt;
                 st.referrals.clear();
             }
