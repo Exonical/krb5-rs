@@ -10,7 +10,7 @@ use krb5_rs::kdc::kdb::mit::mkey::{entry_mkvno, MasterKeys};
 use krb5_rs::kdc::kdb::mit::ulog::{entry_from_update, update_from_entry, Ulog, UlogLock, Update};
 use krb5_rs::kdc::kdb::mit::{
     decode_lockout, encode_lockout, merge_policy, merge_record, new_entry, policy_from_entry,
-    record_from_entry, unparse_name, MitEntry, MitPolicy, TlData, ACTKVNO, MKVNO,
+    record_from_entry, unparse_name, update_tl_data, MitEntry, MitPolicy, TlData, ACTKVNO, MKVNO,
 };
 use krb5_rs::kdc::kdb::FileStore;
 use krb5_rs::kdc::{
@@ -836,7 +836,7 @@ impl LmdbStore {
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
         let modifier = admin_name(&self.inner.realm);
-        self.create_principal_as(entry, last_pwd_change, modifier)
+        self.create_principal_as(entry, last_pwd_change, modifier, &[])
     }
 
     fn create_principal_as(
@@ -844,6 +844,7 @@ impl LmdbStore {
         entry: PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
         modifier: Vec<u8>,
+        tl: &[TlData],
     ) -> Result<(), StoreError> {
         self.refresh_master()?;
         let key = unparse_name(&entry.name, &entry.realm);
@@ -854,7 +855,8 @@ impl LmdbStore {
             password_history: None,
             entry,
         };
-        let raw = new_entry(&record, &self.master_keys(), &modifier)?;
+        let mut raw = new_entry(&record, &self.master_keys(), &modifier)?;
+        update_tl_data(&mut raw, tl);
         let (_, value) = raw.encode()?;
         let held = self.lock_ulog()?;
         let mut txn = self
@@ -1021,7 +1023,7 @@ impl LmdbStore {
     where
         F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError>,
     {
-        self.update_principal_as(name, realm, admin_name(realm), f)
+        self.update_principal_as(name, realm, admin_name(realm), &[], f)
     }
 
     fn update_principal_as<F>(
@@ -1029,6 +1031,7 @@ impl LmdbStore {
         name: &PrincipalName,
         realm: &str,
         modifier: Vec<u8>,
+        tl: &[TlData],
         mut f: F,
     ) -> Result<PrincipalRecord, StoreError>
     where
@@ -1058,6 +1061,7 @@ impl LmdbStore {
         record.mod_time = Some(now_time());
         record.mod_by = Some(modifier.clone());
         merge_record(&mut raw, &record, &self.master_keys(), Some(&modifier))?;
+        update_tl_data(&mut raw, tl);
         let (_, value) = raw.encode()?;
         self.inner
             .principal_db
@@ -1867,6 +1871,7 @@ impl AdminStore for LmdbStore {
 pub struct CallerStore {
     store: LmdbStore,
     modifier: Vec<u8>,
+    tl_data: Vec<TlData>,
 }
 
 impl LmdbStore {
@@ -1875,7 +1880,17 @@ impl LmdbStore {
         CallerStore {
             store: self.clone(),
             modifier,
+            tl_data: Vec::new(),
         }
+    }
+}
+
+impl CallerStore {
+    /// This view, also merging `tl` into each principal it creates or
+    /// updates in the same transaction (`krb5_dbe_update_tl_data`).
+    pub fn with_tl_data(mut self, tl: Vec<TlData>) -> Self {
+        self.tl_data = tl;
+        self
     }
 }
 
@@ -1895,8 +1910,9 @@ impl AdminStore for CallerStore {
     ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
         let store = self.store.clone();
         let modifier = self.modifier.clone();
+        let tl = self.tl_data.clone();
         spawn_write("principal create", move || {
-            store.create_principal_as(entry, last_pwd_change, modifier)
+            store.create_principal_as(entry, last_pwd_change, modifier, &tl)
         })
     }
 
@@ -1913,8 +1929,9 @@ impl AdminStore for CallerStore {
         let modifier = self.modifier.clone();
         let name = name.clone();
         let realm = realm.to_owned();
+        let tl = self.tl_data.clone();
         spawn_write("principal update", move || {
-            store.update_principal_as(&name, &realm, modifier, f)
+            store.update_principal_as(&name, &realm, modifier, &tl, f)
         })
     }
 
@@ -2944,5 +2961,46 @@ mod tests {
             .await
             .expect("delete ignores the lockout failure"));
         assert!(store.get_raw(&alice, "LMDB.TEST").expect("read").is_none());
+    }
+
+    #[tokio::test]
+    async fn caller_store_merges_tl_data_in_the_same_write() {
+        use krb5_rs::kdc::kdb::admin::PrincipalOptions;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let config = test_config(&path);
+        let (store, _master) = test_store(&path);
+        let tl = |kind: u16, data: &[u8]| TlData {
+            kind,
+            data: data.to_vec(),
+        };
+        let svc = PrincipalName::new_principal("svc");
+        let opts = PrincipalOptions::default();
+        let with = |t: Vec<TlData>| {
+            AdminOps::new(
+                store.as_caller(b"admin@LMDB.TEST".to_vec()).with_tl_data(t),
+                config.supported_keysalts.clone(),
+            )
+        };
+        with(vec![tl(300, b"a"), tl(301, b"b")])
+            .add_principal(&svc, "LMDB.TEST", Some("pw"), &opts)
+            .await
+            .expect("add");
+        with(vec![tl(300, b"c")])
+            .modify_principal(&svc, "LMDB.TEST", &opts)
+            .await
+            .expect("modify");
+        let raw = store
+            .get_raw(&svc, "LMDB.TEST")
+            .expect("read")
+            .expect("svc");
+        let got: Vec<_> = raw
+            .tl_data
+            .iter()
+            .filter(|t| t.kind == 300 || t.kind == 301)
+            .map(|t| (t.kind, t.data.clone()))
+            .collect();
+        assert_eq!(got, vec![(301, b"b".to_vec()), (300, b"c".to_vec())]);
     }
 }

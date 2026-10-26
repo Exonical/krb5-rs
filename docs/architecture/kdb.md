@@ -467,8 +467,8 @@ records the caller as the modifier and is appended to the update log while the
 update-log lock taken for the database write is still held, so iprop replicas
 follow (a crash between the commit and the append leaves the log behind the
 database, which the next `kpropd` poll repairs with a full resync, as in MIT).
-Client `KADM5_TL_DATA` on create and modify is stored in a second logged write
-right after the principal change. Deviation: policy `KADM5_POLICY_TL_DATA` is
+Client `KADM5_TL_DATA` on create and modify is merged into the principal in
+the same write, as `krb5_dbe_update_tl_data` does. Deviation: policy `KADM5_POLICY_TL_DATA` is
 checked (types below 256 are refused) but not stored, because klmdb's policy
 encoding here has no TL data; MIT's own `kadmin` never sends it. The live test
 `crates/krb5-rs-kdc/tests/kadmin_write_live.rs` runs the same MIT 1.22.2

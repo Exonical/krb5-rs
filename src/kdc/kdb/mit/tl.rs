@@ -83,11 +83,14 @@ pub fn set_key_change(entry: &mut MitEntry, seconds: u32) {
     );
 }
 
-/// `krb5_dbe_update_tl_data` for each of `tl`: replace the entry's TL data
-/// of the same type, or add it.
+/// `krb5_dbe_update_tl_data` (`lib/kdb/kdb5.c`) for each of `tl`: replace
+/// the entry's TL data of the same type in place, or prepend a new type.
 pub fn update_tl_data(entry: &mut MitEntry, tl: &[TlData]) {
     for t in tl {
-        set_tl(entry, t.kind, Some(t.data.clone()));
+        match entry.tl_data.iter_mut().find(|e| e.kind == t.kind) {
+            Some(e) => e.data = t.data.clone(),
+            None => entry.tl_data.insert(0, t.clone()),
+        }
     }
 }
 
@@ -1165,6 +1168,7 @@ mod tests {
             .filter(|t| t.kind == 300 || t.kind == 301)
             .map(|t| (t.kind, t.data.clone()))
             .collect();
-        assert_eq!(got, vec![(300, b"c".to_vec()), (301, b"b".to_vec())]);
+        // MIT prepends new types; kadm5 reads report them in request order.
+        assert_eq!(got, vec![(301, b"b".to_vec()), (300, b"c".to_vec())]);
     }
 }

@@ -21,7 +21,7 @@ use krb5_rs::kdc::kdb::mit::mkey::entry_mkvno;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
 use krb5_rs::kdc::kdb::mit::{parse_name_with_default, MitEntry};
 use krb5_rs::kdc::kdb::mit::{
-    set_key_change, set_mod_princ, set_string_attr, update_tl_data, KeyData as MitKeyData, TlData,
+    set_key_change, set_mod_princ, set_string_attr, KeyData as MitKeyData, TlData,
 };
 use krb5_rs::kdc::kdb::read_stash;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
@@ -1040,36 +1040,33 @@ impl Kadm5 {
         caller: &Caller<'_>,
         ks: &[kadm5::KeySalt],
     ) -> Result<AdminOps<CallerStore>, u32> {
-        if ks.is_empty() {
-            return Ok(self.admin(caller));
-        }
-        let keysalts = ks
-            .iter()
-            .map(|&(e, t)| ks_salt(t).map(|t| (e, t)))
-            .collect::<Option<Vec<_>>>()
-            .ok_or(code::BAD_KEYSALTS)?;
+        self.admin_with(caller, ks, Vec::new())
+    }
+
+    /// [`Self::admin_ks`] that also stores the client's `KADM5_TL_DATA`
+    /// in the same write, as `kadm5_create_principal_3` and
+    /// `kadm5_modify_principal` do (`svr_principal.c:429-437`, `650-665`).
+    fn admin_with(
+        &self,
+        caller: &Caller<'_>,
+        ks: &[kadm5::KeySalt],
+        tl: Vec<TlData>,
+    ) -> Result<AdminOps<CallerStore>, u32> {
+        let keysalts = if ks.is_empty() {
+            self.keysalts.clone()
+        } else {
+            ks.iter()
+                .map(|&(e, t)| ks_salt(t).map(|t| (e, t)))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(code::BAD_KEYSALTS)?
+        };
         Ok(AdminOps::new(
             self.store
-                .as_caller(caller.client_name.clone().into_bytes()),
+                .as_caller(caller.client_name.clone().into_bytes())
+                .with_tl_data(tl),
             keysalts,
         )
         .with_history_enctype(self.history_enctype))
-    }
-
-    /// The client's `KADM5_TL_DATA` entries, stored as
-    /// `kadm5_create_principal_3` and `kadm5_modify_principal` do
-    /// (`svr_principal.c:429-437`, `650-665`).
-    fn put_tl(&self, name: &PrincipalName, realm: &str, tl: &[TlData]) -> u32 {
-        if tl.is_empty() {
-            return code::OK;
-        }
-        match self.store.update_raw(name, realm, |e, _| {
-            update_tl_data(e, tl);
-            Ok(true)
-        }) {
-            Ok(_) => code::OK,
-            Err(e) => store_code(&e, code::UNK_PRINC),
-        }
     }
 
     /// Administration as `caller`, who is recorded as the modifier.
@@ -1588,9 +1585,9 @@ impl Kadm5 {
             code::BAD_TL_TYPE
         } else {
             let tl = if mask & m::TL_DATA != 0 {
-                &rec.tl_data[..]
+                rec.tl_data.clone()
             } else {
-                &[]
+                Vec::new()
             };
             let (mut opts, mask) = principal_options(rec, mask, restr.as_ref());
             let mask = mask as i32;
@@ -1610,10 +1607,10 @@ impl Kadm5 {
             if mask & m::PRINC_EXPIRE_TIME == 0 {
                 opts.expiration = Some(self.expiration);
             }
-            match self.admin_ks(caller, ks) {
+            match self.admin_with(caller, ks, tl) {
                 Err(c) => c,
                 Ok(a) => match run(a.add_principal(&name, &realm, passwd, &opts)) {
-                    Ok(()) => self.put_tl(&name, &realm, tl),
+                    Ok(()) => code::OK,
                     Err(e) => store_code(&e, code::UNK_POLICY),
                 },
             }
@@ -1671,13 +1668,17 @@ impl Kadm5 {
             code::BAD_SERVER_PARAMS
         } else {
             let tl = if mask & m::TL_DATA != 0 {
-                &rec.tl_data[..]
+                rec.tl_data.clone()
             } else {
-                &[]
+                Vec::new()
             };
             let (opts, _) = principal_options(rec, mask, restr.as_ref());
-            match run(self.admin(caller).modify_principal(&name, &realm, &opts)) {
-                Ok(()) => self.put_tl(&name, &realm, tl),
+            let admin = match self.admin_with(caller, &[], tl) {
+                Ok(a) => a,
+                Err(c) => return c,
+            };
+            match run(admin.modify_principal(&name, &realm, &opts)) {
+                Ok(()) => code::OK,
                 Err(e) => store_code(&e, code::UNK_PRINC),
             }
         };
