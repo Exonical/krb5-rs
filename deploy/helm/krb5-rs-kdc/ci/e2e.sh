@@ -142,6 +142,9 @@ replicas_serve bob bob-pw
 
 step "MIT kadmin through the kadmin Service"
 addprinc admin/admin admin-pw
+# kadmin gets its kadmin/admin ticket through the kdc Service, which also
+# routes to replicas; wait until every replica has the new principal.
+replicas_serve admin/admin admin-pw
 ready=0
 for _ in $(seq 1 30); do
   if kadm admin/admin admin-pw "getprinc kadmin/admin" | grep -q "Principal: kadmin/admin@${REALM}"; then
