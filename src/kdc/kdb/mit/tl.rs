@@ -83,6 +83,14 @@ pub fn set_key_change(entry: &mut MitEntry, seconds: u32) {
     );
 }
 
+/// `krb5_dbe_update_tl_data` for each of `tl`: replace the entry's TL data
+/// of the same type, or add it.
+pub fn update_tl_data(entry: &mut MitEntry, tl: &[TlData]) {
+    for t in tl {
+        set_tl(entry, t.kind, Some(t.data.clone()));
+    }
+}
+
 fn set_tl(entry: &mut MitEntry, kind: u16, data: Option<Vec<u8>>) {
     let first = entry.tl_data.iter().position(|tl| tl.kind == kind);
     entry.tl_data.retain(|tl| {
@@ -1125,5 +1133,38 @@ mod tests {
                 .1,
             creator
         );
+    }
+
+    #[test]
+    fn update_tl_data_replaces_same_type_and_adds_new_ones() {
+        let master = master_key_from_password("R", "master", 18).expect("master key");
+        let mut entry = test_entry(&master);
+        update_tl_data(
+            &mut entry,
+            &[
+                TlData {
+                    kind: 300,
+                    data: b"a".to_vec(),
+                },
+                TlData {
+                    kind: 301,
+                    data: b"b".to_vec(),
+                },
+            ],
+        );
+        update_tl_data(
+            &mut entry,
+            &[TlData {
+                kind: 300,
+                data: b"c".to_vec(),
+            }],
+        );
+        let got: Vec<_> = entry
+            .tl_data
+            .iter()
+            .filter(|t| t.kind >= 300)
+            .map(|t| (t.kind, t.data.clone()))
+            .collect();
+        assert_eq!(got, vec![(300, b"c".to_vec()), (301, b"b".to_vec())]);
     }
 }
