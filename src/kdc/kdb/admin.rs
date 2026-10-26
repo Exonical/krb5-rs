@@ -564,9 +564,23 @@ impl<S: AdminStore> AdminOps<S> {
         password: Option<&str>,
         keep_old: bool,
     ) -> Result<u32, StoreError> {
+        self.change_password_keeping(name, realm, password, u32::from(keep_old))
+            .await
+    }
+
+    /// [`Self::change_password`] keeping old keys like `preserve_old_keys`
+    /// (`kdb_cpw.c:117-145`): none for 0, all for 1, otherwise the newest
+    /// `keep_old - 1` old key versions.
+    pub async fn change_password_keeping(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        password: Option<&str>,
+        keep_old: u32,
+    ) -> Result<u32, StoreError> {
         let history_target = is_history_principal(name);
         // svr_principal.c:1247-1249, 1430-1438.
-        if history_target && (password.is_some() || keep_old) {
+        if history_target && (password.is_some() || keep_old > 0) {
             return Err(StoreError::rejected(PROTECT_PRINCIPAL));
         }
         let current = self.require(name, realm).await?;
@@ -644,8 +658,19 @@ impl<S: AdminStore> AdminOps<S> {
                         }
                     }
                 }
-                if keep_old {
-                    keys.extend(rec.entry.keys.iter().cloned());
+                let mut last = None;
+                let mut changes = 0;
+                for k in rec.entry.keys.iter().filter(|_| keep_old > 0) {
+                    if keep_old > 1 {
+                        if last.is_some_and(|l| l != k.kvno) {
+                            changes += 1;
+                        }
+                        if changes >= keep_old - 1 {
+                            break;
+                        }
+                        last = Some(k.kvno);
+                    }
+                    keys.push(k.clone());
                 }
                 rec.entry.keys = keys;
                 rec.entry

@@ -1556,6 +1556,70 @@ mod tests {
     }
 
     #[test]
+    fn write_args_reject_malformed_xdr() {
+        assert!(WriteArgs::decode(proc_::GET_PRINCIPAL, &[]).is_none());
+        let mut w = XdrWriter::default();
+        w.u32(API_VERSION_4);
+        write_nullstring(&mut w, Some(b"old"));
+        write_nullstring(&mut w, Some(b"new"));
+        let args = WriteArgs::decode(proc_::RENAME_PRINCIPAL, &w.0)
+            .expect("known")
+            .expect("ok");
+        assert_eq!(
+            args,
+            WriteArgs::RenamePrincipal {
+                api_version: API_VERSION_4,
+                src: Some("old".into()),
+                dest: Some("new".into()),
+            }
+        );
+        let mut trailing = w.0.clone();
+        trailing.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(WriteArgs::decode(proc_::RENAME_PRINCIPAL, &trailing)
+            .expect("known")
+            .is_err());
+        for len in 0..w.0.len() {
+            assert!(
+                WriteArgs::decode(proc_::RENAME_PRINCIPAL, &w.0[..len])
+                    .expect("known")
+                    .is_err(),
+                "truncated to {len}"
+            );
+        }
+        for p in [
+            proc_::CREATE_PRINCIPAL,
+            proc_::CREATE_PRINCIPAL3,
+            proc_::MODIFY_PRINCIPAL,
+            proc_::CHPASS_PRINCIPAL3,
+            proc_::CHRAND_PRINCIPAL3,
+            proc_::SETKEY_PRINCIPAL,
+            proc_::SETKEY_PRINCIPAL3,
+            proc_::SETKEY_PRINCIPAL4,
+            proc_::CREATE_POLICY,
+            proc_::MODIFY_POLICY,
+            proc_::PURGEKEYS,
+            proc_::SET_STRING,
+            proc_::EXTRACT_KEYS,
+            proc_::CREATE_ALIAS,
+        ] {
+            let mut w = XdrWriter::default();
+            w.u32(API_VERSION_4);
+            assert!(
+                WriteArgs::decode(p, &w.0).expect("known").is_err(),
+                "proc {p}"
+            );
+        }
+        // A key array longer than the remaining bytes is refused.
+        let mut w = XdrWriter::default();
+        w.u32(API_VERSION_4);
+        write_nullstring(&mut w, Some(b"p"));
+        w.u32(0x7fff_ffff);
+        assert!(WriteArgs::decode(proc_::SETKEY_PRINCIPAL, &w.0)
+            .expect("known")
+            .is_err());
+    }
+
+    #[test]
     fn globs_follow_glob_to_regexp() {
         let g = |e: &str, realm: bool| Glob::new(Some(e), realm).expect("valid");
         assert!(g("*", true).matches(b"alice@R"));

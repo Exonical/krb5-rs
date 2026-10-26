@@ -46,7 +46,10 @@ fn binary_directory() -> PathBuf {
 #[ignore = "requires the MIT container of the Compose stack"]
 fn mit_kadmin_changes_match_mit_kadmind() {
     let c = container();
-    let mkdir = container_run(&["exec", &c, "mkdir", "-p", "/tmp/kadmin-write-live/bin"], "");
+    let mkdir = container_run(
+        &["exec", &c, "mkdir", "-p", "/tmp/kadmin-write-live/bin"],
+        "",
+    );
     assert!(mkdir.status.success(), "{mkdir:?}");
     for name in ["krb5-rs-kadmind", "krb5-rs-kdc"] {
         let path = binary_directory().join(name);
@@ -191,6 +194,7 @@ bob	cpw -pw bob-pw-2 bob
 admin	delpol -force newpol
 admin	delprinc -force dave
 admin	getprinc dave
+admin	addprinc -randkey skey
 admin	listprincs
 EOF
 
@@ -222,12 +226,76 @@ for s in mit rs; do
 done
 diff -u "$B/mit/kt3.list" "$B/rs/kt3.list" || fail "ktadd keytab differs"
 
+# kadmin has no setkey command; call setkey_principal{,_3,_4} directly.
+cat > "$B/setkey.c" <<'CEOF'
+#include <kadm5/admin.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static krb5_context ctx;
+static krb5_principal P(const char *s) {
+    krb5_principal p = NULL; krb5_parse_name(ctx, s, &p); return p;
+}
+static krb5_keyblock kb(krb5_enctype e, int len, int fill) {
+    krb5_keyblock k = {0};
+    k.enctype = e; k.length = len; k.contents = malloc(len);
+    memset(k.contents, fill, len);
+    return k;
+}
+int main(int argc, char **argv) {
+    void *h; kadm5_config_params params = {0};
+    if (krb5_init_context(&ctx)) return 2;
+    long r = kadm5_init_with_password(ctx, argv[1], argv[2], KADM5_ADMIN_SERVICE,
+                                      &params, KADM5_STRUCT_VERSION,
+                                      KADM5_API_VERSION_4, NULL, &h);
+    printf("init %ld\n", r);
+    if (r) return 0;
+    krb5_keyblock k1[2] = {kb(18, 32, 1), kb(17, 16, 2)};
+    printf("setkey %ld\n", (long)kadm5_setkey_principal(h, P("skey"), k1, 2));
+    printf("setkey empty %ld\n", (long)kadm5_setkey_principal(h, P("skey"), k1, 0));
+    krb5_key_salt_tuple ks[2] = {{18, KRB5_KDB_SALTTYPE_NORMAL},
+                                 {18, KRB5_KDB_SALTTYPE_NORMAL}};
+    krb5_keyblock k3[2] = {kb(18, 32, 3), kb(18, 32, 4)};
+    printf("setkey3 dup %ld\n",
+           (long)kadm5_setkey_principal_3(h, P("skey"), TRUE, 2, ks, k3, 2));
+    printf("setkey3 %ld\n",
+           (long)kadm5_setkey_principal_3(h, P("skey"), TRUE, 1, ks, k3, 1));
+    kadm5_key_data kd[2];
+    memset(kd, 0, sizeof(kd));
+    kd[0].kvno = 7; kd[0].key = kb(18, 32, 5);
+    kd[0].salt.type = KRB5_KDB_SALTTYPE_SPECIAL;
+    kd[0].salt.data.data = "weird"; kd[0].salt.data.length = 5;
+    kd[1].kvno = 7; kd[1].key = kb(17, 16, 6);
+    kd[1].salt.type = KRB5_KDB_SALTTYPE_NORMAL;
+    printf("setkey4 %ld\n", (long)kadm5_setkey_principal_4(h, P("skey"), TRUE, kd, 2));
+    printf("setkey4 again %ld\n",
+           (long)kadm5_setkey_principal_4(h, P("skey"), TRUE, kd, 2));
+    kd[1].kvno = 8;
+    printf("setkey4 mixed %ld\n",
+           (long)kadm5_setkey_principal_4(h, P("skey"), FALSE, kd, 2));
+    printf("setkey history %ld\n",
+           (long)kadm5_setkey_principal(h, P("kadmin/history"), k1, 2));
+    printf("setkey locked %ld\n", (long)kadm5_setkey_principal(h, P("locked"), k1, 2));
+    printf("setkey missing %ld\n", (long)kadm5_setkey_principal(h, P("nosuch"), k1, 2));
+    return 0;
+}
+CEOF
+gcc -o "$B/setkey" "$B/setkey.c" $(krb5-config --libs kadm-client) 2>"$B/cc.log" \
+  || fail "building setkey: $(cat $B/cc.log)"
+for s in mit rs; do
+  for u in nobody admin; do
+    KRB5_CONFIG=$B/$s/krb5.conf "$B/setkey" $u@$R $u-pw
+  done > "$B/$s/setkey.out" 2>&1
+done
+diff -u "$B/mit/setkey.out" "$B/rs/setkey.out" || fail "setkey differs"
+grep -q "^setkey4 0$" "$B/rs/setkey.out" || fail "setkey4 failed: $(cat $B/rs/setkey.out)"
+
 stop
 sleep 0.5
 # Read both databases back with MIT's kadmin.local and kproplog.
 for s in mit rs; do
   export KRB5_CONFIG=$B/$s/krb5.conf KRB5_KDC_PROFILE=$B/$s/kdc.conf
-  for p in limx/lim locked bob weak; do
+  for p in limx/lim locked bob weak skey; do
     kadmin.local -r $R -q "getprinc $p" 2>&1 | norm
   done > "$B/$s/final.out"
   kproplog -h -p "$B/$s/db/principal.ulog" 2>&1 | grep -E "Last serial|Entry count|Update log" > "$B/$s/ulog.out" || true

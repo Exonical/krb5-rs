@@ -20,7 +20,9 @@ use krb5_rs::kdc::kdb::master::encrypt_key;
 use krb5_rs::kdc::kdb::mit::mkey::entry_mkvno;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
 use krb5_rs::kdc::kdb::mit::{parse_name_with_default, MitEntry};
-use krb5_rs::kdc::kdb::mit::{set_mod_princ, set_string_attr, KeyData as MitKeyData, TlData};
+use krb5_rs::kdc::kdb::mit::{
+    set_key_change, set_mod_princ, set_string_attr, KeyData as MitKeyData, TlData,
+};
 use krb5_rs::kdc::kdb::read_stash;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
 use krb5_rs::kdc::kdb::restrictions::RestrictedEntry;
@@ -577,6 +579,8 @@ struct Kadm5 {
     max_life: Duration,
     max_rlife: Duration,
     expiration: Option<krb5_rs::types::KerberosTime>,
+    /// `default_principal_flags`.
+    flags: u32,
 }
 
 /// The authenticated caller of one kadm5 call (`stub_setup`).
@@ -617,6 +621,17 @@ impl Caller<'_> {
 
     fn is(&self, name: &PrincipalName, realm: &str) -> bool {
         self.client == *name && self.crealm == realm
+    }
+}
+
+/// `clamp_self_keepold` (`server_stubs.c:391-399`): changing one's own keys
+/// keeps at most `MAX_SELF_KEEPOLD` key versions.
+fn clamp_keepold(caller: &Caller<'_>, name: &PrincipalName, realm: &str, keepold: bool) -> u32 {
+    const MAX_SELF_KEEPOLD: u32 = 5;
+    match (keepold, caller.is(name, realm)) {
+        (false, _) => 0,
+        (true, true) => MAX_SELF_KEEPOLD,
+        (true, false) => 1,
     }
 }
 
@@ -1025,6 +1040,17 @@ impl Kadm5 {
     }
 
     /// `check_lockdown_by_princ`: whether `name` has `lockdown_keys`.
+    /// `stub_setup` with `rec_out`: `KADM5_UNK_PRINC` for a missing target.
+    fn stub_rec(&self, princ: Option<&str>) -> u32 {
+        match self.name(princ) {
+            Ok((name, realm, _)) => match self.lockdown(&name, &realm) {
+                Ok(_) => code::OK,
+                Err(c) => c,
+            },
+            Err(c) => c,
+        }
+    }
+
     fn lockdown(&self, name: &PrincipalName, realm: &str) -> Result<bool, u32> {
         match self.store.raw_entry(name, realm) {
             Ok(Some(e)) => Ok(e.attributes & LOCKDOWN_KEYS != 0),
@@ -1044,6 +1070,32 @@ impl Kadm5 {
                 W::ExtractKeys { .. } => kadm5::getpkeys_ret(0, c, &[]),
                 _ => kadm5::generic_ret(0, c),
             };
+        }
+        // stub_setup fetches the target of these calls before any
+        // authorization check (server_stubs.c:stub_setup `rec_out`).
+        let target = match &args {
+            W::ChrandPrincipal { princ, .. }
+            | W::ExtractKeys { princ, .. }
+            | W::ChpassPrincipal { princ, .. }
+            | W::SetkeyPrincipal { princ, .. }
+            | W::Purgekeys { princ, .. }
+            | W::SetString { princ, .. } => Some(princ.clone()),
+            W::ModifyPrincipal { rec, .. } => Some(
+                rec.principal
+                    .as_deref()
+                    .map(|p| String::from_utf8_lossy(p).into_owned()),
+            ),
+            _ => None,
+        };
+        if let Some(princ) = target {
+            let c = self.stub_rec(princ.as_deref());
+            if c != code::OK {
+                return match args {
+                    W::ChrandPrincipal { .. } => kadm5::chrand_ret(api, c, &[]),
+                    W::ExtractKeys { .. } => kadm5::getpkeys_ret(api, c, &[]),
+                    _ => kadm5::generic_ret(api, c),
+                };
+            }
         }
         let c = match args {
             W::ChrandPrincipal { princ, keepold, .. } => {
@@ -1166,10 +1218,12 @@ impl Kadm5 {
             c = match pass {
                 None => code::EINVAL,
                 Some(pw) => {
-                    match run(self
-                        .admin(caller)
-                        .change_password(&name, &realm, Some(pw), keepold))
-                    {
+                    match run(self.admin(caller).change_password_keeping(
+                        &name,
+                        &realm,
+                        Some(pw),
+                        clamp_keepold(caller, &name, &realm, keepold),
+                    )) {
                         Ok(_) => code::OK,
                         Err(e) => store_code(&e, code::UNK_PRINC),
                     }
@@ -1217,10 +1271,12 @@ impl Kadm5 {
         let mut c = self.check_self_keychange(caller, &name, &realm);
         let mut keys = Vec::new();
         if c == code::OK {
-            c = match run(self
-                .admin(caller)
-                .change_password(&name, &realm, None, keepold))
-            {
+            c = match run(self.admin(caller).change_password_keeping(
+                &name,
+                &realm,
+                None,
+                clamp_keepold(caller, &name, &realm, keepold),
+            )) {
                 Ok(kvno) => match self.current_keys(caller, &name, &realm, kvno) {
                     Ok(k) => {
                         keys = k
@@ -1449,6 +1505,12 @@ impl Kadm5 {
         } else {
             let (mut opts, mask) = principal_options(rec, mask, restr.as_ref());
             let mask = mask as i32;
+            if mask & m::ATTRIBUTES == 0 {
+                opts.attributes = AttrChange {
+                    set: self.flags,
+                    clear: !self.flags,
+                };
+            }
             if mask & m::MAX_LIFE == 0 {
                 opts.max_life = Some((!self.max_life.is_zero()).then_some(self.max_life));
             }
@@ -1589,6 +1651,21 @@ impl Kadm5 {
                 return code::SETKEY_DUP_ENCTYPES;
             }
         }
+        // svr_principal.c:2177-2183: the password expiration restarts from
+        // the policy's pw_max_life.
+        let pw_max_life = match run(self.admin(caller).get_principal(name, realm)) {
+            Ok(rec) => match rec
+                .entry
+                .policy
+                .as_deref()
+                .map(|p| self.store.raw_policy(p))
+            {
+                Some(Ok(Some(p))) => p.pw_max_life,
+                Some(Err(e)) => return store_code(&e, code::UNK_PRINC),
+                _ => 0,
+            },
+            Err(e) => return store_code(&e, code::UNK_PRINC),
+        };
         let modifier = caller.client_name.clone().into_bytes();
         let mut outcome = None;
         let res = self.store.update_raw(name, realm, |e, mk| {
@@ -1628,11 +1705,19 @@ impl Kadm5 {
                     ],
                 });
             }
-            if keepold {
-                data.append(&mut e.key_data);
-            }
+            // MIT copies the old keys after the new ones without counting
+            // them (svr_principal.c:2146-2160), so keepold only checks the
+            // kvno and the old keys are dropped.
             e.key_data = data;
-            set_mod_princ(e, unix_now(), &modifier)?;
+            e.attributes &= !PrincipalAttributes::REQUIRES_PWCHANGE.bits();
+            let now = unix_now();
+            e.pw_expiration = if pw_max_life == 0 {
+                0
+            } else {
+                now.saturating_add(pw_max_life)
+            };
+            set_key_change(e, now);
+            set_mod_princ(e, now, &modifier)?;
             Ok(true)
         });
         match (res, outcome) {
@@ -2201,6 +2286,7 @@ async fn main() {
         max_life: cfg.kdc.max_life,
         max_rlife: cfg.admin_max_renewable_life,
         expiration: cfg.default_principal_expiration,
+        flags: cfg.default_principal_flags,
     });
     spawn_rpc(&mut tasks, &local, &kadm5, kadm5_listeners);
     let kpasswd = Rc::new(Kpasswd {

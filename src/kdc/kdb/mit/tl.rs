@@ -72,6 +72,17 @@ fn get_u32_tl(entry: &MitEntry, kind: u16) -> Result<Option<u32>, StoreError> {
     Ok(Some(u32::from_le_bytes(value)))
 }
 
+/// Record a key change at `seconds`: `krb5_dbe_update_last_pwd_change`, and
+/// the admin unlock that stands for MIT zeroing `fail_auth_count`.
+pub fn set_key_change(entry: &mut MitEntry, seconds: u32) {
+    set_tl(entry, LAST_PWD_CHANGE, Some(seconds.to_le_bytes().to_vec()));
+    set_tl(
+        entry,
+        LAST_ADMIN_UNLOCK,
+        Some(seconds.to_le_bytes().to_vec()),
+    );
+}
+
 fn set_tl(entry: &mut MitEntry, kind: u16, data: Option<Vec<u8>>) {
     let first = entry.tl_data.iter().position(|tl| tl.kind == kind);
     entry.tl_data.retain(|tl| {

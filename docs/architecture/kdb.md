@@ -360,8 +360,8 @@ restriction makes the ACL file a syntax error, as in MIT.
 `krb5_rs::kdc::kdb::restrictions::AclRestrictions::impose` applies them the way
 `auth.c` `impose_restrictions` does. MIT only applies restrictions to kadm5
 `create_principal` and `modify_principal`, so they have no effect on iprop,
-kpasswd or the read-only kadm5 calls, and they will take effect once the kadm5
-admin RPC service gains `create_principal` and `modify_principal`.
+kpasswd or the read-only kadm5 calls; the kadm5 admin RPC service applies them
+to remote `create_principal` and `modify_principal`.
 
 Deliberate iprop-service deviations from MIT `ipropd_svc.c`:
 
@@ -432,17 +432,50 @@ default kadm5_auth modules: `self` (`auth_self.c`: one's own principal and
 strings, and one's own policy) and `acl` (`acl_file`, the `i` and `l`
 permissions). A `kadmin/changepw` ticket may only read its own principal and
 policy, as in `server_stubs.c`. Requests and denials are logged in MIT's
-`Request: ...` / `Unauthorized request: ...` format. The other procedures
-answer `PROC_UNAVAIL` for now. The live test
+`Request: ...` / `Unauthorized request: ...` format. The live test
 `crates/krb5-rs-kdc/tests/kadmin_live.rs` checks that MIT 1.22.2 `kadmin`
 prints the same `getprinc`, `listprincs`, `getpol`, `listpols`, `getstrs` and
 `getprivs` output as `kadmin.local` on the same database, MIT's denial
 messages, and the `kadmin/changepw` limits through libkadm5clnt at API
 versions 2, 3 and 4.
 
+The changing calls are implemented too: `create_principal[3]`,
+`delete_principal`, `modify_principal`, `rename_principal`,
+`chpass_principal[3]`, `chrand_principal[3]`, `setkey_principal[3,4]`,
+`purgekeys`, `set_string`, `create_alias`, `create_policy`, `modify_policy`,
+`delete_policy` and `get_principal_keys` (`ktadd -norandkey`). Each needs the
+`acl_file` permission `server_stubs.c` asks for (`a`, `d`, `m`, `c`, `s`, `e`;
+rename needs `d` on the source and `a` on the target, an alias `a` on the
+alias and `m` on the target), and a `kadmin/changepw` ticket may only change
+its own password or keys. Changing one's own password or random key is always
+allowed with an initial ticket and respects the policy's `minlife`
+(`auth_self.c`, `check_min_life`). `create_principal` and `modify_principal`
+apply the granting entry's ACL restrictions, and create fills in the realm's
+`max_life`, `max_renewable_life` (default 0, as kadmind reads it in
+`alt_prof.c`), `default_principal_expiration` and `default_principal_flags`
+when the client's mask omits them. As in MIT 1.22, a `-policy` naming a policy
+that does not exist is stored and counts as no policy. Also kept from MIT:
+`stub_setup` looks up the target of the key, string and modify calls before
+authorization, so a missing principal is `KADM5_UNK_PRINC` even for callers
+without permission; `setkey_principal[3,4]` with `keepold` refuses a kvno
+already present but then drops the old keys anyway (`svr_principal.c` copies
+them without counting them); and `-keepold` on one's own principal keeps at
+most four old key versions (`clamp_self_keepold`). Principals with
+`+lockdown_keys` refuse `get_principal_keys` with the `e` permission error and
+key changes other than random keys with `KADM5_PROTECT_KEYS`. Every change
+records the caller as the modifier and is written to the update log in the
+same transaction as the database, so iprop replicas follow. The live test
+`crates/krb5-rs-kdc/tests/kadmin_write_live.rs` runs the same MIT 1.22.2
+`kadmin` session against MIT kadmind and against krb5-rs-kadmind (policies,
+principals with dates in `get_date` syntax, passwords, random keys with
+`-keepold`, `purgekeys`, strings, rename, aliases, `ktadd` with and without
+`-norandkey`, lockdown, ACL restrictions, denials and self-service password
+changes) and checks that every command prints the same output, that the
+resulting principals read back the same through `kadmin.local`, and that both
+update logs hold the same number of entries.
+
 Deviations: no kadm5_auth plugins beyond the built-in `self` and `acl`
-behavior; the principal, policy and key changing calls are not implemented
-yet; klmdb only.
+behavior; klmdb only.
 
 ### ONC RPC and RPCSEC_GSS
 
