@@ -368,8 +368,8 @@ impl FileStore {
             keys: random_keys(1, tgt_etypes).map_err(|e| err(e.to_string()))?,
         };
         let principals = vec![
-            store.to_record(&km, Some(now), Some(now), None)?,
-            store.to_record(&tgs, Some(now), Some(now), None)?,
+            store.to_record(&km, Some(now), Some(now), None, &store.master_keys())?,
+            store.to_record(&tgs, Some(now), Some(now), None, &store.master_keys())?,
         ];
         let file = KdbFile {
             version: VERSION,
@@ -460,19 +460,27 @@ impl FileStore {
         last_pwd_change: Option<KerberosTime>,
         mod_time: Option<KerberosTime>,
         previous: Option<&KdbPrincipal>,
+        keys: &MasterKeys,
     ) -> Result<KdbPrincipal, StoreError> {
-        let keys = self.master_keys();
         let (pwd, modified) = (last_pwd_change.as_ref().map(ts), mod_time.as_ref().map(ts));
         let sp = match previous {
-            Some(p) => StoredPrincipal::from_update(e, pwd, modified, &keys, &stored_of(p))?,
-            None => StoredPrincipal::from_entry(e, pwd, modified, &keys)?,
+            Some(p) => StoredPrincipal::from_update(e, pwd, modified, keys, &stored_of(p))?,
+            None => StoredPrincipal::from_entry(e, pwd, modified, keys)?,
         };
         kdb_of(&sp)
     }
 
     fn decrypt_record(&self, r: &KdbPrincipal) -> Result<PrincipalRecord, StoreError> {
+        self.decrypt_with(r, &self.master_keys())
+    }
+
+    fn decrypt_with(
+        &self,
+        r: &KdbPrincipal,
+        keys: &MasterKeys,
+    ) -> Result<PrincipalRecord, StoreError> {
         Ok(PrincipalRecord {
-            entry: stored_of(r).into_entry(&self.master_keys())?,
+            entry: stored_of(r).into_entry(keys)?,
             last_pwd_change: to_time(&r.last_pwd_change),
             password_history: None,
             mod_time: to_time(&r.mod_time),
@@ -485,6 +493,22 @@ impl FileStore {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// The master-key list of the `K/M` in `list` (the file read under the
+    /// write lock), which becomes the loaded list, so a write never wraps keys
+    /// under a stale active key (`kdb_get_active_mkey` rereads `K/M`,
+    /// `server_kdb.c:84-98`).
+    fn masters_in(&self, list: &[KdbPrincipal]) -> Result<MasterKeys, StoreError> {
+        let km_name = master_principal()?;
+        let Some(km) = list.iter().find(|p| is_km(p, &km_name, &self.realm)) else {
+            return Ok(self.master_keys());
+        };
+        let keys = stored_of(km)
+            .master_keys(&self.master)
+            .map_err(|_| err("incorrect master key"))?;
+        *self.masters.write().unwrap_or_else(|e| e.into_inner()) = keys.clone();
+        Ok(keys)
     }
 
     /// The master-key list (`krb5_db_fetch_mkey_list`).
@@ -525,9 +549,10 @@ impl FileStore {
                 .ok_or_else(|| {
                     StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
                 })?;
+            let keys = self.masters_in(list)?;
             let mut sp = stored_of(&list[pos]);
             let mut raw = sp.to_raw()?;
-            if !f(&mut raw, &self.master_keys())? {
+            if !f(&mut raw, &keys)? {
                 return Ok(false);
             }
             sp.apply_raw(&raw)?;
@@ -663,11 +688,13 @@ impl FileStore {
                 let realm = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
                 store_key(&p.name, &realm) == key
             });
+            let keys = self.masters_in(list)?;
             let record = self.to_record(
                 &entry,
                 last_pwd_change,
                 Some(kerberos_time(Utc::now().timestamp())),
                 pos.map(|i| &list[i]),
+                &keys,
             )?;
             match pos {
                 Some(i) => list[i] = record,
@@ -915,14 +942,15 @@ impl FileStore {
         entry: PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
-        let record = self.to_record(
-            &entry,
-            last_pwd_change,
-            Some(kerberos_time(Utc::now().timestamp())),
-            None,
-        )?;
         let key = store_key(&entry.name, &entry.realm);
         self.modify(|list| {
+            let record = self.to_record(
+                &entry,
+                last_pwd_change,
+                Some(kerberos_time(Utc::now().timestamp())),
+                None,
+                &self.masters_in(list)?,
+            )?;
             let exists = list.iter().any(|p| {
                 let realm = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
                 store_key(&p.name, &realm) == key
@@ -956,7 +984,8 @@ impl FileStore {
                 .ok_or_else(|| {
                     StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
                 })?;
-            let mut rec = self.decrypt_record(&list[pos])?;
+            let keys = self.masters_in(list)?;
+            let mut rec = self.decrypt_with(&list[pos], &keys)?;
             f(&mut rec)?;
             rec.mod_time = Some(kerberos_time(Utc::now().timestamp()));
             list[pos] = self.to_record(
@@ -964,6 +993,7 @@ impl FileStore {
                 rec.last_pwd_change,
                 rec.mod_time,
                 Some(&list[pos]),
+                &keys,
             )?;
             Ok(rec)
         })
@@ -1161,6 +1191,48 @@ mod tests {
             security_epoch: 0,
             last_admin_unlock: None,
         }
+    }
+
+    #[test]
+    fn writes_reread_the_master_key_list_another_store_changed() {
+        use crate::kdc::kdb::mit::mkey::{
+            add_new_mkey, entry_mkvno, lookup_actkvno, now, update_actkvno, use_mkey,
+        };
+        let path = temp("stale_masters");
+        let master = master_key_from_password("R", "master", 18).expect("master");
+        let a = FileStore::create(&path, "R", &master).expect("create");
+        let b = FileStore::open(&path, &master).expect("open");
+        a.create_record(user("alice"), None).expect("alice");
+        let km = master_principal().expect("K/M");
+        let second = master_key_from_password("R", "second", 18).expect("second");
+        b.update_raw(&km, "R", |e, keys| {
+            add_new_mkey(e, keys, &second)?;
+            Ok(true)
+        })
+        .expect("add_mkey");
+        b.update_raw(&km, "R", |e, _| {
+            let mut list = lookup_actkvno(e)?;
+            use_mkey(&mut list, 2, 0, now())?;
+            update_actkvno(e, &list);
+            Ok(true)
+        })
+        .expect("use_mkey");
+
+        a.create_record(user("carol"), None).expect("carol");
+        a.update_record(&PrincipalName::new_principal("alice"), "R", |r| {
+            r.entry.keys = random_keys(2, &[18]).expect("keys");
+            Ok(())
+        })
+        .expect("rekey alice");
+        let mkvno = |n: &str| {
+            b.raw_entries()
+                .expect("entries")
+                .into_iter()
+                .find(|e| e.principal == PrincipalName::new_principal(n))
+                .map(|e| entry_mkvno(&e).expect("mkvno"))
+        };
+        assert_eq!(mkvno("carol"), Some(2));
+        assert_eq!(mkvno("alice"), Some(2));
     }
 
     #[test]

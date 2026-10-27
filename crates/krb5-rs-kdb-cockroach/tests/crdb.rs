@@ -645,6 +645,64 @@ async fn the_realm_needs_the_right_master_key_and_exists_once() {
 
 #[tokio::test]
 #[ignore = "needs the CockroachDB test cluster"]
+async fn admin_writes_reread_the_master_key_list_another_store_changed() {
+    use krb5_rs::kdc::kdb::mit::mkey::{
+        add_new_mkey, entry_mkvno, lookup_actkvno, now, update_actkvno, use_mkey,
+    };
+    let (db, a) = TestDb::with_realm("stale_mkey").await;
+    let b = CockroachStore::open(db.admin(), master(), REALM)
+        .await
+        .expect("second store");
+    ops(&a)
+        .add_principal(&name("alice"), REALM, Some("pw"), &plain())
+        .await
+        .expect("alice");
+    let km = PrincipalName {
+        name_type: 1,
+        name_string: ["K", "M"]
+            .iter()
+            .map(|s| krb5_rs::types::KerberosString::from_bytes(s.as_bytes()).expect("K/M"))
+            .collect(),
+    };
+    let second = krb5_rs::kdc::kdb::master_key_from_password(REALM, "second", 18).expect("key");
+    b.update_raw(&km, REALM, |e, keys| {
+        add_new_mkey(e, keys, &second)?;
+        Ok(true)
+    })
+    .await
+    .expect("add_mkey");
+    b.update_raw(&km, REALM, |e, _| {
+        let mut list = lookup_actkvno(e)?;
+        use_mkey(&mut list, 2, 0, now())?;
+        update_actkvno(e, &list);
+        Ok(true)
+    })
+    .await
+    .expect("use_mkey");
+
+    // `a` still holds the list it opened with, where key 1 is active.
+    ops(&a)
+        .add_principal(&name("carol"), REALM, Some("pw"), &plain())
+        .await
+        .expect("carol");
+    ops(&a)
+        .change_password(&name("alice"), REALM, Some("new-pw"), false)
+        .await
+        .expect("cpw alice");
+    let entries = b.raw_entries().await.expect("entries");
+    let mkvno = |n: &str| {
+        entries
+            .iter()
+            .find(|e| e.principal == name(n))
+            .map(|e| entry_mkvno(e).expect("mkvno"))
+    };
+    assert_eq!(mkvno("carol"), Some(2));
+    assert_eq!(mkvno("alice"), Some(2));
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
 async fn a_failing_transaction_leaves_nothing_partial() {
     let (db, store) = TestDb::with_realm("atomic").await;
     let before = (

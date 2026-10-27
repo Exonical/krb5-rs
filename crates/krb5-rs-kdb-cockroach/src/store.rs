@@ -289,6 +289,30 @@ async fn log(tx: &Tx, entity: &str, realm: &str, key: &str, op: &str) -> Result<
 }
 
 /// Write `sp` (insert or update) and its keys, then log it.
+/// The master-key list of `realm`'s `K/M`, read in the write transaction,
+/// so a write wraps new keys under the active master key and can decrypt
+/// entries another administrator rewrapped (`kdb_get_active_mkey` rereads
+/// `K/M` for every change, `server_kdb.c:84-98`).
+async fn masters_in_tx(
+    tx: &Tx,
+    realm: &str,
+    supplied: &EncryptionKey,
+) -> Result<MasterKeys, TxError> {
+    let rows = tx
+        .query(
+            &principal_sql("WHERE p.realm = $1 AND p.name = $2 AND p.deleted = false"),
+            &[&realm, &"K/M"],
+        )
+        .await?;
+    let (km, _, _) = stored_principals(&rows)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| StoreError::not_found(format!("realm {realm} has no K/M entry")))?;
+    Ok(km.master_keys(supplied).map_err(|_| {
+        StoreError::backend("the master key does not match the database (cannot decrypt K/M)")
+    })?)
+}
+
 async fn write_principal(tx: &Tx, sp: &StoredPrincipal, create: bool) -> Result<(), TxError> {
     let key = encode_principal_key(&sp.name)?;
     let name_type = i64::from(sp.name.name_type);
@@ -561,6 +585,10 @@ impl CockroachStore {
             .ok_or_else(|| StoreError::not_found(format!("realm {} has no K/M entry", self.realm)))
     }
 
+    fn set_master_keys(&self, keys: MasterKeys) {
+        *self.master.write().unwrap_or_else(|e| e.into_inner()) = keys;
+    }
+
     /// The loaded master-key list.
     pub fn master_keys(&self) -> MasterKeys {
         self.master
@@ -614,38 +642,49 @@ impl CockroachStore {
         f: F,
     ) -> Result<bool, StoreError>
     where
-        F: FnOnce(&mut krb5_rs::kdc::kdb::mit::MitEntry, &MasterKeys) -> Result<bool, StoreError>,
+        F: FnMut(&mut krb5_rs::kdc::kdb::mit::MitEntry, &MasterKeys) -> Result<bool, StoreError>
+            + Send,
     {
-        self.verify_master().await?;
         let key = encode_principal_key(name)?;
-        let rows = self
-            .db
-            .rows(
-                &principal_sql("WHERE p.realm = $1 AND p.name = $2 AND p.deleted = false"),
-                &[&realm, &key],
-            )
-            .await?;
-        let (mut sp, _, _) = stored_principals(&rows)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
-            })?;
-        let mut raw = sp.to_raw()?;
-        if !f(&mut raw, &self.master_keys())? {
-            return Ok(false);
-        }
-        sp.apply_raw(&raw)?;
-        let sp = &sp;
-        self.db
-            .run_tx(|tx| {
-                Box::pin(async move {
-                    write_principal(&tx, sp, false).await?;
-                    Ok(())
+        let f = Arc::new(Mutex::new(f));
+        let (key_ref, realm_s, what) = (&key, realm.to_string(), format!("{name}@{realm}"));
+        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let (changed, keys) =
+            self.db
+                .run_tx(|tx| {
+                    let f = Arc::clone(&f);
+                    let (realm_s, what) = (realm_s.clone(), what.clone());
+                    Box::pin(async move {
+                        let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                        let rows = tx
+                            .query(
+                                &principal_sql(
+                                    "WHERE p.realm = $1 AND p.name = $2 AND p.deleted = false",
+                                ),
+                                &[&realm_s, key_ref],
+                            )
+                            .await?;
+                        let (mut sp, _, _) = stored_principals(&rows)?
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                StoreError::not_found(format!("Principal {what} does not exist"))
+                            })?;
+                        let mut raw = sp.to_raw()?;
+                        let changed = {
+                            let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
+                            (f)(&mut raw, &keys)?
+                        };
+                        if changed {
+                            sp.apply_raw(&raw)?;
+                            write_principal(&tx, &sp, false).await?;
+                        }
+                        Ok((changed, keys))
+                    })
                 })
-            })
-            .await?;
-        Ok(true)
+                .await?;
+        self.set_master_keys(keys);
+        Ok(changed)
     }
 
     /// Create the realm: `K/M` (holding the master key, encrypted under
@@ -984,16 +1023,14 @@ impl AdminStore for CockroachStore {
         entry: PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
-        let sp = StoredPrincipal::from_entry(
-            &entry,
-            last_pwd_change.map(|t| t.timestamp()),
-            Some(now_unix()),
-            &self.master_keys(),
-        )?;
-        let sp = &sp;
-        self.db
+        let (entry, pwd) = (&entry, last_pwd_change.map(|t| t.timestamp()));
+        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let keys = self
+            .db
             .run_tx(|tx| {
                 Box::pin(async move {
+                    let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                    let sp = &StoredPrincipal::from_entry(entry, pwd, Some(now_unix()), &keys)?;
                     let key = encode_principal_key(&sp.name)?;
                     let exists = tx
                         .query_opt(
@@ -1003,13 +1040,18 @@ impl AdminStore for CockroachStore {
                         )
                         .await?;
                     match exists.map(|row| row.get::<_, bool>(0)) {
-                        Some(false) => Err(conflict_exists(format!("{}@{}", key, sp.realm)).into()),
-                        Some(true) => write_principal(&tx, sp, false).await,
-                        None => write_principal(&tx, sp, true).await,
+                        Some(false) => {
+                            return Err(conflict_exists(format!("{}@{}", key, sp.realm)).into())
+                        }
+                        Some(true) => write_principal(&tx, sp, false).await?,
+                        None => write_principal(&tx, sp, true).await?,
                     }
+                    Ok(keys)
                 })
             })
-            .await
+            .await?;
+        self.set_master_keys(keys);
+        Ok(())
     }
 
     async fn update_principal<F>(
@@ -1024,15 +1066,17 @@ impl AdminStore for CockroachStore {
         let key = encode_principal_key(name)?;
         let f = Arc::new(Mutex::new(f));
         let (key_ref, realm_s) = (&key, realm.to_string());
-        let masters = self.master_keys();
-        let (master, what) = (&masters, format!("{name}@{realm}"));
-        let stored = self
+        let what = format!("{name}@{realm}");
+        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let (stored, keys) = self
             .db
             .run_tx(|tx| {
                 let f = Arc::clone(&f);
                 let realm_s = realm_s.clone();
                 let what = what.clone();
                 Box::pin(async move {
+                    let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                    let master = &keys;
                     let rows = tx
                         .query(
                             &principal_sql(
@@ -1086,10 +1130,11 @@ impl AdminStore for CockroachStore {
                             log(&tx, "lockout", &realm_s, key_ref, "delete").await?;
                         }
                     }
-                    Ok(sp)
+                    Ok((sp, keys))
                 })
             })
             .await?;
+        self.set_master_keys(keys);
         self.record_of(stored)
     }
 

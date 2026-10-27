@@ -177,7 +177,8 @@ for resource-based delegation. klmdb is the default `db_library`;
   picks the key for new and rekeyed principals (`find_actkvno`). A rekey under
   a different active key rewraps all of the entry's keys and sets `MKVNO`;
   unchanged entries keep their wrapping key.
-- **Commands** (klmdb only; same output and messages as `kdb5_util`):
+- **Commands** (klmdb, FileStore and CockroachDB; same output and messages as
+  `kdb5_util`):
   - `add_mkey [-e ENCTYPE] [-s]` prompts twice for the new password, adds the
     key as the next `K/M` version (inactive), rewraps the old keys in it and
     adds `MKEY_AUX` entries; `-s` stashes only the new key.

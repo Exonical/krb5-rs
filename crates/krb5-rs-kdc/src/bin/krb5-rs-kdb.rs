@@ -1628,7 +1628,7 @@ trait MkeyStore {
         f: F,
     ) -> Result<bool, StoreError>
     where
-        F: FnOnce(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError>;
+        F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send;
 }
 
 #[cfg(feature = "klmdb")]
@@ -1646,7 +1646,7 @@ impl MkeyStore for LmdbStore {
         f: F,
     ) -> Result<bool, StoreError>
     where
-        F: FnOnce(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError>,
+        F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send,
     {
         LmdbStore::update_raw(self, name, realm, f)
     }
@@ -1666,7 +1666,7 @@ impl MkeyStore for FileStore {
         f: F,
     ) -> Result<bool, StoreError>
     where
-        F: FnOnce(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError>,
+        F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send,
     {
         FileStore::update_raw(self, name, realm, f)
     }
@@ -1695,7 +1695,7 @@ impl MkeyStore for CockroachMkey<'_> {
         f: F,
     ) -> Result<bool, StoreError>
     where
-        F: FnOnce(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError>,
+        F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send,
     {
         self.rt.block_on(self.store.update_raw(name, realm, f))
     }
