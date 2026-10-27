@@ -1,0 +1,250 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.2.0](https://github.com/Exonical/krb5-rs/compare/krb5-rs-v0.1.0...krb5-rs-v0.2.0) - 2026-10-27
+
+### Added
+
+- *(u2u)* user-to-user tickets in the KDC and the client
+- *(s4u)* S4U2Self by certificate alone (client and KDC get_s4u_x509_principal hook)
+- *(client)* krb5_get_credentials with a ccache; S4U calls look up and store credentials there
+- *(client)* MIT S4U user realm identification and proxy target canonicalization
+- *(client)* MIT cross-realm S4U2Self and S4U2Proxy chains
+- *(client)* follow cross-realm S4U2Self referrals
+- *(kdc)* cross-realm S4U2Self, S4U2Proxy and RBCD with verify_deleg_pac
+- *(pkinit)* anonymous PKINIT (RFC 8062) in the KDC and client, restrict_anonymous_to_tgt
+- *(deploy)* remote kadmin and kpasswd in Helm and Podman, MIT kadmin e2e
+- *(kadmind)* MIT kadm5 admin RPC with read-only calls on kadmind_port
+- *(kdb)* MIT get_date syntax for use_mkey TIME
+- *(kadmind)* parse, validate and carry kadm5.acl restrictions like MIT
+- *(kdb)* MIT master-key rotation (add_mkey, use_mkey, list_mkeys, update_princ_encryption, purge_mkeys)
+- *(kdc)* kpasswd request processing like MIT schpw.c
+- *(kpropd)* MIT iprop mode with ulog replay, Helm/Podman opt-in
+- *(kadmind)* krb5-rs-kadmind -proponly iprop service, live interop with MIT kpropd
+- *(rpc)* ONC RPC over TCP with RPCSEC_GSS client and server
+- *(kdc)* krb5-rs-kproplog
+- *(kdb)* iprop config, klmdb ulog hooks, dump -i/-c and load -i
+- *(kdb)* MIT update log (ulog) format and operations
+- *(kdc)* MIT kprop/kpropd replace KRB5RS-PROP-1; klmdb is the default
+- *(kdb)* MIT kdb5_util dump/load for klmdb and the file store
+- *(kdb)* MIT-compatible klmdb database module
+- *(deploy)* multi-region e2e and a Podman CockroachDB mode
+- *(deploy)* CockroachDB mode for the Helm chart and image variants
+- *(kdb)* CockroachDB-to-Turso replication engine and consistency gates
+- *(kdb)* CockroachDB authoritative store module
+- *(kdb)* Turso MVCC local replica module
+- *(kdc)* async pluggable store traits, policies and MIT lockout
+- *(deploy)* Helm chart, podman kube play and image publishing
+- *(kdc)* primary-to-replica database propagation
+- deployable krb5-rs-kdc binaries and container image
+- *(pkinit)* PKINIT on the KDC and client with MIT 1.22 semantics
+- *(s4u)* S4U2Self, S4U2Proxy and RBCD on the KDC and client
+- *(pac)* MS-PAC parsing, signing and KDC issuance with MIT semantics
+- *(kdc)* cross-realm trust, referrals and transited policy
+- *(kdc)* persistent principal database, kdc.conf and admin tool
+- *(kdc)* UDP/TCP serving, example daemon and MIT client interop tests
+- *(kdc)* FAST armor, encrypted challenge and armored replies
+- *(kdc)* AS and TGS request processing with MIT 1.22 semantics
+- *(transport)* MIT k5_sendto retry state machine, LocatedTransport and primary-KDC fallback
+- krb5.conf profile parser, host-realm mapping and KDC location with MIT semantics
+- FILE/MEMORY credential cache (v1-4) and keytab (v1/v2) with MIT semantics
+- *(protocol)* FAST (RFC 6113) armor + encrypted challenge with MIT fast.c semantics
+- *(gssapi)* SPNEGO (RFC 4178) over the krb5 mechanism with MIT spnego_mech.c semantics
+- *(gssapi)* RFC 4121 krb5 GSS mechanism (init/accept, wrap/unwrap, MIC) with MIT semantics
+- *(protocol)* AP exchange and KRB-SAFE/PRIV/CRED with MIT rd_req/mk_req semantics
+- *(protocol,crypto)* MIT-parity P1+P2 — enc-pa-rep/cookie handling and RFC 8009 etypes
+- *(transport)* add async KDC transport and KerberosClient API
+- *(protocol)* make RENEWABLE configurable in TgsOptions, test PA-PAC-OPTIONS toggle
+- *(protocol)* add TGS exchange state machine
+- *(protocol)* fall back to PA-ETYPE-INFO (type 11) for legacy KDCs
+- *(protocol)* add AS exchange state machine
+- *(crypto)* add AES-CTS-HMAC-SHA1-96 encryption module
+- *(types)* add KerberosFlags<T> newtype for typed ASN.1 flag fields
+- *(types)* implement all RFC 4120 + RFC 6113 ASN.1 types
+- initial scaffold — Cargo.toml, src/lib.rs, CI workflows, README
+
+### Fixed
+
+- *(client)* S4U2Proxy TGT requests keep the configured enctypes
+- *(client)* request only the requested session key enctype
+- *(helm)* wait for admin/admin on every replica before the MIT kadmin e2e
+- *(kdc)* copy the anonymous flag from the TGS header ticket like MIT
+- *(podman)* publish kadmin and kpasswd ports in the primary Quadlet unit
+- *(kadmind)* merge client TL_DATA in the principal write; prepend new TL types like MIT
+- *(kadmind)* store client TL_DATA on create and modify principal
+- *(kdb)* sort_by_key for clippy
+- *(kadmind)* keep newest old key versions regardless of order, bump policy epoch on remote modify, clarify ulog atomicity
+- *(kadmind)* reject bracket ranges glibc regcomp rejects in list globs
+- *(kadmind)* linear-time MIT glob_to_regexp matching with POSIX classes, live lockout state in get_principal
+- *(kdb)* avoid musl-deprecated libc::time_t in getdate
+- *(kadmind)* accept MIT md5/new_princ flags in ACL restrictions
+- *(kdb)* stash reuses the existing stash like kdb5_util, accepts -f
+- *(kdb)* ulog lock guards are !Send and nest in any drop order
+- *(kdb)* share one ulog descriptor and lock gate per log file across a process
+- *(kadmind)* collision-free, length-bounded per-replica dump file names
+- *(rpc)* refuse a second INIT before the replay-window check
+- *(kpropd)* back off after failed iprop calls, retry resync sooner after Busy
+- *(kadmind)* kiprop-only resync, per-replica resync dump file, tabs in iprop_listen
+- *(rpc)* RPCSEC_GSS server advances replay window after MIC, refuses re-INIT, checks handle and service
+- *(kdb)* atomic klmdb write + ulog append, log same-kvno key changes, exclusive reset, reject invalid iprop_ulogsize
+- *(kdb)* reload K/M with loaded master keys after purge; keep salt fields when rewrapping retained keys
+- *(kadmind)* honor clockskew in kpasswd AP-REQ check; init adds kadmin/* to existing databases
+- *(helm)* reject iprop in CockroachDB mode
+- *(rpc)* truncated record marker is an error; cap written records
+- *(kprop)* push after admin changes, MIT error-path interop, Podman replica
+- *(kprop)* canonicalize host names like sn2princ, check ticket server, bound pushes
+- *(kdb)* reject dumps ending inside a record, stage lockout rows before commit
+- *(kdc)* accept Windows TGS checksums and always set enc-pa-rep
+- *(kdb)* crash-safe klmdb conversion and create, MIT password policy
+- *(kdc)* return MIT error codes for authoritative strict-mode denials
+- *(deploy)* address PR #3 review findings and the Linux e2e failure
+- *(kdb)* address PR #2 review findings
+- *(tgs)* recognise referral TGTs by name components, not name type
+- *(fast)* take the client realm from KrbFastFinished, not the outer reply
+- *(crypto)* build AES blocks with the cipher 0.5 API
+- *(crypto)* fill random bytes through the rand 0.10 core trait
+- *(transport)* address retry and framing review
+- *(crypto)* support updated crypto deps
+- *(transport)* skip UDP for oversized messages in UdpTcpTransport
+- *(transport)* validate UDP message size, use fallible principal parsing, strip @REALM from SPN
+- *(client)* use shared ErrorCode constant, gate tests on tokio feature, error on RetryTcp
+- *(protocol)* derive authenticator ctime/cusec from single timestamp
+- *(protocol)* skip sname check with CANONICALIZE, assert handle_referral results in tests
+- *(protocol)* correct PA-PAC-OPTIONS flag name to Branch Aware per MS-KILE
+- *(protocol)* defer first_referral_attempt flip until TGS-REP validated
+- *(crypto)* avoid cloning subkey material via mem::take
+- *(protocol)* validate service principal, zeroize subkey material
+- *(protocol)* validate client identity in TGS-REP, fix realm routing
+- *(protocol)* pin chrono >= 0.4.38 for const east_opt, rename FieldTooLong
+- *(protocol)* validate KRB-ERROR pvno/msg_type before processing
+- *(test)* pipe master key twice for kdb5_util create -W (enter + verify)
+- *(protocol)* use server realm field for WRONG_REALM redirect target
+- *(protocol)* mark ErrorCode non_exhaustive, avoid abs() panic in time_diff
+- *(protocol)* pipe passwords via stdin in KDC setup, add RetryTcp to doc example
+- *(protocol)* reset loop_count on realm redirect, use env vars for KDC secrets
+- *(protocol)* distinct rtime overflow message, validate TCP frame length
+- *(protocol)* use ReplyValidation for lifetime overflow, typed error codes in tests
+- *(protocol)* validate AS-REP pvno/msg_type, return error on till overflow
+- *(protocol)* remove expect() panics, use Duration::MAX for skew overflow
+- *(protocol)* use checked_add for till/rtime, precise error for missing e-data
+- *(protocol)* realign RFC 4120 error codes 26-36, use preauth salt fallback
+- *(protocol)* use Option salt, extract reply s2kparams, guard resp_len
+- *(protocol)* clear cached preauth state on realm redirect
+- *(protocol)* add realm validation, clamp duration cast, scope preauth loop
+- *(protocol)* wire request_pac to include_pac, fix healthcheck and timestamps
+- *(protocol)* mask nonce to 31 bits for MIT KDC compat
+- *(protocol)* persist s2kparams, add RetryTcp, truncate timestamps
+- *(crypto)* enforce per-profile key length validation
+- *(crypto)* pre-allocate zeroized plaintext buffer, return error on negative key_usage
+- *(crypto)* validate key length, reject zero s2kparams, add MIT KAT vectors
+- *(types)* reject oversized BIT STRING in KerberosFlags decode
+- *(crypto)* add UnsupportedEtype error, zeroize plaintext buffer
+- *(build)* remove no-op default features, move test import to top-level
+- *(types)* secure EncryptionKey storage, enforce RFC 4120 till field, validate principal parsing
+- *(types)* secure EncryptionKey zeroize and correct FromStr name_type
+
+### Other
+
+- *(readme)* cross-realm S4U is supported
+- Merge pull request #35 from Exonical/feat/anon-pkinit
+- *(helm)* check the file-mode guards with helm template
+- *(kdb)* update_tl_data test looks only at its own TL types
+- *(kdb)* change_password_keeping keeps the newest old key versions
+- *(kadmind)* setkey parity (stub_setup lookup, keepold drop, side effects), default_principal_flags, self keepold clamp
+- *(kadmind)* live MIT kadmin write test, create defaults, unknown policy, extract lockdown
+- *(kadmind)* chpass, randkey and extract_keys
+- *(kadmind)* delete, set_string and policy mutations
+- *(kadmind)* kadm5 mutation wire types, caller-aware store, initial-ticket flag
+- Merge pull request #29 from Exonical/fix/use-mkey-getdate
+- Merge pull request #28 from Exonical/fix/kadm5-acl-restrictions
+- *(kdb)* kadmind runs iprop calls on the blocking pool
+- *(kadmind)* run iprop GSS handling and LMDB reads on the blocking pool
+- Merge pull request #25 from Exonical/fix/kpropd-iprop-backoff
+- Merge pull request #24 from Exonical/fix/kadmind-iprop
+- Merge pull request #23 from Exonical/fix/rpcsec-gss-hardening
+- Merge pull request #21 from Exonical/feat/kdb-mkey-rotation
+- *(kpasswd)* schpw_util_wrapper status mapping against FileStore
+- *(kadmind)* live MIT kpasswd interop; document the kpasswd service
+- *(rpc)* live RPCSEC_GSS interop with MIT kadmind iprop; document RPC layer
+- Merge pull request #14 from Exonical/feat/podman-e2e
+- -c needs -i
+- MIT iprop update log
+- *(kdc)* iprop ulog, dump -i/-c, load -i, kproplog
+- Podman primary/replica replication e2e
+- verify k3d image imports and retry
+- Merge remote-tracking branch 'origin/main' into feat/klmdb
+- ignore generated CockroachDB test certificates
+- *(kdb)* record Turso replica benchmark results and open findings
+- add a pull request template
+- run live interop against MIT krb5 1.22.2 built from source
+- run the live MIT interop suite against compose KDCs
+- consolidate duplicated test helpers and AS/TGS reply plumbing
+- gate sendto test binaries on the client feature
+- split oversized modules and test binaries into directory modules
+- Merge branch 'feat/#22-transport-client-api' (PR #23) into feat/mit-parity-p1-p2
+- name the copyright holder in the licence appendix and crate metadata
+- Merge branch 'main' into dependabot/cargo/rand-0.10
+- *(deps)* update rand requirement from 0.9 to 0.10
+- *(deps)* update aes requirement from 0.8 to 0.9
+- Merge remote-tracking branch 'origin/dependabot/cargo/pbkdf2-0.13' into feat/#22-transport-client-api
+- Merge remote-tracking branch 'origin/dependabot/cargo/aes-0.9' into feat/#22-transport-client-api
+- Merge remote-tracking branch 'origin/dependabot/cargo/hmac-0.13' into feat/#22-transport-client-api
+- Merge remote-tracking branch 'origin/dependabot/cargo/sha1-0.11' into feat/#22-transport-client-api
+- Merge remote-tracking branch 'origin/dependabot/cargo/rand-0.10' into feat/#22-transport-client-api
+- Merge remote-tracking branch 'origin/chore/#24-msrv-1.92' into feat/#22-transport-client-api
+- Merge remote-tracking branch 'origin/main' into feat/#22-transport-client-api
+- Merge branch 'main' into dependabot/cargo/pbkdf2-0.13
+- *(deps)* bump actions/checkout from 6 to 7
+- Merge branch 'main' into feat/#22-transport-client-api
+- Merge branch 'main' into dependabot/cargo/rand-0.10
+- *(deps)* update pbkdf2 requirement from 0.12 to 0.13
+- *(deps)* update aes requirement from 0.8 to 0.9
+- *(deps)* update hmac requirement from 0.12 to 0.13
+- *(deps)* update sha1 requirement from 0.10 to 0.11
+- Merge branch 'main' into chore/#24-msrv-1.92
+- *(deps)* update sha2 requirement from 0.10 to 0.11
+- Update Cargo.toml
+- *(deps)* update md-5 requirement from 0.10 to 0.11
+- bump MSRV to 1.92, ignore dtolnay/rust-toolchain in dependabot
+- Merge branch 'main' into dependabot/cargo/rand-0.10
+- *(transport)* apply cargo fmt formatting
+- add .github/instructions for Rust code quality rules
+- *(protocol)* explain why #[allow] is used instead of #[expect] for large_enum_variant
+- add #[allow] vs #[expect], pre-1.0 semver, test scripts exclusions to review rules
+- *(protocol)* deduplicate UTC_OFFSET from as_exchange into validate
+- *(protocol)* use shared UTC_OFFSET from validate module
+- *(protocol)* deduplicate now_kerberos/time_diff, fix TGS clock skew
+- add .claude to gitignore
+- update AI review tier rules, add .forge to gitignore
+- Merge branch 'main' into dependabot/cargo/rand-0.10
+- *(test)* clarify connect timeout rationale in KDC transport
+- *(protocol)* scope module doc to AS exchange, clarify ErrorCode as typed source
+- *(protocol)* note chrono const fn dependency for UTC_OFFSET
+- *(test)* clarify default credentials are test-only, note tcp_send duplication
+- *(protocol)* allow large_enum_variant on StepResult with justification
+- *(protocol)* match on reference for Option salt fields
+- *(protocol)* derive error constants from ErrorCode, prefer client etype order
+- *(protocol)* clarify PreauthPlugin is an extension point, not wired
+- *(protocol)* remove dead padata emptiness branch, renumber validation steps
+- *(examples)* apply cargo fmt
+- Merge branch 'main' into dependabot/cargo/rand-0.10
+- Merge remote-tracking branch 'origin/main' into feat/#14-crypto-aes-cts
+- *(types)* clarify AsnType impl follows rasn BitString pattern
+- Merge branch 'main' into dependabot/cargo/rand-0.10
+- *(release)* add concurrency group to release job to prevent publish races
+- *(release)* revert SHA pinning to version tags for dependabot compatibility
+- *(release)* pin actions to SHA, scope permissions per job, add concurrency
+- *(release)* add job ordering and remove unused token from release-pr
+- *(release)* split into explicit release-pr and release jobs
+- *(release)* replace manual tag workflow with release-plz automation
+- *(deps)* Update rand requirement from 0.8 to 0.10
+- *(types)* strengthen Debug redaction check with hex format assertion
+- *(error)* remove duplicate fields from KdcError variant
+- *(types)* tighten zeroize assertions and add semantic equality checks
+- Initial commit
