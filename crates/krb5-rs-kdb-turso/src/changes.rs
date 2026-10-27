@@ -270,8 +270,8 @@ async fn delete_principal(
     Ok(Applied::Yes)
 }
 
-fn policy_fields(p: &StoredPolicy) -> Vec<Value> {
-    vec![
+fn policy_fields(p: &StoredPolicy) -> Result<Vec<Value>, StoreError> {
+    Ok(vec![
         Value::Integer(i64::from(p.pw_min_life)),
         Value::Integer(i64::from(p.pw_max_life)),
         Value::Integer(i64::from(p.pw_min_length)),
@@ -288,9 +288,9 @@ fn policy_fields(p: &StoredPolicy) -> Vec<Value> {
         if p.tl_data.is_empty() {
             Value::Null
         } else {
-            Value::Blob(p.tl_data_bytes())
+            Value::Blob(p.tl_data_bytes()?)
         },
-    ]
+    ])
 }
 
 async fn upsert_policy(
@@ -304,7 +304,7 @@ async fn upsert_policy(
         vec![Value::Text(p.name.clone())],
     )
     .await?;
-    let mut fields = policy_fields(p);
+    let mut fields = policy_fields(p)?;
     fields.extend(version_params(version));
     match existing.first() {
         Some(row) => {

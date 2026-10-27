@@ -74,7 +74,9 @@ fn policy_to_record(p: &Policy) -> Result<KdbPolicy, StoreError> {
         max_renewable_life: p.max_renewable_life,
         allowed_keysalts: p.allowed_keysalts.as_deref().map(general).transpose()?,
         security_epoch: Some(p.security_epoch),
-        tl_data: (!p.tl_data.is_empty()).then(|| p.tl_data_bytes().into()),
+        tl_data: (!p.tl_data.is_empty())
+            .then(|| p.tl_data_bytes().map(Into::into))
+            .transpose()?,
     })
 }
 

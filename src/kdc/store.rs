@@ -155,18 +155,23 @@ impl Policy {
     /// The TL data in MIT LMDB's policy encoding (`put_tl_data`,
     /// plugins/kdb/lmdb/marshal.c): a 16-bit count, then per element a
     /// 16-bit type, a 16-bit length and the contents, little-endian. Empty
-    /// when there is none.
-    pub fn tl_data_bytes(&self) -> Vec<u8> {
+    /// when there is none; more than 65535 elements or bytes in one element
+    /// do not fit.
+    pub fn tl_data_bytes(&self) -> Result<Vec<u8>, StoreError> {
         if self.tl_data.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let mut out = (self.tl_data.len() as u16).to_le_bytes().to_vec();
+        let too_big = |_| StoreError::rejected("policy tl-data too large");
+        let mut out = u16::try_from(self.tl_data.len())
+            .map_err(too_big)?
+            .to_le_bytes()
+            .to_vec();
         for t in &self.tl_data {
             out.extend_from_slice(&t.kind.to_le_bytes());
-            out.extend_from_slice(&(t.data.len() as u16).to_le_bytes());
+            out.extend_from_slice(&u16::try_from(t.data.len()).map_err(too_big)?.to_le_bytes());
             out.extend_from_slice(&t.data);
         }
-        out
+        Ok(out)
     }
 
     /// Parse [`Self::tl_data_bytes`].
@@ -989,10 +994,18 @@ mod policy_tl_tests {
             ],
             ..Policy::default()
         };
-        let b = p.tl_data_bytes();
+        let b = p.tl_data_bytes().expect("encode");
         assert_eq!(b, [2, 0, 0x2e, 1, 3, 0, b'n', b'e', b'w', 0x2c, 1, 0, 0]);
         assert_eq!(Policy::tl_data_from_bytes(&b).expect("decode"), p.tl_data);
-        assert!(Policy::default().tl_data_bytes().is_empty());
+        assert!(Policy::default().tl_data_bytes().expect("empty").is_empty());
+        let big = Policy {
+            tl_data: vec![PolicyTlData {
+                kind: 300,
+                data: vec![0; 65536],
+            }],
+            ..Policy::default()
+        };
+        assert!(big.tl_data_bytes().is_err());
         assert!(Policy::tl_data_from_bytes(&b[..b.len() - 1]).is_err());
     }
 }

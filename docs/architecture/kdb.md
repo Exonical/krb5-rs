@@ -469,8 +469,9 @@ follow (a crash between the commit and the append leaves the log behind the
 database, which the next `kpropd` poll repairs with a full resync, as in MIT).
 Client `KADM5_TL_DATA` on create and modify is merged into the principal in
 the same write, as `krb5_dbe_update_tl_data` does. Policy `KADM5_POLICY_TL_DATA`
-is stored like MIT's: types below 256 are refused, `create_policy` keeps the
-client's list as sent, `modify_policy` applies `krb5_db_update_tl_data` per
+is stored like MIT's: `create_policy` keeps the list as decoded (MIT's
+`xdr_krb5_tl_data` reverses it) without checking types, `modify_policy`
+refuses types below 256 and applies `krb5_db_update_tl_data` per
 element (svr_policy.c:153-159, 349-356), and `get_policy` returns it. klmdb
 keeps it in MIT's policy record, FileStore in the policy record and
 CockroachDB/Turso in a `tl_data` column (schema version 2), all in MIT LMDB's

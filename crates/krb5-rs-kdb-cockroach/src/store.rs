@@ -373,7 +373,9 @@ async fn write_policy(tx: &Tx, p: &Policy, create: bool) -> Result<(), TxError> 
         v(p.max_renewable_life),
     );
     let epoch = to_i64(p.security_epoch)?;
-    let tl = (!p.tl_data.is_empty()).then(|| p.tl_data_bytes());
+    let tl = (!p.tl_data.is_empty())
+        .then(|| p.tl_data_bytes())
+        .transpose()?;
     let params: Params<'_> = &[
         &p.name,
         &a,
