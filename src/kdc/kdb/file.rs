@@ -637,7 +637,7 @@ impl FileStore {
     /// Principals and policies as MIT dump entries in klmdb key order.
     /// Deviation: the file store keeps only what [`PrincipalRecord`] and
     /// [`Policy`] model (no lockout state, string attributes, password
-    /// history or policy tl-data), so only that is dumped.
+    /// history), so only that is dumped.
     pub fn dump_entries(&self) -> Result<(Vec<MitEntry>, Vec<MitPolicy>), StoreError> {
         let (records, policies) = self.export_records()?;
         let creator = unparse_name(&PrincipalName::new_principal("db_creation"), &self.realm);
