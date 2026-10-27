@@ -13,7 +13,8 @@
 //! Requires podman + the compose container. Run with:
 //!   cargo test --all-features --test kdc_s4u_live -- --ignored --test-threads=1
 
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 
@@ -23,11 +24,13 @@ use krb5_rs::kdc::{
 };
 use krb5_rs::keytab::{FileKeytab, Keytab, KeytabEntry};
 use krb5_rs::pac::{ticket_pac, verify_ticket_pac};
-use krb5_rs::protocol::ap::decrypt_ticket;
+use krb5_rs::protocol::ap::{
+    decrypt_ticket, ApError, ApReqOptions, AuthContext, AuthContextFlags, KeySource,
+};
 use krb5_rs::protocol::{
     AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
 };
-use krb5_rs::types::{EncryptionKey, PrincipalName, TicketFlags};
+use krb5_rs::types::{EncryptionKey, HostAddress, PrincipalName, Ticket, TicketFlags};
 use krb5_rs::Krb5Error;
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -361,6 +364,226 @@ fn our_client_u2u_against_mit_kdc() {
     assert!(cred.ticket.enc_part.kvno.unwrap_or(0) == 0);
     let part = decrypt_ticket(&tgt.session_key, &cred.ticket).expect("decrypt in TGT key");
     assert_eq!(part.cname.name_string, tgt.client.name_string);
+}
+
+/// A login to OUR KDC.
+fn our_tgt(name: PrincipalName, password: &str) -> Credential {
+    live();
+    let mut ex = AsExchange::new(AsExchangeConfig::new(name, REALM), password);
+    let mut reply = Vec::new();
+    while let StepResult::SendToKdc { data, .. } | StepResult::RetryTcp { data, .. } =
+        ex.step(&reply).expect("AS step")
+    {
+        reply = kdc_send_to(&format!("127.0.0.1:{PORT}"), &data).expect("our KDC");
+    }
+    ex.credential().expect("TGT").clone()
+}
+
+fn run_tgs_ours(mut ex: TgsExchange) -> Credential {
+    let mut reply = Vec::new();
+    loop {
+        match ex.step(&reply).expect("TGS step") {
+            TgsStepResult::SendToKdc { data, .. } | TgsStepResult::RetryTcp { data, .. } => {
+                reply = kdc_send_to(&format!("127.0.0.1:{PORT}"), &data).expect("our KDC");
+            }
+            TgsStepResult::Complete => return ex.credential().expect("cred").clone(),
+        }
+    }
+}
+
+/// `krb5_write_message`: a 4-byte big-endian length, then the data.
+fn write_message(s: &mut TcpStream, data: &[u8]) {
+    let len = u32::try_from(data.len()).expect("length");
+    s.write_all(&len.to_be_bytes()).expect("write length");
+    s.write_all(data).expect("write data");
+}
+
+/// `krb5_read_message`.
+fn read_message(s: &mut TcpStream) -> Vec<u8> {
+    let mut len = [0u8; 4];
+    s.read_exact(&mut len).expect("read length");
+    let mut data = vec![0u8; u32::from_be_bytes(len) as usize];
+    s.read_exact(&mut data).expect("read data");
+    data
+}
+
+/// `krb5_auth_con_genaddrs` with GENERATE_*_FULL_ADDR: (address, port).
+fn genaddrs(a: SocketAddr) -> (HostAddress, HostAddress) {
+    let IpAddr::V4(ip) = a.ip() else {
+        panic!("IPv4 expected: {a}");
+    };
+    (
+        HostAddress {
+            addr_type: 2,
+            address: ip.octets().to_vec().into(),
+        },
+        HostAddress {
+            addr_type: 0x0101,
+            address: a.port().to_be_bytes().to_vec().into(),
+        },
+    )
+}
+
+/// The auth context of the user_user sample programs: DO_SEQUENCE and the
+/// connection's full addresses (appl/user_user/client.c:209-229).
+fn uu_auth_context(s: &TcpStream) -> AuthContext {
+    let mut ac = AuthContext::new();
+    let (la, lp) = genaddrs(s.local_addr().expect("local addr"));
+    let (ra, rp) = genaddrs(s.peer_addr().expect("peer addr"));
+    ac.set_addrs(Some(la), Some(ra));
+    ac.set_ports(Some(lp), Some(rp));
+    ac.set_flags(AuthContextFlags::DO_SEQUENCE);
+    ac
+}
+
+/// No keytab: user-to-user tickets decrypt with the TGT session key.
+struct NoKeys;
+
+impl KeySource for NoKeys {
+    fn get_key(
+        &self,
+        _: &PrincipalName,
+        _: &[u8],
+        _: Option<i32>,
+        _: i32,
+    ) -> Result<EncryptionKey, ApError> {
+        Err(ApError::NoKey)
+    }
+}
+
+const UU_HELLO: &[u8] = b"Hello, other end of connection.\0";
+
+// t_user2user.py: MIT uuclient against a user-to-user server built on our
+// library (the protocol of appl/user_user/server.c), with tickets from our
+// KDC.
+#[test]
+#[ignore = "requires podman + MIT client container"]
+fn mit_uuclient_against_our_user_to_user_server() {
+    setup("/tmp/cc_uu_unused", "HTTP/s4u.test.realm");
+    let alice = format!("KRB5_CONFIG={CONF} KRB5CCNAME=/tmp/cc_uu_alice");
+    let (code, out) = run(
+        &format!("{alice} kinit alice@{REALM}"),
+        Some(&format!("{USER_PW}\n")),
+    );
+    assert_eq!(code, 0, "kinit alice: {out}");
+
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().expect("accept");
+        let pname = read_message(&mut s);
+        let pname = std::str::from_utf8(pname.strip_suffix(b"\0").expect("NUL"))
+            .expect("utf-8")
+            .to_string();
+        let ticket: Ticket = rasn::der::decode(&read_message(&mut s)).expect("client TGT");
+        let (user, realm) = pname.split_once('@').expect("realm");
+        assert_eq!(realm, REALM);
+        let svc_tgt = our_tgt(svc("s4u"), "svc-password");
+        let cred = run_tgs_ours(
+            TgsExchange::new(
+                svc_tgt,
+                PrincipalName::new_principal(user),
+                TgsOptions::default(),
+            )
+            .with_second_ticket(Some(ticket)),
+        );
+        let mut ac = uu_auth_context(&s);
+        let opts = ApReqOptions {
+            use_session_key: true,
+            ..ApReqOptions::default()
+        };
+        let ap_req = ac.mk_req(&opts, None, &cred).expect("mk_req");
+        write_message(&mut s, &ap_req);
+        let (safe, _) = ac.mk_safe(UU_HELLO).expect("mk_safe");
+        write_message(&mut s, &safe);
+        pname
+    });
+    let (code, out) = run(
+        &format!("{alice} uuclient {} 'testing message' {port}", host()),
+        None,
+    );
+    assert_eq!(code, 0, "uuclient: {out}");
+    assert_eq!(server.join().expect("server"), format!("alice@{REALM}"));
+    assert!(
+        out.contains(&format!("server is named \"HTTP/s4u.test.realm@{REALM}\"")),
+        "{out}"
+    );
+    assert!(
+        out.contains("uu-client: server says \"Hello, other end of connection.\""),
+        "{out}"
+    );
+}
+
+fn container_ip() -> String {
+    let out = Command::new(container_cli())
+        .args([
+            "inspect",
+            "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+            KDC_CONTAINER,
+        ])
+        .output()
+        .expect("inspect");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .expect("container IP")
+        .to_string()
+}
+
+// t_user2user.py the other way round: a client built on our library (the
+// protocol of appl/user_user/client.c) against MIT uuserver, which gets
+// its user-to-user ticket from our KDC.
+#[test]
+#[ignore = "requires podman + MIT client container"]
+fn our_user_to_user_client_against_mit_uuserver() {
+    const UU_PORT: u16 = 10395;
+    let e = setup("/tmp/cc_uu_svc", "HTTP/s4u.test.realm");
+    let _ = run("pkill -x uuserver", None);
+    let started = Command::new(container_cli())
+        .args([
+            "exec",
+            "-d",
+            KDC_CONTAINER,
+            "bash",
+            "-c",
+            &format!("{e} uuserver {UU_PORT} > /tmp/uuserver.log 2>&1"),
+        ])
+        .status()
+        .expect("start uuserver");
+    assert!(started.success());
+    let addr = format!("{}:{UU_PORT}", container_ip());
+    let mut s = (0..50)
+        .find_map(|_| {
+            TcpStream::connect(&addr).ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                None
+            })
+        })
+        .expect("connect to uuserver");
+
+    let alice = PrincipalName::new_principal("alice");
+    let tgt = our_tgt(alice.clone(), USER_PW);
+    write_message(&mut s, format!("alice@{REALM}\0").as_bytes());
+    write_message(&mut s, &rasn::der::encode(&tgt.ticket).expect("encode TGT"));
+    let ap_req = read_message(&mut s);
+    let mut ac = uu_auth_context(&s);
+    // krb5_auth_con_setuseruserkey (client.c:231).
+    ac.set_session_key(tgt.session_key.clone());
+    let r = ac
+        .rd_req(&ap_req, Some(&alice), &NoKeys)
+        .expect("rd_req with the TGT session key");
+    assert_eq!(r.ticket.cname.name_string, svc("s4u").name_string);
+    assert!(r
+        .ap_options
+        .contains(krb5_rs::types::ApOptions::USE_SESSION_KEY));
+    let (msg, _) = ac.rd_safe(&read_message(&mut s)).expect("rd_safe");
+    assert_eq!(msg, UU_HELLO);
+    let (_, log) = run("cat /tmp/uuserver.log", None);
+    assert!(
+        log.contains("client principal is \"alice@TEST.REALM\""),
+        "{log}"
+    );
 }
 
 /// Copy a ccache between the container and the host (`to_host`) or back.
