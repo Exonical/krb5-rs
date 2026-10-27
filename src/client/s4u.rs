@@ -126,7 +126,7 @@ impl<T: KdcTransport> KerberosClient<T> {
         };
         let mut cred = self
             .run_tgs(
-                TgsExchange::s4u2self(tgt, user, realm, self.gc_tgs_options(options))
+                TgsExchange::s4u2self(tgt, user, realm, self.req_tgs_options(options, req))
                     .with_subject_certificate(subject_cert.map(<[u8]>::to_vec))
                     .with_authdata(req.authdata.clone()),
             )
@@ -277,9 +277,13 @@ impl<T: KdcTransport> KerberosClient<T> {
                 req.crealm.clone(),
             );
             let tgt = self.get_credentials(ccache, options, &tgtq).await?;
-            let exchange =
-                TgsExchange::s4u2proxy(tgt, evidence.clone(), server, self.gc_tgs_options(options))
-                    .with_authdata(req.authdata.clone());
+            let exchange = TgsExchange::s4u2proxy(
+                tgt,
+                evidence.clone(),
+                server,
+                self.req_tgs_options(options, req),
+            )
+            .with_authdata(req.authdata.clone());
             match self.run_tgs(exchange).await {
                 Ok(mut cred) => {
                     cred.server = req.server.clone();

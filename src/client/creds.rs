@@ -124,6 +124,16 @@ impl<T: KdcTransport> KerberosClient<T> {
         tgs
     }
 
+    /// The TGS options for the request for `req` itself: only the requested
+    /// session key enctype, if any (send_tgs.c:195-203).
+    pub(super) fn req_tgs_options(&self, options: GcOptions, req: &CredsRequest) -> TgsOptions {
+        let mut tgs = self.gc_tgs_options(options);
+        if req.enctype != 0 {
+            tgs.etypes = vec![req.enctype];
+        }
+        tgs
+    }
+
     /// `k5_get_cached_cred` (get_creds.c:52-150).
     pub(super) fn get_cached_cred<C: Ccache>(
         &self,
@@ -318,6 +328,10 @@ impl<T: KdcTransport> KerberosClient<T> {
                 }
             }
         };
+        let mut tgs = tgs;
+        if req.enctype != 0 {
+            tgs.etypes = vec![req.enctype];
+        }
         self.run_tgs(TgsExchange::new(tgt, server, tgs).with_authdata(req.authdata.clone()))
             .await
     }

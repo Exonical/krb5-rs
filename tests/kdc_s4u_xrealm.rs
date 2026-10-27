@@ -557,6 +557,49 @@ mod client_layer {
     }
 
     #[tokio::test]
+    async fn get_credentials_requests_only_the_requested_enctype() {
+        let w = Arc::new(world(false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, sends) = client(&w);
+        let mut req = CredsRequest::new(service(), SREALM, target(), UREALM);
+        req.enctype = 17;
+        let cred = client
+            .get_credentials(&mut cc, GcOptions::empty(), &req)
+            .await
+            .expect("service ticket");
+        assert_eq!(cred.session_key.keytype, 17);
+        let used = sends.load(Ordering::SeqCst);
+        let again = client
+            .get_credentials(&mut cc, GcOptions::CACHED, &req)
+            .await
+            .expect("cached aes128 ticket");
+        assert_eq!(again.session_key.keytype, 17);
+        assert_eq!(sends.load(Ordering::SeqCst), used);
+    }
+
+    #[tokio::test]
+    async fn s4u_requests_only_the_requested_enctype() {
+        let w = Arc::new(world(true, true));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, _) = client(&w);
+        let mut req = xuser();
+        req.enctype = 17;
+        let evidence = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &req, None)
+            .await
+            .expect("S4U2Self");
+        assert_eq!(evidence.session_key.keytype, 17);
+        let (_, evidence) = super::evidence(&w).await;
+        let mut proxy = CredsRequest::new(evidence.client.clone(), SREALM, target(), UREALM);
+        proxy.enctype = 17;
+        let cred = client
+            .get_credentials_for_proxy(&mut cc, GcOptions::empty(), &proxy, &evidence)
+            .await
+            .expect("S4U2Proxy");
+        assert_eq!(cred.session_key.keytype, 17);
+    }
+
+    #[tokio::test]
     async fn get_credentials_requests_authdata_and_matches_it_in_the_cache() {
         use krb5_rs::types::AuthorizationDataElement;
         let w = Arc::new(world(false, false));
