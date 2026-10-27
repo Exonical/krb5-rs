@@ -91,6 +91,14 @@ data:
     {{- include "krb5-rs-kdc.cockroachKdcConf" . | nindent 4 }}
   krb5.conf: |
     {{- include "krb5-rs-kdc.krb5Conf" . | nindent 4 }}
+{{- if .Values.kadmin.enabled }}
+  kadmind-kdc.conf: |
+    {{- include "krb5-rs-kdc.cockroachKadmindConf" . | nindent 4 }}
+  kadm5.acl: |
+    {{- range .Values.kadmin.acl }}
+    {{ . }}
+    {{- end }}
+{{- end }}
 {{- if .Values.cockroach.admin.url }}
   admin-kdc.conf: |
     {{- include "krb5-rs-kdc.cockroachClientConf" (dict "ctx" . "url" .Values.cockroach.admin.url "certDir" "/crdb-admin") | nindent 4 }}

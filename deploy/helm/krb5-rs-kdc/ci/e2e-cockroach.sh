@@ -153,6 +153,8 @@ run_helm upgrade --install "$REL" "$CHART" --namespace "$NS" \
   --set cockroach.bootstrap.multiRegion.enabled=false \
   --set cockroach.prune.enabled=false \
   --set kdcs.replicaCount=2 \
+  --set kadmin.enabled=true \
+  --set-string "kadmin.acl[0]=admin/admin@${REALM} *" \
   --set-string cockroach.maxStaleness=10s \
   --set-string cockroach.replication.pollInterval=1s \
   --wait --timeout=15m
@@ -196,6 +198,51 @@ for ordinal in 0 1; do
   [ "$seen" = 1 ] || { echo "KDC pod $pod did not replicate alice within 30 seconds"; exit 1; }
   echo "$pod serves alice from its local replica"
 done
+
+step "MIT kadmin and kpasswd through the kadmin Service"
+"$KUBECTL" rollout status "deployment/${FULL}-kadmin" -n "$NS" --timeout=300s
+printf 'admin-pw\n' | admin_run addprinc admin/admin
+mit "cat > /tmp/krb5-kadm.conf <<'EOF'
+[libdefaults]
+ default_realm = ${REALM}
+ dns_lookup_kdc = false
+ dns_lookup_realm = false
+[realms]
+ ${REALM} = {
+  kdc = ${FULL}-kdc.${NS}.svc:88
+  admin_server = ${FULL}-kadmin.${NS}.svc:749
+  kpasswd_server = ${FULL}-kadmin.${NS}.svc:464
+ }
+EOF"
+kadm() {
+  mit "KRB5_CONFIG=/tmp/krb5-kadm.conf KRB5CCNAME=/tmp/cc_kadm timeout 30 kadmin -p admin/admin -w admin-pw -q \"$1\" 2>&1"
+}
+ready=0
+for _ in $(seq 1 60); do
+  if kadm "getprinc kadmin/admin" | grep -q "Principal: kadmin/admin@${REALM}"; then
+    ready=1
+    break
+  fi
+  sleep 2
+done
+[ "$ready" = 1 ] || { kadm "getprinc kadmin/admin"; exit 1; }
+out=$(kadm "addprinc -pw carol-pw +requires_preauth carol")
+grep -q "Principal \"carol@${REALM}\" created." <<<"$out" || { echo "$out"; exit 1; }
+out=$(kadm "getprinc carol")
+grep -q "Last modified: .* (admin/admin@${REALM})" <<<"$out" || { echo "$out"; exit 1; }
+kadm "listprincs" | grep -qx "carol@${REALM}"
+out=$(mit "printf 'carol-pw\ncarol-new-pw\ncarol-new-pw\n' | KRB5_CONFIG=/tmp/krb5-kadm.conf KRB5CCNAME=/tmp/cc_kpw timeout 30 kpasswd carol@${REALM} 2>&1")
+grep -q "Password changed." <<<"$out" || { echo "$out"; exit 1; }
+write_krb5_conf "${FULL}-kdc.${NS}.svc:88"
+seen=0
+for _ in $(seq 1 30); do
+  if kinit_user carol carol-new-pw >/dev/null 2>&1; then
+    seen=1
+    break
+  fi
+  sleep 1
+done
+[ "$seen" = 1 ] || { echo "the KDCs did not serve carol's new password within 30 seconds"; exit 1; }
 
 step "replica status lists each regional KDC id"
 status_file="$CERT_DIR/replication-status"

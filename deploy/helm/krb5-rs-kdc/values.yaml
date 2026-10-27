@@ -159,7 +159,12 @@ propagation:
 # with krb5-rs-kdb addprinc on the primary. The kadmin/admin and
 # kadmin/changepw service principals are created with the database.
 kadmin:
+  # File mode: kadmind runs in the primary pod. CockroachDB mode: a kadmin
+  # Deployment connects as cockroach.admin (required).
   enabled: false
+  # kadmind pods in CockroachDB mode.
+  replicaCount: 1
+  resources: {}
   # Container ports (MIT's 749 and 464 need root).
   containerPort: 7490
   kpasswdContainerPort: 4640

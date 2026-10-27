@@ -17,9 +17,9 @@ pub use codec::{decode_lockout, encode_lockout, KeyData, MitEntry, MitPolicy, Tl
 pub use name::{parse_name, parse_name_with_default, unparse_name};
 pub use tl::{
     constrained_delegation_values, history_entry, history_key_matches, merge_policy, merge_record,
-    new_entry, policy_from_entry, record_from_entry, set_key_change, set_mod_princ,
-    set_string_attr, string_attributes, update_tl_data, StringAttribute, ACTKVNO,
-    CONSTRAINED_DELEGATION_ACL, KADM5_POLICY, KADM_DATA, LAST_ADMIN_UNLOCK, LAST_PWD_CHANGE,
-    MKEY_AUX, MKVNO, MOD_PRINC, STRING_ATTRS,
+    new_entry, policy_from_entry, policy_to_entry, record_from_entry, record_without_keys,
+    set_key_change, set_mod_princ, set_string_attr, string_attributes, update_tl_data,
+    StringAttribute, ACTKVNO, CONSTRAINED_DELEGATION_ACL, KADM5_POLICY, KADM_DATA,
+    LAST_ADMIN_UNLOCK, LAST_PWD_CHANGE, MKEY_AUX, MKVNO, MOD_PRINC, STRING_ATTRS,
 };
 pub use xdr::OsaPrincipalData;

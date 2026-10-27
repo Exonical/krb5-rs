@@ -1,0 +1,133 @@
+{{- if and (eq .Values.database.mode "cockroach") .Values.kadmin.enabled }}
+# MIT kadmind for remote kadmin and kpasswd, writing to CockroachDB as
+# cockroach.admin. Stateless: every KDC pod sees its changes through
+# replication. No iprop: CockroachDB replicates instead.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "krb5-rs-kdc.fullname" . }}-kadmin
+  labels:
+    {{- include "krb5-rs-kdc.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kadmin
+spec:
+  replicas: {{ .Values.kadmin.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "krb5-rs-kdc.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kadmin
+  template:
+    metadata:
+      labels:
+        {{- include "krb5-rs-kdc.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kadmin
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        # kadmind reads the master key from a stash, as MIT's does.
+        - name: stash
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kdb"]
+          args:
+            - --config
+            - /etc/krb5-rs/kadmind-kdc.conf
+            - --krb5-config
+            - /etc/krb5-rs/krb5.conf
+            - --realm
+            - {{ .Values.realm | quote }}
+            - --master-password-file
+            - /secrets/master-password
+            - stash
+            - -f
+            - /stash/stash
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+            - name: cockroach-admin
+              mountPath: /crdb-admin
+              readOnly: true
+            - name: stash
+              mountPath: /stash
+      containers:
+        - name: kadmind
+          image: {{ include "krb5-rs-kdc.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/krb5-rs-kadmind"]
+          args:
+            - -nofork
+            - -r
+            - {{ .Values.realm }}
+          ports:
+            - name: kadmin
+              containerPort: {{ .Values.kadmin.containerPort }}
+              protocol: TCP
+            - name: kpasswd-udp
+              containerPort: {{ .Values.kadmin.kpasswdContainerPort }}
+              protocol: UDP
+            - name: kpasswd-tcp
+              containerPort: {{ .Values.kadmin.kpasswdContainerPort }}
+              protocol: TCP
+          env:
+            - name: KRB5_KDC_PROFILE
+              value: /etc/krb5-rs/kadmind-kdc.conf
+            - name: KRB5_CONFIG
+              value: /etc/krb5-rs/krb5.conf
+          readinessProbe:
+            tcpSocket:
+              port: kadmin
+            periodSeconds: 5
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.kadmin.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/krb5-rs
+              readOnly: true
+            - name: cockroach-admin
+              mountPath: /crdb-admin
+              readOnly: true
+            - name: stash
+              mountPath: /stash
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "krb5-rs-kdc.fullname" . }}
+            items:
+              - key: kadmind-kdc.conf
+                path: kadmind-kdc.conf
+              - key: krb5.conf
+                path: krb5.conf
+              - key: kadm5.acl
+                path: kadm5.acl
+        - name: secrets
+          secret:
+            secretName: {{ include "krb5-rs-kdc.secretName" . }}
+            defaultMode: 0440
+        - name: cockroach-admin
+          secret:
+            secretName: {{ .Values.cockroach.admin.tlsSecret }}
+            defaultMode: 0440
+        - name: stash
+          emptyDir:
+            medium: Memory
+{{- end }}

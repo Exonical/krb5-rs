@@ -24,6 +24,7 @@
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- if and .Values.kadmin.enabled (ne .Values.database.mode "file") -}}
-{{- fail "kadmin.enabled requires database.mode=file (kadmind is klmdb only)" -}}
+{{- if and .Values.kadmin.enabled (eq .Values.database.mode "cockroach") -}}
+{{- $_ := required "cockroach.admin.url is required for kadmin in CockroachDB mode" .Values.cockroach.admin.url -}}
+{{- $_ := required "cockroach.admin.tlsSecret is required for kadmin in CockroachDB mode" .Values.cockroach.admin.tlsSecret -}}
 {{- end -}}

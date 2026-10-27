@@ -703,6 +703,126 @@ async fn admin_writes_reread_the_master_key_list_another_store_changed() {
 
 #[tokio::test]
 #[ignore = "needs the CockroachDB test cluster"]
+async fn raw_entries_round_trip_aliases_strings_and_renames_like_mit() {
+    use krb5_rs::kdc::kdb::mit::{
+        set_mod_princ, set_string_attr, string_attributes, MitEntry, TlData, STRING_ATTRS,
+    };
+    const ALIAS_TARGET: u16 = 0x000c;
+    let (db, store) = TestDb::with_realm("raw_entries").await;
+    ops(&store)
+        .add_principal(&name("alice"), REALM, Some("pw"), &plain())
+        .await
+        .expect("alice");
+    assert!(store
+        .raw_entry(&name("nobody"), REALM)
+        .await
+        .expect("read")
+        .is_none());
+
+    store
+        .update_raw(&name("alice"), REALM, |e, _| {
+            set_string_attr(e, b"session_enctypes", Some(b"aes256-cts"))?;
+            set_mod_princ(e, 1_700_000_000, b"admin/admin@CRDB.TEST")?;
+            Ok(true)
+        })
+        .await
+        .expect("setstr");
+    let raw = store
+        .raw_entry(&name("alice"), REALM)
+        .await
+        .expect("read")
+        .expect("alice");
+    let strings = string_attributes(&raw).expect("strings");
+    assert!(strings
+        .iter()
+        .any(|a| a.0 == b"session_enctypes" && a.1 == b"aes256-cts"));
+    let mod_princ = raw
+        .tl_data
+        .iter()
+        .find(|t| t.kind == 0x0002)
+        .expect("MOD_PRINC");
+    assert_eq!(&mod_princ.data[4..], b"admin/admin@CRDB.TEST\0");
+    assert_eq!(
+        raw.tl_data
+            .iter()
+            .filter(|t| t.kind == STRING_ATTRS)
+            .count(),
+        1
+    );
+
+    let mut target = b"alice@CRDB.TEST".to_vec();
+    target.push(0);
+    let alias = MitEntry {
+        principal: name("al"),
+        realm: REALM.into(),
+        attributes: PrincipalAttributes::DISALLOW_ALL_TIX.bits(),
+        max_life: 0,
+        max_renewable_life: 0,
+        expiration: 0,
+        pw_expiration: 0,
+        last_success: 0,
+        last_failed: 0,
+        fail_auth_count: 0,
+        tl_data: vec![TlData {
+            kind: ALIAS_TARGET,
+            data: target.clone(),
+        }],
+        key_data: Vec::new(),
+    };
+    store.create_raw(&alias).await.expect("alias");
+    let err = store.create_raw(&alias).await.expect_err("duplicate alias");
+    assert_eq!(err.kind(), StoreErrorKind::Conflict);
+    let got = store
+        .raw_entry(&name("al"), REALM)
+        .await
+        .expect("read")
+        .expect("al");
+    assert!(got.key_data.is_empty());
+    assert!(got
+        .tl_data
+        .iter()
+        .any(|t| t.kind == ALIAS_TARGET && t.data == target));
+
+    store
+        .rename_raw(&name("alice"), REALM, |mut e, _| {
+            e.principal = name("bob");
+            Ok(e)
+        })
+        .await
+        .expect("rename");
+    assert!(store
+        .raw_entry(&name("alice"), REALM)
+        .await
+        .expect("read")
+        .is_none());
+    let bob = store
+        .raw_entry(&name("bob"), REALM)
+        .await
+        .expect("read")
+        .expect("bob");
+    assert_eq!(bob.key_data.len(), raw.key_data.len());
+    assert!(string_attributes(&bob)
+        .expect("strings")
+        .iter()
+        .any(|a| a.0 == b"session_enctypes"));
+    let rec = AdminStore::get_record(&store, &name("bob"), REALM)
+        .await
+        .expect("get")
+        .expect("bob");
+    assert_eq!(rec.entry.keys.len(), raw.key_data.len());
+    let err = store
+        .rename_raw(&name("bob"), REALM, |mut e, _| {
+            e.principal = name("al");
+            Ok(e)
+        })
+        .await
+        .expect_err("rename onto the alias");
+    assert_eq!(err.kind(), StoreErrorKind::Conflict);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
 async fn a_failing_transaction_leaves_nothing_partial() {
     let (db, store) = TestDb::with_realm("atomic").await;
     let before = (

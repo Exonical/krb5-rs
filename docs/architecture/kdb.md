@@ -408,8 +408,8 @@ release), so rerun `init` after upgrading before starting kadmind. The live test
 `crates/krb5-rs-kdc/tests/kpasswd_live.rs` runs MIT 1.22.2 `kpasswd` over UDP
 and TCP and `krb5_set_password_using_ccache` against it.
 
-Deviations: authorization uses only `acl_file` (no kadm5_auth plugins);
-klmdb only.
+Deviations: authorization uses only `acl_file` (no kadm5_auth plugins).
+Like the admin RPC service below, it runs on klmdb or CockroachDB.
 
 ### kadm5 admin RPC service
 
@@ -494,8 +494,24 @@ changes) and checks that every command prints the same output, that the
 resulting principals read back the same through `kadmin.local`, and that both
 update logs hold the same number of entries.
 
+With `db_library = krb5-rs-cockroach`, kadmind administers the CockroachDB
+realm through the module's `[dbmodules]` connection (the `kdc_admin` role),
+the way MIT's kadmind goes through whichever KDB module `db_library` names.
+The master key comes from `key_stash_file`, as in MIT. Principals keep their
+MIT tl-data in the `principals.tl_data` column, so the modifier in
+`MOD_PRINC`, string attributes, client-supplied tl-data and alias entries
+(`KRB5_TL_ALIAS_TARGET`, no keys) read back as on klmdb; renaming an alias
+fails with `KRB5_KDB_ALIAS_UNSUPPORTED`, as in `kdb5.c`. Every write reads
+`K/M` and the principal in one serializable transaction, retried on conflict.
+iprop needs klmdb: kadmind refuses `iprop_enable` with CockroachDB, which
+replicates to the KDCs itself. The live test
+`crates/krb5-rs-kdc/tests/kadmin_cockroach_live.rs` runs MIT 1.22.2 `kadmin`
+(principals, strings, policies, aliases, rename, `cpw`, `delprinc`) and
+`kpasswd` against it, and `kinit` against a CockroachDB KDC reading the same
+realm.
+
 Deviations: no kadm5_auth plugins beyond the built-in `self` and `acl`
-behavior; klmdb only.
+behavior.
 
 ### ONC RPC and RPCSEC_GSS
 
@@ -950,7 +966,11 @@ epoch.
   Service, port 749 and 464 mapped to unprivileged container ports, with
   `kadmin.acl` as its `kadm5.acl`; `krb5-rs-kdb init` creates `kadmin/admin`
   and `kadmin/changepw`, whose keys kadmind reads from the database, so no
-  keytab is needed. Replicas run no kadmind, as with MIT. In CockroachDB mode, each region runs a KDC
+  keytab is needed. Replicas run no kadmind, as with MIT. In CockroachDB
+  mode, `kadmin.enabled` runs a `<release>-kadmin` Deployment
+  (`kadmin.replicaCount`, default 1) behind the same Service: an init
+  container writes the stash from the master password and kadmind connects as
+  `cockroach.admin` (required). In CockroachDB mode, each region runs a KDC
   StatefulSet with a PVC per pod, an idempotent bootstrap Job as a
   pre-install/pre-upgrade hook, and an optional prune CronJob; startup,
   readiness and liveness use the HTTP probes. Use the `-cockroach` image

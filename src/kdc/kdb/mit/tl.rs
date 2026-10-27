@@ -516,6 +516,14 @@ pub fn record_from_entry(
         .iter()
         .map(|data| key_from_data(data, &entry.principal, &entry.realm, master))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut record = record_without_keys(entry)?;
+    record.entry.keys = keys;
+    Ok(record)
+}
+
+/// [`record_from_entry`] without decrypting the keys (`entry.keys` empty),
+/// for stores that keep keys encrypted.
+pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreError> {
     let mut allowed_to_delegate_from = Vec::new();
     if let Some((_, value)) = attr_pairs(entry)?
         .into_iter()
@@ -549,7 +557,7 @@ pub fn record_from_entry(
                 .then(|| Duration::from_secs(u64::from(entry.max_renewable_life))),
             expiration: from_timestamp(entry.expiration),
             pw_expiration: from_timestamp(entry.pw_expiration),
-            keys,
+            keys: Vec::new(),
             allowed_to_delegate_to: constrained_delegation_values(entry)?,
             allowed_to_delegate_from,
             policy,
@@ -744,6 +752,34 @@ pub fn merge_policy(entry: &mut MitPolicy, policy: &Policy) -> Result<(), StoreE
         })
         .collect();
     Ok(())
+}
+
+/// The MIT policy record for a store policy (the inverse of
+/// [`policy_from_entry`]).
+pub fn policy_to_entry(policy: &Policy) -> MitPolicy {
+    MitPolicy {
+        name: policy.name.clone(),
+        pw_min_life: policy.pw_min_life,
+        pw_max_life: policy.pw_max_life,
+        pw_min_length: policy.pw_min_length,
+        pw_min_classes: policy.pw_min_classes,
+        pw_history_num: policy.pw_history_num,
+        pw_max_fail: policy.pw_max_fail,
+        pw_failcnt_interval: policy.pw_failcnt_interval,
+        pw_lockout_duration: policy.pw_lockout_duration,
+        attributes: policy.attributes,
+        max_life: policy.max_life,
+        max_renewable_life: policy.max_renewable_life,
+        allowed_keysalts: policy.allowed_keysalts.clone(),
+        tl_data: policy
+            .tl_data
+            .iter()
+            .map(|t| TlData {
+                kind: t.kind,
+                data: t.data.clone(),
+            })
+            .collect(),
+    }
 }
 
 /// Map MIT policy fields to the krb5-rs KDC policy model.
