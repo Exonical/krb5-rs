@@ -452,6 +452,13 @@ impl TgsExchange {
         Some(opts)
     }
 
+    /// Whether the next request is one of S4U2Proxy's TGT requests to the
+    /// target realm (s4u_creds.c:900-1000), made without `in_creds`.
+    pub(super) fn s4u_tgt_request(&self) -> bool {
+        matches!(&self.s4u, S4uMode::Proxy(st)
+            if matches!(st.phase, ProxyPhase::TargetTgt | ProxyPhase::ProxyTgt))
+    }
+
     pub(super) fn s4u_additional_tickets(&self) -> Option<Vec<Ticket>> {
         match &self.s4u {
             S4uMode::Proxy(st) => match st.phase {

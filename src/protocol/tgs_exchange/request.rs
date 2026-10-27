@@ -74,7 +74,10 @@ impl TgsExchange {
             till,
             rtime: None,
             nonce: self.nonce,
-            etype: self.options.etypes.clone(),
+            etype: match self.enctype {
+                Some(e) if !self.s4u_tgt_request() => vec![e],
+                _ => self.options.etypes.clone(),
+            },
             addresses: None,
             enc_authorization_data,
             additional_tickets: self.s4u_additional_tickets(),
