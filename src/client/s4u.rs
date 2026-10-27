@@ -149,7 +149,7 @@ impl<T: KdcTransport> KerberosClient<T> {
         }
         cred.authdata = req.authdata.clone();
         if !options.contains(GcOptions::NO_STORE) {
-            Self::store_cred(ccache, &cred, None)?;
+            Self::store_cred(ccache, &cred, None, false)?;
         }
         Ok(cred)
     }
@@ -288,7 +288,7 @@ impl<T: KdcTransport> KerberosClient<T> {
                     cred.srealm = req.srealm.clone();
                     cred.authdata = req.authdata.clone();
                     if !options.contains(GcOptions::NO_STORE) {
-                        let _ = Self::store_cred(ccache, &cred, req.second_ticket.as_ref());
+                        let _ = Self::store_cred(ccache, &cred, req.second_ticket.as_ref(), false);
                     }
                     return Ok(cred);
                 }

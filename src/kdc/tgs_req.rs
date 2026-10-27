@@ -426,6 +426,12 @@ impl<S: PrincipalStore> Kdc<S> {
         } else {
             None
         };
+        // The user-to-user second ticket (decrypt_2ndtkt, do_tgs_req.c:719-724).
+        let u2u = opts.contains(KdcOptions::ENC_TKT_IN_SKEY);
+        let u2u_tkt = match body.additional_tickets.as_ref().and_then(|t| t.first()) {
+            Some(t) if u2u => Some(self.decrypt_2ndtkt(t, &local_tgt).await?),
+            _ => None,
+        };
         // A cross-realm S4U2Proxy evidence ticket is a cross-realm TGT naming
         // the requested client in its PAC (do_tgs_req.c:734-746).
         let stkt_pac_client = match &stkt {
@@ -517,6 +523,23 @@ impl<S: PrincipalStore> Kdc<S> {
             )?;
         } else if is_crossrealm && client_realm == *realm {
             return Err(KdcError::new(KDC_ERR_POLICY, "INVALID LINEAGE"));
+        }
+
+        // check_tgs_u2u (tgs_policy.c:574-597).
+        if u2u {
+            let e = u2u_tkt
+                .as_ref()
+                .ok_or_else(|| KdcError::new(KDC_ERR_BADOPTION, "NO_2ND_TKT"))?;
+            let local_tgs = is_tgs_principal(&e.sname)
+                && e.sname.name_string[1].as_bytes() == e.realm.as_bytes()
+                && e.realm == server.realm;
+            if !local_tgs {
+                return Err(KdcError::new(KDC_ERR_POLICY, "2ND_TKT_NOT_TGS"));
+            }
+            let crealm = realm_string(&e.part.crealm);
+            if !super::s4u::is_client_db_alias(&server, &e.part.cname, &crealm) {
+                return Err(KdcError::new(KDC_ERR_SERVER_NOMATCH, "2ND_TKT_MISMATCH"));
+            }
         }
 
         if proxy {
@@ -713,7 +736,14 @@ impl<S: PrincipalStore> Kdc<S> {
         }
 
         // tgs_issue_ticket (do_tgs_req.c:955-1139).
-        let session_etype = select_session_keytype(&server, &body.etype, &permitted)
+        // gen_session_key (do_tgs_req.c:337-362): for user-to-user, the
+        // second ticket's session key enctype if the client asked for it.
+        let u2u_etype = u2u_tkt
+            .as_ref()
+            .map(|e| e.part.key.keytype)
+            .filter(|e| body.etype.contains(e));
+        let session_etype = u2u_etype
+            .or_else(|| select_session_keytype(&server, &body.etype, &permitted))
             .ok_or_else(|| KdcError::new(KDC_ERR_ETYPE_NOSUPP, "BAD_ENCRYPTION_TYPE"))?;
         let session_key = random_key(session_etype)?;
         let server_key = server
@@ -785,13 +815,14 @@ impl<S: PrincipalStore> Kdc<S> {
         } else {
             sname.clone()
         };
-        let ticket = encrypt_ticket_part(
-            &server_key.key,
-            Some(kvno),
-            realm,
-            ticket_sname.clone(),
-            &part,
-        )?;
+        // User-to-user tickets are encrypted in the second ticket's session
+        // key, with kvno 0 (do_tgs_req.c:997-1000, 1056-1058).
+        let (ticket_key, ticket_kvno) = match &u2u_tkt {
+            Some(e) => (&e.part.key, None),
+            None => (&server_key.key, Some(kvno)),
+        };
+        let ticket =
+            encrypt_ticket_part(ticket_key, ticket_kvno, realm, ticket_sname.clone(), &part)?;
 
         // kdc_fast_response_handle_padata / kdc_fast_handle_reply_key
         // (do_tgs_req.c:1090-1097).

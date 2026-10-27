@@ -173,8 +173,10 @@ impl<T: KdcTransport> KerberosClient<T> {
         ccache: &mut C,
         cred: &Credential,
         second_ticket: Option<&Ticket>,
+        is_skey: bool,
     ) -> Result<(), Krb5Error> {
         let mut cc = CcCredential::from(cred);
+        cc.is_skey = is_skey;
         if let Some(t) = second_ticket {
             cc.second_ticket = rasn::der::encode(t)?;
         }
@@ -255,9 +257,6 @@ impl<T: KdcTransport> KerberosClient<T> {
             Err(e) if !is_cache_miss(&e) || options.contains(GcOptions::CACHED) => return Err(e),
             Err(_) => {}
         }
-        if options.contains(GcOptions::USER_USER) {
-            return Err(invalid("user-to-user TGS requests are not supported"));
-        }
         let tgs = self.gc_tgs_options(options);
         let mut iter = CanonPrinc::new(&req.server);
         let mut last = None;
@@ -272,7 +271,12 @@ impl<T: KdcTransport> KerberosClient<T> {
                     cred.srealm = req.srealm.clone();
                     cred.authdata = req.authdata.clone();
                     if !options.contains(GcOptions::NO_STORE) {
-                        let _ = Self::store_cred(ccache, &cred, None);
+                        let _ = Self::store_cred(
+                            ccache,
+                            &cred,
+                            req.second_ticket.as_ref(),
+                            req.second_ticket.is_some(),
+                        );
                     }
                     return Ok(cred);
                 }
@@ -312,7 +316,7 @@ impl<T: KdcTransport> KerberosClient<T> {
                         .run_tgs(TgsExchange::new(local_tgt, tgt_name(srealm), tgs.clone()))
                         .await?;
                     if tgt.server.name_string == tgt_name(srealm).name_string {
-                        let _ = Self::store_cred(ccache, &tgt, None);
+                        let _ = Self::store_cred(ccache, &tgt, None, false);
                     }
                     tgt
                 }
@@ -321,7 +325,8 @@ impl<T: KdcTransport> KerberosClient<T> {
         self.run_tgs(
             TgsExchange::new(tgt, server, tgs)
                 .with_authdata(req.authdata.clone())
-                .with_enctype(req.enctype),
+                .with_enctype(req.enctype)
+                .with_second_ticket(req.second_ticket.clone()),
         )
         .await
     }

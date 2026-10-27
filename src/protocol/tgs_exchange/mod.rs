@@ -196,6 +196,8 @@ pub struct TgsExchange {
     authdata: Option<crate::types::AuthorizationData>,
     /// Session key enctype to request (`in_creds->keyblock.enctype`).
     enctype: Option<i32>,
+    /// User-to-user second ticket (`in_creds->second_ticket`).
+    u2u_ticket: Option<crate::types::Ticket>,
 }
 
 impl TgsExchange {
@@ -219,7 +221,17 @@ impl TgsExchange {
             s4u: s4u::S4uMode::None,
             authdata: None,
             enctype: None,
+            u2u_ticket: None,
         }
+    }
+
+    /// User-to-user: send `ticket` (the TGT of the target server) as the
+    /// second ticket with ENC-TKT-IN-SKEY (get_creds.c:361-363,
+    /// send_tgs.c:215-226); the KDC encrypts the ticket in its session key.
+    #[must_use]
+    pub fn with_second_ticket(mut self, ticket: Option<crate::types::Ticket>) -> Self {
+        self.u2u_ticket = ticket;
+        self
     }
 
     /// Request only `enctype` for the session key, or the configured

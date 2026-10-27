@@ -832,6 +832,54 @@ mod client_layer {
             .expect("stored for xuser@U.REALM");
     }
 
+    // t_u2u.py: kvno --u2u against the KDC.
+    #[tokio::test]
+    async fn user_to_user_ticket_is_encrypted_in_the_second_tickets_session_key() {
+        let w = Arc::new(world(false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, sends) = client(&w);
+        let alice = PrincipalName::new_principal("alice");
+        let alice_tgt = w.login(alice.clone()).await;
+        let mut req = CredsRequest::new(service(), SREALM, alice, SREALM);
+        req.second_ticket = Some(alice_tgt.ticket.clone());
+        let cred = client
+            .get_credentials(&mut cc, GcOptions::USER_USER, &req)
+            .await
+            .expect("user-to-user ticket");
+        assert!(cred.ticket.enc_part.kvno.is_none());
+        assert_eq!(cred.session_key.keytype, alice_tgt.session_key.keytype);
+        let part = decrypt_ticket(&alice_tgt.session_key, &cred.ticket).expect("decrypt");
+        assert_eq!(part.cname.name_string, service().name_string);
+        let stored = cc.creds().expect("creds");
+        assert!(stored.last().expect("stored").is_skey);
+        let used = sends.load(Ordering::SeqCst);
+        client
+            .get_credentials(&mut cc, GcOptions::USER_USER | GcOptions::CACHED, &req)
+            .await
+            .expect("cached user-to-user ticket");
+        assert_eq!(sends.load(Ordering::SeqCst), used);
+    }
+
+    // check_tgs_u2u (tgs_policy.c:591-595).
+    #[tokio::test]
+    async fn user_to_user_with_another_principals_tgt_is_server_nomatch() {
+        let w = Arc::new(world(false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, _) = client(&w);
+        let alice_tgt = w.login(PrincipalName::new_principal("alice")).await;
+        let mut req = CredsRequest::new(
+            service(),
+            SREALM,
+            PrincipalName::new_principal("other"),
+            SREALM,
+        );
+        req.second_ticket = Some(alice_tgt.ticket);
+        let r = client
+            .get_credentials(&mut cc, GcOptions::USER_USER, &req)
+            .await;
+        assert_eq!(kdc_code(&r), 26, "{r:?}");
+    }
+
     /// A ccache whose lookups fail with KRB5_CC_FORMAT.
     struct Broken(MemoryCcache);
 
