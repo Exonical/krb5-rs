@@ -6,6 +6,7 @@ mod common;
 
 use common::*;
 use krb5_rs::kdc::replication::ReplicationTs;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
 /// A raw session as root (TLS through the crate's own rustls setup is not
@@ -218,155 +219,164 @@ async fn fact_bucket_scan_finds_a_long_transaction_from_its_start_bucket() {
         .await
         .expect("test transaction bound");
 
-    let writer = raw_with_options(
-        &db.name,
-        Some("-c transaction_timeout=3s -c statement_timeout=0"),
-    )
-    .await;
-    let observer = raw(&db.name).await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        let epoch = one(&observer, "SELECT EXTRACT(EPOCH FROM now())::STRING").await;
-        let second = epoch.parse::<f64>().expect("server time");
-        if second % 10.0 >= 8.5 {
-            break;
+    for attempt in 1..=3 {
+        let writer = raw_with_options(
+            &db.name,
+            Some("-c transaction_timeout=3s -c statement_timeout=0"),
+        )
+        .await;
+        let observer = raw(&db.name).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let epoch = one(&observer, "SELECT EXTRACT(EPOCH FROM now())::STRING").await;
+            let second = epoch.parse::<f64>().expect("server time");
+            if second % 10.0 >= 8.5 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "missed bucket boundary"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let writer_task = tokio::spawn(async move {
+            writer.batch_execute("BEGIN").await.expect("begin writer");
+            let txn_start = one(&writer, "SELECT EXTRACT(EPOCH FROM now())::STRING")
+                .await
+                .parse::<f64>()
+                .expect("txn start");
+            let bucket = one(
+                &writer,
+                "SELECT floor(EXTRACT(EPOCH FROM now()) / bucket_width_seconds)::INT8::STRING \
+                 FROM replication_meta WHERE id = 1",
+            )
+            .await
+            .parse::<i64>()
+            .expect("start bucket");
+            started_tx.send((txn_start, bucket)).expect("send start");
+            release_rx.await.expect("release writer");
+            writer
+                .batch_execute(
+                    "INSERT INTO bucket_probe VALUES (1, 1); \
+                     INSERT INTO replication_log (bucket,id,entity,realm,\"key\",op,txn_id) \
+                     SELECT floor(EXTRACT(EPOCH FROM now())/bucket_width_seconds)::INT8, \
+                     '00000000-0000-4000-8000-000000000001'::UUID, 'principal', \
+                     'R', 'alice', 'upsert', '00000000-0000-4000-8000-000000000002'::UUID \
+                     FROM replication_meta WHERE id=1",
+                )
+                .await
+                .expect("write data and log");
+            let result = writer.batch_execute("COMMIT").await;
+            committed_tx
+                .send(
+                    result
+                        .as_ref()
+                        .map_or_else(|e| e.to_string(), |_| "ok".into()),
+                )
+                .expect("send commit");
+            result
+        });
+
+        let (txn_start, start_bucket) = started_rx.await.expect("writer started");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let checkpoint_bucket = loop {
+            let current_bucket = one(
+                &observer,
+                "SELECT floor(EXTRACT(EPOCH FROM now())/10)::INT8::STRING",
+            )
+            .await
+            .parse::<i64>()
+            .expect("current bucket");
+            if current_bucket > start_bucket {
+                break current_bucket;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "writer did not span a bucket boundary"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let ckpt = one(&observer, "SELECT cluster_logical_timestamp()::STRING").await;
+        let ckpt_ts = ckpt.parse::<ReplicationTs>().expect("checkpoint");
+        let d = 3_000_000_000i64;
+        let width = 10i64;
+        let low_bucket = (ckpt_ts.wall_nanos - d)
+            .div_euclid(1_000_000_000)
+            .div_euclid(width);
         assert!(
-            tokio::time::Instant::now() < deadline,
-            "missed bucket boundary"
+            start_bucket >= low_bucket,
+            "D scan omitted the writer's bucket"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(start_bucket < checkpoint_bucket);
+        println!(
+            "writer transaction start={txn_start}, log bucket={start_bucket}, \
+             ckpt={ckpt}, scan low bucket={low_bucket}"
+        );
+        observer
+            .batch_execute(&format!("BEGIN READ ONLY AS OF SYSTEM TIME '{ckpt}'"))
+            .await
+            .expect("begin checkpoint scan");
+        let visible = observer
+            .query_one(
+                "SELECT count(*)::INT8 FROM replication_log WHERE bucket BETWEEN $1 AND $2",
+                &[&low_bucket, &checkpoint_bucket],
+            )
+            .await
+            .expect("scan checkpoint bucket range")
+            .get::<_, i64>(0);
+        assert_eq!(visible, 0, "the uncommitted log row is not visible at ckpt");
+        observer
+            .batch_execute("COMMIT")
+            .await
+            .expect("commit checkpoint scan");
+        release_tx.send(()).expect("release writer");
+        let writer_commit = committed_rx.await.expect("writer commit time");
+        println!("writer commit after checkpoint read: {writer_commit}");
+        match writer_task.await.expect("writer completes") {
+            Err(e) if attempt < 3 && e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => {
+                println!("attempt {attempt}: writer must retry: {e}");
+                continue;
+            }
+            result => result.expect("commit writer"),
+        }
+
+        let t = one(&observer, "SELECT cluster_logical_timestamp()::STRING").await;
+        let t_ts = t.parse::<ReplicationTs>().expect("read timestamp");
+        let high_bucket = t_ts.wall_nanos.div_euclid(1_000_000_000).div_euclid(width);
+        assert!(
+            start_bucket < high_bucket,
+            "test did not cross a bucket boundary"
+        );
+        observer
+            .batch_execute(&format!("BEGIN READ ONLY AS OF SYSTEM TIME '{t}'"))
+            .await
+            .expect("begin after-commit AOST");
+        let row = observer
+            .query_opt(
+                "SELECT id::STRING, crdb_internal_mvcc_timestamp::STRING FROM replication_log \
+                 WHERE bucket BETWEEN $1 AND $2 \
+                 AND crdb_internal_mvcc_timestamp::STRING::DECIMAL > $3::STRING::DECIMAL \
+                 AND crdb_internal_mvcc_timestamp::STRING::DECIMAL <= $4::STRING::DECIMAL",
+                &[&low_bucket, &high_bucket, &ckpt, &t],
+            )
+            .await
+            .expect("bucket range scan");
+        let row = row.expect("the start-bucket row must be found in the D window");
+        let row_version = row
+            .get::<_, String>(1)
+            .parse::<ReplicationTs>()
+            .expect("log row MVCC");
+        assert!(row_version > ckpt_ts);
+        observer
+            .batch_execute("COMMIT")
+            .await
+            .expect("commit after-commit AOST");
+        break;
     }
-
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
-    let writer_task = tokio::spawn(async move {
-        writer.batch_execute("BEGIN").await.expect("begin writer");
-        let txn_start = one(&writer, "SELECT EXTRACT(EPOCH FROM now())::STRING")
-            .await
-            .parse::<f64>()
-            .expect("txn start");
-        let bucket = one(
-            &writer,
-            "SELECT floor(EXTRACT(EPOCH FROM now()) / bucket_width_seconds)::INT8::STRING \
-             FROM replication_meta WHERE id = 1",
-        )
-        .await
-        .parse::<i64>()
-        .expect("start bucket");
-        started_tx.send((txn_start, bucket)).expect("send start");
-        release_rx.await.expect("release writer");
-        writer
-            .batch_execute(
-                "INSERT INTO bucket_probe VALUES (1, 1); \
-                 INSERT INTO replication_log (bucket,id,entity,realm,\"key\",op,txn_id) \
-                 SELECT floor(EXTRACT(EPOCH FROM now())/bucket_width_seconds)::INT8, \
-                 '00000000-0000-4000-8000-000000000001'::UUID, 'principal', \
-                 'R', 'alice', 'upsert', '00000000-0000-4000-8000-000000000002'::UUID \
-                 FROM replication_meta WHERE id=1",
-            )
-            .await
-            .expect("write data and log");
-        let result = writer.batch_execute("COMMIT").await;
-        committed_tx
-            .send(
-                result
-                    .as_ref()
-                    .map_or_else(|e| e.to_string(), |_| "ok".into()),
-            )
-            .expect("send commit");
-        result.expect("commit writer");
-    });
-
-    let (txn_start, start_bucket) = started_rx.await.expect("writer started");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    let checkpoint_bucket = loop {
-        let current_bucket = one(
-            &observer,
-            "SELECT floor(EXTRACT(EPOCH FROM now())/10)::INT8::STRING",
-        )
-        .await
-        .parse::<i64>()
-        .expect("current bucket");
-        if current_bucket > start_bucket {
-            break current_bucket;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "writer did not span a bucket boundary"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    };
-    let ckpt = one(&observer, "SELECT cluster_logical_timestamp()::STRING").await;
-    let ckpt_ts = ckpt.parse::<ReplicationTs>().expect("checkpoint");
-    let d = 3_000_000_000i64;
-    let width = 10i64;
-    let low_bucket = (ckpt_ts.wall_nanos - d)
-        .div_euclid(1_000_000_000)
-        .div_euclid(width);
-    assert!(
-        start_bucket >= low_bucket,
-        "D scan omitted the writer's bucket"
-    );
-    assert!(start_bucket < checkpoint_bucket);
-    println!(
-        "writer transaction start={txn_start}, log bucket={start_bucket}, \
-         ckpt={ckpt}, scan low bucket={low_bucket}"
-    );
-    observer
-        .batch_execute(&format!("BEGIN READ ONLY AS OF SYSTEM TIME '{ckpt}'"))
-        .await
-        .expect("begin checkpoint scan");
-    let visible = observer
-        .query_one(
-            "SELECT count(*)::INT8 FROM replication_log WHERE bucket BETWEEN $1 AND $2",
-            &[&low_bucket, &checkpoint_bucket],
-        )
-        .await
-        .expect("scan checkpoint bucket range")
-        .get::<_, i64>(0);
-    assert_eq!(visible, 0, "the uncommitted log row is not visible at ckpt");
-    observer
-        .batch_execute("COMMIT")
-        .await
-        .expect("commit checkpoint scan");
-    release_tx.send(()).expect("release writer");
-    let writer_commit = committed_rx.await.expect("writer commit time");
-    println!("writer commit after checkpoint read: {writer_commit}");
-    writer_task.await.expect("writer completes");
-
-    let t = one(&observer, "SELECT cluster_logical_timestamp()::STRING").await;
-    let t_ts = t.parse::<ReplicationTs>().expect("read timestamp");
-    let high_bucket = t_ts.wall_nanos.div_euclid(1_000_000_000).div_euclid(width);
-    assert!(
-        start_bucket < high_bucket,
-        "test did not cross a bucket boundary"
-    );
-    observer
-        .batch_execute(&format!("BEGIN READ ONLY AS OF SYSTEM TIME '{t}'"))
-        .await
-        .expect("begin after-commit AOST");
-    let row = observer
-        .query_opt(
-            "SELECT id::STRING, crdb_internal_mvcc_timestamp::STRING FROM replication_log \
-             WHERE bucket BETWEEN $1 AND $2 \
-             AND crdb_internal_mvcc_timestamp::STRING::DECIMAL > $3::STRING::DECIMAL \
-             AND crdb_internal_mvcc_timestamp::STRING::DECIMAL <= $4::STRING::DECIMAL",
-            &[&low_bucket, &high_bucket, &ckpt, &t],
-        )
-        .await
-        .expect("bucket range scan");
-    let row = row.expect("the start-bucket row must be found in the D window");
-    let row_version = row
-        .get::<_, String>(1)
-        .parse::<ReplicationTs>()
-        .expect("log row MVCC");
-    assert!(row_version > ckpt_ts);
-    observer
-        .batch_execute("COMMIT")
-        .await
-        .expect("commit after-commit AOST");
     db.drop_db().await;
 }
 
