@@ -231,8 +231,18 @@ grep -q "Principal \"carol@${REALM}\" created." <<<"$out" || { echo "$out"; exit
 out=$(kadm "getprinc carol")
 grep -q "Last modified: .* (admin/admin@${REALM})" <<<"$out" || { echo "$out"; exit 1; }
 kadm "listprincs" | grep -qx "carol@${REALM}"
-out=$(mit "printf 'carol-pw\ncarol-new-pw\ncarol-new-pw\n' | KRB5_CONFIG=/tmp/krb5-kadm.conf KRB5CCNAME=/tmp/cc_kpw timeout 30 kpasswd carol@${REALM} 2>&1")
-grep -q "Password changed." <<<"$out" || { echo "$out"; exit 1; }
+# kpasswd first gets a kadmin/changepw ticket from a KDC, whose replica
+# may not have carol yet.
+changed=0
+for _ in $(seq 1 30); do
+  out=$(mit "printf 'carol-pw\ncarol-new-pw\ncarol-new-pw\n' | KRB5_CONFIG=/tmp/krb5-kadm.conf KRB5CCNAME=/tmp/cc_kpw timeout 30 kpasswd carol@${REALM} 2>&1" || true)
+  if grep -q "Password changed." <<<"$out"; then
+    changed=1
+    break
+  fi
+  sleep 1
+done
+[ "$changed" = 1 ] || { echo "$out"; exit 1; }
 write_krb5_conf "${FULL}-kdc.${NS}.svc:88"
 seen=0
 for _ in $(seq 1 30); do
