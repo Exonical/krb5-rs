@@ -468,9 +468,16 @@ update-log lock taken for the database write is still held, so iprop replicas
 follow (a crash between the commit and the append leaves the log behind the
 database, which the next `kpropd` poll repairs with a full resync, as in MIT).
 Client `KADM5_TL_DATA` on create and modify is merged into the principal in
-the same write, as `krb5_dbe_update_tl_data` does. Deviation: policy `KADM5_POLICY_TL_DATA` is
-checked (types below 256 are refused) but not stored, because klmdb's policy
-encoding here has no TL data; MIT's own `kadmin` never sends it. The live test
+the same write, as `krb5_dbe_update_tl_data` does. Policy `KADM5_POLICY_TL_DATA`
+is stored like MIT's: `create_policy` keeps the list as decoded (MIT's
+`xdr_krb5_tl_data` reverses it) without checking types, `modify_policy`
+refuses types below 256 and applies `krb5_db_update_tl_data` per
+element (svr_policy.c:153-159, 349-356), and `get_policy` returns it. klmdb
+keeps it in MIT's policy record, FileStore in the policy record and
+CockroachDB/Turso in a `tl_data` column (schema version 2), all in MIT LMDB's
+`put_tl_data` encoding. `create_policy` also sets MIT's minimum length,
+character classes and history of 1 when the client leaves them out
+(svr_policy.c:113-134). The live test
 `crates/krb5-rs-kdc/tests/kadmin_write_live.rs` runs the same MIT 1.22.2
 `kadmin` session against MIT kadmind and against krb5-rs-kadmind (policies,
 principals with dates in `get_date` syntax, passwords, random keys with

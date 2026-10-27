@@ -978,6 +978,13 @@ fn policy_change(rec: &kadm5::PolicyEnt, mask: i32, api: u32) -> PolicyChange {
     }
 }
 
+fn policy_tl(t: &TlData) -> krb5_rs::kdc::PolicyTlData {
+    krb5_rs::kdc::PolicyTlData {
+        kind: t.kind,
+        data: t.data.clone(),
+    }
+}
+
 /// The version 4 policy fields `PolicyChange` does not carry.
 fn apply_policy_v4(p: &mut Policy, rec: &kadm5::PolicyEnt, mask: i32, api: u32) {
     if api < kadm5::API_VERSION_4 {
@@ -1938,9 +1945,27 @@ impl Kadm5 {
                 return Err(code::BAD_MASK);
             }
             let max = (mask & kmask::PW_MAX_LIFE != 0).then_some(rec.pw_max_life);
-            check_policy(rec, mask, max)?;
+            // Only kadm5_modify_policy refuses TL types below 256.
+            check_policy(rec, mask & !kmask::POLICY_TL_DATA, max)?;
             let mut p = policy_change(rec, mask, api).into_policy(name);
+            // MIN_PW_LENGTH, MIN_PW_CLASSES and MIN_PW_HISTORY when unset
+            // (svr_policy.c:15-18, 113-134).
+            for (m, f) in [
+                (kmask::PW_MIN_LENGTH, &mut p.pw_min_length),
+                (kmask::PW_MIN_CLASSES, &mut p.pw_min_classes),
+                (kmask::PW_HISTORY_NUM, &mut p.pw_history_num),
+            ] {
+                if mask & m == 0 {
+                    *f = 1;
+                }
+            }
             apply_policy_v4(&mut p, rec, mask, api);
+            // kadm5_create_policy stores the list as decoded
+            // (svr_policy.c:153-159); MIT's xdr_krb5_tl_data decodes it
+            // in reverse order.
+            if api >= kadm5::API_VERSION_4 && mask & kmask::POLICY_TL_DATA != 0 {
+                p.tl_data = rec.tl_data.iter().rev().map(policy_tl).collect();
+            }
             run(self.admin(caller).add_policy(p)).map_err(|e| store_code(&e, code::UNK_POLICY))
         })()
         .map_or_else(|c| c, |()| code::OK);
@@ -1985,6 +2010,16 @@ impl Kadm5 {
             run(self.store.update_policy(name, move |p| {
                 change.apply(p);
                 apply_policy_v4(p, &rec, mask, api);
+                // kadm5_modify_policy: krb5_db_update_tl_data for each
+                // element of the reverse-decoded list (svr_policy.c:349-356).
+                if api >= kadm5::API_VERSION_4 && mask & kmask::POLICY_TL_DATA != 0 {
+                    for t in rec.tl_data.iter().rev() {
+                        match p.tl_data.iter_mut().find(|e| e.kind == t.kind) {
+                            Some(e) => e.data = t.data.clone(),
+                            None => p.tl_data.insert(0, policy_tl(t)),
+                        }
+                    }
+                }
                 p.security_epoch += 1;
                 Ok(())
             }))

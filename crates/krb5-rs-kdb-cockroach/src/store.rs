@@ -218,7 +218,7 @@ fn stored_principals(
 const POLICY_COLUMNS: &str = "name, pw_min_life, pw_max_life, pw_min_length, pw_min_classes, \
     pw_history_num, pw_max_fail, pw_failcnt_interval, pw_lockout_duration, attributes, \
     max_life, max_renewable_life, allowed_keysalts, security_epoch, deleted, \
-    crdb_internal_mvcc_timestamp::STRING";
+    crdb_internal_mvcc_timestamp::STRING, tl_data";
 
 fn policy_of(row: &Row) -> Result<(Policy, ReplicationTs, bool), StoreError> {
     let n = |i: usize| {
@@ -242,6 +242,9 @@ fn policy_of(row: &Row) -> Result<(Policy, ReplicationTs, bool), StoreError> {
             allowed_keysalts: row.get(12),
             security_epoch: u64::try_from(row.get::<_, i64>(13))
                 .map_err(|_| StoreError::corrupt("negative epoch"))?,
+            tl_data: Policy::tl_data_from_bytes(
+                &row.get::<_, Option<Vec<u8>>>(16).unwrap_or_default(),
+            )?,
         },
         ts_of(&row.get::<_, String>(15))?,
         row.get(14),
@@ -370,6 +373,9 @@ async fn write_policy(tx: &Tx, p: &Policy, create: bool) -> Result<(), TxError> 
         v(p.max_renewable_life),
     );
     let epoch = to_i64(p.security_epoch)?;
+    let tl = (!p.tl_data.is_empty())
+        .then(|| p.tl_data_bytes())
+        .transpose()?;
     let params: Params<'_> = &[
         &p.name,
         &a,
@@ -385,15 +391,16 @@ async fn write_policy(tx: &Tx, p: &Policy, create: bool) -> Result<(), TxError> 
         &k,
         &p.allowed_keysalts,
         &epoch,
+        &tl,
     ];
     if create {
         tx.execute(
             "INSERT INTO policies (name, pw_min_life, pw_max_life, pw_min_length, \
              pw_min_classes, pw_history_num, pw_max_fail, pw_failcnt_interval, \
              pw_lockout_duration, attributes, max_life, max_renewable_life, allowed_keysalts, \
-             security_epoch, deleted) \
+             security_epoch, tl_data, deleted) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-             false)",
+             $15, false)",
             params,
         )
         .await?;
@@ -403,7 +410,7 @@ async fn write_policy(tx: &Tx, p: &Policy, create: bool) -> Result<(), TxError> 
              pw_min_classes = $5, pw_history_num = $6, pw_max_fail = $7, \
              pw_failcnt_interval = $8, pw_lockout_duration = $9, attributes = $10, \
              max_life = $11, max_renewable_life = $12, allowed_keysalts = $13, \
-             security_epoch = $14, deleted = false WHERE name = $1",
+             security_epoch = $14, tl_data = $15, deleted = false WHERE name = $1",
             params,
         )
         .await?;

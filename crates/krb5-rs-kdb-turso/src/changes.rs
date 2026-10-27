@@ -270,8 +270,8 @@ async fn delete_principal(
     Ok(Applied::Yes)
 }
 
-fn policy_fields(p: &StoredPolicy) -> Vec<Value> {
-    vec![
+fn policy_fields(p: &StoredPolicy) -> Result<Vec<Value>, StoreError> {
+    Ok(vec![
         Value::Integer(i64::from(p.pw_min_life)),
         Value::Integer(i64::from(p.pw_max_life)),
         Value::Integer(i64::from(p.pw_min_length)),
@@ -285,7 +285,12 @@ fn policy_fields(p: &StoredPolicy) -> Vec<Value> {
         Value::Integer(i64::from(p.max_renewable_life)),
         opt_t(&p.allowed_keysalts),
         Value::Integer(i64::try_from(p.security_epoch).unwrap_or(i64::MAX)),
-    ]
+        if p.tl_data.is_empty() {
+            Value::Null
+        } else {
+            Value::Blob(p.tl_data_bytes()?)
+        },
+    ])
 }
 
 async fn upsert_policy(
@@ -299,7 +304,7 @@ async fn upsert_policy(
         vec![Value::Text(p.name.clone())],
     )
     .await?;
-    let mut fields = policy_fields(p);
+    let mut fields = policy_fields(p)?;
     fields.extend(version_params(version));
     match existing.first() {
         Some(row) => {
@@ -313,8 +318,8 @@ async fn upsert_policy(
                  pw_min_classes = ?, pw_history_num = ?, pw_max_fail = ?, \
                  pw_failcnt_interval = ?, pw_lockout_duration = ?, attributes = ?, \
                  max_life = ?, max_renewable_life = ?, allowed_keysalts = ?, \
-                 security_epoch = ?, version_wall = ?, version_logical = ?, deleted = 0 \
-                 WHERE id = ?",
+                 security_epoch = ?, tl_data = ?, version_wall = ?, version_logical = ?, \
+                 deleted = 0 WHERE id = ?",
                 fields,
             )
             .await?;
@@ -327,8 +332,8 @@ async fn upsert_policy(
                 "INSERT INTO policies (name, pw_min_life, pw_max_life, pw_min_length, \
                  pw_min_classes, pw_history_num, pw_max_fail, pw_failcnt_interval, \
                  pw_lockout_duration, attributes, max_life, max_renewable_life, \
-                 allowed_keysalts, security_epoch, version_wall, version_logical, deleted) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                 allowed_keysalts, security_epoch, tl_data, version_wall, version_logical, \
+                 deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 all,
             )
             .await?;
@@ -610,7 +615,7 @@ pub(crate) fn principal_from_rows(
 /// Policy columns after `name` for `SELECT ... FROM policies`.
 pub(crate) const POLICY_SQL: &str = "SELECT name, pw_min_life, pw_max_life, pw_min_length, \
     pw_min_classes, pw_history_num, pw_max_fail, pw_failcnt_interval, pw_lockout_duration, \
-    attributes, max_life, max_renewable_life, allowed_keysalts, security_epoch \
+    attributes, max_life, max_renewable_life, allowed_keysalts, security_epoch, tl_data \
     FROM policies WHERE name = ? AND deleted = 0";
 
 pub(crate) fn policy_from_row(row: &Row) -> Result<StoredPolicy, StoreError> {
@@ -633,5 +638,6 @@ pub(crate) fn policy_from_row(row: &Row) -> Result<StoredPolicy, StoreError> {
         allowed_keysalts: opt_text(row, 12)?,
         security_epoch: u64::try_from(int(row, 13)?)
             .map_err(|_| StoreError::corrupt("negative epoch"))?,
+        tl_data: StoredPolicy::tl_data_from_bytes(&opt_blob(row, 14)?.unwrap_or_default())?,
     })
 }

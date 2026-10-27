@@ -138,6 +138,68 @@ pub struct Policy {
     pub allowed_keysalts: Option<String>,
     /// Bumped by every change to the policy (krb5-rs; docs/architecture §3).
     pub security_epoch: u64,
+    /// Policy TL data (`osa_policy_ent_rec` `tl_data`), in stored order.
+    pub tl_data: Vec<PolicyTlData>,
+}
+
+/// One policy TL data element (MIT `krb5_tl_data`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PolicyTlData {
+    /// `tl_data_type`.
+    pub kind: u16,
+    /// `tl_data_contents`.
+    pub data: Vec<u8>,
+}
+
+impl Policy {
+    /// The TL data in MIT LMDB's policy encoding (`put_tl_data`,
+    /// plugins/kdb/lmdb/marshal.c): a 16-bit count, then per element a
+    /// 16-bit type, a 16-bit length and the contents, little-endian. Empty
+    /// when there is none; more than 65535 elements or bytes in one element
+    /// do not fit.
+    pub fn tl_data_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        if self.tl_data.is_empty() {
+            return Ok(Vec::new());
+        }
+        let too_big = |_| StoreError::rejected("policy tl-data too large");
+        let mut out = u16::try_from(self.tl_data.len())
+            .map_err(too_big)?
+            .to_le_bytes()
+            .to_vec();
+        for t in &self.tl_data {
+            out.extend_from_slice(&t.kind.to_le_bytes());
+            out.extend_from_slice(&u16::try_from(t.data.len()).map_err(too_big)?.to_le_bytes());
+            out.extend_from_slice(&t.data);
+        }
+        Ok(out)
+    }
+
+    /// Parse [`Self::tl_data_bytes`].
+    pub fn tl_data_from_bytes(b: &[u8]) -> Result<Vec<PolicyTlData>, StoreError> {
+        let bad = || StoreError::corrupt("truncated policy tl-data");
+        if b.is_empty() {
+            return Ok(Vec::new());
+        }
+        let u16_at = |i: usize| -> Result<u16, StoreError> {
+            b.get(i..i + 2)
+                .map(|x| u16::from_le_bytes([x[0], x[1]]))
+                .ok_or_else(bad)
+        };
+        let n = u16_at(0)?;
+        let mut at = 2;
+        let mut out = Vec::with_capacity(usize::from(n));
+        for _ in 0..n {
+            let kind = u16_at(at)?;
+            let len = usize::from(u16_at(at + 2)?);
+            let data = b.get(at + 4..at + 4 + len).ok_or_else(bad)?.to_vec();
+            at += 4 + len;
+            out.push(PolicyTlData { kind, data });
+        }
+        if at != b.len() {
+            return Err(bad());
+        }
+        Ok(out)
+    }
 }
 
 /// Per-principal authentication state that is local to one KDC and never
@@ -910,5 +972,40 @@ mod tests {
             record_success: false,
         });
         assert_eq!((s.fail_count, s.last_success), (0, 50));
+    }
+}
+
+#[cfg(test)]
+mod policy_tl_tests {
+    use super::*;
+
+    #[test]
+    fn policy_tl_data_round_trips_in_put_tl_data_encoding() {
+        let p = Policy {
+            tl_data: vec![
+                PolicyTlData {
+                    kind: 302,
+                    data: b"new".to_vec(),
+                },
+                PolicyTlData {
+                    kind: 300,
+                    data: Vec::new(),
+                },
+            ],
+            ..Policy::default()
+        };
+        let b = p.tl_data_bytes().expect("encode");
+        assert_eq!(b, [2, 0, 0x2e, 1, 3, 0, b'n', b'e', b'w', 0x2c, 1, 0, 0]);
+        assert_eq!(Policy::tl_data_from_bytes(&b).expect("decode"), p.tl_data);
+        assert!(Policy::default().tl_data_bytes().expect("empty").is_empty());
+        let big = Policy {
+            tl_data: vec![PolicyTlData {
+                kind: 300,
+                data: vec![0; 65536],
+            }],
+            ..Policy::default()
+        };
+        assert!(big.tl_data_bytes().is_err());
+        assert!(Policy::tl_data_from_bytes(&b[..b.len() - 1]).is_err());
     }
 }

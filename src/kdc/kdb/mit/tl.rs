@@ -720,7 +720,7 @@ pub fn new_entry(
     Ok(entry)
 }
 
-/// Merge the exposed `Policy` fields, keeping MIT's policy tl-data.
+/// Store the `Policy` fields in an MIT policy record.
 pub fn merge_policy(entry: &mut MitPolicy, policy: &Policy) -> Result<(), StoreError> {
     entry.name = policy.name.clone();
     entry.pw_min_life = policy.pw_min_life;
@@ -735,6 +735,14 @@ pub fn merge_policy(entry: &mut MitPolicy, policy: &Policy) -> Result<(), StoreE
     entry.max_life = policy.max_life;
     entry.max_renewable_life = policy.max_renewable_life;
     entry.allowed_keysalts = policy.allowed_keysalts.clone();
+    entry.tl_data = policy
+        .tl_data
+        .iter()
+        .map(|t| TlData {
+            kind: t.kind,
+            data: t.data.clone(),
+        })
+        .collect();
     Ok(())
 }
 
@@ -755,6 +763,14 @@ pub fn policy_from_entry(entry: &MitPolicy) -> Policy {
         max_renewable_life: entry.max_renewable_life,
         allowed_keysalts: entry.allowed_keysalts.clone(),
         security_epoch: 0,
+        tl_data: entry
+            .tl_data
+            .iter()
+            .map(|t| crate::kdc::PolicyTlData {
+                kind: t.kind,
+                data: t.data.clone(),
+            })
+            .collect(),
     }
 }
 

@@ -35,8 +35,8 @@ fn err(msg: impl Into<String>) -> StoreError {
     StoreError::backend(msg)
 }
 
-fn policy_from_record(p: &KdbPolicy) -> Policy {
-    Policy {
+fn policy_from_record(p: &KdbPolicy) -> Result<Policy, StoreError> {
+    Ok(Policy {
         name: String::from_utf8_lossy(p.name.as_bytes()).to_string(),
         pw_min_life: p.pw_min_life,
         pw_max_life: p.pw_max_life,
@@ -54,7 +54,8 @@ fn policy_from_record(p: &KdbPolicy) -> Policy {
             .as_ref()
             .map(|g| String::from_utf8_lossy(g.as_bytes()).to_string()),
         security_epoch: p.security_epoch.unwrap_or(0),
-    }
+        tl_data: Policy::tl_data_from_bytes(p.tl_data.as_deref().unwrap_or(&[]))?,
+    })
 }
 
 fn policy_to_record(p: &Policy) -> Result<KdbPolicy, StoreError> {
@@ -73,6 +74,9 @@ fn policy_to_record(p: &Policy) -> Result<KdbPolicy, StoreError> {
         max_renewable_life: p.max_renewable_life,
         allowed_keysalts: p.allowed_keysalts.as_deref().map(general).transpose()?,
         security_epoch: Some(p.security_epoch),
+        tl_data: (!p.tl_data.is_empty())
+            .then(|| p.tl_data_bytes().map(Into::into))
+            .transpose()?,
     })
 }
 
@@ -448,10 +452,10 @@ impl FileStore {
             .iter()
             .flatten()
             .map(|p| {
-                let policy = policy_from_record(p);
-                (policy.name.clone(), policy)
+                let policy = policy_from_record(p)?;
+                Ok((policy.name.clone(), policy))
             })
-            .collect();
+            .collect::<Result<_, StoreError>>()?;
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
         *cache = Cache {
             stamp: Some(stamp),
@@ -633,7 +637,7 @@ impl FileStore {
     /// Principals and policies as MIT dump entries in klmdb key order.
     /// Deviation: the file store keeps only what [`PrincipalRecord`] and
     /// [`Policy`] model (no lockout state, string attributes, password
-    /// history or policy tl-data), so only that is dumped.
+    /// history), so only that is dumped.
     pub fn dump_entries(&self) -> Result<(Vec<MitEntry>, Vec<MitPolicy>), StoreError> {
         let (records, policies) = self.export_records()?;
         let creator = unparse_name(&PrincipalName::new_principal("db_creation"), &self.realm);
@@ -835,7 +839,7 @@ impl FileStore {
                     StoreError::not_found(format!("Policy \"{name}\" does not exist"))
                 })?;
             let list = file.policies.as_mut().expect("found above");
-            let mut policy = policy_from_record(&list[pos]);
+            let mut policy = policy_from_record(&list[pos])?;
             f(&mut policy)?;
             list[pos] = policy_to_record(&policy)?;
             Ok(policy)
