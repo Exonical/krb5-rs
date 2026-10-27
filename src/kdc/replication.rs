@@ -18,7 +18,7 @@ use super::db::{KeyEntry, PrincipalAttributes, PrincipalEntry};
 use super::kdb::master::{decrypt_key, encrypt_key};
 use super::kdb::mit::mkey::{entry_mkvno, MasterKeys};
 use super::kdb::mit::{
-    merge_record, record_without_keys, CONSTRAINED_DELEGATION_ACL, LAST_ADMIN_UNLOCK,
+    merge_record, record_without_keys, unparse_name, CONSTRAINED_DELEGATION_ACL, LAST_ADMIN_UNLOCK,
     LAST_PWD_CHANGE,
 };
 use super::kdb::mit::{KeyData, MitEntry, TlData, ACTKVNO, MKEY_AUX, MKVNO, MOD_PRINC};
@@ -444,7 +444,22 @@ impl StoredPrincipal {
     pub fn to_mit(&self, keys: &MasterKeys) -> Result<MitEntry, StoreError> {
         let mut raw = self.to_raw()?;
         let key_data = std::mem::take(&mut raw.key_data);
-        let has_mod_princ = raw.tl_data.iter().any(|t| t.kind == MOD_PRINC);
+        // Every MIT entry has MOD_PRINC (kadmin clients cannot unparse a
+        // missing modifier); rows written before CockroachDB kept it get the
+        // realm's `db_creation` principal, as `kdb5_util create` records.
+        if !raw.tl_data.iter().any(|t| t.kind == MOD_PRINC) {
+            let secs = u32::try_from(self.mod_time.unwrap_or(0)).unwrap_or(0);
+            let mut data = secs.to_le_bytes().to_vec();
+            data.extend(unparse_name(
+                &PrincipalName::new_principal("db_creation"),
+                &self.realm,
+            ));
+            data.push(0);
+            raw.tl_data.push(TlData {
+                kind: MOD_PRINC,
+                data,
+            });
+        }
         let keyless = StoredPrincipal {
             keys: Vec::new(),
             ..self.clone()
@@ -452,7 +467,7 @@ impl StoredPrincipal {
         let record = PrincipalRecord {
             entry: keyless.into_entry(keys)?,
             last_pwd_change: self.last_pwd_change.map(kerberos_time),
-            mod_time: self.mod_time.filter(|_| has_mod_princ).map(kerberos_time),
+            mod_time: self.mod_time.map(kerberos_time),
             mod_by: None,
             password_history: None,
         };

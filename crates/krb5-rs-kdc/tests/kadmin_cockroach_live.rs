@@ -293,6 +293,12 @@ login() { echo "$2" | kinit -c "$B/cc_${1//\//_}" "$1" >/dev/null; }
 
 retry login alice alice-pw || fail "alice kinit"
 retry login admin/admin admin-pw || fail "admin kinit"
+out=$(kadm "getprinc krbtgt/$R")
+grep -q "Last modified: .* (db_creation@$R)" <<<"$out" || fail "realm principal: $out"
+out=$(kadm "getprinc kadmin/admin")
+grep -q "Last modified: .* (krb5-rs-kdb@$R)" <<<"$out" || fail "init principal: $out"
+out=$(kadm "getprinc alice")
+grep -q "Last modified: .* (krb5-rs-kdb@$R)" <<<"$out" || fail "krb5-rs-kdb principal: $out"
 out=$(kadm "addprinc -pw carol-pw +requires_preauth carol")
 grep -q "Principal \"carol@$R\" created." <<<"$out" || fail "addprinc: $out"
 out=$(kadm "getprinc carol")

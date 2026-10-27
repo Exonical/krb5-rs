@@ -143,11 +143,22 @@ fn stamp(
     keys: &MasterKeys,
     now: i64,
 ) -> Result<StoredPrincipal, StoreError> {
-    let Some(c) = caller else { return Ok(sp) };
+    // Without a kadmin client the writer is krb5-rs-kdb, as on klmdb.
+    let admin;
+    let (modifier, tl): (&[u8], &[krb5_rs::kdc::kdb::mit::TlData]) = match caller {
+        Some(c) => (&c.modifier, &c.tl),
+        None => {
+            admin = krb5_rs::kdc::kdb::mit::unparse_name(
+                &PrincipalName::new_principal("krb5-rs-kdb"),
+                &sp.realm,
+            );
+            (&admin, &[])
+        }
+    };
     let mut raw = sp.to_mit(keys)?;
     let secs = u32::try_from(now).map_err(|_| StoreError::backend("time outside u32 range"))?;
-    krb5_rs::kdc::kdb::mit::set_mod_princ(&mut raw, secs, &c.modifier)?;
-    krb5_rs::kdc::kdb::mit::update_tl_data(&mut raw, &c.tl);
+    krb5_rs::kdc::kdb::mit::set_mod_princ(&mut raw, secs, modifier)?;
+    krb5_rs::kdc::kdb::mit::update_tl_data(&mut raw, tl);
     StoredPrincipal::from_mit(&raw, Some(&sp))
 }
 
