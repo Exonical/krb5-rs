@@ -80,7 +80,9 @@ impl TgsExchange {
             },
             addresses: None,
             enc_authorization_data,
-            additional_tickets: self.s4u_additional_tickets(),
+            additional_tickets: self
+                .s4u_additional_tickets()
+                .or_else(|| self.u2u_ticket.clone().map(|t| vec![t])),
         };
 
         // DER-encode req_body for checksum computation
@@ -137,6 +139,9 @@ impl TgsExchange {
         }
         if self.options.disable_transited_check {
             kdc_opts |= KdcOptions::DISABLE_TRANSITED_CHECK;
+        }
+        if self.u2u_ticket.is_some() {
+            kdc_opts |= KdcOptions::ENC_TKT_IN_SKEY;
         }
         kdc_opts
     }

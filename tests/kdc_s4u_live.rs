@@ -317,6 +317,52 @@ fn mit_kvno_s4u2self_by_certificate_fails_like_against_mits_db2() {
     assert!(out.contains(want), "{out}");
 }
 
+// t_u2u.py: MIT `kvno --u2u` against our KDC and against MIT's.
+#[test]
+#[ignore = "requires podman + MIT client container"]
+fn mit_kvno_u2u_against_our_kdc_and_mits() {
+    let e = setup("/tmp/cc_u2u_svc", "HTTP/s4u.test.realm");
+    let alice = format!("KRB5_CONFIG={CONF} KRB5CCNAME=/tmp/cc_u2u_alice");
+    let (code, out) = run(
+        &format!("{alice} kinit alice@{REALM}"),
+        Some(&format!("{USER_PW}\n")),
+    );
+    assert_eq!(code, 0, "kinit alice: {out}");
+    let (code, out) = run(
+        &format!("{e} KRB5_TRACE=/dev/stderr kvno --u2u /tmp/cc_u2u_alice alice@{REALM}"),
+        None,
+    );
+    assert_eq!(code, 0, "kvno --u2u against our KDC: {out}");
+    assert!(out.contains(&format!("alice@{REALM}: kvno = 0")), "{out}");
+
+    let mit = "KRB5CCNAME=/tmp/cc_u2u_mit";
+    let (code, out) = run(
+        &format!("{mit} kinit HTTP/server.test.realm@{REALM}"),
+        Some("httpsecret\n"),
+    );
+    assert_eq!(code, 0, "kinit against MIT: {out}");
+    let (code, mit_out) = run(
+        &format!("{mit} kvno --u2u /tmp/cc_u2u_mit HTTP/server.test.realm@{REALM}"),
+        None,
+    );
+    assert_eq!(code, 0, "kvno --u2u against MIT: {mit_out}");
+    assert!(mit_out.contains("kvno = 0"), "{mit_out}");
+}
+
+#[test]
+#[ignore = "requires podman + MIT KDC container"]
+fn our_client_u2u_against_mit_kdc() {
+    let tgt = service_tgt();
+    let cred = run_tgs(
+        TgsExchange::new(tgt.clone(), tgt.client.clone(), TgsOptions::default())
+            .with_second_ticket(Some(tgt.ticket.clone())),
+    )
+    .expect("user-to-user ticket from MIT");
+    assert!(cred.ticket.enc_part.kvno.unwrap_or(0) == 0);
+    let part = decrypt_ticket(&tgt.session_key, &cred.ticket).expect("decrypt in TGT key");
+    assert_eq!(part.cname.name_string, tgt.client.name_string);
+}
+
 /// Copy a ccache between the container and the host (`to_host`) or back.
 fn cp_ccache(container_path: &str, host_path: &std::path::Path, to_host: bool) {
     let remote = format!("{KDC_CONTAINER}:{container_path}");

@@ -33,7 +33,6 @@ pub(crate) const AS_INVALID_OPTIONS: KdcOptions = KdcOptions::FORWARDED
 pub(crate) const UNSUPPORTED_OPTIONS: KdcOptions = KdcOptions::ALLOW_POSTDATE
     .union(KdcOptions::POSTDATED)
     .union(KdcOptions::VALIDATE)
-    .union(KdcOptions::ENC_TKT_IN_SKEY)
     .union(KdcOptions::PROXY);
 
 /// Realm-wide lifetime limits (MIT `realm_maxlife` / `realm_maxrlife`).
@@ -406,13 +405,20 @@ pub(crate) fn check_tgs_svc_policy(
     {
         return Err(KdcError::new(KDC_ERR_POLICY, "NON-RENEWABLE TICKET"));
     }
+    if opts.contains(KdcOptions::ENC_TKT_IN_SKEY)
+        && attrs.contains(PrincipalAttributes::DISALLOW_DUP_SKEY)
+    {
+        return Err(KdcError::new(KDC_ERR_POLICY, "DUP_SKEY DISALLOWED"));
+    }
     if attrs.contains(PrincipalAttributes::DISALLOW_ALL_TIX) {
         return Err(KdcError::new(
             KDC_ERR_S_PRINCIPAL_UNKNOWN,
             "SERVER LOCKED OUT",
         ));
     }
-    if attrs.contains(PrincipalAttributes::DISALLOW_SVR) {
+    if attrs.contains(PrincipalAttributes::DISALLOW_SVR)
+        && !opts.contains(KdcOptions::ENC_TKT_IN_SKEY)
+    {
         return Err(KdcError::new(
             KDC_ERR_MUST_USE_USER2USER,
             "SERVER NOT ALLOWED",
