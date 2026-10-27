@@ -16,6 +16,8 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use super::db::{KeyEntry, PrincipalAttributes, PrincipalEntry};
 use super::kdb::master::{decrypt_key, encrypt_key};
+use super::kdb::mit::mkey::{entry_mkvno, MasterKeys};
+use super::kdb::mit::{KeyData, MitEntry, TlData, ACTKVNO, MKEY_AUX, MKVNO, MOD_PRINC};
 use super::policy::{kerberos_time, ts};
 use super::store::{Policy, StoreError};
 use crate::types::{EncryptionKey, PrincipalName};
@@ -163,28 +165,124 @@ pub struct StoredPrincipal {
     pub security_epoch: u64,
     /// Last administrative unlock, unix seconds.
     pub last_admin_unlock: Option<i64>,
+    /// MIT tl-data the model has no field for: `K/M`'s `KRB5_TL_ACTKVNO`
+    /// and `KRB5_TL_MKEY_AUX`.
+    pub tl_data: Vec<TlData>,
+}
+
+fn same_keys(a: &[KeyEntry], b: &[KeyEntry]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            a.kvno == b.kvno
+                && a.key.keytype == b.key.keytype
+                && a.key.key_bytes() == b.key.key_bytes()
+                && a.salt == b.salt
+                && a.s2kparams == b.s2kparams
+        })
+}
+
+fn mit_u32(v: Option<i64>) -> u32 {
+    v.and_then(|v| u32::try_from(v).ok()).unwrap_or(0)
+}
+
+/// MIT `put_tl_data` layout for tl-data in a database column (as
+/// `Policy::tl_data_bytes`); `None` when empty.
+pub fn encode_tl_data(tl: &[TlData]) -> Result<Option<Vec<u8>>, StoreError> {
+    if tl.is_empty() {
+        return Ok(None);
+    }
+    let too_big = |_| StoreError::rejected("principal tl-data too large");
+    let mut out = u16::try_from(tl.len())
+        .map_err(too_big)?
+        .to_le_bytes()
+        .to_vec();
+    for t in tl {
+        out.extend_from_slice(&t.kind.to_le_bytes());
+        out.extend_from_slice(&u16::try_from(t.data.len()).map_err(too_big)?.to_le_bytes());
+        out.extend_from_slice(&t.data);
+    }
+    Ok(Some(out))
+}
+
+/// Inverse of [`encode_tl_data`].
+pub fn decode_tl_data(b: Option<&[u8]>) -> Result<Vec<TlData>, StoreError> {
+    let b = b.unwrap_or_default();
+    if b.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bad = || StoreError::corrupt("truncated principal tl-data");
+    let u16_at = |at: usize| {
+        b.get(at..at + 2)
+            .map(|x| u16::from_le_bytes([x[0], x[1]]))
+            .ok_or_else(bad)
+    };
+    let count = u16_at(0)?;
+    let mut at = 2;
+    let mut out = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let (kind, len) = (u16_at(at)?, usize::from(u16_at(at + 2)?));
+        let data = b.get(at + 4..at + 4 + len).ok_or_else(bad)?.to_vec();
+        out.push(TlData { kind, data });
+        at += 4 + len;
+    }
+    if at != b.len() {
+        return Err(bad());
+    }
+    Ok(out)
 }
 
 impl StoredPrincipal {
-    /// Encrypt `entry`'s keys under `master` (requires the master key).
+    /// Encrypt `entry`'s keys under the active master key and record its
+    /// version, as `krb5_dbe_encrypt_key_data` with `krb5_dbe_find_act_mkey`.
     pub fn from_entry(
         entry: &PrincipalEntry,
         last_pwd_change: Option<i64>,
         mod_time: Option<i64>,
-        master: &EncryptionKey,
+        keys: &MasterKeys,
     ) -> Result<Self, StoreError> {
-        let mut keys = Vec::with_capacity(entry.keys.len());
+        let (mkvno, master) = keys.active()?;
+        let mut stored = Vec::with_capacity(entry.keys.len());
         for k in &entry.keys {
-            keys.push(StoredKey {
+            stored.push(StoredKey {
                 kvno: k.kvno,
                 enctype: k.key.keytype,
-                mkvno: 1,
+                mkvno: u32::from(mkvno),
                 enc_key: encrypt_key(master, &k.key)?,
                 salt: k.salt.clone(),
                 s2kparams: k.s2kparams.clone(),
             });
         }
-        Ok(Self {
+        Ok(Self::with_keys(entry, last_pwd_change, mod_time, stored))
+    }
+
+    /// [`StoredPrincipal::from_entry`] for a rewrite of `previous`: when the
+    /// keys are unchanged their stored form (and master key version) is
+    /// kept, as `krb5_db_put_principal` keeps untouched `key_data`; tl-data
+    /// is carried over.
+    pub fn from_update(
+        entry: &PrincipalEntry,
+        last_pwd_change: Option<i64>,
+        mod_time: Option<i64>,
+        keys: &MasterKeys,
+        previous: &StoredPrincipal,
+    ) -> Result<Self, StoreError> {
+        let mut sp = match previous.clone().into_entry(keys) {
+            Ok(old) if same_keys(&old.keys, &entry.keys) => {
+                Self::with_keys(entry, last_pwd_change, mod_time, previous.keys.clone())
+            }
+            _ => Self::from_entry(entry, last_pwd_change, mod_time, keys)?,
+        };
+        sp.tl_data = previous.tl_data.clone();
+        Ok(sp)
+    }
+
+    fn with_keys(
+        entry: &PrincipalEntry,
+        last_pwd_change: Option<i64>,
+        mod_time: Option<i64>,
+        keys: Vec<StoredKey>,
+    ) -> Self {
+        Self {
             name: entry.name.clone(),
             realm: entry.realm.clone(),
             attributes: entry.attributes.bits(),
@@ -200,14 +298,24 @@ impl StoredPrincipal {
             policy: entry.policy.clone(),
             security_epoch: entry.security_epoch,
             last_admin_unlock: entry.last_admin_unlock.as_ref().map(ts),
-        })
+            tl_data: Vec::new(),
+        }
     }
 
-    /// Decrypt the keys with `master`; a wrong master key or a damaged blob
-    /// is an error.
-    pub fn into_entry(self, master: &EncryptionKey) -> Result<PrincipalEntry, StoreError> {
+    /// Decrypt each key with the master key version it records; a missing
+    /// master key, a wrong one or a damaged blob is an error.
+    pub fn into_entry(self, masters: &MasterKeys) -> Result<PrincipalEntry, StoreError> {
         let mut keys = Vec::with_capacity(self.keys.len());
         for k in self.keys {
+            let master = u16::try_from(k.mkvno)
+                .ok()
+                .and_then(|v| masters.get(v))
+                .ok_or_else(|| {
+                    StoreError::backend(format!(
+                        "No matching key in entry (master key version {})",
+                        k.mkvno
+                    ))
+                })?;
             keys.push(KeyEntry {
                 kvno: k.kvno,
                 key: decrypt_key(master, k.enctype, &k.enc_key)?,
@@ -230,6 +338,104 @@ impl StoredPrincipal {
             security_epoch: self.security_epoch,
             last_admin_unlock: self.last_admin_unlock.map(kerberos_time),
         })
+    }
+
+    /// The MIT entry the master-key commands work on: keys stay encrypted,
+    /// with the stored master key version as `KRB5_TL_MKVNO`.
+    pub fn to_raw(&self) -> Result<MitEntry, StoreError> {
+        let mut tl_data = self.tl_data.clone();
+        if let Some(mkvno) = self.keys.first().map(|k| k.mkvno).filter(|v| *v != 1) {
+            let mkvno = u16::try_from(mkvno)
+                .map_err(|_| StoreError::corrupt("master key version out of range"))?;
+            tl_data.push(TlData {
+                kind: MKVNO,
+                data: mkvno.to_le_bytes().to_vec(),
+            });
+        }
+        let key_data = self
+            .keys
+            .iter()
+            .map(|k| {
+                Ok(KeyData {
+                    ver: 1,
+                    kvno: u16::try_from(k.kvno)
+                        .map_err(|_| StoreError::corrupt("kvno exceeds MIT's 16 bits"))?,
+                    fields: vec![(
+                        i16::try_from(k.enctype)
+                            .map_err(|_| StoreError::corrupt("enctype exceeds i16"))?,
+                        k.enc_key.clone(),
+                    )],
+                })
+            })
+            .collect::<Result<_, StoreError>>()?;
+        Ok(MitEntry {
+            principal: self.name.clone(),
+            realm: self.realm.clone(),
+            attributes: self.attributes,
+            max_life: self
+                .max_life
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            max_renewable_life: self
+                .max_renewable_life
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            expiration: mit_u32(self.expiration),
+            pw_expiration: mit_u32(self.pw_expiration),
+            last_success: 0,
+            last_failed: 0,
+            fail_auth_count: 0,
+            tl_data,
+            key_data,
+        })
+    }
+
+    /// Take back the keys, master key version, `KRB5_TL_ACTKVNO`,
+    /// `KRB5_TL_MKEY_AUX` and `KRB5_TL_MOD_PRINC` time of an entry from
+    /// [`StoredPrincipal::to_raw`] after a master-key command changed it.
+    /// A key keeps its salt when its kvno and enctype are unchanged.
+    pub fn apply_raw(&mut self, raw: &MitEntry) -> Result<(), StoreError> {
+        let mkvno = u32::from(entry_mkvno(raw)?);
+        let mut keys = Vec::with_capacity(raw.key_data.len());
+        for data in &raw.key_data {
+            let (etype, blob) = data
+                .fields
+                .first()
+                .ok_or_else(|| StoreError::corrupt("key-data record has no key field"))?;
+            let (kvno, enctype) = (u32::from(data.kvno), i32::from(*etype));
+            let old = self
+                .keys
+                .iter()
+                .find(|k| k.kvno == kvno && k.enctype == enctype);
+            keys.push(StoredKey {
+                kvno,
+                enctype,
+                mkvno,
+                enc_key: blob.clone(),
+                salt: old.and_then(|k| k.salt.clone()),
+                s2kparams: old.and_then(|k| k.s2kparams.clone()),
+            });
+        }
+        self.keys = keys;
+        self.tl_data = raw
+            .tl_data
+            .iter()
+            .filter(|t| matches!(t.kind, ACTKVNO | MKEY_AUX))
+            .cloned()
+            .collect();
+        if let Some(t) = raw.tl_data.iter().find(|t| t.kind == MOD_PRINC) {
+            if let Some(bytes) = t.data.get(..4) {
+                let secs = u32::from_le_bytes(bytes.try_into().expect("4 bytes"));
+                self.mod_time = Some(i64::from(secs));
+            }
+        }
+        Ok(())
+    }
+
+    /// `krb5_db_fetch_mkey_list` for a stored `K/M`: `supplied` opens the
+    /// newest master key, directly or through `KRB5_TL_MKEY_AUX`.
+    pub fn master_keys(&self, supplied: &EncryptionKey) -> Result<MasterKeys, StoreError> {
+        MasterKeys::fetch(&self.to_raw()?, supplied)
     }
 }
 
@@ -611,18 +817,63 @@ mod tests {
             .expect("entry");
         entry.policy = Some("p".into());
         entry.security_epoch = 7;
+        let masters = MasterKeys::single(master.clone());
         let stored =
-            StoredPrincipal::from_entry(&entry, Some(10), Some(20), &master).expect("stored");
+            StoredPrincipal::from_entry(&entry, Some(10), Some(20), &masters).expect("stored");
         assert_eq!(stored.keys.len(), 2);
         for (s, k) in stored.keys.iter().zip(&entry.keys) {
             assert_ne!(&s.enc_key[2..], k.key.key_bytes(), "keys are encrypted");
         }
-        let back = stored.clone().into_entry(&master).expect("decrypt");
+        let back = stored.clone().into_entry(&masters).expect("decrypt");
         assert_eq!(back.keys[0].key.key_bytes(), entry.keys[0].key.key_bytes());
         assert_eq!(
             (back.policy.as_deref(), back.security_epoch),
             (Some("p"), 7)
         );
-        assert!(stored.into_entry(&wrong).is_err());
+        assert!(stored
+            .clone()
+            .into_entry(&MasterKeys::single(wrong.clone()))
+            .is_err());
+
+        // A second master key, active now: new writes use it, unchanged
+        // rewrites keep the old wrapping, and each key opens by its mkvno.
+        let mut km = StoredPrincipal::from_entry(
+            &PrincipalEntry {
+                keys: vec![KeyEntry {
+                    kvno: 1,
+                    key: master.clone(),
+                    salt: None,
+                    s2kparams: None,
+                }],
+                ..entry.clone()
+            },
+            None,
+            None,
+            &masters,
+        )
+        .expect("K/M");
+        let mut raw = km.to_raw().expect("raw");
+        let kvno =
+            crate::kdc::kdb::mit::mkey::add_new_mkey(&mut raw, &masters, &wrong).expect("add");
+        km.apply_raw(&raw).expect("apply");
+        assert_eq!((kvno, km.keys.len(), km.keys[0].mkvno), (2, 2, 2));
+        let both = km.master_keys(&master).expect("old key opens via MKEY_AUX");
+        assert_eq!(both.keys.len(), 2);
+        let mut rotated = both.clone();
+        rotated.actkvno = vec![crate::kdc::kdb::mit::mkey::ActKvno {
+            kvno: 2,
+            act_time: 0,
+        }];
+        let kept =
+            StoredPrincipal::from_update(&entry, None, None, &rotated, &stored).expect("unchanged");
+        assert_eq!(kept.keys, stored.keys);
+        let mut changed = entry.clone();
+        changed.keys.truncate(1);
+        let fresh =
+            StoredPrincipal::from_update(&changed, None, None, &rotated, &stored).expect("new");
+        assert_eq!(fresh.keys[0].mkvno, 2);
+        let back = fresh.into_entry(&both).expect("opens under kvno 2");
+        assert_eq!(back.keys[0].key.key_bytes(), entry.keys[0].key.key_bytes());
+        assert!(stored.into_entry(&rotated).is_ok());
     }
 }

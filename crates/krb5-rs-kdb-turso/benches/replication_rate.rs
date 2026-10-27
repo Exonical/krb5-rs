@@ -36,7 +36,7 @@ fn stored(i: usize) -> StoredPrincipal {
         &store.get(&name, REALM).expect("entry"),
         None,
         None,
-        &master(),
+        &krb5_rs::kdc::kdb::mit::mkey::MasterKeys::single(master()),
     )
     .expect("stored")
 }

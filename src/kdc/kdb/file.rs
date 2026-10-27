@@ -9,22 +9,23 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use chrono::Utc;
 use rasn::types::{GeneralString, OctetString};
 
-use super::format::{KdbFile, KdbKey, KdbPolicy, KdbPrincipal, MAGIC, VERSION};
-use super::master::{decrypt_key, encrypt_key, master_principal};
-use super::mit::mkey::MasterKeys;
+use super::format::{KdbFile, KdbKey, KdbPolicy, KdbPrincipal, KdbTlData, MAGIC, VERSION};
+use super::master::master_principal;
+use super::mit::mkey::{entry_mkvno, ActKvno, MasterKeys};
 use super::mit::{
     merge_policy, new_entry, policy_from_entry, record_from_entry, unparse_name, MitEntry,
-    MitPolicy,
+    MitPolicy, TlData, ACTKVNO, MKEY_AUX,
 };
 use crate::kdc::db::{
     random_keys, store_key, KeyEntry, PrincipalAttributes, PrincipalEntry, StoreKey,
 };
-use crate::kdc::policy::kerberos_time;
+use crate::kdc::policy::{kerberos_time, ts};
+use crate::kdc::replication::{StoredKey, StoredPrincipal};
 use crate::kdc::store::{
     AdminStore, HealthCheck, Policy, PolicyStore, PrincipalRecord, PrincipalStore, StoreError,
     StoreErrorKind,
@@ -117,6 +118,8 @@ pub struct FileStore {
     path: PathBuf,
     realm: String,
     master: EncryptionKey,
+    /// Master-key list from `K/M`, reloaded with the cache.
+    masters: RwLock<MasterKeys>,
     cache: RwLock<Cache>,
 }
 
@@ -178,6 +181,103 @@ fn write_atomic(path: &Path, file: &KdbFile) -> Result<(), StoreError> {
     })
 }
 
+/// A file record in the shared stored form: keys stay encrypted.
+fn stored_of(r: &KdbPrincipal) -> StoredPrincipal {
+    let lossy = |g: &GeneralString| String::from_utf8_lossy(g.as_bytes()).to_string();
+    StoredPrincipal {
+        name: r.name.clone(),
+        realm: lossy(&r.realm),
+        attributes: r.attributes,
+        max_life: r.max_life,
+        max_renewable_life: r.max_renewable_life,
+        expiration: r.expiration.as_ref().map(ts),
+        pw_expiration: r.pw_expiration.as_ref().map(ts),
+        last_pwd_change: r.last_pwd_change.as_ref().map(ts),
+        mod_time: r.mod_time.as_ref().map(ts),
+        keys: r
+            .keys
+            .iter()
+            .map(|k| StoredKey {
+                kvno: k.kvno,
+                enctype: k.enctype,
+                mkvno: k.mkvno,
+                enc_key: k.enc_key.to_vec(),
+                salt: k.salt.as_ref().map(|s| s.to_vec()),
+                s2kparams: k.s2kparams.as_ref().map(|s| s.to_vec()),
+            })
+            .collect(),
+        allowed_to_delegate_to: string_list(&r.allowed_to_delegate_to),
+        allowed_to_delegate_from: string_list(&r.allowed_to_delegate_from),
+        policy: r.policy.as_ref().map(lossy),
+        security_epoch: r.security_epoch.unwrap_or(0),
+        last_admin_unlock: r.last_admin_unlock.as_ref().map(ts),
+        tl_data: r
+            .tl_data
+            .iter()
+            .flatten()
+            .map(|t| TlData {
+                kind: t.kind,
+                data: t.data.to_vec(),
+            })
+            .collect(),
+    }
+}
+
+/// Inverse of [`stored_of`].
+fn kdb_of(sp: &StoredPrincipal) -> Result<KdbPrincipal, StoreError> {
+    let keys = sp
+        .keys
+        .iter()
+        .map(|k| KdbKey {
+            kvno: k.kvno,
+            enctype: k.enctype,
+            mkvno: k.mkvno,
+            enc_key: OctetString::from(k.enc_key.clone()),
+            salt: k.salt.clone().map(OctetString::from),
+            s2kparams: k.s2kparams.clone().map(OctetString::from),
+        })
+        .collect();
+    Ok(KdbPrincipal {
+        name: sp.name.clone(),
+        realm: general(&sp.realm)?,
+        attributes: sp.attributes,
+        max_life: sp.max_life,
+        max_renewable_life: sp.max_renewable_life,
+        expiration: sp.expiration.map(kerberos_time),
+        pw_expiration: sp.pw_expiration.map(kerberos_time),
+        last_pwd_change: sp.last_pwd_change.map(kerberos_time),
+        mod_time: sp.mod_time.map(kerberos_time),
+        keys,
+        allowed_to_delegate_to: general_list(&sp.allowed_to_delegate_to)?,
+        allowed_to_delegate_from: general_list(&sp.allowed_to_delegate_from)?,
+        policy: sp.policy.as_deref().map(general).transpose()?,
+        security_epoch: (sp.security_epoch != 0).then_some(sp.security_epoch),
+        last_admin_unlock: sp.last_admin_unlock.map(kerberos_time),
+        tl_data: (!sp.tl_data.is_empty()).then(|| {
+            sp.tl_data
+                .iter()
+                .map(|t| KdbTlData {
+                    kind: t.kind,
+                    data: OctetString::from(t.data.clone()),
+                })
+                .collect()
+        }),
+    })
+}
+
+/// `keys` with `kvno` as the active master key, to wrap one entry's keys
+/// under the master key it already uses.
+fn active_as(keys: &MasterKeys, kvno: u16) -> MasterKeys {
+    MasterKeys {
+        keys: keys.keys.clone(),
+        actkvno: vec![ActKvno { kvno, act_time: 0 }],
+    }
+}
+
+fn is_km(p: &KdbPrincipal, km: &PrincipalName, realm: &str) -> bool {
+    p.name == *km && p.realm.as_bytes() == realm.as_bytes()
+}
+
 fn to_time(t: &Option<KerberosTime>) -> Option<KerberosTime> {
     *t
 }
@@ -221,6 +321,7 @@ impl FileStore {
             path: path.to_path_buf(),
             realm: realm.to_string(),
             master: master.clone(),
+            masters: RwLock::new(MasterKeys::single(master.clone())),
             cache: RwLock::new(Cache::default()),
         };
         let now = kerberos_time(Utc::now().timestamp());
@@ -267,8 +368,8 @@ impl FileStore {
             keys: random_keys(1, tgt_etypes).map_err(|e| err(e.to_string()))?,
         };
         let principals = vec![
-            store.to_record(&km, Some(now), Some(now))?,
-            store.to_record(&tgs, Some(now), Some(now))?,
+            store.to_record(&km, Some(now), Some(now), None, &store.master_keys())?,
+            store.to_record(&tgs, Some(now), Some(now), None, &store.master_keys())?,
         ];
         let file = KdbFile {
             version: VERSION,
@@ -282,8 +383,8 @@ impl FileStore {
         Ok(store)
     }
 
-    /// Open an existing database, verifying the master key against the
-    /// stored `K/M` key.
+    /// Open an existing database. `master` must open the newest `K/M` key,
+    /// directly or through `KRB5_TL_MKEY_AUX` (`krb5_db_fetch_mkey_list`).
     pub fn open(path: &Path, master: &EncryptionKey) -> Result<Self, StoreError> {
         let (_, file) = read_file(path)?;
         let realm = String::from_utf8_lossy(file.realm.as_bytes()).to_string();
@@ -293,18 +394,14 @@ impl FileStore {
             .iter()
             .find(|p| p.name == master_name && p.realm.as_bytes() == realm.as_bytes())
             .ok_or_else(|| err("database has no K/M principal"))?;
-        let stored = km.keys.first().ok_or_else(|| err("K/M has no key"))?;
-        let stored_master = decrypt_key(master, stored.enctype, stored.enc_key.as_ref())
+        let keys = stored_of(km)
+            .master_keys(master)
             .map_err(|_| err("incorrect master key"))?;
-        if stored_master.key_bytes() != master.key_bytes()
-            || stored_master.keytype != master.keytype
-        {
-            return Err(err("incorrect master key"));
-        }
         let store = Self {
             path: path.to_path_buf(),
             realm,
             master: master.clone(),
+            masters: RwLock::new(keys),
             cache: RwLock::new(Cache::default()),
         };
         store.refresh(true)?;
@@ -355,76 +452,112 @@ impl FileStore {
         Ok(store.serial())
     }
 
+    /// Store `e` with its keys under the active master key; unchanged keys
+    /// of `previous` keep their stored form and master key version.
     fn to_record(
         &self,
         e: &PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
         mod_time: Option<KerberosTime>,
+        previous: Option<&KdbPrincipal>,
+        keys: &MasterKeys,
     ) -> Result<KdbPrincipal, StoreError> {
-        let secs = |d: Option<Duration>| d.map(|d| d.as_secs());
-        let mut keys = Vec::with_capacity(e.keys.len());
-        for k in &e.keys {
-            keys.push(KdbKey {
-                kvno: k.kvno,
-                enctype: k.key.keytype,
-                mkvno: 1,
-                enc_key: OctetString::from(encrypt_key(&self.master, &k.key)?),
-                salt: k.salt.clone().map(OctetString::from),
-                s2kparams: k.s2kparams.clone().map(OctetString::from),
-            });
-        }
-        Ok(KdbPrincipal {
-            name: e.name.clone(),
-            realm: general(&e.realm)?,
-            attributes: e.attributes.bits(),
-            max_life: secs(e.max_life),
-            max_renewable_life: secs(e.max_renewable_life),
-            expiration: to_time(&e.expiration),
-            pw_expiration: to_time(&e.pw_expiration),
-            last_pwd_change,
-            mod_time,
-            keys,
-            allowed_to_delegate_to: general_list(&e.allowed_to_delegate_to)?,
-            allowed_to_delegate_from: general_list(&e.allowed_to_delegate_from)?,
-            policy: e.policy.as_deref().map(general).transpose()?,
-            security_epoch: (e.security_epoch != 0).then_some(e.security_epoch),
-            last_admin_unlock: e.last_admin_unlock,
-        })
+        let (pwd, modified) = (last_pwd_change.as_ref().map(ts), mod_time.as_ref().map(ts));
+        let sp = match previous {
+            Some(p) => StoredPrincipal::from_update(e, pwd, modified, keys, &stored_of(p))?,
+            None => StoredPrincipal::from_entry(e, pwd, modified, keys)?,
+        };
+        kdb_of(&sp)
     }
 
     fn decrypt_record(&self, r: &KdbPrincipal) -> Result<PrincipalRecord, StoreError> {
-        let mut keys = Vec::with_capacity(r.keys.len());
-        for k in &r.keys {
-            keys.push(KeyEntry {
-                kvno: k.kvno,
-                key: decrypt_key(&self.master, k.enctype, k.enc_key.as_ref())?,
-                salt: k.salt.as_ref().map(|s| s.to_vec()),
-                s2kparams: k.s2kparams.as_ref().map(|s| s.to_vec()),
-            });
-        }
+        self.decrypt_with(r, &self.master_keys())
+    }
+
+    fn decrypt_with(
+        &self,
+        r: &KdbPrincipal,
+        keys: &MasterKeys,
+    ) -> Result<PrincipalRecord, StoreError> {
         Ok(PrincipalRecord {
-            entry: PrincipalEntry {
-                name: r.name.clone(),
-                realm: String::from_utf8_lossy(r.realm.as_bytes()).to_string(),
-                attributes: PrincipalAttributes::from_bits_retain(r.attributes),
-                max_life: r.max_life.map(Duration::from_secs),
-                max_renewable_life: r.max_renewable_life.map(Duration::from_secs),
-                expiration: to_time(&r.expiration),
-                pw_expiration: to_time(&r.pw_expiration),
-                keys,
-                allowed_to_delegate_to: string_list(&r.allowed_to_delegate_to),
-                allowed_to_delegate_from: string_list(&r.allowed_to_delegate_from),
-                policy: r
-                    .policy
-                    .as_ref()
-                    .map(|g| String::from_utf8_lossy(g.as_bytes()).to_string()),
-                security_epoch: r.security_epoch.unwrap_or(0),
-                last_admin_unlock: r.last_admin_unlock,
-            },
+            entry: stored_of(r).into_entry(keys)?,
             last_pwd_change: to_time(&r.last_pwd_change),
             password_history: None,
             mod_time: to_time(&r.mod_time),
             mod_by: None,
+        })
+    }
+
+    fn master_keys(&self) -> MasterKeys {
+        self.masters
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The master-key list of the `K/M` in `list` (the file read under the
+    /// write lock), which becomes the loaded list, so a write never wraps keys
+    /// under a stale active key (`kdb_get_active_mkey` rereads `K/M`,
+    /// `server_kdb.c:84-98`).
+    fn masters_in(&self, list: &[KdbPrincipal]) -> Result<MasterKeys, StoreError> {
+        let km_name = master_principal()?;
+        let Some(km) = list.iter().find(|p| is_km(p, &km_name, &self.realm)) else {
+            return Ok(self.master_keys());
+        };
+        let keys = stored_of(km)
+            .master_keys(&self.master)
+            .map_err(|_| err("incorrect master key"))?;
+        *self.masters.write().unwrap_or_else(|e| e.into_inner()) = keys.clone();
+        Ok(keys)
+    }
+
+    /// The master-key list (`krb5_db_fetch_mkey_list`).
+    pub fn master_key_list(&self) -> Result<MasterKeys, StoreError> {
+        self.refresh(false)?;
+        Ok(self.master_keys())
+    }
+
+    /// Every principal as a raw MIT entry with its keys still encrypted,
+    /// for the `kdb5_util` master-key commands.
+    pub fn raw_entries(&self) -> Result<Vec<MitEntry>, StoreError> {
+        self.refresh(false)?;
+        let cache = self.read_cache();
+        let mut raws = cache
+            .records
+            .values()
+            .map(|r| stored_of(r).to_raw())
+            .collect::<Result<Vec<_>, _>>()?;
+        raws.sort_by_cached_key(|e| unparse_name(&e.principal, &e.realm));
+        Ok(raws)
+    }
+
+    /// Read-modify-write one principal's raw MIT entry under the write lock;
+    /// `f` returns false to leave it unchanged.
+    pub fn update_raw<F>(&self, name: &PrincipalName, realm: &str, f: F) -> Result<bool, StoreError>
+    where
+        F: FnOnce(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError>,
+    {
+        self.refresh(false)?;
+        let key = store_key(name, realm);
+        self.modify(|list| {
+            let pos = list
+                .iter()
+                .position(|p| {
+                    let r = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
+                    store_key(&p.name, &r) == key
+                })
+                .ok_or_else(|| {
+                    StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
+                })?;
+            let keys = self.masters_in(list)?;
+            let mut sp = stored_of(&list[pos]);
+            let mut raw = sp.to_raw()?;
+            if !f(&mut raw, &keys)? {
+                return Ok(false);
+            }
+            sp.apply_raw(&raw)?;
+            list[pos] = kdb_of(&sp)?;
+            Ok(true)
         })
     }
 
@@ -439,6 +572,17 @@ impl FileStore {
             return Ok(());
         }
         let (stamp, file) = read_file(&self.path)?;
+        let km_name = master_principal()?;
+        if let Some(km) = file
+            .principals
+            .iter()
+            .find(|p| is_km(p, &km_name, &self.realm))
+        {
+            let keys = stored_of(km)
+                .master_keys(&self.master)
+                .map_err(|_| err("incorrect master key"))?;
+            *self.masters.write().unwrap_or_else(|e| e.into_inner()) = keys;
+        }
         let records = file
             .principals
             .into_iter()
@@ -538,18 +682,24 @@ impl FileStore {
         entry: PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
-        let record = self.to_record(
-            &entry,
-            last_pwd_change,
-            Some(kerberos_time(Utc::now().timestamp())),
-        )?;
         let key = store_key(&entry.name, &entry.realm);
         self.modify(|list| {
-            list.retain(|p| {
+            let pos = list.iter().position(|p| {
                 let realm = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
-                store_key(&p.name, &realm) != key
+                store_key(&p.name, &realm) == key
             });
-            list.push(record);
+            let keys = self.masters_in(list)?;
+            let record = self.to_record(
+                &entry,
+                last_pwd_change,
+                Some(kerberos_time(Utc::now().timestamp())),
+                pos.map(|i| &list[i]),
+                &keys,
+            )?;
+            match pos {
+                Some(i) => list[i] = record,
+                None => list.push(record),
+            }
             Ok(())
         })
     }
@@ -639,12 +789,26 @@ impl FileStore {
     /// [`Policy`] model (no lockout state, string attributes, password
     /// history), so only that is dumped.
     pub fn dump_entries(&self) -> Result<(Vec<MitEntry>, Vec<MitPolicy>), StoreError> {
-        let (records, policies) = self.export_records()?;
+        let (_, policies) = self.export_records()?;
         let creator = unparse_name(&PrincipalName::new_principal("db_creation"), &self.realm);
-        let mut entries = records
+        let keys = self.master_keys();
+        let raws: Vec<KdbPrincipal> = self.read_cache().records.values().cloned().collect();
+        let mut entries = raws
             .iter()
-            .map(|r| new_entry(r, &MasterKeys::single(self.master.clone()), &creator))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|raw| {
+                let sp = stored_of(raw);
+                let mkvno = sp.keys.first().map_or(Ok(1), |k| {
+                    u16::try_from(k.mkvno).map_err(|_| err("master key version out of range"))
+                })?;
+                let mut entry = new_entry(
+                    &self.decrypt_record(raw)?,
+                    &active_as(&keys, mkvno),
+                    &creator,
+                )?;
+                entry.tl_data.extend(sp.tl_data);
+                Ok(entry)
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
         entries.sort_by_cached_key(|e| unparse_name(&e.principal, &e.realm));
         let policies = policies
             .iter()
@@ -673,8 +837,9 @@ impl FileStore {
 
     /// Load dump records. Without `update` the new database is written to
     /// `<path>~` and renamed over `path`, like MIT's db2 temporary database
-    /// (`plugins/kdb/db2/kdb_db2.c:298,1419-1460`). Keys must be encrypted in
-    /// `master`; fields the file store does not model are dropped.
+    /// (`plugins/kdb/db2/kdb_db2.c:298,1419-1460`). `master` must open the
+    /// dump's `K/M`; each entry keeps its master key version. Fields the file
+    /// store does not model are dropped.
     pub fn load_dump(
         path: &Path,
         realm: &str,
@@ -683,6 +848,10 @@ impl FileStore {
         policies: &[MitPolicy],
         update: bool,
     ) -> Result<(), StoreError> {
+        let km_name = master_principal()?;
+        let dumped_km = entries
+            .iter()
+            .find(|e| e.principal == km_name && e.realm == realm);
         let store = if update {
             Self::open(path, master)?
         } else {
@@ -690,15 +859,32 @@ impl FileStore {
                 path: path.to_path_buf(),
                 realm: realm.to_string(),
                 master: master.clone(),
+                masters: RwLock::new(MasterKeys::single(master.clone())),
                 cache: RwLock::new(Cache::default()),
             }
         };
+        let keys = match dumped_km {
+            Some(km) => MasterKeys::fetch(km, master)?,
+            None => store.master_keys(),
+        };
         let mut principals = Vec::with_capacity(entries.len());
         for entry in entries {
-            let record = record_from_entry(entry, &MasterKeys::single(master.clone()))?;
+            let record = record_from_entry(entry, &keys)?;
+            let mut sp = StoredPrincipal::from_entry(
+                &record.entry,
+                record.last_pwd_change.as_ref().map(ts),
+                record.mod_time.as_ref().map(ts),
+                &active_as(&keys, entry_mkvno(entry)?),
+            )?;
+            sp.tl_data = entry
+                .tl_data
+                .iter()
+                .filter(|t| matches!(t.kind, ACTKVNO | MKEY_AUX))
+                .cloned()
+                .collect();
             principals.push((
                 store_key(&record.entry.name, &record.entry.realm),
-                store.to_record(&record.entry, record.last_pwd_change, record.mod_time)?,
+                kdb_of(&sp)?,
             ));
         }
         let policies = policies
@@ -756,13 +942,15 @@ impl FileStore {
         entry: PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
-        let record = self.to_record(
-            &entry,
-            last_pwd_change,
-            Some(kerberos_time(Utc::now().timestamp())),
-        )?;
         let key = store_key(&entry.name, &entry.realm);
         self.modify(|list| {
+            let record = self.to_record(
+                &entry,
+                last_pwd_change,
+                Some(kerberos_time(Utc::now().timestamp())),
+                None,
+                &self.masters_in(list)?,
+            )?;
             let exists = list.iter().any(|p| {
                 let realm = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
                 store_key(&p.name, &realm) == key
@@ -796,10 +984,17 @@ impl FileStore {
                 .ok_or_else(|| {
                     StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
                 })?;
-            let mut rec = self.decrypt_record(&list[pos])?;
+            let keys = self.masters_in(list)?;
+            let mut rec = self.decrypt_with(&list[pos], &keys)?;
             f(&mut rec)?;
             rec.mod_time = Some(kerberos_time(Utc::now().timestamp()));
-            list[pos] = self.to_record(&rec.entry, rec.last_pwd_change, rec.mod_time)?;
+            list[pos] = self.to_record(
+                &rec.entry,
+                rec.last_pwd_change,
+                rec.mod_time,
+                Some(&list[pos]),
+                &keys,
+            )?;
             Ok(rec)
         })
     }
@@ -996,6 +1191,48 @@ mod tests {
             security_epoch: 0,
             last_admin_unlock: None,
         }
+    }
+
+    #[test]
+    fn writes_reread_the_master_key_list_another_store_changed() {
+        use crate::kdc::kdb::mit::mkey::{
+            add_new_mkey, entry_mkvno, lookup_actkvno, now, update_actkvno, use_mkey,
+        };
+        let path = temp("stale_masters");
+        let master = master_key_from_password("R", "master", 18).expect("master");
+        let a = FileStore::create(&path, "R", &master).expect("create");
+        let b = FileStore::open(&path, &master).expect("open");
+        a.create_record(user("alice"), None).expect("alice");
+        let km = master_principal().expect("K/M");
+        let second = master_key_from_password("R", "second", 18).expect("second");
+        b.update_raw(&km, "R", |e, keys| {
+            add_new_mkey(e, keys, &second)?;
+            Ok(true)
+        })
+        .expect("add_mkey");
+        b.update_raw(&km, "R", |e, _| {
+            let mut list = lookup_actkvno(e)?;
+            use_mkey(&mut list, 2, 0, now())?;
+            update_actkvno(e, &list);
+            Ok(true)
+        })
+        .expect("use_mkey");
+
+        a.create_record(user("carol"), None).expect("carol");
+        a.update_record(&PrincipalName::new_principal("alice"), "R", |r| {
+            r.entry.keys = random_keys(2, &[18]).expect("keys");
+            Ok(())
+        })
+        .expect("rekey alice");
+        let mkvno = |n: &str| {
+            b.raw_entries()
+                .expect("entries")
+                .into_iter()
+                .find(|e| e.principal == PrincipalName::new_principal(n))
+                .map(|e| entry_mkvno(&e).expect("mkvno"))
+        };
+        assert_eq!(mkvno("carol"), Some(2));
+        assert_eq!(mkvno("alice"), Some(2));
     }
 
     #[test]

@@ -35,7 +35,13 @@ fn stored(i: usize) -> StoredPrincipal {
         )
         .expect("add");
     let entry = store.get(&name, REALM).expect("entry");
-    StoredPrincipal::from_entry(&entry, None, None, &master()).expect("stored")
+    StoredPrincipal::from_entry(
+        &entry,
+        None,
+        None,
+        &krb5_rs::kdc::kdb::mit::mkey::MasterKeys::single(master()),
+    )
+    .expect("stored")
 }
 
 fn batch(clock: &AtomicI64, principals: &[StoredPrincipal]) -> ChangeBatch {

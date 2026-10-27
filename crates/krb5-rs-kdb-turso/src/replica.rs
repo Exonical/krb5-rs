@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use tokio::sync::RwLock as AsyncRwLock;
 
+use krb5_rs::kdc::kdb::mit::mkey::MasterKeys;
 use krb5_rs::kdc::replication::{
     ApplyOutcome, Change, ChangeBatch, RebuildWriter, ReplicaCheckpoint, ReplicaSink, ReplicationTs,
 };
@@ -78,6 +79,9 @@ struct Shared {
     dir: PathBuf,
     options: TursoOptions,
     master: EncryptionKey,
+    /// The master-key list from the replicated `K/M`, reloaded when a key
+    /// names a version it lacks.
+    masters: RwLock<MasterKeys>,
     current: RwLock<Arc<Inner>>,
     auth_state_writes: AsyncRwLock<()>,
     pending: Mutex<Vec<Pending>>,
@@ -165,6 +169,7 @@ impl TursoReplica {
         let this = Self(Arc::new(Shared {
             dir,
             options,
+            masters: RwLock::new(MasterKeys::single(master_key.clone())),
             master: master_key,
             current: RwLock::new(inner),
             auth_state_writes: AsyncRwLock::new(()),
@@ -380,9 +385,49 @@ impl TursoReplica {
             .await
             .map_err(map_err)?
         };
-        principal_from_rows(realm, &key, &rows)?
-            .map(|p| p.into_entry(&self.0.master))
-            .transpose()
+        let Some(sp) = principal_from_rows(realm, &key, &rows)? else {
+            return Ok(None);
+        };
+        let known = |keys: &MasterKeys| {
+            sp.keys.iter().all(|k| {
+                u16::try_from(k.mkvno)
+                    .ok()
+                    .and_then(|v| keys.get(v))
+                    .is_some()
+            })
+        };
+        if !known(&self.0.masters.read().unwrap_or_else(|e| e.into_inner())) {
+            self.reload_masters(&inner, realm).await?;
+        }
+        let masters = self
+            .0
+            .masters
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        sp.into_entry(&masters).map(Some)
+    }
+
+    /// `krb5_db_fetch_mkey_list` against the replicated `K/M`.
+    async fn reload_masters(&self, inner: &Inner, realm: &str) -> Result<(), StoreError> {
+        let rows = {
+            let conn = inner.conn().await;
+            query(
+                &conn,
+                LOOKUP_SQL,
+                vec![
+                    Value::Text(realm.to_string()),
+                    Value::Text("K/M".to_string()),
+                ],
+            )
+            .await
+            .map_err(map_err)?
+        };
+        let km = principal_from_rows(realm, "K/M", &rows)?
+            .ok_or_else(|| StoreError::not_found(format!("realm {realm} has no K/M entry")))?;
+        let keys = km.master_keys(&self.0.master)?;
+        *self.0.masters.write().unwrap_or_else(|e| e.into_inner()) = keys;
+        Ok(())
     }
 }
 

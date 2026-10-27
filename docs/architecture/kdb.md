@@ -177,7 +177,8 @@ for resource-based delegation. klmdb is the default `db_library`;
   picks the key for new and rekeyed principals (`find_actkvno`). A rekey under
   a different active key rewraps all of the entry's keys and sets `MKVNO`;
   unchanged entries keep their wrapping key.
-- **Commands** (klmdb only; same output and messages as `kdb5_util`):
+- **Commands** (klmdb, FileStore and CockroachDB; same output and messages as
+  `kdb5_util`):
   - `add_mkey [-e ENCTYPE] [-s]` prompts twice for the new password, adds the
     key as the next `K/M` version (inactive), rewraps the old keys in it and
     adds `MKEY_AUX` entries; `-s` stashes only the new key.
@@ -204,9 +205,15 @@ for resource-based delegation. klmdb is the default `db_library`;
 `get_date` (`src/kadmin/cli/getdate.y`); as an extension, unix seconds and
 RFC 3339 are accepted when `get_date` fails.
 
-Deviations: errors are reported as
-`krb5-rs-kdb: <message>` rather than com_err text; FileStore and CockroachDB
-keep a single master key.
+FileStore and CockroachDB keep the same model: `K/M` holds every master key
+version with `KRB5_TL_ACTKVNO` and `KRB5_TL_MKEY_AUX` (FileStore record field
+15, CockroachDB `principals.tl_data`, schema version 3), each principal key
+records its `mkvno`, new keys are wrapped under the active master key, and
+unchanged keys keep the wrapping they have. The same `krb5-rs-kdb` commands
+run against both, and their dumps carry each entry's master key version.
+
+Deviation: errors are reported as `krb5-rs-kdb: <message>` rather than
+com_err text.
 
 ### MIT dump/load
 

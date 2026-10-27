@@ -98,6 +98,19 @@ pub(super) struct KdbPrincipal {
     pub security_epoch: Option<u64>,
     #[rasn(tag(explicit(context, 14)))]
     pub last_admin_unlock: Option<KerberosTime>,
+    /// MIT tl-data with no field above: `K/M`'s `KRB5_TL_ACTKVNO` and
+    /// `KRB5_TL_MKEY_AUX`.
+    #[rasn(tag(explicit(context, 15)))]
+    pub tl_data: Option<Vec<KdbTlData>>,
+}
+
+/// One MIT `krb5_tl_data`.
+#[derive(AsnType, Encode, Decode, Debug, Clone)]
+pub(super) struct KdbTlData {
+    #[rasn(tag(explicit(context, 0)))]
+    pub kind: u16,
+    #[rasn(tag(explicit(context, 1)))]
+    pub data: OctetString,
 }
 
 /// One master-key-encrypted long-term key (MIT `krb5_key_data`).
@@ -172,5 +185,6 @@ mod tests {
         assert!(
             rec.policy.is_none() && rec.security_epoch.is_none() && rec.last_admin_unlock.is_none()
         );
+        assert!(rec.tl_data.is_none());
     }
 }

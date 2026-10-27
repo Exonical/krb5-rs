@@ -16,12 +16,12 @@ use krb5_rs::kdc::kdb::admin::{
     format_policy, format_principal, parse_lifetime, parse_principal, parse_time, AdminOps,
     AttrChange, PolicyChange, PrincipalOptions,
 };
-#[cfg(feature = "klmdb")]
 use krb5_rs::kdc::kdb::master::{read_stash_kvno, write_stash_list};
 use krb5_rs::kdc::kdb::mit::dump::{
     policy_record, principal_record, read_dump, read_records, DumpVersion, IpropHeader,
     LoadFailure, Record,
 };
+use krb5_rs::kdc::kdb::mit::mkey::MasterKeys;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Time, Ulog, UpdateStatus};
 use krb5_rs::kdc::kdb::mit::{unparse_name, MitEntry, MitPolicy};
 use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, write_stash, FileStore};
@@ -394,9 +394,21 @@ fn main() {
         "stash" => {
             let (keyfile, key) =
                 stash_source(&args, &cfg, &realm, master_password_file.as_deref(), |k| {
-                    FileStore::open(&cfg.database_name, k).map(|_| k.clone())
+                    FileStore::open(&cfg.database_name, k)
                 });
-            ok(write_stash(&keyfile, &realm, &key));
+            let keys = ok(key.master_key_list());
+            ok(write_stash_list(&keyfile, &realm, &keys.keys));
+            return;
+        }
+        "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
+            mkey_command(
+                &cmd,
+                args,
+                &cfg,
+                &realm,
+                master_password_file.as_deref(),
+                |k| FileStore::open(&cfg.database_name, k),
+            );
             return;
         }
         "dump" => {
@@ -797,7 +809,9 @@ fn klmdb_command(
             ok(write_stash_list(&keyfile, realm, &keys.keys));
         }
         "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
-            mkey_command(cmd, args, cfg, realm, global_master_password_file);
+            mkey_command(cmd, args, cfg, realm, global_master_password_file, |k| {
+                LmdbStore::open(cfg, k)
+            });
         }
         "dump" => dump_command(args, iprop, || {
             let master = master_key(cfg, realm, global_master_password_file);
@@ -1392,9 +1406,14 @@ fn cockroach_command(
             let (keyfile, key) =
                 stash_source(&args, cfg, realm, global_master_password_file, |k| {
                     rt.block_on(CockroachStore::open(config.clone(), k.clone(), realm))
-                        .map(|_| k.clone())
                 });
-            ok(write_stash(&keyfile, realm, &key));
+            ok(write_stash_list(&keyfile, realm, &key.master_keys().keys));
+        }
+        "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
+            mkey_command(cmd, args, cfg, realm, global_master_password_file, |k| {
+                let store = rt.block_on(CockroachStore::open(config.clone(), k.clone(), realm))?;
+                Ok(CockroachMkey { rt: &rt, store })
+            });
         }
         "replication" => {
             let master = master_key(cfg, realm, global_master_password_file);
@@ -1483,7 +1502,6 @@ fn cockroach_command(
     fail("db_library krb5-rs-cockroach needs a krb5-rs-kdb built with the `cockroach` feature");
 }
 
-#[cfg(feature = "klmdb")]
 fn km_principal() -> krb5_rs::types::PrincipalName {
     krb5_rs::types::PrincipalName {
         name_type: 1,
@@ -1495,7 +1513,6 @@ fn km_principal() -> krb5_rs::types::PrincipalName {
 }
 
 /// MIT `strdate` (`kdb5_mkey.c:29-40`).
-#[cfg(feature = "klmdb")]
 #[allow(deprecated)] // libc::time_t on musl
 fn strdate(when: u32) -> String {
     let t = libc::time_t::from(when);
@@ -1523,7 +1540,6 @@ fn strdate(when: u32) -> String {
 }
 
 /// MIT `are_you_sure` (`kdb5_mkey.c:805-826`).
-#[cfg(feature = "klmdb")]
 fn confirm(question: &str) -> bool {
     print!("{question}\n(type 'yes' to confirm)? ");
     let _ = std::io::stdout().flush();
@@ -1533,7 +1549,6 @@ fn confirm(question: &str) -> bool {
 
 /// Shell glob as MIT `glob_to_regexp` converts it: `?`, `*`, `[...]`
 /// (regex bracket syntax) and `\\` quoting.
-#[cfg(feature = "klmdb")]
 fn glob_match(p: &[u8], s: &[u8]) -> bool {
     match p.first() {
         None => s.is_empty(),
@@ -1574,7 +1589,6 @@ fn glob_match(p: &[u8], s: &[u8]) -> bool {
     }
 }
 
-#[cfg(feature = "klmdb")]
 fn entry_display_name(entry: &MitEntry) -> String {
     let mut name = unparse_name(&entry.principal, &entry.realm);
     if name.last() == Some(&0) {
@@ -1584,7 +1598,6 @@ fn entry_display_name(entry: &MitEntry) -> String {
 }
 
 /// Single-letter getopt flags (`-fnv` style); returns the operands.
-#[cfg(feature = "klmdb")]
 fn mkey_flags(args: Vec<String>, allowed: &str, flags: &mut [bool]) -> Vec<String> {
     let mut operands = Vec::new();
     for a in args {
@@ -1602,14 +1615,101 @@ fn mkey_flags(args: Vec<String>, allowed: &str, flags: &mut [bool]) -> Vec<Strin
     operands
 }
 
-/// MIT `kdb5_util` master-key commands (`kadmin/dbutil/kdb5_mkey.c`).
+/// The database operations the master-key commands need: MIT's
+/// `krb5_db_fetch_mkey_list`, `krb5_db_iterate` and `krb5_db_get_principal`
+/// + `krb5_db_put_principal` on entries whose keys stay encrypted.
+trait MkeyStore {
+    fn master_key_list(&self) -> Result<MasterKeys, StoreError>;
+    fn raw_entries(&self) -> Result<Vec<MitEntry>, StoreError>;
+    fn update_raw<F>(
+        &self,
+        name: &krb5_rs::types::PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> Result<bool, StoreError>
+    where
+        F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send;
+}
+
 #[cfg(feature = "klmdb")]
-fn mkey_command(
+impl MkeyStore for LmdbStore {
+    fn master_key_list(&self) -> Result<MasterKeys, StoreError> {
+        LmdbStore::master_key_list(self)
+    }
+    fn raw_entries(&self) -> Result<Vec<MitEntry>, StoreError> {
+        LmdbStore::raw_entries(self)
+    }
+    fn update_raw<F>(
+        &self,
+        name: &krb5_rs::types::PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> Result<bool, StoreError>
+    where
+        F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send,
+    {
+        LmdbStore::update_raw(self, name, realm, f)
+    }
+}
+
+impl MkeyStore for FileStore {
+    fn master_key_list(&self) -> Result<MasterKeys, StoreError> {
+        FileStore::master_key_list(self)
+    }
+    fn raw_entries(&self) -> Result<Vec<MitEntry>, StoreError> {
+        FileStore::raw_entries(self)
+    }
+    fn update_raw<F>(
+        &self,
+        name: &krb5_rs::types::PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> Result<bool, StoreError>
+    where
+        F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send,
+    {
+        FileStore::update_raw(self, name, realm, f)
+    }
+}
+
+/// A CockroachDB realm driven from the synchronous command code.
+#[cfg(feature = "cockroach")]
+struct CockroachMkey<'a> {
+    rt: &'a tokio::runtime::Runtime,
+    store: krb5_rs_kdb_cockroach::CockroachStore,
+}
+
+#[cfg(feature = "cockroach")]
+impl MkeyStore for CockroachMkey<'_> {
+    fn master_key_list(&self) -> Result<MasterKeys, StoreError> {
+        self.rt.block_on(self.store.verify_master())?;
+        Ok(self.store.master_keys())
+    }
+    fn raw_entries(&self) -> Result<Vec<MitEntry>, StoreError> {
+        self.rt.block_on(self.store.raw_entries())
+    }
+    fn update_raw<F>(
+        &self,
+        name: &krb5_rs::types::PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> Result<bool, StoreError>
+    where
+        F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send,
+    {
+        self.rt.block_on(self.store.update_raw(name, realm, f))
+    }
+}
+
+/// MIT `kdb5_util` master-key commands (`kadmin/dbutil/kdb5_mkey.c`).
+/// `open` opens the database with the key from the stash or password file.
+fn mkey_command<S: MkeyStore>(
     cmd: &str,
     args: Vec<String>,
     cfg: &RealmConfig,
     realm: &str,
     global_master_password_file: Option<&str>,
+    open: impl FnOnce(&krb5_rs::types::EncryptionKey) -> Result<S, StoreError>,
 ) {
     use krb5_rs::kdc::kdb::mit::mkey::{
         add_new_mkey, convert_entry, entry_mkvno, lookup_actkvno, now, purge_mkeys, update_actkvno,
@@ -1624,7 +1724,7 @@ fn mkey_command(
             (key, Some(kvno))
         }
     };
-    let store = ok(LmdbStore::open(cfg, &master));
+    let store = ok(open(&master));
     let keys = ok(store.master_key_list());
     let km = km_principal();
     let fullname = format!("K/M@{realm}");

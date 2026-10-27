@@ -62,7 +62,7 @@ fn principal() -> krb5_rs::kdc::replication::StoredPrincipal {
             .expect("entry"),
         None,
         None,
-        &master(),
+        &krb5_rs::kdc::kdb::mit::mkey::MasterKeys::single(master()),
     )
     .expect("stored")
 }

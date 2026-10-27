@@ -13,12 +13,13 @@ use turso::{Builder, Connection, Database, Row, Value};
 use crate::TursoOptions;
 
 /// Newest schema version this build understands.
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 /// Forward-only migrations: (version, name, SQL).
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("migrations/v1.sql")),
     (2, "policy tl_data", include_str!("migrations/v2.sql")),
+    (3, "principal tl_data", include_str!("migrations/v3.sql")),
 ];
 
 /// A failure inside a transaction body: the database's, or one of ours.

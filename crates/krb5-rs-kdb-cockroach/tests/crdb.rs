@@ -368,9 +368,9 @@ async fn concurrent_migrations_of_a_fresh_database_all_succeed() {
         }
         while let Some(run) = runs.join_next().await {
             let report = run.expect("migrate task").expect("concurrent migrate");
-            assert_eq!(report.to, 2);
+            assert_eq!(report.to, 3);
         }
-        assert_eq!(count(&db, "schema_migrations").await, 2);
+        assert_eq!(count(&db, "schema_migrations").await, 3);
         assert_eq!(count(&db, "replication_meta").await, 1);
         db.drop_db().await;
     }
@@ -418,9 +418,9 @@ async fn migrations_are_idempotent() {
     let second = CockroachStore::migrate(db.root(), &opts)
         .await
         .expect("second");
-    assert_eq!((first.from, first.to), (0, 2));
-    assert_eq!((second.from, second.to), (2, 2));
-    assert_eq!(count(&db, "schema_migrations").await, 2);
+    assert_eq!((first.from, first.to), (0, 3));
+    assert_eq!((second.from, second.to), (3, 3));
+    assert_eq!(count(&db, "schema_migrations").await, 3);
     let tables = db
         .text("SELECT string_agg(table_name, ',' ORDER BY table_name) FROM [SHOW TABLES]")
         .await;
@@ -640,6 +640,64 @@ async fn the_realm_needs_the_right_master_key_and_exists_once() {
         leaked[0], "0",
         "the master key must not be stored in the clear"
     );
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn admin_writes_reread_the_master_key_list_another_store_changed() {
+    use krb5_rs::kdc::kdb::mit::mkey::{
+        add_new_mkey, entry_mkvno, lookup_actkvno, now, update_actkvno, use_mkey,
+    };
+    let (db, a) = TestDb::with_realm("stale_mkey").await;
+    let b = CockroachStore::open(db.admin(), master(), REALM)
+        .await
+        .expect("second store");
+    ops(&a)
+        .add_principal(&name("alice"), REALM, Some("pw"), &plain())
+        .await
+        .expect("alice");
+    let km = PrincipalName {
+        name_type: 1,
+        name_string: ["K", "M"]
+            .iter()
+            .map(|s| krb5_rs::types::KerberosString::from_bytes(s.as_bytes()).expect("K/M"))
+            .collect(),
+    };
+    let second = krb5_rs::kdc::kdb::master_key_from_password(REALM, "second", 18).expect("key");
+    b.update_raw(&km, REALM, |e, keys| {
+        add_new_mkey(e, keys, &second)?;
+        Ok(true)
+    })
+    .await
+    .expect("add_mkey");
+    b.update_raw(&km, REALM, |e, _| {
+        let mut list = lookup_actkvno(e)?;
+        use_mkey(&mut list, 2, 0, now())?;
+        update_actkvno(e, &list);
+        Ok(true)
+    })
+    .await
+    .expect("use_mkey");
+
+    // `a` still holds the list it opened with, where key 1 is active.
+    ops(&a)
+        .add_principal(&name("carol"), REALM, Some("pw"), &plain())
+        .await
+        .expect("carol");
+    ops(&a)
+        .change_password(&name("alice"), REALM, Some("new-pw"), false)
+        .await
+        .expect("cpw alice");
+    let entries = b.raw_entries().await.expect("entries");
+    let mkvno = |n: &str| {
+        entries
+            .iter()
+            .find(|e| e.principal == name(n))
+            .map(|e| entry_mkvno(e).expect("mkvno"))
+    };
+    assert_eq!(mkvno("carol"), Some(2));
+    assert_eq!(mkvno("alice"), Some(2));
     db.drop_db().await;
 }
 

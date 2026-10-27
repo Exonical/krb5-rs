@@ -128,9 +128,9 @@ async fn kdb_administers_a_cockroachdb_realm_and_reports_replication() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("migrate"));
 
     let out = ok(&root, &["database", "migrate", "--create-roles"], "");
-    assert!(out.contains("Schema version 0 -> 1"), "{out}");
+    assert!(out.contains("Schema version 0 -> 3"), "{out}");
     let out = ok(&root, &["database", "migrate", "--create-roles"], "");
-    assert!(out.contains("Schema version 1 -> 1"), "{out}");
+    assert!(out.contains("Schema version 3 -> 3"), "{out}");
 
     // Realm creation, with a stash, then the kadmin commands.
     ok(&admin, &["create", "-s"], "master-password\n");
@@ -415,4 +415,84 @@ async fn concurrent_init_runs_create_a_shared_principal_once() {
         &format!("DROP DATABASE \"{db}\" CASCADE"),
     )
     .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn master_key_rotation_add_use_update_and_purge() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path();
+    let db = format!("krb5t_cli_mkey_{}", std::process::id());
+    run_sql(
+        &crdb_config("root", "defaultdb"),
+        &format!("CREATE DATABASE \"{db}\""),
+    )
+    .await
+    .expect("create database");
+    let root = write_conf(dir, "root.conf", "root", &db);
+    let admin = write_conf(dir, "admin.conf", "kdc_admin", &db);
+    ok(&root, &["database", "migrate", "--create-roles"], "");
+    ok(&admin, &["create", "-s"], "master-password\n");
+    ok(&admin, &["addprinc", "alice"], "alice-password\n");
+
+    let out = ok(
+        &admin,
+        &["add_mkey", "-s"],
+        "second-password\nsecond-password\n",
+    );
+    assert!(out.contains("Creating new master key"), "{out}");
+    let out = ok(&admin, &["list_mkeys"], "");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[1], "KVNO: 2, Enctype: aes256-cts-hmac-sha1-96, No activate time set",
+        "{out}"
+    );
+    assert!(
+        lines[2].starts_with("KVNO: 1,") && lines[2].ends_with(" *"),
+        "{out}"
+    );
+
+    ok(&admin, &["use_mkey", "2"], "");
+    let out = ok(&admin, &["list_mkeys"], "");
+    assert!(
+        out.lines().nth(1).is_some_and(|l| l.ends_with(" *")),
+        "{out}"
+    );
+
+    // New principals are wrapped under the active key; alice keeps KVNO 1
+    // until update_princ_encryption rewraps her.
+    ok(&admin, &["addprinc", "bob"], "bob-password\n");
+    let out = ok(&admin, &["update_princ_encryption", "-n", "-v"], "");
+    assert!(
+        out.contains(&format!("would update: alice@{REALM}")),
+        "{out}"
+    );
+    assert!(
+        !out.contains(&format!("would update: bob@{REALM}")),
+        "{out}"
+    );
+    let out = ok(&admin, &["update_princ_encryption", "-f", "-v"], "");
+    assert!(out.contains(&format!("updating: alice@{REALM}")), "{out}");
+    let out = ok(&admin, &["update_princ_encryption", "-f"], "");
+    assert!(out.contains(": 0 updated,"), "{out}");
+    ok(&admin, &["getprinc", "alice"], "");
+
+    // The first master password still opens the realm through MKEY_AUX.
+    let old = dir.join("old-master");
+    std::fs::write(&old, "master-password\n").expect("old master");
+    let old = old.to_string_lossy().into_owned();
+    ok(&admin, &["--master-password-file", &old, "list_mkeys"], "");
+
+    let out = ok(&admin, &["purge_mkeys", "-f", "-v"], "");
+    assert!(out.ends_with("1 key(s) purged.\n"), "{out}");
+    let out = ok(&admin, &["list_mkeys"], "");
+    assert_eq!(out.lines().count(), 2, "{out}");
+    ok(&admin, &["getprinc", "alice"], "");
+    ok(&admin, &["getprinc", "bob"], "");
+    assert!(
+        !kdb(&admin, &["--master-password-file", &old, "list_mkeys"], "")
+            .status
+            .success(),
+        "purged master key must no longer open the realm"
+    );
 }
