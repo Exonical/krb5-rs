@@ -194,6 +194,8 @@ pub struct TgsExchange {
     /// Authorization data to request (`in_creds->authdata`); cleared once a
     /// referral TGT carries it (get_creds.c:602-605).
     authdata: Option<crate::types::AuthorizationData>,
+    /// Session key enctype to request (`in_creds->keyblock.enctype`).
+    enctype: Option<i32>,
 }
 
 impl TgsExchange {
@@ -216,7 +218,17 @@ impl TgsExchange {
             fast_state: FastState::new(),
             s4u: s4u::S4uMode::None,
             authdata: None,
+            enctype: None,
         }
+    }
+
+    /// Request only `enctype` for the session key, or the configured
+    /// etypes when 0 (send_tgs.c:195-203). The TGT requests of S4U2Proxy
+    /// (`get_tgt_to_target_realm`) still use the configured etypes.
+    #[must_use]
+    pub fn with_enctype(mut self, enctype: i32) -> Self {
+        self.enctype = (enctype != 0).then_some(enctype);
+        self
     }
 
     /// Request `authdata` in the TGS-REQ enc-authorization-data

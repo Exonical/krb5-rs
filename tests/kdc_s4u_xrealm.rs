@@ -417,19 +417,50 @@ mod client_layer {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    struct Route(Arc<World>, Arc<AtomicUsize>);
+    type Log = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+    struct Route(Arc<World>, Arc<AtomicUsize>, Log);
 
     impl KdcTransport for Route {
         async fn send_recv(&self, realm: &str, message: &[u8]) -> Result<Vec<u8>, Krb5Error> {
             self.1.fetch_add(1, Ordering::SeqCst);
+            self.2.lock().expect("log").push(message.to_vec());
             Ok(self.0.send(realm, message).await)
         }
     }
 
     fn client(w: &Arc<World>) -> (KerberosClient<Route>, Arc<AtomicUsize>) {
+        let (client, sends, _) = logged_client(w);
+        (client, sends)
+    }
+
+    fn logged_client(w: &Arc<World>) -> (KerberosClient<Route>, Arc<AtomicUsize>, Log) {
         let sends = Arc::new(AtomicUsize::new(0));
-        let route = Route(Arc::clone(w), Arc::clone(&sends));
-        (KerberosClient::new(SREALM, route), sends)
+        let log = Log::default();
+        let route = Route(Arc::clone(w), Arc::clone(&sends), Arc::clone(&log));
+        (KerberosClient::new(SREALM, route), sends, log)
+    }
+
+    /// (sname components, etypes) of each TGS-REQ in `log`.
+    fn tgs_requests(log: &Log) -> Vec<(Vec<String>, Vec<i32>)> {
+        log.lock()
+            .expect("log")
+            .iter()
+            .filter_map(|m| rasn::der::decode::<krb5_rs::types::TgsReq>(m).ok())
+            .map(|r| {
+                let body = r.0.req_body;
+                let sname = body
+                    .sname
+                    .map(|n| {
+                        n.name_string
+                            .iter()
+                            .map(|g| String::from_utf8_lossy(g.as_bytes()).into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (sname, body.etype)
+            })
+            .collect()
     }
 
     /// The service's ccache, holding its TGT (as after `kinit -k`).
@@ -554,6 +585,70 @@ mod client_layer {
             .expect("from the cached cross-realm TGT");
         assert_eq!(sends.load(Ordering::SeqCst), used + 1);
         assert_eq!(no_store.creds().expect("creds").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_credentials_requests_only_the_requested_enctype() {
+        let w = Arc::new(world(false, false));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, sends) = client(&w);
+        let mut req = CredsRequest::new(service(), SREALM, target(), UREALM);
+        req.enctype = 17;
+        let cred = client
+            .get_credentials(&mut cc, GcOptions::empty(), &req)
+            .await
+            .expect("service ticket");
+        assert_eq!(cred.session_key.keytype, 17);
+        let used = sends.load(Ordering::SeqCst);
+        let again = client
+            .get_credentials(&mut cc, GcOptions::CACHED, &req)
+            .await
+            .expect("cached aes128 ticket");
+        assert_eq!(again.session_key.keytype, 17);
+        assert_eq!(sends.load(Ordering::SeqCst), used);
+    }
+
+    // s4u_creds.c: get_tgt_to_target_realm asks for TGTs without
+    // in_creds, so only the proxy requests carry the requested enctype.
+    #[tokio::test]
+    async fn s4u2proxy_tgt_requests_keep_the_configured_enctypes() {
+        let w = Arc::new(world(false, true));
+        let (tgt, evidence) = super::evidence(&w).await;
+        let mut cc = service_ccache(&tgt);
+        let (client, _, log) = logged_client(&w);
+        let mut req = CredsRequest::new(evidence.client.clone(), SREALM, target(), UREALM);
+        req.enctype = 17;
+        client
+            .get_credentials_for_proxy(&mut cc, GcOptions::empty(), &req, &evidence)
+            .await
+            .expect("S4U2Proxy");
+        let configured = krb5_rs::protocol::TgsOptions::default().etypes;
+        // The proxy request, get_tgt_to_target_realm's referral and the
+        // target ticket it discards, then the final proxy request.
+        let etypes: Vec<Vec<i32>> = tgs_requests(&log).into_iter().map(|(_, e)| e).collect();
+        assert_eq!(etypes, [vec![17], configured.clone(), configured, vec![17]]);
+    }
+
+    #[tokio::test]
+    async fn s4u_requests_only_the_requested_enctype() {
+        let w = Arc::new(world(true, true));
+        let mut cc = service_ccache(&w.login(service()).await);
+        let (client, _) = client(&w);
+        let mut req = xuser();
+        req.enctype = 17;
+        let evidence = client
+            .get_credentials_for_user(&mut cc, GcOptions::empty(), &req, None)
+            .await
+            .expect("S4U2Self");
+        assert_eq!(evidence.session_key.keytype, 17);
+        let (_, evidence) = super::evidence(&w).await;
+        let mut proxy = CredsRequest::new(evidence.client.clone(), SREALM, target(), UREALM);
+        proxy.enctype = 17;
+        let cred = client
+            .get_credentials_for_proxy(&mut cc, GcOptions::empty(), &proxy, &evidence)
+            .await
+            .expect("S4U2Proxy");
+        assert_eq!(cred.session_key.keytype, 17);
     }
 
     #[tokio::test]

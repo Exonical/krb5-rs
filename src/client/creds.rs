@@ -318,7 +318,11 @@ impl<T: KdcTransport> KerberosClient<T> {
                 }
             }
         };
-        self.run_tgs(TgsExchange::new(tgt, server, tgs).with_authdata(req.authdata.clone()))
-            .await
+        self.run_tgs(
+            TgsExchange::new(tgt, server, tgs)
+                .with_authdata(req.authdata.clone())
+                .with_enctype(req.enctype),
+        )
+        .await
     }
 }
