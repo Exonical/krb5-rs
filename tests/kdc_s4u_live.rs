@@ -392,19 +392,20 @@ fn run_tgs_ours(mut ex: TgsExchange) -> Credential {
 }
 
 /// `krb5_write_message`: a 4-byte big-endian length, then the data.
-fn write_message(s: &mut TcpStream, data: &[u8]) {
-    let len = u32::try_from(data.len()).expect("length");
-    s.write_all(&len.to_be_bytes()).expect("write length");
-    s.write_all(data).expect("write data");
+fn write_message(s: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
+    let len = u32::try_from(data.len())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    s.write_all(&len.to_be_bytes())?;
+    s.write_all(data)
 }
 
 /// `krb5_read_message`.
-fn read_message(s: &mut TcpStream) -> Vec<u8> {
+fn read_message(s: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
-    s.read_exact(&mut len).expect("read length");
+    s.read_exact(&mut len)?;
     let mut data = vec![0u8; u32::from_be_bytes(len) as usize];
-    s.read_exact(&mut data).expect("read data");
-    data
+    s.read_exact(&mut data)?;
+    Ok(data)
 }
 
 /// `krb5_auth_con_genaddrs` with GENERATE_*_FULL_ADDR: (address, port).
@@ -426,15 +427,17 @@ fn genaddrs(a: SocketAddr) -> (HostAddress, HostAddress) {
 
 /// The auth context of the user_user sample programs: DO_SEQUENCE and the
 /// connection's full addresses (appl/user_user/client.c:209-229).
-fn uu_auth_context(s: &TcpStream) -> AuthContext {
+fn uu_auth_context(s: &TcpStream) -> std::io::Result<AuthContext> {
     let mut ac = AuthContext::new();
-    let (la, lp) = genaddrs(s.local_addr().expect("local addr"));
-    let (ra, rp) = genaddrs(s.peer_addr().expect("peer addr"));
+    let (la, lp) = genaddrs(s.local_addr()?);
+    let (ra, rp) = genaddrs(s.peer_addr()?);
     ac.set_addrs(Some(la), Some(ra));
     ac.set_ports(Some(lp), Some(rp));
     ac.set_flags(AuthContextFlags::DO_SEQUENCE);
-    ac
+    Ok(ac)
 }
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// No keytab: user-to-user tickets decrypt with the TGT session key.
 struct NoKeys;
@@ -458,7 +461,7 @@ const UU_HELLO: &[u8] = b"Hello, other end of connection.\0";
 // KDC.
 #[test]
 #[ignore = "requires podman + MIT client container"]
-fn mit_uuclient_against_our_user_to_user_server() {
+fn mit_uuclient_against_our_user_to_user_server() -> Result<(), BoxError> {
     setup("/tmp/cc_uu_unused", "HTTP/s4u.test.realm");
     let alice = format!("KRB5_CONFIG={CONF} KRB5CCNAME=/tmp/cc_uu_alice");
     let (code, out) = run(
@@ -467,15 +470,15 @@ fn mit_uuclient_against_our_user_to_user_server() {
     );
     assert_eq!(code, 0, "kinit alice: {out}");
 
-    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let server = std::thread::spawn(move || {
-        let (mut s, _) = listener.accept().expect("accept");
-        let pname = read_message(&mut s);
+    let listener = std::net::TcpListener::bind("0.0.0.0:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || -> Result<String, BoxError> {
+        let (mut s, _) = listener.accept()?;
+        let pname = read_message(&mut s)?;
         let pname = std::str::from_utf8(pname.strip_suffix(b"\0").expect("NUL"))
             .expect("utf-8")
             .to_string();
-        let ticket: Ticket = rasn::der::decode(&read_message(&mut s)).expect("client TGT");
+        let ticket: Ticket = rasn::der::decode(&read_message(&mut s)?).expect("client TGT");
         let (user, realm) = pname.split_once('@').expect("realm");
         assert_eq!(realm, REALM);
         let svc_tgt = our_tgt(svc("s4u"), "svc-password");
@@ -487,23 +490,23 @@ fn mit_uuclient_against_our_user_to_user_server() {
             )
             .with_second_ticket(Some(ticket)),
         );
-        let mut ac = uu_auth_context(&s);
+        let mut ac = uu_auth_context(&s)?;
         let opts = ApReqOptions {
             use_session_key: true,
             ..ApReqOptions::default()
         };
         let ap_req = ac.mk_req(&opts, None, &cred).expect("mk_req");
-        write_message(&mut s, &ap_req);
+        write_message(&mut s, &ap_req)?;
         let (safe, _) = ac.mk_safe(UU_HELLO).expect("mk_safe");
-        write_message(&mut s, &safe);
-        pname
+        write_message(&mut s, &safe)?;
+        Ok(pname)
     });
     let (code, out) = run(
         &format!("{alice} uuclient {} 'testing message' {port}", host()),
         None,
     );
     assert_eq!(code, 0, "uuclient: {out}");
-    assert_eq!(server.join().expect("server"), format!("alice@{REALM}"));
+    assert_eq!(server.join().expect("server")?, format!("alice@{REALM}"));
     assert!(
         out.contains(&format!("server is named \"HTTP/s4u.test.realm@{REALM}\"")),
         "{out}"
@@ -512,6 +515,7 @@ fn mit_uuclient_against_our_user_to_user_server() {
         out.contains("uu-client: server says \"Hello, other end of connection.\""),
         "{out}"
     );
+    Ok(())
 }
 
 fn container_ip() -> String {
@@ -536,7 +540,7 @@ fn container_ip() -> String {
 // its user-to-user ticket from our KDC.
 #[test]
 #[ignore = "requires podman + MIT client container"]
-fn our_user_to_user_client_against_mit_uuserver() {
+fn our_user_to_user_client_against_mit_uuserver() -> Result<(), BoxError> {
     const UU_PORT: u16 = 10395;
     let e = setup("/tmp/cc_uu_svc", "HTTP/s4u.test.realm");
     let _ = run("pkill -x uuserver", None);
@@ -549,9 +553,17 @@ fn our_user_to_user_client_against_mit_uuserver() {
             "-c",
             &format!("{e} uuserver {UU_PORT} > /tmp/uuserver.log 2>&1"),
         ])
-        .status()
-        .expect("start uuserver");
+        .status()?;
     assert!(started.success());
+    // uuserver exits after one connection; this stops it if the test fails
+    // before connecting.
+    struct StopUuserver;
+    impl Drop for StopUuserver {
+        fn drop(&mut self) {
+            let _ = run("pkill -x uuserver", None);
+        }
+    }
+    let _stop = StopUuserver;
     let addr = format!("{}:{UU_PORT}", container_ip());
     let mut s = (0..50)
         .find_map(|_| {
@@ -564,10 +576,10 @@ fn our_user_to_user_client_against_mit_uuserver() {
 
     let alice = PrincipalName::new_principal("alice");
     let tgt = our_tgt(alice.clone(), USER_PW);
-    write_message(&mut s, format!("alice@{REALM}\0").as_bytes());
-    write_message(&mut s, &rasn::der::encode(&tgt.ticket).expect("encode TGT"));
-    let ap_req = read_message(&mut s);
-    let mut ac = uu_auth_context(&s);
+    write_message(&mut s, format!("alice@{REALM}\0").as_bytes())?;
+    write_message(&mut s, &rasn::der::encode(&tgt.ticket)?)?;
+    let ap_req = read_message(&mut s)?;
+    let mut ac = uu_auth_context(&s)?;
     // krb5_auth_con_setuseruserkey (client.c:231).
     ac.set_session_key(tgt.session_key.clone());
     let r = ac
@@ -577,13 +589,14 @@ fn our_user_to_user_client_against_mit_uuserver() {
     assert!(r
         .ap_options
         .contains(krb5_rs::types::ApOptions::USE_SESSION_KEY));
-    let (msg, _) = ac.rd_safe(&read_message(&mut s)).expect("rd_safe");
+    let (msg, _) = ac.rd_safe(&read_message(&mut s)?).expect("rd_safe");
     assert_eq!(msg, UU_HELLO);
     let (_, log) = run("cat /tmp/uuserver.log", None);
     assert!(
         log.contains("client principal is \"alice@TEST.REALM\""),
         "{log}"
     );
+    Ok(())
 }
 
 /// Copy a ccache between the container and the host (`to_host`) or back.
