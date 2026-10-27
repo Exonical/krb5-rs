@@ -850,6 +850,15 @@ mod client_layer {
         assert_eq!(cred.session_key.keytype, alice_tgt.session_key.keytype);
         let part = decrypt_ticket(&alice_tgt.session_key, &cred.ticket).expect("decrypt");
         assert_eq!(part.cname.name_string, service().name_string);
+        // The PAC server checksum uses the ticket key (do_tgs_req.c:1038-1043).
+        assert!(krb5_rs::pac::ticket_pac(&part).expect("pac").is_some());
+        krb5_rs::pac::verify_ticket_pac(
+            &part,
+            &PrincipalName::new_principal("alice"),
+            &alice_tgt.session_key,
+            None,
+        )
+        .expect("PAC verifies with the second ticket's session key");
         let stored = cc.creds().expect("creds");
         assert!(stored.last().expect("stored").is_skey);
         let used = sends.load(Ordering::SeqCst);
