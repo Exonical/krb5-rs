@@ -60,6 +60,9 @@ pub(super) struct KdbPolicy {
     pub allowed_keysalts: Option<GeneralString>,
     #[rasn(tag(explicit(context, 13)))]
     pub security_epoch: Option<u64>,
+    /// `Policy::tl_data_bytes`.
+    #[rasn(tag(explicit(context, 14)))]
+    pub tl_data: Option<rasn::types::OctetString>,
 }
 
 /// One principal record; lifetimes are in seconds.

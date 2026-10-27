@@ -66,7 +66,8 @@ pub use store::{
     AdminStore, AlwaysAllow, AuthState, AuthStateStore, AuthStateUpdate, AuthoritativeDenial,
     AuthoritativeState, ConsistencyGate, GateDecision, GateSubject, HealthCheck, LockoutReport,
     LockoutReporter, MemoryAuthState, NoPolicies, NoopLockoutReporter, Policy, PolicyStore,
-    PrincipalRecord, PrincipalRole, PrincipalStore, SecurityState, StoreError, StoreErrorKind,
+    PolicyTlData, PrincipalRecord, PrincipalRole, PrincipalStore, SecurityState, StoreError,
+    StoreErrorKind,
 };
 
 use std::sync::Arc;

@@ -131,7 +131,7 @@ async fn mvcc_is_set_on_create_and_verified_on_reopen() {
             s.mvcc && s.journal_mode.eq_ignore_ascii_case("mvcc"),
             "{s:?}"
         );
-        assert_eq!(s.schema_version, 1);
+        assert_eq!(s.schema_version, 2);
         assert!(s.checkpoint.is_none());
         r.health().await.expect("healthy");
     }
@@ -190,7 +190,7 @@ async fn migrations_are_idempotent_and_a_newer_schema_is_refused() {
             .expect("one")
             .get(0)
             .expect("int");
-        assert_eq!(n, 1, "reopening must not re-apply the migration");
+        assert_eq!(n, 2, "reopening must not re-apply the migrations");
         conn.execute("BEGIN CONCURRENT", ()).await.expect("begin");
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (99, 'future', 0)",
@@ -408,6 +408,10 @@ async fn policies_and_lockouts_replicate_too() {
         pw_lockout_duration: 600,
         security_epoch: 4,
         allowed_keysalts: Some("aes256-cts-hmac-sha1-96:normal".into()),
+        tl_data: vec![krb5_rs::kdc::PolicyTlData {
+            kind: 300,
+            data: b"tl".to_vec(),
+        }],
         ..Policy::default()
     };
     ReplicaSink::apply(

@@ -1261,7 +1261,14 @@ impl LmdbStore {
             max_life: policy.max_life,
             max_renewable_life: policy.max_renewable_life,
             allowed_keysalts: policy.allowed_keysalts,
-            tl_data: Vec::new(),
+            tl_data: policy
+                .tl_data
+                .into_iter()
+                .map(|t| TlData {
+                    kind: t.kind,
+                    data: t.data,
+                })
+                .collect(),
         }
         .encode()?;
         let mut txn = self

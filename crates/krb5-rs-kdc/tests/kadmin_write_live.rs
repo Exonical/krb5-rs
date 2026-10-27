@@ -295,6 +295,67 @@ done
 diff -u "$B/mit/setkey.out" "$B/rs/setkey.out" || fail "setkey differs"
 grep -q "^setkey4 0$" "$B/rs/setkey.out" || fail "setkey4 failed: $(cat $B/rs/setkey.out)"
 
+# kadmin has no policy TL data option; call create/modify/get_policy directly.
+cat > "$B/poltl.c" <<'CEOF'
+#include <kadm5/admin.h>
+#include <stdio.h>
+#include <string.h>
+static void tl(krb5_tl_data *t, krb5_int16 type, const char *s, krb5_tl_data *next) {
+    t->tl_data_type = type; t->tl_data_length = strlen(s);
+    t->tl_data_contents = (krb5_octet *)s; t->tl_data_next = next;
+}
+static void show(void *h, char *name) {
+    kadm5_policy_ent_rec e;
+    long r = kadm5_get_policy(h, name, &e);
+    printf("get %s %ld", name, r);
+    if (!r) {
+        printf(" n=%d", e.n_tl_data);
+        for (krb5_tl_data *t = e.tl_data; t; t = t->tl_data_next)
+            printf(" %d:%.*s", t->tl_data_type, t->tl_data_length, t->tl_data_contents);
+        kadm5_free_policy_ent(h, &e);
+    }
+    printf("\n");
+}
+int main(int argc, char **argv) {
+    krb5_context ctx; void *h; kadm5_config_params params = {0};
+    krb5_tl_data a, b, c, d, e;
+    if (krb5_init_context(&ctx)) return 2;
+    long r = kadm5_init_with_password(ctx, argv[1], argv[2], KADM5_ADMIN_SERVICE,
+                                      &params, KADM5_STRUCT_VERSION,
+                                      KADM5_API_VERSION_4, NULL, &h);
+    printf("init %ld\n", r);
+    if (r) return 0;
+    kadm5_policy_ent_rec p;
+    memset(&p, 0, sizeof(p));
+    p.policy = "tlpol";
+    tl(&c, 300, "c", NULL); tl(&b, 301, "bb", &c); tl(&a, 300, "a", &b);
+    p.n_tl_data = 3; p.tl_data = &a;
+    printf("create %ld\n", (long)kadm5_create_policy(h, &p, KADM5_POLICY | KADM5_POLICY_TL_DATA));
+    show(h, "tlpol");
+    tl(&e, 302, "new", NULL); tl(&d, 301, "XX", &e);
+    p.n_tl_data = 2; p.tl_data = &d;
+    printf("modify %ld\n", (long)kadm5_modify_policy(h, &p, KADM5_POLICY_TL_DATA));
+    show(h, "tlpol");
+    printf("modify maxlife %ld\n", (long)kadm5_modify_policy(h, &p, KADM5_PW_MAX_LIFE));
+    show(h, "tlpol");
+    tl(&a, 100, "low", NULL);
+    p.policy = "lowpol"; p.n_tl_data = 1; p.tl_data = &a;
+    printf("create low %ld\n", (long)kadm5_create_policy(h, &p, KADM5_POLICY | KADM5_POLICY_TL_DATA));
+    p.policy = "plain";
+    printf("modify low %ld\n", (long)kadm5_modify_policy(h, &p, KADM5_POLICY_TL_DATA));
+    show(h, "plain");
+    return 0;
+}
+CEOF
+gcc -o "$B/poltl" "$B/poltl.c" $(krb5-config --libs kadm-client) 2>"$B/cc.log" \
+  || fail "building poltl: $(cat $B/cc.log)"
+for s in mit rs; do
+  KRB5_CONFIG=$B/$s/krb5.conf "$B/poltl" admin@$R admin-pw > "$B/$s/poltl.out" 2>&1
+done
+diff -u "$B/mit/poltl.out" "$B/rs/poltl.out" || fail "policy TL data differs"
+grep -q "^get tlpol 0 n=4 300:a 301:XX 300:c 302:new$" "$B/rs/poltl.out" \
+  || fail "policy TL data not stored: $(cat $B/rs/poltl.out)"
+
 stop
 sleep 0.5
 # Read both databases back with MIT's kadmin.local and kproplog.
@@ -304,7 +365,9 @@ for s in mit rs; do
     kadmin.local -r $R -q "getprinc $p" 2>&1 | norm
   done > "$B/$s/final.out"
   kproplog -h -p "$B/$s/db/principal.ulog" 2>&1 | grep -E "Last serial|Entry count|Update log" > "$B/$s/ulog.out" || true
+  kdb5_util -r $R dump "$B/$s/final.dump" && grep "^policy" "$B/$s/final.dump" > "$B/$s/policies.out"
 done
+diff -u "$B/mit/policies.out" "$B/rs/policies.out" || fail "dumped policies differ"
 diff -u "$B/mit/final.out" "$B/rs/final.out" || fail "databases differ"
 diff -u "$B/mit/ulog.out" "$B/rs/ulog.out" || fail "update logs differ"
 echo KADMIN_WRITE_LIVE_OK

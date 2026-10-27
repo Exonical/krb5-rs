@@ -368,9 +368,9 @@ async fn concurrent_migrations_of_a_fresh_database_all_succeed() {
         }
         while let Some(run) = runs.join_next().await {
             let report = run.expect("migrate task").expect("concurrent migrate");
-            assert_eq!(report.to, 1);
+            assert_eq!(report.to, 2);
         }
-        assert_eq!(count(&db, "schema_migrations").await, 1);
+        assert_eq!(count(&db, "schema_migrations").await, 2);
         assert_eq!(count(&db, "replication_meta").await, 1);
         db.drop_db().await;
     }
@@ -418,9 +418,9 @@ async fn migrations_are_idempotent() {
     let second = CockroachStore::migrate(db.root(), &opts)
         .await
         .expect("second");
-    assert_eq!((first.from, first.to), (0, 1));
-    assert_eq!((second.from, second.to), (1, 1));
-    assert_eq!(count(&db, "schema_migrations").await, 1);
+    assert_eq!((first.from, first.to), (0, 2));
+    assert_eq!((second.from, second.to), (2, 2));
+    assert_eq!(count(&db, "schema_migrations").await, 2);
     let tables = db
         .text("SELECT string_agg(table_name, ',' ORDER BY table_name) FROM [SHOW TABLES]")
         .await;
