@@ -15,6 +15,8 @@ MIT_IMAGE="${MIT_IMAGE:-docker.io/library/krb5-rs-mit-test:1.22.2}"
 KDC_HOST="${PODMAN_KDC_HOST:-172.30.251.165}"
 KDC_PORT="${PODMAN_KDC_PORT:-18888}"
 METRICS_PORT="${PODMAN_METRICS_PORT:-19100}"
+KADMIN_PORT="${PODMAN_KADMIN_PORT:-17749}"
+KPASSWD_PORT="${PODMAN_KPASSWD_PORT:-17464}"
 TEST_PREFIX=krb5-rs-kdc-podman-e2e
 MASTER_SECRET="${TEST_PREFIX}-master"
 TLS_SECRET="${TEST_PREFIX}-replica-tls"
@@ -204,18 +206,25 @@ MASTER_PLACEHOLDER="$(placeholder CHANGE-ME-MASTER-PASSWORD)"
 CA_PLACEHOLDER="$(placeholder CHANGE-ME-CA-CERTIFICATE)"
 CERT_PLACEHOLDER="$(placeholder CHANGE-ME-REPLICA-CERTIFICATE)"
 KEY_PLACEHOLDER="$(placeholder CHANGE-ME-REPLICA-PRIVATE-KEY)"
+ADMIN_CERT_PLACEHOLDER="$(placeholder CHANGE-ME-ADMIN-CERTIFICATE)"
+ADMIN_KEY_PLACEHOLDER="$(placeholder CHANGE-ME-ADMIN-PRIVATE-KEY)"
 replace_manifest "$MASTER_PLACEHOLDER" "$(base64_file "$MASTER_PASSWORD")"
 replace_manifest "$CA_PLACEHOLDER" "$(base64_file "$CERTS_DIR/ca.crt")"
 replace_manifest "$CERT_PLACEHOLDER" "$(base64_file "$CERTS_DIR/client.kdc_replica.crt")"
 replace_manifest "$KEY_PLACEHOLDER" "$(base64_file "$CERTS_DIR/client.kdc_replica.key")"
+replace_manifest "$ADMIN_CERT_PLACEHOLDER" "$(base64_file "$CERTS_DIR/client.kdc_admin.crt")"
+replace_manifest "$ADMIN_KEY_PLACEHOLDER" "$(base64_file "$CERTS_DIR/client.kdc_admin.key")"
 sed -i "s/hostPort: 88/hostPort: ${KDC_PORT}/g" "$MANIFEST"
 sed -i "s/hostPort: 19100/hostPort: ${METRICS_PORT}/g" "$MANIFEST"
+sed -i "s/hostPort: 749/hostPort: ${KADMIN_PORT}/g" "$MANIFEST"
+sed -i "s/hostPort: 464/hostPort: ${KPASSWD_PORT}/g" "$MANIFEST"
 if grep -q 'CHANGE-ME' "$MANIFEST"; then
   grep -n 'CHANGE-ME' "$MANIFEST" >&2 || true
   echo "unfilled CHANGE-ME value remains in the temporary Podman manifest" >&2
   exit 1
 fi
-for marker in "$MASTER_PLACEHOLDER" "$CA_PLACEHOLDER" "$CERT_PLACEHOLDER" "$KEY_PLACEHOLDER"; do
+for marker in "$MASTER_PLACEHOLDER" "$CA_PLACEHOLDER" "$CERT_PLACEHOLDER" "$KEY_PLACEHOLDER" \
+  "$ADMIN_CERT_PLACEHOLDER" "$ADMIN_KEY_PLACEHOLDER"; do
   if grep -Fq "$marker" "$MANIFEST"; then
     echo "unfilled base64 Secret placeholder remains in the temporary Podman manifest" >&2
     exit 1
@@ -271,6 +280,8 @@ cat > "$CONFIG_DIR/mit-krb5.conf" <<EOF
 [realms]
  ${REALM} = {
   kdc = ${KDC_HOST}:${KDC_PORT}
+  admin_server = ${KDC_HOST}:${KADMIN_PORT}
+  kpasswd_server = ${KDC_HOST}:${KPASSWD_PORT}
  }
 EOF
 
@@ -296,6 +307,48 @@ if [ "$authenticated" != 1 ]; then
   exit 1
 fi
 echo "MIT kinit succeeded against ${KDC_HOST}:${KDC_PORT}"
+
+step "administer with MIT kadmin and kpasswd through the Podman-published kadmind"
+printf 'admin-password\n' | run_kdb admin.conf \
+  --master-password-file /secrets/master-password addprinc admin/admin
+mit_run() {
+  "$CLI" run --rm -i --network host \
+    -v "$(host_path "$CONFIG_DIR/mit-krb5.conf"):/tmp/krb5.conf:ro" \
+    "$MIT_IMAGE" bash -c "export KRB5_CONFIG=/tmp/krb5.conf KRB5CCNAME=FILE:/tmp/cc_\$RANDOM; $1"
+}
+administered=0
+for _ in $(seq 1 30); do
+  if mit_run "timeout 30 kadmin -p admin/admin -w admin-password -q 'addprinc -pw carol-password carol'" \
+    > "$TEMP_DIR/kadmin-output" 2>&1 && grep -q "Principal \"carol@${REALM}\" created." "$TEMP_DIR/kadmin-output"
+  then
+    administered=1
+    break
+  fi
+  sleep 1
+done
+if [ "$administered" != 1 ]; then
+  cat "$TEMP_DIR/kadmin-output" >&2 || true
+  "$CLI" logs "${TEST_PREFIX}-kadmind" 2>&1 | tail -80 || true
+  echo "MIT kadmin did not add carol through the Podman-published kadmind"
+  exit 1
+fi
+changed=0
+for _ in $(seq 1 30); do
+  if printf 'carol-password\ncarol-new-password\ncarol-new-password\n' \
+    | mit_run "timeout 30 kpasswd carol@${REALM}" > "$TEMP_DIR/kpasswd-output" 2>&1 \
+    && grep -q "Password changed." "$TEMP_DIR/kpasswd-output"
+  then
+    changed=1
+    break
+  fi
+  sleep 1
+done
+if [ "$changed" != 1 ]; then
+  cat "$TEMP_DIR/kpasswd-output" >&2 || true
+  echo "MIT kpasswd did not change carol's password through the Podman-published kadmind"
+  exit 1
+fi
+echo "MIT kadmin and kpasswd succeeded against ${KDC_HOST}:${KADMIN_PORT}/${KPASSWD_PORT}"
 
 step "tear down the Pod and drop the scratch database"
 podman_kube_down

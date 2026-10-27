@@ -148,7 +148,12 @@ ports. Remove the `kadmind` container to run without remote administration.
 ## External CockroachDB
 
 `krb5-rs-kdc-cockroach.yaml` runs the CockroachDB-enabled image and gives this
-KDC its own persistent Turso replica. It does not run CockroachDB. Before
+KDC its own persistent Turso replica. It does not run CockroachDB. Its `kadmind` container serves remote MIT `kadmin` (host TCP 749) and
+`kpasswd` (host UDP/TCP 464), writing to CockroachDB with `kdc_admin`'s
+certificate from the `krb5-rs-kdc-cockroach-admin-tls` Secret; an init
+container writes its stash from the master password. Edit `kadm5.acl` in the
+ConfigMap, or remove the `kadmind` container, its init container and the
+admin Secret to run without remote administration. Before
 playing the Pod, create the database and schema with a CockroachDB SQL
 administrator, then initialize the realm with `kdc_admin`. Use a database
 name and realm consistently in the client profiles and URLs:
