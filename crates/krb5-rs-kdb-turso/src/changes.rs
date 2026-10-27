@@ -2,8 +2,8 @@
 //! inside a caller-owned transaction on one connection.
 
 use krb5_rs::kdc::replication::{
-    Change, LockoutRecord, ReplicaCheckpoint, ReplicationTs, StoredKey, StoredPolicy,
-    StoredPrincipal,
+    decode_tl_data, encode_tl_data, Change, LockoutRecord, ReplicaCheckpoint, ReplicationTs,
+    StoredKey, StoredPolicy, StoredPrincipal,
 };
 use krb5_rs::kdc::StoreError;
 use turso::{Connection, Row, Value};
@@ -147,6 +147,7 @@ async fn upsert_principal(
         opt_i(p.last_admin_unlock),
         Value::Text(join_list(&p.allowed_to_delegate_to)),
         Value::Text(join_list(&p.allowed_to_delegate_from)),
+        encode_tl_data(&p.tl_data)?.map_or(Value::Null, Value::Blob),
     ];
     fields.extend(version_params(version));
     let id = match id {
@@ -157,8 +158,8 @@ async fn upsert_principal(
                 "UPDATE principals SET name_type = ?, attributes = ?, max_life = ?, \
                  max_renewable_life = ?, expiration = ?, pw_expiration = ?, last_pwd_change = ?, \
                  mod_time = ?, policy = ?, security_epoch = ?, last_admin_unlock = ?, \
-                 delegate_to = ?, delegate_from = ?, version_wall = ?, version_logical = ?, \
-                 deleted = 0 WHERE id = ?",
+                 delegate_to = ?, delegate_from = ?, tl_data = ?, version_wall = ?, \
+                 version_logical = ?, deleted = 0 WHERE id = ?",
                 fields,
             )
             .await?;
@@ -178,8 +179,8 @@ async fn upsert_principal(
                 "INSERT INTO principals (realm, name, name_type, attributes, max_life, \
                  max_renewable_life, expiration, pw_expiration, last_pwd_change, mod_time, \
                  policy, security_epoch, last_admin_unlock, delegate_to, delegate_from, \
-                 version_wall, version_logical, deleted) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                 tl_data, version_wall, version_logical, deleted) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 all,
             )
             .await?;
@@ -562,7 +563,7 @@ pub(crate) async fn write_checkpoint(
 pub(crate) const LOOKUP_SQL: &str = "SELECT p.name_type, p.attributes, p.max_life, \
     p.max_renewable_life, p.expiration, p.pw_expiration, p.last_pwd_change, p.mod_time, \
     p.policy, p.security_epoch, p.last_admin_unlock, p.delegate_to, p.delegate_from, \
-    k.kvno, k.enctype, k.mkvno, k.enc_key, k.salt, k.s2kparams \
+    k.kvno, k.enctype, k.mkvno, k.enc_key, k.salt, k.s2kparams, p.tl_data \
     FROM principals p LEFT JOIN principal_keys k ON k.principal_id = p.id \
     WHERE p.realm = ? AND p.name = ? AND p.deleted = 0 \
     ORDER BY k.kvno DESC, k.enctype ASC";
@@ -609,6 +610,7 @@ pub(crate) fn principal_from_rows(
         policy: opt_text(first, 8)?,
         security_epoch: to_u64(int(first, 9)?)?,
         last_admin_unlock: opt_int(first, 10)?,
+        tl_data: decode_tl_data(opt_blob(first, 19)?.as_deref())?,
     }))
 }
 

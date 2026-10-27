@@ -90,7 +90,13 @@ fn principal(who: &str, pw: &str, kvno: u32, epoch: u64) -> StoredPrincipal {
         .expect("add");
     let mut e = store.get(&name(who), REALM).expect("entry");
     e.security_epoch = epoch;
-    StoredPrincipal::from_entry(&e, Some(5), Some(6), &master()).expect("stored")
+    StoredPrincipal::from_entry(
+        &e,
+        Some(5),
+        Some(6),
+        &krb5_rs::kdc::kdb::mit::mkey::MasterKeys::single(master()),
+    )
+    .expect("stored")
 }
 
 fn up(p: StoredPrincipal, v: ReplicationTs) -> Change {
@@ -131,7 +137,7 @@ async fn mvcc_is_set_on_create_and_verified_on_reopen() {
             s.mvcc && s.journal_mode.eq_ignore_ascii_case("mvcc"),
             "{s:?}"
         );
-        assert_eq!(s.schema_version, 2);
+        assert_eq!(s.schema_version, 3);
         assert!(s.checkpoint.is_none());
         r.health().await.expect("healthy");
     }
@@ -190,7 +196,7 @@ async fn migrations_are_idempotent_and_a_newer_schema_is_refused() {
             .expect("one")
             .get(0)
             .expect("int");
-        assert_eq!(n, 2, "reopening must not re-apply the migrations");
+        assert_eq!(n, 3, "reopening must not re-apply the migrations");
         conn.execute("BEGIN CONCURRENT", ()).await.expect("begin");
         conn.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (99, 'future', 0)",
@@ -954,7 +960,7 @@ fn file_store_changes(dir: &TmpDir) -> Vec<Change> {
                 &rec.entry,
                 rec.last_pwd_change.map(|t| t.timestamp()),
                 None,
-                &master(),
+                &krb5_rs::kdc::kdb::mit::mkey::MasterKeys::single(master()),
             )
             .expect("stored"),
             ts(1 + i64::try_from(i).expect("small")),
@@ -1002,7 +1008,13 @@ async fn a_kdc_on_the_replica_serves_as_and_tgs_and_counts_lockouts() {
         batch(
             ts(12),
             vec![up(
-                StoredPrincipal::from_entry(&alice, None, None, &master()).expect("stored"),
+                StoredPrincipal::from_entry(
+                    &alice,
+                    None,
+                    None,
+                    &krb5_rs::kdc::kdb::mit::mkey::MasterKeys::single(master()),
+                )
+                .expect("stored"),
                 ts(12),
             )],
         ),
@@ -1093,7 +1105,13 @@ async fn an_as_request_honours_a_lockout_replicated_from_the_authority() {
         batch(
             ts(12),
             vec![up(
-                StoredPrincipal::from_entry(&alice, None, None, &master()).expect("stored"),
+                StoredPrincipal::from_entry(
+                    &alice,
+                    None,
+                    None,
+                    &krb5_rs::kdc::kdb::mit::mkey::MasterKeys::single(master()),
+                )
+                .expect("stored"),
                 ts(12),
             )],
         ),
@@ -1168,7 +1186,13 @@ async fn no_plaintext_key_bytes_reach_the_database_files() {
         batch(
             ts(1),
             vec![up(
-                StoredPrincipal::from_entry(&entry, None, None, &master()).expect("stored"),
+                StoredPrincipal::from_entry(
+                    &entry,
+                    None,
+                    None,
+                    &krb5_rs::kdc::kdb::mit::mkey::MasterKeys::single(master()),
+                )
+                .expect("stored"),
                 ts(1),
             )],
         ),

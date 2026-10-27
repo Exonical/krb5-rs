@@ -59,6 +59,16 @@ impl Env {
         }
     }
 
+    /// Select `db_library = library` for the realm.
+    fn with_library(self, library: &str) -> Env {
+        let mut conf = std::fs::read_to_string(&self.conf).expect("kdc.conf");
+        conf.push_str(&format!(
+            "[dbmodules]\n {REALM} = {{\n  db_library = {library}\n }}\n"
+        ));
+        std::fs::write(&self.conf, conf).expect("kdc.conf");
+        self
+    }
+
     fn run(&self, args: &[&str], stdin: &str) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdb"))
             .args(["--config", &self.conf.to_string_lossy(), "--realm", REALM])
@@ -365,7 +375,33 @@ fn policy_commands_and_principal_policy_options() {
 #[cfg(feature = "klmdb")]
 #[test]
 fn master_key_rotation_add_use_update_and_purge() {
-    let env = Env::new("mkey");
+    rotate_master_keys(&Env::new("mkey"));
+}
+
+#[test]
+fn file_store_master_key_rotation_add_use_update_and_purge() {
+    let env = Env::new("mkey_file").with_library("krb5-rs-file");
+    rotate_master_keys(&env);
+    // A dump carries each entry's master key version and K/M's ACTKVNO and
+    // MKEY_AUX; loading it back keeps the database open under the stash.
+    let dump = env.dir.join("dump");
+    let dump = dump.to_string_lossy().into_owned();
+    env.ok(&["dump", &dump], "");
+    let text = std::fs::read_to_string(&dump).expect("dump");
+    assert!(text.contains(&format!("K/M@{REALM}")), "{text}");
+    env.ok(&["load", &dump], "");
+    env.ok(&["getprinc", "alice"], "");
+    let out = env.ok(&["list_mkeys"], "");
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(
+        out.lines()
+            .nth(1)
+            .is_some_and(|l| l.starts_with("KVNO: 2,") && l.ends_with(" *")),
+        "{out}"
+    );
+}
+
+fn rotate_master_keys(env: &Env) {
     env.ok(&["create", "-s"], "master-password\n");
     env.ok(&["addprinc", "alice"], "alice-password\n");
 

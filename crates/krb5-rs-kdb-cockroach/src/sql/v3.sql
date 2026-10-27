@@ -1,0 +1,1 @@
+ALTER TABLE principals ADD COLUMN IF NOT EXISTS tl_data BYTES;

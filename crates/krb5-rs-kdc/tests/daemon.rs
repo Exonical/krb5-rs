@@ -608,7 +608,13 @@ async fn the_daemon_serves_from_a_turso_replica_selected_by_db_library() {
             .expect("list")
             .iter()
             .map(|e| Change::UpsertPrincipal {
-                principal: StoredPrincipal::from_entry(e, None, None, &key).expect("stored"),
+                principal: StoredPrincipal::from_entry(
+                    e,
+                    None,
+                    None,
+                    &krb5_rs::kdc::kdb::mit::mkey::MasterKeys::single(key.clone()),
+                )
+                .expect("stored"),
                 version: ts,
             })
             .collect();

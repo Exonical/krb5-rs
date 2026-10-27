@@ -1,12 +1,13 @@
 //! [`CockroachStore`]: the authoritative store.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use krb5_rs::kdc::kdb::master::decrypt_key;
+use krb5_rs::kdc::kdb::mit::mkey::MasterKeys;
 use krb5_rs::kdc::replication::{
-    decode_principal_key, encode_principal_key, Change, ChangeBatch, LockoutRecord, PollResult,
-    ReplicaRegistry, ReplicationSource, ReplicationTs, Snapshot, StoredKey, StoredPrincipal,
+    decode_principal_key, decode_tl_data, encode_principal_key, encode_tl_data, Change,
+    ChangeBatch, LockoutRecord, PollResult, ReplicaRegistry, ReplicationSource, ReplicationTs,
+    Snapshot, StoredKey, StoredPrincipal,
 };
 use krb5_rs::kdc::{
     AdminStore, AuthoritativeState, HealthCheck, Policy, PrincipalAttributes, PrincipalEntry,
@@ -119,7 +120,8 @@ impl WaitOutcome {
 #[derive(Clone)]
 pub struct CockroachStore {
     db: Arc<Db>,
-    master: EncryptionKey,
+    supplied_master: EncryptionKey,
+    master: Arc<RwLock<MasterKeys>>,
     realm: String,
 }
 
@@ -136,7 +138,7 @@ const PRINCIPAL_COLUMNS: &str = "p.realm, p.name, p.name_type, p.attributes, p.m
     p.max_renewable_life, p.expiration, p.pw_expiration, p.last_pwd_change, p.mod_time, \
     p.policy, p.security_epoch, p.last_admin_unlock, p.delegate_to, p.delegate_from, \
     p.deleted, p.crdb_internal_mvcc_timestamp::STRING, \
-    k.kvno, k.enctype, k.mkvno, k.enc_key, k.salt, k.s2kparams";
+    k.kvno, k.enctype, k.mkvno, k.enc_key, k.salt, k.s2kparams, p.tl_data";
 
 fn principal_sql(filter: &str) -> String {
     principal_sql_at("", filter)
@@ -187,6 +189,7 @@ fn stored_principals(
                 allowed_to_delegate_to: row.get(13),
                 allowed_to_delegate_from: row.get(14),
                 keys: Vec::new(),
+                tl_data: decode_tl_data(row.get::<_, Option<Vec<u8>>>(23).as_deref())?,
             };
             let deleted: bool = row.get(15);
             let version = ts_of(&row.get::<_, String>(16))?;
@@ -292,6 +295,7 @@ async fn write_principal(tx: &Tx, sp: &StoredPrincipal, create: bool) -> Result<
     let attributes = i64::from(sp.attributes);
     let (max_life, max_renewable) = (opt_u(sp.max_life)?, opt_u(sp.max_renewable_life)?);
     let epoch = to_i64(sp.security_epoch)?;
+    let tl_data = encode_tl_data(&sp.tl_data)?;
     let params: Params<'_> = &[
         &sp.realm,
         &key,
@@ -308,14 +312,15 @@ async fn write_principal(tx: &Tx, sp: &StoredPrincipal, create: bool) -> Result<
         &sp.last_admin_unlock,
         &sp.allowed_to_delegate_to,
         &sp.allowed_to_delegate_from,
+        &tl_data,
     ];
     if create {
         tx.execute(
             "INSERT INTO principals (realm, name, name_type, attributes, max_life, \
              max_renewable_life, expiration, pw_expiration, last_pwd_change, mod_time, policy, \
-             security_epoch, last_admin_unlock, delegate_to, delegate_from, deleted) \
+             security_epoch, last_admin_unlock, delegate_to, delegate_from, tl_data, deleted) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-             false)",
+             $16, false)",
             params,
         )
         .await?;
@@ -325,7 +330,7 @@ async fn write_principal(tx: &Tx, sp: &StoredPrincipal, create: bool) -> Result<
              max_renewable_life = $6, expiration = $7, pw_expiration = $8, \
              last_pwd_change = $9, mod_time = $10, policy = $11, security_epoch = $12, \
              last_admin_unlock = $13, delegate_to = $14, delegate_from = $15, \
-             deleted = false, mod_by = current_user() \
+             tl_data = $16, deleted = false, mod_by = current_user() \
              WHERE realm = $1 AND name = $2",
             params,
         )
@@ -468,7 +473,8 @@ impl CockroachStore {
         }
         Ok(Self {
             db,
-            master: master_key,
+            master: Arc::new(RwLock::new(MasterKeys::single(master_key.clone()))),
+            supplied_master: master_key,
             realm: realm.to_string(),
         })
     }
@@ -528,8 +534,19 @@ impl CockroachStore {
         decode_principal_key("K/M", 1)
     }
 
-    /// Check that the master key opens the realm's `K/M` entry.
+    /// Check that the master key opens the realm's `K/M` entry and load
+    /// its master-key list (`krb5_db_fetch_mkey_list`): the supplied key
+    /// opens the newest master key, directly or through `KRB5_TL_MKEY_AUX`.
     pub async fn verify_master(&self) -> Result<(), StoreError> {
+        let sp = self.km_stored().await?;
+        let keys = sp.master_keys(&self.supplied_master).map_err(|_| {
+            StoreError::backend("the master key does not match the database (cannot decrypt K/M)")
+        })?;
+        *self.master.write().unwrap_or_else(|e| e.into_inner()) = keys;
+        Ok(())
+    }
+
+    async fn km_stored(&self) -> Result<StoredPrincipal, StoreError> {
         let rows = self
             .db
             .rows(
@@ -537,25 +554,98 @@ impl CockroachStore {
                 &[&self.realm, &"K/M"],
             )
             .await?;
-        let (sp, _, _) = stored_principals(&rows)?
+        stored_principals(&rows)?
+            .into_iter()
+            .next()
+            .map(|(sp, _, _)| sp)
+            .ok_or_else(|| StoreError::not_found(format!("realm {} has no K/M entry", self.realm)))
+    }
+
+    /// The loaded master-key list.
+    pub fn master_keys(&self) -> MasterKeys {
+        self.master
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Reload the master-key list when a stored key names a master key
+    /// version it lacks (`krb5_dbe_find_mkey`, `kdb5.c:1412-1450`).
+    async fn ensure_masters<'a>(
+        &self,
+        sps: impl IntoIterator<Item = &'a StoredPrincipal>,
+    ) -> Result<(), StoreError> {
+        let keys = self.master_keys();
+        let missing = sps.into_iter().flat_map(|sp| &sp.keys).any(|k| {
+            u16::try_from(k.mkvno)
+                .ok()
+                .and_then(|v| keys.get(v))
+                .is_none()
+        });
+        if missing {
+            self.verify_master().await?;
+        }
+        Ok(())
+    }
+
+    /// Every principal of the realm as a raw MIT entry (keys still
+    /// encrypted), for the `kdb5_util` master-key commands.
+    pub async fn raw_entries(&self) -> Result<Vec<krb5_rs::kdc::kdb::mit::MitEntry>, StoreError> {
+        let rows = self
+            .db
+            .rows(
+                &principal_sql("WHERE p.realm = $1 AND p.deleted = false"),
+                &[&self.realm],
+            )
+            .await?;
+        stored_principals(&rows)?
+            .into_iter()
+            .map(|(sp, _, _)| sp.to_raw())
+            .collect()
+    }
+
+    /// Read-modify-write one principal's raw MIT entry, as `kdb5_util`'s
+    /// `krb5_db_get_principal` + `krb5_db_put_principal`; `f` returns false
+    /// to leave it unchanged. The master-key list is reread first.
+    pub async fn update_raw<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> Result<bool, StoreError>
+    where
+        F: FnOnce(&mut krb5_rs::kdc::kdb::mit::MitEntry, &MasterKeys) -> Result<bool, StoreError>,
+    {
+        self.verify_master().await?;
+        let key = encode_principal_key(name)?;
+        let rows = self
+            .db
+            .rows(
+                &principal_sql("WHERE p.realm = $1 AND p.name = $2 AND p.deleted = false"),
+                &[&realm, &key],
+            )
+            .await?;
+        let (mut sp, _, _) = stored_principals(&rows)?
             .into_iter()
             .next()
             .ok_or_else(|| {
-                StoreError::not_found(format!("realm {} has no K/M entry", self.realm))
+                StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
             })?;
-        let key = sp
-            .keys
-            .first()
-            .ok_or_else(|| StoreError::corrupt("K/M has no key"))?;
-        let km = decrypt_key(&self.master, key.enctype, &key.enc_key).map_err(|_| {
-            StoreError::backend("the master key does not match the database (cannot decrypt K/M)")
-        })?;
-        if km.key_bytes() != self.master.key_bytes() {
-            return Err(StoreError::backend(
-                "the master key does not match the database (K/M differs)",
-            ));
+        let mut raw = sp.to_raw()?;
+        if !f(&mut raw, &self.master_keys())? {
+            return Ok(false);
         }
-        Ok(())
+        sp.apply_raw(&raw)?;
+        let sp = &sp;
+        self.db
+            .run_tx(|tx| {
+                Box::pin(async move {
+                    write_principal(&tx, sp, false).await?;
+                    Ok(())
+                })
+            })
+            .await?;
+        Ok(true)
     }
 
     /// Create the realm: `K/M` (holding the master key, encrypted under
@@ -576,7 +666,7 @@ impl CockroachStore {
             pw_expiration: None,
             keys: vec![krb5_rs::kdc::KeyEntry {
                 kvno: 1,
-                key: self.master.clone(),
+                key: self.supplied_master.clone(),
                 salt: None,
                 s2kparams: None,
             }],
@@ -597,11 +687,12 @@ impl CockroachStore {
             security_epoch: 1,
             ..tgs
         };
+        let masters = MasterKeys::single(self.supplied_master.clone());
         let stored = [
-            StoredPrincipal::from_entry(&km, Some(now), Some(now), &self.master)?,
-            StoredPrincipal::from_entry(&tgs, Some(now), Some(now), &self.master)?,
+            StoredPrincipal::from_entry(&km, Some(now), Some(now), &masters)?,
+            StoredPrincipal::from_entry(&tgs, Some(now), Some(now), &masters)?,
         ];
-        let master_enctype = i64::from(self.master.keytype);
+        let master_enctype = i64::from(self.supplied_master.keytype);
         let stored = &stored;
         let realm_ref = &realm;
         self.db
@@ -629,7 +720,7 @@ impl CockroachStore {
     fn record_of(&self, sp: StoredPrincipal) -> Result<PrincipalRecord, StoreError> {
         let (last_pwd_change, mod_time) = (sp.last_pwd_change, sp.mod_time);
         Ok(PrincipalRecord {
-            entry: sp.into_entry(&self.master)?,
+            entry: sp.into_entry(&self.master_keys())?,
             last_pwd_change: last_pwd_change.map(kt),
             mod_time: mod_time.map(kt),
             mod_by: None,
@@ -879,12 +970,13 @@ impl AdminStore for CockroachStore {
                 &[&realm, &key],
             )
             .await?;
-        stored_principals(&rows)?
+        let found = stored_principals(&rows)?
             .into_iter()
             .next()
             .filter(|(_, _, deleted)| !deleted)
-            .map(|(sp, _, _)| self.record_of(sp))
-            .transpose()
+            .map(|(sp, _, _)| sp);
+        self.ensure_masters(&found).await?;
+        found.map(|sp| self.record_of(sp)).transpose()
     }
 
     async fn create_principal(
@@ -896,7 +988,7 @@ impl AdminStore for CockroachStore {
             &entry,
             last_pwd_change.map(|t| t.timestamp()),
             Some(now_unix()),
-            &self.master,
+            &self.master_keys(),
         )?;
         let sp = &sp;
         self.db
@@ -932,7 +1024,8 @@ impl AdminStore for CockroachStore {
         let key = encode_principal_key(name)?;
         let f = Arc::new(Mutex::new(f));
         let (key_ref, realm_s) = (&key, realm.to_string());
-        let (master, what) = (&self.master, format!("{name}@{realm}"));
+        let masters = self.master_keys();
+        let (master, what) = (&masters, format!("{name}@{realm}"));
         let stored = self
             .db
             .run_tx(|tx| {
@@ -956,6 +1049,7 @@ impl AdminStore for CockroachStore {
                                 StoreError::not_found(format!("Principal {what} does not exist"))
                             })?;
                     let (last_pwd, mod_time) = (sp.last_pwd_change, sp.mod_time);
+                    let previous = sp.clone();
                     let mut rec = PrincipalRecord {
                         entry: sp.into_entry(master)?,
                         last_pwd_change: last_pwd.map(kt),
@@ -971,11 +1065,12 @@ impl AdminStore for CockroachStore {
                     let unlocked =
                         rec.entry.last_admin_unlock.map(|t| t.timestamp()) != unlock_before;
                     let now = now_unix();
-                    let sp = StoredPrincipal::from_entry(
+                    let sp = StoredPrincipal::from_update(
                         &rec.entry,
                         rec.last_pwd_change.map(|t| t.timestamp()),
                         Some(now),
                         master,
+                        &previous,
                     )?;
                     write_principal(&tx, &sp, false).await?;
                     if unlocked {
@@ -1047,10 +1142,12 @@ impl AdminStore for CockroachStore {
             .db
             .rows(&principal_sql("WHERE p.deleted = false"), &[])
             .await?;
-        stored_principals(&rows)?
+        let found: Vec<_> = stored_principals(&rows)?
             .into_iter()
-            .map(|(sp, _, _)| self.record_of(sp))
-            .collect()
+            .map(|(sp, _, _)| sp)
+            .collect();
+        self.ensure_masters(&found).await?;
+        found.into_iter().map(|sp| self.record_of(sp)).collect()
     }
 
     async fn get_policy(&self, name: &str) -> Result<Option<Policy>, StoreError> {
