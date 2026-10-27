@@ -781,10 +781,12 @@ impl<S: PrincipalStore> Kdc<S> {
             caddr: ticket_caddr,
             authorization_data: None,
         };
+        // handle_authdata gets the ticket-encrypting key: the second
+        // ticket's session key for user-to-user (do_tgs_req.c:1038-1043).
         self.issue_tgs_authdata(
             &mut part,
             &server,
-            &server_key.key,
+            u2u_tkt.as_ref().map_or(&server_key.key, |e| &e.part.key),
             &local_tgt,
             body.enc_authorization_data
                 .as_ref()
