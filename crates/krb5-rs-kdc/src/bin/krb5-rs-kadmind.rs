@@ -34,8 +34,12 @@ use krb5_rs::protocol::ap::{ApError, KeySource};
 use krb5_rs::rpc::gss::{GssServer, ServerStep};
 use krb5_rs::rpc::{read_record, write_record, AcceptStat, AuthStat, Call, CallError, Reply};
 use krb5_rs::types::{EncryptionKey, PrincipalName};
-use krb5_rs_kdb_lmdb::{CallerStore, LmdbStore};
+use krb5_rs_kdb_lmdb::LmdbStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[path = "kadmind/db.rs"]
+mod db;
+use db::{CallerDb, Db};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const KDC_DIR: &str = "/usr/local/var/krb5kdc";
@@ -324,7 +328,7 @@ fn acl_permits_iprop(acl: &[AclEntry], client: &PrincipalName, realm: &str) -> b
 
 /// Service keys read from the database (MIT's `KDB:` keytab).
 struct DbKeys {
-    store: Arc<LmdbStore>,
+    store: Db,
     realm: String,
 }
 
@@ -536,7 +540,7 @@ impl State {
 
 /// One RPC program served over RPCSEC_GSS on TCP.
 trait Program: Send + Sync + 'static {
-    fn keys(&self) -> (Arc<LmdbStore>, String);
+    fn keys(&self) -> (Db, String);
     fn dispatch(
         &self,
         gss: &mut GssServer,
@@ -549,8 +553,8 @@ trait Program: Send + Sync + 'static {
 }
 
 impl Program for State {
-    fn keys(&self) -> (Arc<LmdbStore>, String) {
-        (self.store.clone(), self.realm.clone())
+    fn keys(&self) -> (Db, String) {
+        (Db::Lmdb(self.store.clone()), self.realm.clone())
     }
 
     fn dispatch(
@@ -569,7 +573,7 @@ impl Program for State {
 /// The kadm5 admin RPC program (`kadm_rpc_svc.c`, `server_stubs.c`).
 struct Kadm5 {
     realm: String,
-    store: Arc<LmdbStore>,
+    store: Db,
     acl: Arc<Vec<AclEntry>>,
     keysalts: Vec<(i32, krb5_rs::crypto::SaltType)>,
     history_enctype: i32,
@@ -893,6 +897,11 @@ fn setkey_data(keys: kadm5::SetKeys) -> Result<Vec<kadm5::KeyData>, u32> {
 /// `KRB5_TL_ALIAS_TARGET` (`kdb.h`).
 const ALIAS_TARGET: u16 = 0x000c;
 
+/// `KRB5_KDB_ALIAS_UNSUPPORTED` (`kdb5_err.et`), which MIT's kadmind returns
+/// for renaming an alias (`krb5_db_rename_principal`, `kdb5.c:1077-1083`).
+const KDB_ALIAS_UNSUPPORTED: u32 = 2_514_958_848 + 46;
+const ALIAS_UNSUPPORTED: &str = "Operation unsupported on alias principal name";
+
 fn tl_bytes(e: &MitEntry, kind: u16) -> Option<&[u8]> {
     e.tl_data
         .iter()
@@ -934,7 +943,8 @@ fn unix_now() -> u32 {
 
 /// The kadm5 code for a store failure; `unknown` for a missing entry.
 fn store_code(e: &StoreError, unknown: u32) -> u32 {
-    const REJECTED: [(&str, u32); 4] = [
+    const REJECTED: [(&str, u32); 5] = [
+        (ALIAS_UNSUPPORTED, KDB_ALIAS_UNSUPPORTED),
         ("Password is too short", code::PASS_Q_TOOSHORT),
         (
             "Password does not contain enough character classes",
@@ -1046,7 +1056,7 @@ impl Kadm5 {
         &self,
         caller: &Caller<'_>,
         ks: &[kadm5::KeySalt],
-    ) -> Result<AdminOps<CallerStore>, u32> {
+    ) -> Result<AdminOps<CallerDb>, u32> {
         self.admin_with(caller, ks, Vec::new())
     }
 
@@ -1058,7 +1068,7 @@ impl Kadm5 {
         caller: &Caller<'_>,
         ks: &[kadm5::KeySalt],
         tl: Vec<TlData>,
-    ) -> Result<AdminOps<CallerStore>, u32> {
+    ) -> Result<AdminOps<CallerDb>, u32> {
         let keysalts = if ks.is_empty() {
             self.keysalts.clone()
         } else {
@@ -1077,7 +1087,7 @@ impl Kadm5 {
     }
 
     /// Administration as `caller`, who is recorded as the modifier.
-    fn admin(&self, caller: &Caller<'_>) -> AdminOps<CallerStore> {
+    fn admin(&self, caller: &Caller<'_>) -> AdminOps<CallerDb> {
         AdminOps::new(
             self.store
                 .as_caller(caller.client_name.clone().into_bytes()),
@@ -1461,9 +1471,7 @@ impl Kadm5 {
                 let modifier = caller.client_name.clone().into_bytes();
                 let res = self.store.rename_raw(&sname, &srealm, |mut e, _| {
                     if tl_bytes(&e, ALIAS_TARGET).is_some() {
-                        return Err(StoreError::rejected(
-                            "Operation unsupported on alias principal name",
-                        ));
+                        return Err(StoreError::rejected(ALIAS_UNSUPPORTED));
                     }
                     specialize_salt(&mut e);
                     e.principal = dname.clone();
@@ -2052,7 +2060,7 @@ impl Kadm5 {
 }
 
 impl Program for Kadm5 {
-    fn keys(&self) -> (Arc<LmdbStore>, String) {
+    fn keys(&self) -> (Db, String) {
         (self.store.clone(), self.realm.clone())
     }
 
@@ -2339,10 +2347,29 @@ async fn main() {
     });
     let master = read_stash(&cfg.key_stash_file, &realm)
         .unwrap_or_else(|e| die(format!("{e} while reading master key")));
-    let store = Arc::new(
-        LmdbStore::open(&cfg, &master)
-            .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
-    );
+    let db = match cfg.db_module.library.as_deref() {
+        #[cfg(feature = "cockroach")]
+        Some("krb5-rs-cockroach") => {
+            if cfg.iprop.enabled {
+                die("iprop_enable is not supported with db_library krb5-rs-cockroach");
+            }
+            let config = krb5_rs_kdb_cockroach::CockroachConfig::from_db_module(&cfg.db_module)
+                .unwrap_or_else(|e| die(format!("{e} while initializing database")));
+            Db::Cockroach(
+                krb5_rs_kdb_cockroach::CockroachStore::open(config, master, &realm)
+                    .await
+                    .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+            )
+        }
+        #[cfg(not(feature = "cockroach"))]
+        Some("krb5-rs-cockroach") => die(
+            "db_library krb5-rs-cockroach needs a krb5-rs-kadmind built with the `cockroach` feature",
+        ),
+        _ => Db::Lmdb(Arc::new(
+            LmdbStore::open(&cfg, &master)
+                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+        )),
+    };
 
     let mut iprop_listeners = Vec::new();
     if let Some(port) = iprop_port {
@@ -2393,6 +2420,9 @@ async fn main() {
     let local = tokio::task::LocalSet::new();
     let mut tasks = tokio::task::JoinSet::new();
     if iprop_port.is_some() {
+        let Some(store) = db.lmdb() else {
+            die("iprop needs db_library klmdb");
+        };
         let state = Arc::new(State {
             realm: realm.clone(),
             store: store.clone(),
@@ -2410,7 +2440,7 @@ async fn main() {
     }
     let kadm5 = Arc::new(Kadm5 {
         realm: realm.clone(),
-        store: store.clone(),
+        store: db.clone(),
         acl: acl.clone(),
         keysalts: cfg.supported_keysalts.clone(),
         history_enctype: cfg.master_key_type,
@@ -2422,10 +2452,10 @@ async fn main() {
     spawn_rpc(&mut tasks, &local, &kadm5, kadm5_listeners);
     let kpasswd = Rc::new(Kpasswd {
         keys: DbKeys {
-            store: store.clone(),
+            store: db.clone(),
             realm: realm.clone(),
         },
-        admin: AdminOps::new(store, cfg.supported_keysalts.clone())
+        admin: AdminOps::new(db, cfg.supported_keysalts.clone())
             .with_history_enctype(cfg.master_key_type),
         realm,
         acl,
@@ -2507,7 +2537,7 @@ async fn bind_udp(addrs: Vec<SocketAddr>, out: &mut Vec<UdpSocket>) {
 /// The kpasswd service (`schpw.c` `dispatch`).
 struct Kpasswd {
     realm: String,
-    admin: AdminOps<Arc<LmdbStore>>,
+    admin: AdminOps<Db>,
     keys: DbKeys,
     acl: Arc<Vec<AclEntry>>,
     replay: ReplayCache,

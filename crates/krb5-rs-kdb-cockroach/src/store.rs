@@ -123,6 +123,43 @@ pub struct CockroachStore {
     supplied_master: EncryptionKey,
     master: Arc<RwLock<MasterKeys>>,
     realm: String,
+    caller: Option<Arc<Caller>>,
+}
+
+/// The kadmin client a store writes for: MIT's `kadm5_create_principal` and
+/// `kadm5_modify_principal` record it in `MOD_PRINC` and add the client's
+/// tl-data (`svr_principal.c`).
+#[derive(Debug)]
+struct Caller {
+    modifier: Vec<u8>,
+    tl: Vec<krb5_rs::kdc::kdb::mit::TlData>,
+}
+
+/// `sp` with the caller's `MOD_PRINC` and tl-data, as the LMDB store's
+/// `create_principal_as`/`update_principal_as` write them.
+fn stamp(
+    sp: StoredPrincipal,
+    caller: Option<&Caller>,
+    keys: &MasterKeys,
+    now: i64,
+) -> Result<StoredPrincipal, StoreError> {
+    // Without a kadmin client the writer is krb5-rs-kdb, as on klmdb.
+    let admin;
+    let (modifier, tl): (&[u8], &[krb5_rs::kdc::kdb::mit::TlData]) = match caller {
+        Some(c) => (&c.modifier, &c.tl),
+        None => {
+            admin = krb5_rs::kdc::kdb::mit::unparse_name(
+                &PrincipalName::new_principal("krb5-rs-kdb"),
+                &sp.realm,
+            );
+            (&admin, &[])
+        }
+    };
+    let mut raw = sp.to_mit(keys)?;
+    let secs = u32::try_from(now).map_err(|_| StoreError::backend("time outside u32 range"))?;
+    krb5_rs::kdc::kdb::mit::set_mod_princ(&mut raw, secs, modifier)?;
+    krb5_rs::kdc::kdb::mit::update_tl_data(&mut raw, tl);
+    StoredPrincipal::from_mit(&raw, Some(&sp))
 }
 
 impl std::fmt::Debug for CockroachStore {
@@ -313,6 +350,22 @@ async fn masters_in_tx(
     })?)
 }
 
+/// Write a new principal; `Conflict` if a live one has its name.
+async fn insert_principal(tx: &Tx, sp: &StoredPrincipal) -> Result<(), TxError> {
+    let key = encode_principal_key(&sp.name)?;
+    let exists = tx
+        .query_opt(
+            "SELECT deleted FROM principals WHERE realm = $1 AND name = $2 FOR UPDATE",
+            &[&sp.realm, &key],
+        )
+        .await?;
+    match exists.map(|row| row.get::<_, bool>(0)) {
+        Some(false) => Err(conflict_exists(format!("{}@{}", key, sp.realm)).into()),
+        Some(true) => write_principal(tx, sp, false).await,
+        None => write_principal(tx, sp, true).await,
+    }
+}
+
 async fn write_principal(tx: &Tx, sp: &StoredPrincipal, create: bool) -> Result<(), TxError> {
     let key = encode_principal_key(&sp.name)?;
     let name_type = i64::from(sp.name.name_type);
@@ -500,6 +553,7 @@ impl CockroachStore {
             master: Arc::new(RwLock::new(MasterKeys::single(master_key.clone()))),
             supplied_master: master_key,
             realm: realm.to_string(),
+            caller: None,
         })
     }
 
@@ -670,13 +724,13 @@ impl CockroachStore {
                             .ok_or_else(|| {
                                 StoreError::not_found(format!("Principal {what} does not exist"))
                             })?;
-                        let mut raw = sp.to_raw()?;
+                        let mut raw = sp.to_mit(&keys)?;
                         let changed = {
                             let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
                             (f)(&mut raw, &keys)?
                         };
                         if changed {
-                            sp.apply_raw(&raw)?;
+                            sp = StoredPrincipal::from_mit(&raw, Some(&sp))?;
                             write_principal(&tx, &sp, false).await?;
                         }
                         Ok((changed, keys))
@@ -685,6 +739,138 @@ impl CockroachStore {
                 .await?;
         self.set_master_keys(keys);
         Ok(changed)
+    }
+
+    /// This store, writing principals for the kadmin client `modifier`
+    /// with its tl-data `tl` (the LMDB store's `CallerStore`).
+    pub fn as_caller(&self, modifier: Vec<u8>, tl: Vec<krb5_rs::kdc::kdb::mit::TlData>) -> Self {
+        Self {
+            caller: Some(Arc::new(Caller { modifier, tl })),
+            ..self.clone()
+        }
+    }
+
+    /// The stored entry for `name` as an MIT entry, keys still encrypted
+    /// (`krb5_db_get_principal`), for remote kadmin.
+    pub async fn raw_entry(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<krb5_rs::kdc::kdb::mit::MitEntry>, StoreError> {
+        let key = encode_principal_key(name)?;
+        let rows = self
+            .db
+            .rows(
+                &principal_sql("WHERE p.realm = $1 AND p.name = $2 AND p.deleted = false"),
+                &[&realm, &key],
+            )
+            .await?;
+        let Some((sp, _, _)) = stored_principals(&rows)?.into_iter().next() else {
+            return Ok(None);
+        };
+        sp.to_mit(&self.master_keys()).map(Some)
+    }
+
+    /// The policy `name` as an MIT policy record (`krb5_db_get_policy`).
+    pub async fn raw_policy(
+        &self,
+        name: &str,
+    ) -> Result<Option<krb5_rs::kdc::kdb::mit::MitPolicy>, StoreError> {
+        Ok(AdminStore::get_policy(self, name)
+            .await?
+            .as_ref()
+            .map(krb5_rs::kdc::kdb::mit::policy_to_entry))
+    }
+
+    /// Store a new MIT entry, such as an alias (`kdb_put_entry` of a fresh
+    /// `krb5_db_entry`); `Conflict` if the name is taken.
+    pub async fn create_raw(
+        &self,
+        raw: &krb5_rs::kdc::kdb::mit::MitEntry,
+    ) -> Result<(), StoreError> {
+        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let keys = self
+            .db
+            .run_tx(|tx| {
+                Box::pin(async move {
+                    let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                    let sp = StoredPrincipal::from_mit(raw, None)?;
+                    insert_principal(&tx, &sp).await?;
+                    Ok(keys)
+                })
+            })
+            .await?;
+        self.set_master_keys(keys);
+        Ok(())
+    }
+
+    /// `krb5_db_def_rename_principal` (`lib/kdb/kdb_default.c:516-551`):
+    /// `f` turns the source entry into the renamed one, which is stored and
+    /// the source deleted in one transaction.
+    pub async fn rename_raw<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> Result<(), StoreError>
+    where
+        F: FnMut(
+                krb5_rs::kdc::kdb::mit::MitEntry,
+                &MasterKeys,
+            ) -> Result<krb5_rs::kdc::kdb::mit::MitEntry, StoreError>
+            + Send,
+    {
+        let key = encode_principal_key(name)?;
+        let f = Arc::new(Mutex::new(f));
+        let (key_ref, realm_s, what) = (&key, realm.to_string(), format!("{name}@{realm}"));
+        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let keys = self
+            .db
+            .run_tx(|tx| {
+                let f = Arc::clone(&f);
+                let (realm_s, what) = (realm_s.clone(), what.clone());
+                Box::pin(async move {
+                    let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                    let rows = tx
+                        .query(
+                            &principal_sql(
+                                "WHERE p.realm = $1 AND p.name = $2 AND p.deleted = false",
+                            ),
+                            &[&realm_s, key_ref],
+                        )
+                        .await?;
+                    let (sp, _, _) =
+                        stored_principals(&rows)?
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                StoreError::not_found(format!("Principal {what} does not exist"))
+                            })?;
+                    let renamed = {
+                        let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
+                        (f)(sp.to_mit(&keys)?, &keys)?
+                    };
+                    let dest = StoredPrincipal::from_mit(&renamed, Some(&sp))?;
+                    insert_principal(&tx, &dest).await?;
+                    tx.execute(
+                        "UPDATE principals SET deleted = true, \
+                         mod_time = EXTRACT(EPOCH FROM now())::INT8, mod_by = current_user() \
+                         WHERE realm = $1 AND name = $2 AND deleted = false",
+                        &[&realm_s, key_ref],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM principal_keys WHERE realm = $1 AND name = $2",
+                        &[&realm_s, key_ref],
+                    )
+                    .await?;
+                    log(&tx, "principal", &realm_s, key_ref, "delete").await?;
+                    Ok(keys)
+                })
+            })
+            .await?;
+        self.set_master_keys(keys);
+        Ok(())
     }
 
     /// Create the realm: `K/M` (holding the master key, encrypted under
@@ -1024,13 +1210,20 @@ impl AdminStore for CockroachStore {
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
         let (entry, pwd) = (&entry, last_pwd_change.map(|t| t.timestamp()));
+        let caller = self.caller.as_deref();
         let (km_realm, supplied) = (&self.realm, &self.supplied_master);
         let keys = self
             .db
             .run_tx(|tx| {
                 Box::pin(async move {
                     let keys = masters_in_tx(&tx, km_realm, supplied).await?;
-                    let sp = &StoredPrincipal::from_entry(entry, pwd, Some(now_unix()), &keys)?;
+                    let now = now_unix();
+                    let sp = &stamp(
+                        StoredPrincipal::from_entry(entry, pwd, Some(now), &keys)?,
+                        caller,
+                        &keys,
+                        now,
+                    )?;
                     let key = encode_principal_key(&sp.name)?;
                     let exists = tx
                         .query_opt(
@@ -1067,6 +1260,7 @@ impl AdminStore for CockroachStore {
         let f = Arc::new(Mutex::new(f));
         let (key_ref, realm_s) = (&key, realm.to_string());
         let what = format!("{name}@{realm}");
+        let caller = self.caller.as_deref();
         let (km_realm, supplied) = (&self.realm, &self.supplied_master);
         let (stored, keys) = self
             .db
@@ -1116,6 +1310,7 @@ impl AdminStore for CockroachStore {
                         master,
                         &previous,
                     )?;
+                    let sp = stamp(sp, caller, master, now)?;
                     write_principal(&tx, &sp, false).await?;
                     if unlocked {
                         // An administrative unlock lifts the replicated lockout.

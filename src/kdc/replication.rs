@@ -17,9 +17,13 @@ use chrono::{DateTime, TimeZone, Utc};
 use super::db::{KeyEntry, PrincipalAttributes, PrincipalEntry};
 use super::kdb::master::{decrypt_key, encrypt_key};
 use super::kdb::mit::mkey::{entry_mkvno, MasterKeys};
+use super::kdb::mit::{
+    merge_record, record_without_keys, unparse_name, CONSTRAINED_DELEGATION_ACL, LAST_ADMIN_UNLOCK,
+    LAST_PWD_CHANGE,
+};
 use super::kdb::mit::{KeyData, MitEntry, TlData, ACTKVNO, MKEY_AUX, MKVNO, MOD_PRINC};
 use super::policy::{kerberos_time, ts};
-use super::store::{Policy, StoreError};
+use super::store::{Policy, PrincipalRecord, StoreError};
 use crate::types::{EncryptionKey, PrincipalName};
 
 /// A CockroachDB hybrid logical clock timestamp, the decimal
@@ -430,6 +434,79 @@ impl StoredPrincipal {
             }
         }
         Ok(())
+    }
+
+    /// The full MIT entry (keys still encrypted): [`Self::to_raw`] with the
+    /// stored fields kept as their MIT tl-data (`LAST_PWD_CHANGE`,
+    /// `KADM_DATA`, delegation ACLs and attributes), as remote kadmin reads it.
+    /// `keys` is only consulted for the active master key version; the
+    /// stored keys are not decrypted.
+    pub fn to_mit(&self, keys: &MasterKeys) -> Result<MitEntry, StoreError> {
+        let mut raw = self.to_raw()?;
+        let key_data = std::mem::take(&mut raw.key_data);
+        // Every MIT entry has MOD_PRINC (kadmin clients cannot unparse a
+        // missing modifier); rows written before CockroachDB kept it get the
+        // realm's `db_creation` principal, as `kdb5_util create` records.
+        if !raw.tl_data.iter().any(|t| t.kind == MOD_PRINC) {
+            let secs = u32::try_from(self.mod_time.unwrap_or(0)).unwrap_or(0);
+            let mut data = secs.to_le_bytes().to_vec();
+            data.extend(unparse_name(
+                &PrincipalName::new_principal("db_creation"),
+                &self.realm,
+            ));
+            data.push(0);
+            raw.tl_data.push(TlData {
+                kind: MOD_PRINC,
+                data,
+            });
+        }
+        let keyless = StoredPrincipal {
+            keys: Vec::new(),
+            ..self.clone()
+        };
+        let record = PrincipalRecord {
+            entry: keyless.into_entry(keys)?,
+            last_pwd_change: self.last_pwd_change.map(kerberos_time),
+            mod_time: self.mod_time.map(kerberos_time),
+            mod_by: None,
+            password_history: None,
+        };
+        merge_record(&mut raw, &record, keys, None)?;
+        raw.key_data = key_data;
+        Ok(raw)
+    }
+
+    /// The inverse of [`Self::to_mit`]: the stored fields from the entry's
+    /// tl-data, its encrypted keys unchanged, and every other tl-data kept.
+    /// `previous` supplies what MIT entries do not carry (security epoch).
+    pub fn from_mit(
+        raw: &MitEntry,
+        previous: Option<&StoredPrincipal>,
+    ) -> Result<Self, StoreError> {
+        let mut record = record_without_keys(raw)?;
+        if let Some(p) = previous {
+            record.entry.security_epoch = p.security_epoch;
+        }
+        let mut sp = Self::with_keys(
+            &record.entry,
+            record.last_pwd_change.as_ref().map(ts),
+            record.mod_time.as_ref().map(ts),
+            Vec::new(),
+        );
+        sp.apply_raw(raw)?;
+        sp.mod_time = record.mod_time.as_ref().map(ts);
+        sp.tl_data = raw
+            .tl_data
+            .iter()
+            .filter(|t| {
+                !matches!(
+                    t.kind,
+                    LAST_PWD_CHANGE | LAST_ADMIN_UNLOCK | CONSTRAINED_DELEGATION_ACL | MKVNO
+                )
+            })
+            .cloned()
+            .collect();
+        Ok(sp)
     }
 
     /// `krb5_db_fetch_mkey_list` for a stored `K/M`: `supplied` opens the

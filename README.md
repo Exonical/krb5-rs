@@ -307,9 +307,10 @@ CockroachDB mode for bounded staleness.
   CronJob in exactly one release, and give administration a separate
   `kdc_admin` URL and TLS Secret. When NetworkPolicy is enabled, set
   `metrics.networkPolicy.from` to admit Prometheus scrapes.
-  `kadmin.enabled=true` (file mode) runs `krb5-rs-kadmind` on the primary
-  for remote MIT `kadmin` and `kpasswd` through the `<release>-kadmin`
-  Service (TCP 749, UDP/TCP 464), with `kadmin.acl` as its `kadm5.acl`. See
+  `kadmin.enabled=true` runs `krb5-rs-kadmind` for remote MIT `kadmin` and
+  `kpasswd` through the `<release>-kadmin` Service (TCP 749, UDP/TCP 464),
+  with `kadmin.acl` as its `kadm5.acl`: on the primary in file mode, as a
+  Deployment connecting as `cockroach.admin` in CockroachDB mode. See
   [`deploy/helm/krb5-rs-kdc/examples/multi-region`](deploy/helm/krb5-rs-kdc/examples/multi-region)
   for three regional values files.
 - **Podman** (`deploy/podman`): a primary pod (KDC, kprop and a

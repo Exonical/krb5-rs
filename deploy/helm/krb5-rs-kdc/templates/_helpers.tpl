@@ -119,6 +119,30 @@ Set "kdc" to include the KDC replication and local-replica options.
  }
 {{- end }}
 
+{{/* kdc.conf for kadmind in CockroachDB mode: the kdc_admin connection,
+the stash the kadmin pod's init container writes, and MIT's kadmind
+relations. */}}
+{{- define "krb5-rs-kdc.cockroachKadmindConf" -}}
+{{- $v := .Values }}
+[realms]
+ {{ required "realm is required" $v.realm }} = {
+  database_module = crdb
+  key_stash_file = /stash/stash
+  acl_file = /etc/krb5-rs/kadm5.acl
+  kadmind_port = {{ $v.kadmin.containerPort }}
+  kpasswd_port = {{ $v.kadmin.kpasswdContainerPort }}
+  max_life = {{ $v.kdc.maxLife }}
+  max_renewable_life = {{ $v.kdc.maxRenewableLife }}
+  supported_enctypes = {{ $v.kdc.supportedEnctypes }}
+ }
+{{- with $v.kdc.extraKdcConf }}
+
+{{ . }}
+{{- end }}
+
+{{ include "krb5-rs-kdc.cockroachDbmodule" (dict "ctx" . "url" $v.cockroach.admin.url "certDir" "/crdb-admin" "kdc" false) }}
+{{- end }}
+
 {{- define "krb5-rs-kdc.cockroachClientConf" -}}
 {{- $v := .ctx.Values }}
 [realms]
