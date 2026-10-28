@@ -18,6 +18,17 @@ data:
   tls.crt: Q0hBTkdFLU1FLVJFUExJQ0EtQ0VSVElGSUNBVEU=
   tls.key: Q0hBTkdFLU1FLVJFUExJQ0EtUFJJVkFURS1LRVk=
 ---
+# kdc_admin's client certificate, for kadmind.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: krb5-rs-kdc-cockroach-admin-tls
+type: Opaque
+data:
+  ca.crt: Q0hBTkdFLU1FLUNBLUNFUlRJRklDQVRF
+  tls.crt: Q0hBTkdFLU1FLUFETUlOLUNFUlRJRklDQVRF
+  tls.key: Q0hBTkdFLU1FLUFETUlOLVBSSVZBVEUtS0VZ
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -62,6 +73,34 @@ data:
       replication_rebuild = auto
       replication_heartbeat_interval = 5s
      }
+  kadmind-kdc.conf: |
+    [realms]
+     CHANGE-ME-REALM = {
+      database_module = crdb
+      key_stash_file = /stash/stash
+      acl_file = /etc/krb5-rs/kadm5.acl
+      kadmind_port = 7490
+      kpasswd_port = 4640
+      max_life = 24h
+      max_renewable_life = 7d
+      supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal
+     }
+
+    [dbmodules]
+     crdb = {
+      db_library = krb5-rs-cockroach
+      cockroach_url = postgresql://kdc_admin@CHANGE-ME-CRDB-HOST:26257/CHANGE-ME-DATABASE?sslmode=verify-full
+      cockroach_ca = /crdb-admin/ca.crt
+      cockroach_cert = /crdb-admin/tls.crt
+      cockroach_key = /crdb-admin/tls.key
+      cockroach_pool_size = 8
+      cockroach_pool_idle_timeout = 0s
+      cockroach_connect_timeout = 5s
+      cockroach_statement_timeout = 10s
+      cockroach_transaction_timeout = 30s
+     }
+  kadm5.acl: |
+    */admin@CHANGE-ME-REALM *
   krb5.conf: |
     [libdefaults]
      default_realm = CHANGE-ME-REALM
@@ -92,7 +131,84 @@ spec:
     runAsUser: 65532
     runAsGroup: 65532
     fsGroup: 65532
+  initContainers:
+    # kadmind reads the master key from a stash, as MIT's does.
+    - name: stash
+      image: ghcr.io/exonical/krb5-rs-kdc:CHANGE-ME-tag-cockroach
+      imagePullPolicy: IfNotPresent
+      command: ["/usr/local/bin/krb5-rs-kdb"]
+      args:
+        - --config=/etc/krb5-rs/kadmind-kdc.conf
+        - --krb5-config=/etc/krb5-rs/krb5.conf
+        - --realm=CHANGE-ME-REALM
+        - --master-password-file=/secrets/master-password
+        - stash
+        - -f
+        - /stash/stash
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: config
+          mountPath: /etc/krb5-rs
+          readOnly: true
+        - name: master-password
+          mountPath: /secrets
+          readOnly: true
+        - name: cockroach-admin-tls
+          mountPath: /crdb-admin
+          readOnly: true
+        - name: stash
+          mountPath: /stash
   containers:
+    # MIT kadmind: remote kadmin (host TCP 749) and kpasswd (host UDP/TCP
+    # 464), writing to CockroachDB as kdc_admin. Remove it, its init
+    # container and the admin Secret to run without remote administration.
+    - name: kadmind
+      image: ghcr.io/exonical/krb5-rs-kdc:CHANGE-ME-tag-cockroach
+      imagePullPolicy: IfNotPresent
+      command: ["/usr/local/bin/krb5-rs-kadmind"]
+      args:
+        - -nofork
+        - -r
+        - CHANGE-ME-REALM
+      env:
+        - name: KRB5_KDC_PROFILE
+          value: /etc/krb5-rs/kadmind-kdc.conf
+        - name: KRB5_CONFIG
+          value: /etc/krb5-rs/krb5.conf
+      ports:
+        - name: kadmin
+          containerPort: 7490
+          hostPort: 749
+          protocol: TCP
+        - name: kpasswd-udp
+          containerPort: 4640
+          hostPort: 464
+          protocol: UDP
+        - name: kpasswd-tcp
+          containerPort: 4640
+          hostPort: 464
+          protocol: TCP
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: config
+          mountPath: /etc/krb5-rs
+          readOnly: true
+        - name: cockroach-admin-tls
+          mountPath: /crdb-admin
+          readOnly: true
+        - name: stash
+          mountPath: /stash
+          readOnly: true
     - name: kdc
       image: ghcr.io/exonical/krb5-rs-kdc:CHANGE-ME-tag-cockroach
       imagePullPolicy: IfNotPresent
@@ -172,5 +288,12 @@ spec:
         secretName: krb5-rs-kdc-cockroach-replica-tls
         defaultMode: 0444
     - name: tmp
+      emptyDir:
+        medium: Memory
+    - name: cockroach-admin-tls
+      secret:
+        secretName: krb5-rs-kdc-cockroach-admin-tls
+        defaultMode: 0444
+    - name: stash
       emptyDir:
         medium: Memory
