@@ -580,7 +580,7 @@ backend types appear in the signatures.
 |---|---|---|---|
 | `PrincipalStore` | KDC hot path | `lookup(name, realm) -> Option<PrincipalEntry>`, including encrypted-at-rest keys decrypted with the master key | Memory, File, klmdb, Turso |
 | `PolicyStore` | KDC | `policy(name) -> Option<Policy>` (lockout parameters and other KDC-relevant fields) | Memory, File, klmdb, Turso |
-| `AuthStateStore` | KDC | per-principal failure counters, last success/failure, local lock (§8) | Memory, klmdb, Turso |
+| `AuthStateStore` | KDC | per-principal failure counters, last success/failure, local lock (§8) | Memory, klmdb, Turso, Cockroach (realm-wide, through `SharedAuthState`) |
 | `AdminStore` | admin CLI | transactional create/modify/delete/rekey/policy operations | File, klmdb, Cockroach |
 | `ReplicationSource` | replication engine | `snapshot()` and `changes_since(ts, limit)` | Cockroach |
 | `ReplicaSink` | replication engine | `checkpoint()`, `apply(batch)`, `replace_all(snapshot)` (atomic with the checkpoint), replica status | Turso |
@@ -603,7 +603,7 @@ one intentional API break.
   - `security_epoch: u64`. It is bumped by every security-sensitive change: disable, password reset, key rotation or revocation, compromise flag, lockout and unlock, and restrictive policy assignment.
   - `last_admin_unlock`: the time of the last administrative unlock (MIT `KRB5_TL_LAST_ADMIN_UNLOCK`). Lockout counting restarts after it, so it is replicated administrative state.
 
-  `last_success`, `last_failed` and `fail_auth_count` are local auth state, not replicated (§8). They are **not** fields of `PrincipalEntry`: they live behind `AuthStateStore` as `AuthState`.
+  `last_success`, `last_failed` and `fail_auth_count` are auth state (§8): local to each KDC with klmdb, File and Memory, shared by every KDC in CockroachDB mode. They are **not** fields of `PrincipalEntry`: they live behind `AuthStateStore` as `AuthState`.
 - `PrincipalRecord` carries modification metadata (`mod_time`, plus raw MIT
   unparsed `mod_by` bytes when a backend represents them). The file backend
   has no `mod_by` field in its legacy DER image.
@@ -627,6 +627,7 @@ client-side retry protocol (`SAVEPOINT cockroach_restart`).
 | `principal_keys` | `(realm, name, kvno, enctype)` | Master-key-encrypted key, salt, s2kparams, mkvno. Old kvnos are kept for key history |
 | `policies` | `name` | Policy fields, `security_epoch`, `deleted` (tombstone) |
 | `lockouts` | `(realm, name)` | Replicated lockout records written by KDCs (§8), `deleted` (tombstone) |
+| `auth_state` | `(realm, name)` | Realm-wide lockout counters written by every KDC (§8): `fail_count`, `last_failed`, `last_success` (MIT `fail_auth_count`, `last_failed`, `last_success`). No row means all zero |
 | `replication_log` | `(bucket, id)` | One row per changed entity per transaction: `entity`, `realm`, `key`, `op`, `txn_id`. `bucket = floor(now() / bucket_width)`, where `now()` is the transaction's start timestamp, which does not pin the commit timestamp. Polling scans from `bucket(since − D − margin)` and pruning retains the same margin. Rows are ordered by their own MVCC commit timestamp (`crdb_internal_mvcc_timestamp`) |
 | `transaction_markers` | per-attempt `id` | Stable logical transaction id plus a fresh physical attempt id, for SQLSTATE 40003 resolution |
 | `replication_meta` | singleton | `pruned_before`, the low watermark of retained log rows; `bucket_width_seconds` (10 by default) and `transaction_timeout_ms` (D) shared by writers/readers |
@@ -656,7 +657,7 @@ PR 7.
 
 **Multi-region.** The database has `PRIMARY REGION` plus the regions
 California, Ohio and Washington DC. `principals`, `principal_keys`, `policies`,
-`lockouts`, `replication_log` and `replication_meta` are `LOCALITY GLOBAL`:
+`lockouts`, `auth_state`, `replication_log` and `replication_meta` are `LOCALITY GLOBAL`:
 reads are served consistently by the local region, and writes pay commit-wait.
 `realms` remains regional: it holds bootstrap metadata and making realm
 initialization a GLOBAL transaction adds commit-wait without improving the
@@ -671,7 +672,7 @@ Same entities, plus the replica's own tables:
 |---|---|
 | `principals`, `principal_keys`, `policies`, `lockouts` | Mirror of the authoritative rows plus `version_wall`/`version_logical` (the HLC split into two integers, compared in Rust) and `deleted` (a delete keeps a versioned tombstone row, so an older re-create cannot resurrect it). Rowid tables with unique indexes, because MVCC does not support indexes on `WITHOUT ROWID` tables |
 | `replication_state` | singleton: `checkpoint_ts`, `snapshot_ts`, `last_success_unix`, `status` |
-| `auth_state` | `(realm, name)`: `fail_count`, `last_failed`, `last_success`. Local only, never replicated. The lock end is derived from the policy's duration (MIT `locked_check_p`); a replicated `lockouts` row folds into the state as `fail_count = u32::MAX`, `last_failed = locked_at` while active |
+| `auth_state` | `(realm, name)`: `fail_count`, `last_failed`, `last_success`. Local only, never replicated: the fallback while the KDC cannot reach CockroachDB (§8). The lock end is derived from the policy's duration (MIT `locked_check_p`); a replicated `lockouts` row folds into the state as `fail_count = u32::MAX`, `last_failed = locked_at` while active |
 | `schema_migrations` | |
 
 The database is opened in MVCC journal mode (`PRAGMA journal_mode = 'mvcc'`).
@@ -830,7 +831,7 @@ KDC↔CockroachDB uses TLS with certificate authentication
 (`sslmode=verify-full`, client certificates). The KDC's database user has only
 these privileges:
 - SELECT on replicated tables;
-- INSERT/UPDATE on `lockouts` and `replica_status`;
+- INSERT/UPDATE on `lockouts`, `auth_state` and `replica_status`;
 - nothing else.
 Admin users are separate. Key material is master-key-encrypted in both
 databases, never logged, and never exported in metrics.
@@ -916,23 +917,37 @@ accordingly.
 | Regional aggregation | Exact per region | A regional write per failure |
 | Global counters | Exact everywhere | A cross-region write per failure; a hot row under attack |
 
-**Chosen: local counters plus replicated lockouts.** Counters follow MIT
+**Chosen: MIT's two models, by backend.** Counters follow MIT
 `lockout.c` semantics (`pw_max_fail`, `pw_failcnt_interval`,
-`pw_lockout_duration`). In CockroachDB replica mode they live in Turso
-`auth_state` and are never replicated. In standalone klmdb mode, the same
-three fields live in the per-environment `lockout` database; File/Memory
-backends keep them in memory. When a KDC trips the threshold, it locks locally at once and
-reports the lockout to CockroachDB `lockouts` asynchronously, with retries and
-a bounded queue. The report replicates to every KDC. The KDC does not touch
-`principals` (least privilege), so the report does not bump the principal's
-`security_epoch`; `AuthoritativeState` reports the lockout from the `lockouts`
-table (an active row means locked), and an administrative unlock deletes the
-row in the same transaction that bumps the epoch.
+`pw_lockout_duration`, `disable_lockout`, `disable_last_success`). MIT keeps
+them per KDC under kprop and iprop, and in the shared directory with the LDAP
+module (`doc/admin/lockout.rst` "KDC replication and account lockout").
 
-Global guarantee: an attacker gets at most about `pw_max_fail × N_kdc`
-attempts, plus whatever fits in the replication delay, before every KDC
-enforces the lockout. Admin unlock deletes the lockout record and bumps the
-epoch.
+- **klmdb, File, Memory (MIT kprop model).** In standalone klmdb mode the
+  three fields live in the per-environment `lockout` database; File/Memory
+  backends keep them in memory. They are never propagated.
+- **CockroachDB (MIT LDAP model).** The counters live in CockroachDB
+  `auth_state`, and every KDC updates them as `krb5_ldap_lockout_audit` does
+  (`plugins/kdb/ldap/libkdb_ldap/lockout.c`): a failed preauthentication or
+  bad integrity counts, a preauthenticated success clears the count and
+  records `last_success`, and a locked principal is not touched. Each update
+  is one read-modify-write transaction, so concurrent failures on different
+  KDCs are all counted and the threshold holds realm-wide. Cost: a GLOBAL
+  CockroachDB write per failed login, and per preauthenticated success unless
+  `disable_last_success` is set. `kadmin getprinc` and `kdb5_util dump` read
+  the counters back; `modprinc -unlock` and a password or key change zero
+  `fail_auth_count` (`svr_principal.c:677`), and rename and delete move and
+  remove the row. While CockroachDB is unreachable, a KDC counts in its Turso
+  `auth_state` instead (`SharedAuthState`), as under kprop.
+
+When a KDC trips the threshold it also reports the lockout to CockroachDB
+`lockouts` asynchronously, with retries and a bounded queue. The report
+replicates to every KDC, so a KDC that fell back to local counters still
+enforces it. The KDC does not touch `principals` (least privilege), so the
+report does not bump the principal's `security_epoch`; `AuthoritativeState`
+reports the lockout from the `lockouts` table (an active row means locked),
+and an administrative unlock deletes the row in the same transaction that
+bumps the epoch and zeroes the counter.
 
 ## 9. Operations
 

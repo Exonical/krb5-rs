@@ -10,8 +10,8 @@ use krb5_rs::kdc::replication::{
     Snapshot, StoredKey, StoredPrincipal,
 };
 use krb5_rs::kdc::{
-    AdminStore, AuthoritativeState, HealthCheck, Policy, PrincipalAttributes, PrincipalEntry,
-    PrincipalRecord, SecurityState, StoreError,
+    AdminStore, AuthState, AuthStateStore, AuthStateUpdate, AuthoritativeState, HealthCheck,
+    Policy, PrincipalAttributes, PrincipalEntry, PrincipalRecord, SecurityState, StoreError,
 };
 use krb5_rs::types::{EncryptionKey, KerberosTime, PrincipalName};
 use tokio_postgres::Row;
@@ -351,6 +351,52 @@ async fn masters_in_tx(
 }
 
 /// Write a new principal; `Conflict` if a live one has its name.
+fn auth_state_of(row: &Row) -> AuthState {
+    AuthState {
+        fail_count: u32::try_from(row.get::<_, i64>(0)).unwrap_or(u32::MAX),
+        last_failed: row.get(1),
+        last_success: row.get(2),
+    }
+}
+
+/// The principal's lockout counters (MIT `last_success`, `last_failed`,
+/// `fail_auth_count`), all zero without a row.
+async fn auth_state_in(tx: &Tx, realm: &str, key: &str) -> Result<AuthState, TxError> {
+    let rows = tx
+        .query(
+            "SELECT fail_count, last_failed, last_success FROM auth_state \
+             WHERE realm = $1 AND name = $2",
+            &[&realm, &key],
+        )
+        .await?;
+    Ok(rows.first().map(auth_state_of).unwrap_or_default())
+}
+
+async fn put_auth_state(tx: &Tx, realm: &str, key: &str, state: &AuthState) -> Result<(), TxError> {
+    tx.execute(
+        "UPSERT INTO auth_state (realm, name, fail_count, last_failed, last_success) \
+         VALUES ($1, $2, $3, $4, $5)",
+        &[
+            &realm,
+            &key,
+            &i64::from(state.fail_count),
+            &state.last_failed,
+            &state.last_success,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn delete_auth_state(tx: &Tx, realm: &str, key: &str) -> Result<(), TxError> {
+    tx.execute(
+        "DELETE FROM auth_state WHERE realm = $1 AND name = $2",
+        &[&realm, &key],
+    )
+    .await?;
+    Ok(())
+}
+
 async fn insert_principal(tx: &Tx, sp: &StoredPrincipal) -> Result<(), TxError> {
     let key = encode_principal_key(&sp.name)?;
     let exists = tx
@@ -680,9 +726,25 @@ impl CockroachStore {
                 &[&self.realm],
             )
             .await?;
+        let states: std::collections::HashMap<String, AuthState> = self
+            .db
+            .rows(
+                "SELECT fail_count, last_failed, last_success, name FROM auth_state \
+                 WHERE realm = $1",
+                &[&self.realm],
+            )
+            .await?
+            .iter()
+            .map(|r| (r.get::<_, String>(3), auth_state_of(r)))
+            .collect();
         stored_principals(&rows)?
             .into_iter()
-            .map(|(sp, _, _)| sp.to_raw())
+            .map(|(sp, _, _)| {
+                let mut raw = sp.to_raw()?;
+                let key = encode_principal_key(&sp.name)?;
+                raw.set_auth_state(states.get(&key).copied().unwrap_or_default())?;
+                Ok(raw)
+            })
             .collect()
     }
 
@@ -725,6 +787,8 @@ impl CockroachStore {
                                 StoreError::not_found(format!("Principal {what} does not exist"))
                             })?;
                         let mut raw = sp.to_mit(&keys)?;
+                        let before = auth_state_in(&tx, &realm_s, key_ref).await?;
+                        raw.set_auth_state(before)?;
                         let changed = {
                             let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
                             (f)(&mut raw, &keys)?
@@ -732,6 +796,10 @@ impl CockroachStore {
                         if changed {
                             sp = StoredPrincipal::from_mit(&raw, Some(&sp))?;
                             write_principal(&tx, &sp, false).await?;
+                            let after = raw.auth_state();
+                            if after != before {
+                                put_auth_state(&tx, &realm_s, key_ref, &after).await?;
+                            }
                         }
                         Ok((changed, keys))
                     })
@@ -768,7 +836,9 @@ impl CockroachStore {
         let Some((sp, _, _)) = stored_principals(&rows)?.into_iter().next() else {
             return Ok(None);
         };
-        sp.to_mit(&self.master_keys()).map(Some)
+        let mut raw = sp.to_mit(&self.master_keys())?;
+        raw.set_auth_state(AuthStateStore::auth_state(self, name, realm).await?)?;
+        Ok(Some(raw))
     }
 
     /// The policy `name` as an MIT policy record (`krb5_db_get_policy`).
@@ -796,6 +866,11 @@ impl CockroachStore {
                     let keys = masters_in_tx(&tx, km_realm, supplied).await?;
                     let sp = StoredPrincipal::from_mit(raw, None)?;
                     insert_principal(&tx, &sp).await?;
+                    let state = raw.auth_state();
+                    if state != AuthState::default() {
+                        let key = encode_principal_key(&sp.name)?;
+                        put_auth_state(&tx, &sp.realm, &key, &state).await?;
+                    }
                     Ok(keys)
                 })
             })
@@ -846,12 +921,20 @@ impl CockroachStore {
                             .ok_or_else(|| {
                                 StoreError::not_found(format!("Principal {what} does not exist"))
                             })?;
+                    let mut source = sp.to_mit(&keys)?;
+                    source.set_auth_state(auth_state_in(&tx, &realm_s, key_ref).await?)?;
                     let renamed = {
                         let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
-                        (f)(sp.to_mit(&keys)?, &keys)?
+                        (f)(source, &keys)?
                     };
                     let dest = StoredPrincipal::from_mit(&renamed, Some(&sp))?;
                     insert_principal(&tx, &dest).await?;
+                    delete_auth_state(&tx, &realm_s, key_ref).await?;
+                    let state = renamed.auth_state();
+                    if state != AuthState::default() {
+                        let dest_key = encode_principal_key(&dest.name)?;
+                        put_auth_state(&tx, &dest.realm, &dest_key, &state).await?;
+                    }
                     tx.execute(
                         "UPDATE principals SET deleted = true, \
                          mod_time = EXTRACT(EPOCH FROM now())::INT8, mod_by = current_user() \
@@ -1181,6 +1264,48 @@ fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('/', "\\/")
 }
 
+/// The realm-wide lockout counters every KDC updates, as MIT's LDAP module
+/// keeps them in the shared directory (`plugins/kdb/ldap/libkdb_ldap/lockout.c`,
+/// `doc/admin/lockout.rst` "KDC replication and account lockout").
+impl AuthStateStore for CockroachStore {
+    async fn auth_state(&self, name: &PrincipalName, realm: &str) -> Result<AuthState, StoreError> {
+        let key = encode_principal_key(name)?;
+        let rows = self
+            .db
+            .rows(
+                "SELECT fail_count, last_failed, last_success FROM auth_state \
+                 WHERE realm = $1 AND name = $2",
+                &[&realm, &key],
+            )
+            .await?;
+        Ok(rows.first().map(auth_state_of).unwrap_or_default())
+    }
+
+    /// `krb5_ldap_lockout_audit`'s update in one transaction, so concurrent
+    /// failures on different KDCs are all counted
+    /// (`KADM5_FAIL_AUTH_COUNT_INCREMENT`, ldap_principal2.c).
+    async fn apply(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        update: &AuthStateUpdate,
+    ) -> Result<AuthState, StoreError> {
+        let key = encode_principal_key(name)?;
+        let (key, realm, update) = (&key, realm.to_string(), *update);
+        self.db
+            .run_tx(|tx| {
+                let realm = realm.clone();
+                Box::pin(async move {
+                    let mut state = auth_state_in(&tx, &realm, key).await?;
+                    state.apply(&update);
+                    put_auth_state(&tx, &realm, key, &state).await?;
+                    Ok(state)
+                })
+            })
+            .await
+    }
+}
+
 impl AdminStore for CockroachStore {
     async fn get_record(
         &self,
@@ -1324,6 +1449,12 @@ impl AdminStore for CockroachStore {
                         if lifted > 0 {
                             log(&tx, "lockout", &realm_s, key_ref, "delete").await?;
                         }
+                        // MIT zeroes `fail_auth_count` (svr_principal.c:677).
+                        tx.execute(
+                            "UPDATE auth_state SET fail_count = 0 WHERE realm = $1 AND name = $2",
+                            &[&realm_s, key_ref],
+                        )
+                        .await?;
                     }
                     Ok((sp, keys))
                 })
@@ -1360,6 +1491,7 @@ impl AdminStore for CockroachStore {
                         &[&realm, key],
                     )
                     .await?;
+                    delete_auth_state(&tx, &realm, key).await?;
                     log(&tx, "principal", &realm, key, "delete").await?;
                     let lifted = tx
                         .execute(

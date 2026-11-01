@@ -128,9 +128,9 @@ async fn kdb_administers_a_cockroachdb_realm_and_reports_replication() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("migrate"));
 
     let out = ok(&root, &["database", "migrate", "--create-roles"], "");
-    assert!(out.contains("Schema version 0 -> 3"), "{out}");
+    assert!(out.contains("Schema version 0 -> 4"), "{out}");
     let out = ok(&root, &["database", "migrate", "--create-roles"], "");
-    assert!(out.contains("Schema version 3 -> 3"), "{out}");
+    assert!(out.contains("Schema version 4 -> 4"), "{out}");
 
     // Realm creation, with a stash, then the kadmin commands.
     ok(&admin, &["create", "-s"], "master-password\n");

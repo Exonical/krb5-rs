@@ -565,7 +565,11 @@ async fn cockroach_mode(
         DaemonStore::Turso(replica.clone(), Arc::clone(&metrics)),
     )
     .policies(replica.clone())
-    .auth_state(replica)
+    // Lockout counters are realm-wide in CockroachDB, as in MIT's LDAP module.
+    .auth_state(krb5_rs::kdc::SharedAuthState::new(
+        authority.clone(),
+        replica,
+    ))
     .consistency(gate)
     .lockout_reporter(reporter.clone())
     .build();
