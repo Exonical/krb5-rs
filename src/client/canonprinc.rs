@@ -86,42 +86,13 @@ fn qualify_shortname(c: &HostCanonicalization, host: &str) -> Option<String> {
 }
 
 /// The getaddrinfo(AI_CANONNAME) name, then the getnameinfo(NI_NAMEREQD)
-/// name with `rdns`, looked up with hickory-resolver (the crate has no
-/// unsafe code for libc's resolver).
-#[cfg(feature = "dns")]
+/// name with `rdns`, from the system resolver as in MIT (sn2princ.c:100-121).
 async fn dns_canonical_name(host: &str, rdns: bool) -> Option<String> {
-    use hickory_resolver::proto::rr::RData;
-    let resolver = hickory_resolver::Resolver::builder_tokio().ok()?.build();
-    let lookup = resolver.lookup_ip(host).await.ok()?;
-    let mut canon = lookup
-        .as_lookup()
-        .records()
-        .iter()
-        .rev()
-        .find_map(|r| match r.data() {
-            RData::CNAME(c) => Some(c.0.to_utf8()),
-            _ => None,
-        })
-        .unwrap_or_else(|| host.to_string());
-    if rdns {
-        if let Some(ip) = lookup.iter().next() {
-            if let Some(ptr) = resolver
-                .reverse_lookup(ip)
-                .await
-                .ok()
-                .and_then(|r| r.iter().next().map(|n| n.0.to_utf8()))
-            {
-                canon = ptr;
-            }
-        }
-    }
-    Some(canon)
-}
-
-/// Without a DNS resolver the lookup fails, as getaddrinfo would.
-#[cfg(not(feature = "dns"))]
-async fn dns_canonical_name(_host: &str, _rdns: bool) -> Option<String> {
-    None
+    let host = host.to_string();
+    tokio::task::spawn_blocking(move || crate::locate::dns_canonical(&host, rdns))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// `expand_hostname` (sn2princ.c).

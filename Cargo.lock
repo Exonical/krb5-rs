@@ -1700,6 +1700,7 @@ dependencies = [
  "bitflags",
  "chrono",
  "crypto-bigint",
+ "hickory-proto",
  "hickory-resolver",
  "hmac",
  "libc",
