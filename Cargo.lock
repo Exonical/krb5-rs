@@ -1694,7 +1694,7 @@ dependencies = [
 
 [[package]]
 name = "krb5-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes 0.9.3",
  "bitflags",
