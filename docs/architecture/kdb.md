@@ -934,11 +934,14 @@ module (`doc/admin/lockout.rst` "KDC replication and account lockout").
   is one read-modify-write transaction, so concurrent failures on different
   KDCs are all counted and the threshold holds realm-wide. Cost: a GLOBAL
   CockroachDB write per failed login, and per preauthenticated success unless
-  `disable_last_success` is set. `kadmin getprinc` and `kdb5_util dump` read
-  the counters back; `modprinc -unlock` and a password or key change zero
+  `disable_last_success` is set. `kadmin getprinc` reads the counters back; `modprinc -unlock` and a password or key change zero
   `fail_auth_count` (`svr_principal.c:677`), and rename and delete move and
-  remove the row. While CockroachDB is unreachable, a KDC counts in its Turso
-  `auth_state` instead (`SharedAuthState`), as under kprop.
+  remove the row; an audit racing a delete writes nothing. While CockroachDB
+  is unreachable, a KDC counts in its Turso `auth_state` instead
+  (`SharedAuthState`), as under kprop. Each shared read or update is copied
+  into Turso, so an outage starts from the last shared counters. Any other
+  CockroachDB error (permissions, schema) is returned rather than counted
+  locally: the lockout check then refuses the login.
 
 When a KDC trips the threshold it also reports the lockout to CockroachDB
 `lockouts` asynchronously, with retries and a bounded queue. The report

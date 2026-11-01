@@ -1296,9 +1296,22 @@ impl AuthStateStore for CockroachStore {
             .run_tx(|tx| {
                 let realm = realm.clone();
                 Box::pin(async move {
+                    // LDAP modifies the existing entry, which fails once it
+                    // is deleted: a login audit racing a delete must not
+                    // leave counters for a later principal of that name.
+                    let live = !tx
+                        .query(
+                            "SELECT 1::INT8 FROM principals \
+                             WHERE realm = $1 AND name = $2 AND deleted = false",
+                            &[&realm, key],
+                        )
+                        .await?
+                        .is_empty();
                     let mut state = auth_state_in(&tx, &realm, key).await?;
                     state.apply(&update);
-                    put_auth_state(&tx, &realm, key, &state).await?;
+                    if live {
+                        put_auth_state(&tx, &realm, key, &state).await?;
+                    }
                     Ok(state)
                 })
             })

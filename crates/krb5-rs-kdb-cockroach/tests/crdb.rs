@@ -2186,6 +2186,11 @@ async fn lockout_counters_are_realm_wide_and_in_raw_entries_like_mit_ldap() {
         .await
         .expect("delete");
     assert_eq!(count(&db, "auth_state").await, 0);
+    // An audit that loaded bob before the delete writes nothing.
+    AuthStateStore::apply(&kdcs[1], &name("bob"), REALM, &fail)
+        .await
+        .expect("late audit");
+    assert_eq!(count(&db, "auth_state").await, 0);
     db.drop_db().await;
 }
 
