@@ -7,13 +7,14 @@ use krb5_rs::kdc::StoreError;
 use crate::db::{is_retryable, Db, TxError};
 
 /// Newest schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Forward-only migrations: (version, name, SQL).
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("sql/v1.sql")),
     (2, "policy tl_data", include_str!("sql/v2.sql")),
     (3, "principal tl_data", include_str!("sql/v3.sql")),
+    (4, "auth_state", include_str!("sql/v4.sql")),
 ];
 
 const ROLES_SQL: &str = include_str!("sql/roles.sql");
@@ -342,6 +343,7 @@ pub(crate) fn multi_region_sql(db: &str, mr: &MultiRegion) -> String {
         "principal_keys",
         "policies",
         "lockouts",
+        "auth_state",
         "replication_log",
         "replication_meta",
     ] {

@@ -17,8 +17,8 @@ use krb5_rs::kdc::replication::{
     Change, ReplicationSource, ReplicationTs, Snapshot, StoredPrincipal,
 };
 use krb5_rs::kdc::{
-    AdminStore, AuthoritativeState, LockoutReport, LockoutReporter, PrincipalAttributes,
-    PrincipalStore, StoreErrorKind,
+    AdminStore, AuthState, AuthStateUpdate, AuthoritativeState, LockoutReport, LockoutReporter,
+    PrincipalAttributes, PrincipalStore, StoreErrorKind,
 };
 use krb5_rs::types::PrincipalName;
 use krb5_rs_kdb_cockroach::run_sql;
@@ -368,9 +368,9 @@ async fn concurrent_migrations_of_a_fresh_database_all_succeed() {
         }
         while let Some(run) = runs.join_next().await {
             let report = run.expect("migrate task").expect("concurrent migrate");
-            assert_eq!(report.to, 3);
+            assert_eq!(report.to, 4);
         }
-        assert_eq!(count(&db, "schema_migrations").await, 3);
+        assert_eq!(count(&db, "schema_migrations").await, 4);
         assert_eq!(count(&db, "replication_meta").await, 1);
         db.drop_db().await;
     }
@@ -418,13 +418,14 @@ async fn migrations_are_idempotent() {
     let second = CockroachStore::migrate(db.root(), &opts)
         .await
         .expect("second");
-    assert_eq!((first.from, first.to), (0, 3));
-    assert_eq!((second.from, second.to), (3, 3));
-    assert_eq!(count(&db, "schema_migrations").await, 3);
+    assert_eq!((first.from, first.to), (0, 4));
+    assert_eq!((second.from, second.to), (4, 4));
+    assert_eq!(count(&db, "schema_migrations").await, 4);
     let tables = db
         .text("SELECT string_agg(table_name, ',' ORDER BY table_name) FROM [SHOW TABLES]")
         .await;
     for t in [
+        "auth_state",
         "lockouts",
         "policies",
         "principal_keys",
@@ -501,6 +502,7 @@ async fn the_multi_region_step_sets_regions_global_tables_and_regional_by_row() 
         "principal_keys",
         "policies",
         "lockouts",
+        "auth_state",
         "replication_log",
         "replication_meta",
     ] {
@@ -2006,6 +2008,7 @@ async fn authoritative_state_reports_epoch_disabled_and_lockout() {
 #[tokio::test]
 #[ignore = "needs the CockroachDB test cluster"]
 async fn the_replica_role_writes_lockouts_and_heartbeats_but_nothing_else() {
+    use krb5_rs::kdc::AuthStateStore;
     let (db, store) = TestDb::with_realm("privileges").await;
     ops(&store)
         .add_principal(&name("carol"), REALM, Some("pw"), &plain())
@@ -2035,11 +2038,154 @@ async fn the_replica_role_writes_lockouts_and_heartbeats_but_nothing_else() {
         .await
         .expect("read")
         .is_some());
-    // And it can heartbeat and report lockouts.
+    // And it can heartbeat, report lockouts and count logins.
     replica
         .heartbeat("kdc-1", "ohio", ReplicationTs::new(5, 0))
         .await
         .expect("heartbeat");
+    let fail = AuthStateUpdate::Failure {
+        stamp: 1_700_000_000,
+        failcnt_interval: 0,
+        last_admin_unlock: None,
+    };
+    AuthStateStore::apply(&replica, &name("carol"), REALM, &fail)
+        .await
+        .expect("auth state");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn lockout_counters_are_realm_wide_and_in_raw_entries_like_mit_ldap() {
+    use krb5_rs::kdc::AuthStateStore;
+    let (db, store) = TestDb::with_realm("auth_state").await;
+    let o = ops(&store);
+    o.add_principal(&name("alice"), REALM, Some("pw"), &plain())
+        .await
+        .expect("alice");
+    let mut kdcs = Vec::new();
+    for _ in 0..4 {
+        kdcs.push(
+            CockroachStore::connect(db.replica(), master(), REALM)
+                .await
+                .expect("replica"),
+        );
+    }
+    let fail = AuthStateUpdate::Failure {
+        stamp: 1_700_000_100,
+        failcnt_interval: 0,
+        last_admin_unlock: None,
+    };
+    // Concurrent failures on different KDCs are all counted.
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let kdc = kdcs[i % kdcs.len()].clone();
+        tasks.push(tokio::spawn(async move {
+            AuthStateStore::apply(&kdc, &name("alice"), REALM, &fail).await
+        }));
+    }
+    for t in tasks {
+        t.await.expect("join").expect("apply");
+    }
+    let state = |s: &CockroachStore| {
+        let s = s.clone();
+        async move {
+            AuthStateStore::auth_state(&s, &name("alice"), REALM)
+                .await
+                .expect("state")
+        }
+    };
+    assert_eq!(
+        state(&kdcs[1]).await,
+        AuthState {
+            fail_count: 16,
+            last_failed: 1_700_000_100,
+            last_success: 0
+        }
+    );
+    // kadmin reads them back (getprinc, kdb5_util dump).
+    let raw = store
+        .raw_entry(&name("alice"), REALM)
+        .await
+        .expect("read")
+        .expect("alice");
+    assert_eq!(
+        (raw.fail_auth_count, raw.last_failed, raw.last_success),
+        (16, 1_700_000_100, 0)
+    );
+    let all = store.raw_entries().await.expect("raw entries");
+    let alice = all
+        .iter()
+        .find(|e| e.principal == name("alice"))
+        .expect("alice listed");
+    assert_eq!(alice.fail_auth_count, 16);
+
+    // A preauthenticated success clears the failures and records the time.
+    let success = AuthStateUpdate::Success {
+        stamp: 1_700_000_200,
+        clear_failures: true,
+        record_success: true,
+    };
+    AuthStateStore::apply(&kdcs[2], &name("alice"), REALM, &success)
+        .await
+        .expect("success");
+    assert_eq!(
+        state(&store).await,
+        AuthState {
+            fail_count: 0,
+            last_failed: 1_700_000_100,
+            last_success: 1_700_000_200
+        }
+    );
+
+    // modprinc -unlock zeroes fail_auth_count and keeps the times.
+    for kdc in &kdcs[..2] {
+        AuthStateStore::apply(kdc, &name("alice"), REALM, &fail)
+            .await
+            .expect("fail");
+    }
+    assert_eq!(state(&store).await.fail_count, 2);
+    let mut unlock = plain();
+    unlock.unlock = true;
+    o.modify_principal(&name("alice"), REALM, &unlock)
+        .await
+        .expect("unlock");
+    assert_eq!(
+        state(&kdcs[3]).await,
+        AuthState {
+            fail_count: 0,
+            last_failed: 1_700_000_100,
+            last_success: 1_700_000_200
+        }
+    );
+
+    // Raw writes (kdb5_util load, kadmind) store the fields.
+    store
+        .update_raw(&name("alice"), REALM, |e, _| {
+            e.fail_auth_count = 5;
+            Ok(true)
+        })
+        .await
+        .expect("update_raw");
+    assert_eq!(state(&kdcs[0]).await.fail_count, 5);
+
+    // Rename moves them; delete removes them.
+    store
+        .rename_raw(&name("alice"), REALM, |mut e, _| {
+            e.principal = name("bob");
+            Ok(e)
+        })
+        .await
+        .expect("rename");
+    assert_eq!(state(&store).await, AuthState::default());
+    let bob = AuthStateStore::auth_state(&kdcs[0], &name("bob"), REALM)
+        .await
+        .expect("bob");
+    assert_eq!(bob.fail_count, 5);
+    o.delete_principal(&name("bob"), REALM)
+        .await
+        .expect("delete");
+    assert_eq!(count(&db, "auth_state").await, 0);
     db.drop_db().await;
 }
 

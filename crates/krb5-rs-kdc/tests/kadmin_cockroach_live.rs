@@ -304,6 +304,17 @@ grep -q "Principal \"carol@$R\" created." <<<"$out" || fail "addprinc: $out"
 out=$(kadm "getprinc carol")
 grep -q "Last modified: .* (admin/admin@$R)" <<<"$out" || fail "modifier: $out"
 grep -q "REQUIRES_PRE_AUTH" <<<"$out" || fail "attributes: $out"
+grep -q "Failed password attempts: 0" <<<"$out" || fail "new fail count: $out"
+# The KDC's lockout counters are realm-wide in CockroachDB (MIT's LDAP model).
+retry login carol carol-pw || fail "carol kinit"
+if echo wrong-pw | kinit -c "$B/cc_bad" carol >/dev/null 2>&1; then fail "wrong password accepted"; fi
+out=$(kadm "getprinc carol")
+grep -q "Failed password attempts: 1" <<<"$out" || fail "fail count: $out"
+if grep -q "Last successful authentication: \[never\]" <<<"$out"; then fail "last success: $out"; fi
+if grep -q "Last failed authentication: \[never\]" <<<"$out"; then fail "last failed: $out"; fi
+out=$(kadm "modprinc -unlock carol")
+out=$(kadm "getprinc carol")
+grep -q "Failed password attempts: 0" <<<"$out" || fail "unlock: $out"
 out=$(kadm "setstr carol session_enctypes aes256-cts")
 out=$(kadm "getstrs carol")
 grep -q "session_enctypes: aes256-cts" <<<"$out" || fail "getstrs: $out"

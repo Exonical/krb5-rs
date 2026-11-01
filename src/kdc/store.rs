@@ -202,9 +202,9 @@ impl Policy {
     }
 }
 
-/// Per-principal authentication state that is local to one KDC and never
-/// replicated (MIT `krb5_db_entry` `last_success`, `last_failed`,
-/// `fail_auth_count`; docs/architecture §8). Times are Unix seconds, 0 = never.
+/// Per-principal authentication state (MIT `krb5_db_entry` `last_success`,
+/// `last_failed`, `fail_auth_count`; docs/architecture §8): local to one KDC,
+/// or shared by the realm's KDCs with [`SharedAuthState`]. Times are Unix seconds, 0 = never.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AuthState {
     /// Consecutive failures counted so far.
@@ -803,6 +803,66 @@ impl LockoutReporter for NoopLockoutReporter {
     fn report(&self, _report: LockoutReport) {}
 }
 
+/// [`AuthStateStore`] over lockout counters shared by every KDC of the
+/// realm, as MIT's LDAP module keeps them in the directory
+/// (`doc/admin/lockout.rst` "KDC replication and account lockout"). While
+/// the shared store fails, this KDC counts in its `local` store instead,
+/// as MIT's KDCs do under kprop.
+#[derive(Debug)]
+pub struct SharedAuthState<S, L> {
+    shared: S,
+    local: L,
+    fallbacks: std::sync::atomic::AtomicU64,
+}
+
+impl<S, L> SharedAuthState<S, L> {
+    /// Counters in `shared`, falling back to `local`.
+    pub fn new(shared: S, local: L) -> Self {
+        Self {
+            shared,
+            local,
+            fallbacks: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Reads and updates that fell back to the local store.
+    pub fn fallbacks(&self) -> u64 {
+        self.fallbacks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn fell_back(&self) {
+        self.fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl<S: AuthStateStore, L: AuthStateStore> AuthStateStore for SharedAuthState<S, L> {
+    async fn auth_state(&self, name: &PrincipalName, realm: &str) -> Result<AuthState, StoreError> {
+        match self.shared.auth_state(name, realm).await {
+            Ok(state) => Ok(state),
+            Err(_) => {
+                self.fell_back();
+                self.local.auth_state(name, realm).await
+            }
+        }
+    }
+
+    async fn apply(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        update: &AuthStateUpdate,
+    ) -> Result<AuthState, StoreError> {
+        match self.shared.apply(name, realm, update).await {
+            Ok(state) => Ok(state),
+            Err(_) => {
+                self.fell_back();
+                self.local.apply(name, realm, update).await
+            }
+        }
+    }
+}
+
 /// In-memory [`AuthStateStore`]: the state of the File and Memory backends. It
 /// is **not persisted**: failure counters and `last_success` reset when the
 /// process restarts (administrative unlocks and policies are persisted by the
@@ -912,6 +972,62 @@ impl<T: ConsistencyGate> DynGate for T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Down;
+
+    impl AuthStateStore for Down {
+        async fn auth_state(&self, _: &PrincipalName, _: &str) -> Result<AuthState, StoreError> {
+            Err(StoreError::backend("down"))
+        }
+
+        async fn apply(
+            &self,
+            _: &PrincipalName,
+            _: &str,
+            _: &AuthStateUpdate,
+        ) -> Result<AuthState, StoreError> {
+            Err(StoreError::backend("down"))
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_auth_state_counts_in_the_shared_store_and_falls_back_locally() {
+        let name = PrincipalName::new_principal("alice");
+        let fail = AuthStateUpdate::Failure {
+            stamp: 100,
+            failcnt_interval: 0,
+            last_admin_unlock: None,
+        };
+        let kdc1 = SharedAuthState::new(MemoryAuthState::new(), MemoryAuthState::new());
+        AuthStateStore::apply(&kdc1, &name, "R", &fail)
+            .await
+            .expect("apply");
+        assert_eq!(
+            AuthStateStore::auth_state(&kdc1.shared, &name, "R")
+                .await
+                .expect("shared")
+                .fail_count,
+            1
+        );
+        assert_eq!(
+            AuthStateStore::auth_state(&kdc1.local, &name, "R")
+                .await
+                .expect("local")
+                .fail_count,
+            0
+        );
+        assert_eq!(kdc1.fallbacks(), 0);
+
+        let down = SharedAuthState::new(Down, MemoryAuthState::new());
+        AuthStateStore::apply(&down, &name, "R", &fail)
+            .await
+            .expect("local apply");
+        let state = AuthStateStore::auth_state(&down, &name, "R")
+            .await
+            .expect("local read");
+        assert_eq!((state.fail_count, state.last_failed), (1, 100));
+        assert_eq!(down.fallbacks(), 2);
+    }
 
     #[test]
     fn store_errors_carry_a_kind_and_the_legacy_text() {

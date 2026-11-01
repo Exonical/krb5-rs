@@ -3,19 +3,20 @@
 -- whose CN is the user name.
 --
 -- kdc_replica (every KDC): read the replicated data; write only what a KDC
--- must: its heartbeat, and lockout reports with their replication-log row. It
--- never writes principals, keys or policies.
+-- must: its heartbeat, lockout reports with their replication-log row, and the
+-- realm-wide lockout counters (auth_state). It never writes principals, keys
+-- or policies.
 -- kdc_admin: everything (administration and migrations).
 CREATE USER IF NOT EXISTS kdc_replica;
 CREATE USER IF NOT EXISTS kdc_admin;
 GRANT CONNECT ON DATABASE {db} TO kdc_replica;
 GRANT ALL ON DATABASE {db} TO kdc_admin;
-GRANT SELECT ON TABLE realms, principals, principal_keys, policies, lockouts,
+GRANT SELECT ON TABLE realms, principals, principal_keys, policies, lockouts, auth_state,
     replication_log, replication_meta, replica_status, schema_migrations,
     transaction_markers TO kdc_replica;
-GRANT INSERT, UPDATE ON TABLE lockouts, replica_status TO kdc_replica;
+GRANT INSERT, UPDATE ON TABLE lockouts, auth_state, replica_status TO kdc_replica;
 GRANT INSERT ON TABLE replication_log TO kdc_replica;
 GRANT INSERT ON TABLE transaction_markers TO kdc_replica;
-GRANT ALL ON TABLE realms, principals, principal_keys, policies, lockouts,
+GRANT ALL ON TABLE realms, principals, principal_keys, policies, lockouts, auth_state,
     replication_log, replication_meta, replica_status, schema_migrations,
     transaction_markers TO kdc_admin;
