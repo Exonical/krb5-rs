@@ -238,6 +238,9 @@ pub enum AuthStateUpdate {
         /// The principal's last administrative unlock.
         last_admin_unlock: Option<i64>,
     },
+    /// Replace the whole state: a [`SharedAuthState`] copying the shared
+    /// counters into its local fallback store.
+    Set(AuthState),
 }
 
 impl AuthState {
@@ -275,6 +278,7 @@ impl AuthState {
                 self.last_failed = stamp;
                 self.fail_count = self.fail_count.saturating_add(1);
             }
+            AuthStateUpdate::Set(state) => *self = state,
         }
     }
 }
@@ -836,14 +840,42 @@ impl<S, L> SharedAuthState<S, L> {
     }
 }
 
+impl<S: AuthStateStore, L: AuthStateStore> SharedAuthState<S, L> {
+    /// Only an unreachable shared store falls back; any other error (a
+    /// permission or schema problem) is returned, so lockout fails closed
+    /// instead of silently becoming per KDC.
+    fn falls_back(e: &StoreError) -> bool {
+        e.kind() == StoreErrorKind::Unavailable
+    }
+
+    /// Copy the shared counters into the local store, so a later outage
+    /// starts from them and not from an earlier outage's counts. A local
+    /// count of `u32::MAX` is a replicated lockout, kept until it is lifted.
+    async fn mirror(&self, name: &PrincipalName, realm: &str, shared: AuthState) {
+        match self.local.auth_state(name, realm).await {
+            Ok(local) if local != shared && local.fail_count != u32::MAX => {
+                let _ = self
+                    .local
+                    .apply(name, realm, &AuthStateUpdate::Set(shared))
+                    .await;
+            }
+            _ => {}
+        }
+    }
+}
+
 impl<S: AuthStateStore, L: AuthStateStore> AuthStateStore for SharedAuthState<S, L> {
     async fn auth_state(&self, name: &PrincipalName, realm: &str) -> Result<AuthState, StoreError> {
         match self.shared.auth_state(name, realm).await {
-            Ok(state) => Ok(state),
-            Err(_) => {
+            Ok(state) => {
+                self.mirror(name, realm, state).await;
+                Ok(state)
+            }
+            Err(e) if Self::falls_back(&e) => {
                 self.fell_back();
                 self.local.auth_state(name, realm).await
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -854,11 +886,15 @@ impl<S: AuthStateStore, L: AuthStateStore> AuthStateStore for SharedAuthState<S,
         update: &AuthStateUpdate,
     ) -> Result<AuthState, StoreError> {
         match self.shared.apply(name, realm, update).await {
-            Ok(state) => Ok(state),
-            Err(_) => {
+            Ok(state) => {
+                self.mirror(name, realm, state).await;
+                Ok(state)
+            }
+            Err(e) if Self::falls_back(&e) => {
                 self.fell_back();
                 self.local.apply(name, realm, update).await
             }
+            Err(e) => Err(e),
         }
     }
 }
@@ -977,7 +1013,7 @@ mod tests {
 
     impl AuthStateStore for Down {
         async fn auth_state(&self, _: &PrincipalName, _: &str) -> Result<AuthState, StoreError> {
-            Err(StoreError::backend("down"))
+            Err(StoreError::unavailable("down"))
         }
 
         async fn apply(
@@ -986,8 +1022,98 @@ mod tests {
             _: &str,
             _: &AuthStateUpdate,
         ) -> Result<AuthState, StoreError> {
-            Err(StoreError::backend("down"))
+            Err(StoreError::unavailable("down"))
         }
+    }
+
+    /// A shared store that can go down and come back.
+    #[derive(Default)]
+    struct Flaky {
+        down: std::sync::atomic::AtomicBool,
+        denied: std::sync::atomic::AtomicBool,
+        inner: MemoryAuthState,
+    }
+
+    impl Flaky {
+        fn check(&self) -> Result<(), StoreError> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.down.load(Relaxed) {
+                return Err(StoreError::unavailable("down"));
+            }
+            if self.denied.load(Relaxed) {
+                return Err(StoreError::backend("permission denied (SQLSTATE 42501)"));
+            }
+            Ok(())
+        }
+    }
+
+    impl AuthStateStore for Flaky {
+        async fn auth_state(&self, n: &PrincipalName, r: &str) -> Result<AuthState, StoreError> {
+            self.check()?;
+            AuthStateStore::auth_state(&self.inner, n, r).await
+        }
+
+        async fn apply(
+            &self,
+            n: &PrincipalName,
+            r: &str,
+            u: &AuthStateUpdate,
+        ) -> Result<AuthState, StoreError> {
+            self.check()?;
+            AuthStateStore::apply(&self.inner, n, r, u).await
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_auth_state_refreshes_the_fallback_and_fails_closed_on_other_errors() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let name = PrincipalName::new_principal("alice");
+        let fail = AuthStateUpdate::Failure {
+            stamp: 100,
+            failcnt_interval: 0,
+            last_admin_unlock: None,
+        };
+        let kdc = SharedAuthState::new(Flaky::default(), MemoryAuthState::new());
+        // An outage counts three failures locally.
+        kdc.shared.down.store(true, Relaxed);
+        for _ in 0..3 {
+            AuthStateStore::apply(&kdc, &name, "R", &fail)
+                .await
+                .expect("local");
+        }
+        // Back up: a success elsewhere cleared the shared count, and the
+        // next read copies that into the fallback.
+        kdc.shared.down.store(false, Relaxed);
+        let shared = AuthStateStore::auth_state(&kdc, &name, "R")
+            .await
+            .expect("shared");
+        assert_eq!(shared, AuthState::default());
+        kdc.shared.down.store(true, Relaxed);
+        let again = AuthStateStore::auth_state(&kdc, &name, "R")
+            .await
+            .expect("local");
+        assert_eq!(again, AuthState::default());
+        // A shared update is mirrored too.
+        kdc.shared.down.store(false, Relaxed);
+        AuthStateStore::apply(&kdc, &name, "R", &fail)
+            .await
+            .expect("shared");
+        let local = AuthStateStore::auth_state(&kdc.local, &name, "R")
+            .await
+            .expect("local");
+        assert_eq!((local.fail_count, local.last_failed), (1, 100));
+        // A permission error is returned, not counted locally.
+        kdc.shared.denied.store(true, Relaxed);
+        let before = kdc.fallbacks();
+        assert!(AuthStateStore::apply(&kdc, &name, "R", &fail)
+            .await
+            .is_err());
+        assert!(AuthStateStore::auth_state(&kdc, &name, "R").await.is_err());
+        assert_eq!(kdc.fallbacks(), before);
+        let local = AuthStateStore::auth_state(&kdc.local, &name, "R")
+            .await
+            .expect("local");
+        assert_eq!(local.fail_count, 1);
     }
 
     #[tokio::test]
@@ -1014,7 +1140,8 @@ mod tests {
                 .await
                 .expect("local")
                 .fail_count,
-            0
+            1,
+            "the shared result is mirrored locally"
         );
         assert_eq!(kdc1.fallbacks(), 0);
 
