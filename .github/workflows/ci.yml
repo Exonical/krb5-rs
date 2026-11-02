@@ -86,10 +86,16 @@ jobs:
           touch "$W/kadm5.acl" && chmod 666 "$W/kdc.conf" "$W/kadm5.acl"
           printf 'm\nm\n' | docker run -i --rm -v "$W:/w" --entrypoint /usr/local/bin/krb5-rs-kdb \
             "$IMAGE" --config /w/kdc.conf -r SMOKE.TEST create -s >/dev/null
-          timeout 10 docker run --rm -v "$W:/w" -e KRB5_KDC_PROFILE=/w/kdc.conf -e KRB5_CONFIG=/dev/null \
-            --entrypoint /usr/local/bin/krb5-rs-kadmind "$IMAGE" -nofork -r SMOKE.TEST > "$W/out" 2>&1 || true
-          cat "$W/out"
-          grep -q 'krb5-rs-kadmind: starting' "$W/out"
+          # As PID 1, kadmind ignores SIGTERM: run it detached and remove it.
+          docker run -d --name kadmind-smoke -v "$W:/w" -e KRB5_KDC_PROFILE=/w/kdc.conf -e KRB5_CONFIG=/dev/null \
+            --entrypoint /usr/local/bin/krb5-rs-kadmind "$IMAGE" -nofork -r SMOKE.TEST
+          for _ in $(seq 30); do
+            docker logs kadmind-smoke 2>&1 | grep -q 'krb5-rs-kadmind: starting' && break
+            sleep 1
+          done
+          docker logs kadmind-smoke
+          docker logs kadmind-smoke 2>&1 | grep -q 'krb5-rs-kadmind: starting'
+          docker rm -f kadmind-smoke
 
   helm:
     runs-on: ubuntu-latest
