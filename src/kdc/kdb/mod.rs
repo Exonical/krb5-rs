@@ -11,6 +11,7 @@ mod file;
 mod format;
 pub mod getdate;
 pub mod kadm5;
+pub mod kadm5_auth;
 #[cfg(feature = "tokio")]
 pub mod kpasswd;
 #[cfg(feature = "tokio")]

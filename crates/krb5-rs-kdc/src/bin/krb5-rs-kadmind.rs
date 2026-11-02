@@ -14,6 +14,7 @@ use krb5_rs::gssapi::krb5::Krb5Acceptor;
 use krb5_rs::kdc::kdb::admin::{AdminOps, AttrChange, PolicyChange, PrincipalOptions};
 use krb5_rs::kdc::kdb::kadm5::mask as kmask;
 use krb5_rs::kdc::kdb::kadm5::{self, code, PrincipalEnt, ReadArgs, KADM_PROG, KADM_VERS};
+use krb5_rs::kdc::kdb::kadm5_auth::{Kadm5AuthModules, Princ, Request};
 use krb5_rs::kdc::kdb::kpasswd::{process_request, Service, KPASSWD_PORT};
 use krb5_rs::kdc::kdb::kprop::ReplayCache;
 use krb5_rs::kdc::kdb::master::encrypt_key;
@@ -37,6 +38,8 @@ use krb5_rs::types::{EncryptionKey, PrincipalName};
 use krb5_rs_kdb_lmdb::LmdbStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "kadmind/auth.rs"]
+mod auth;
 #[path = "kadmind/db.rs"]
 mod db;
 use db::{CallerDb, Db};
@@ -374,7 +377,7 @@ struct State {
     realm: String,
     store: Arc<LmdbStore>,
     ulog: Ulog,
-    acl: Arc<Vec<AclEntry>>,
+    auth: Arc<Kadm5AuthModules>,
     kdb_util: PathBuf,
     kprop: PathBuf,
     kprop_port: Option<String>,
@@ -389,7 +392,11 @@ impl State {
     /// `iprop_get_updates_1_svc` (`ipropd_svc.c`).
     fn get_updates(&self, client: &PrincipalName, crealm: &str, last: &Last) -> Vec<u8> {
         let mut w = XdrWriter::default();
-        if !acl_permits_iprop(&self.acl, client, crealm) {
+        if !self
+            .auth
+            .authorize(auth_princ(client, crealm), &Request::Iprop)
+            .is_some()
+        {
             eprintln!(
                 "krb5-rs-kadmind: Unauthorized request: iprop_get_updates_1, client={}",
                 unparse(client, crealm)
@@ -425,7 +432,11 @@ impl State {
     /// -c` and send it to the client's host with `kprop`, in the
     /// background.
     fn full_resync(&self, client: &PrincipalName, crealm: &str, vers: u32) -> Vec<u8> {
-        let status = if !acl_permits_iprop(&self.acl, client, crealm) {
+        let status = if !self
+            .auth
+            .authorize(auth_princ(client, crealm), &Request::Iprop)
+            .is_some()
+        {
             eprintln!(
                 "krb5-rs-kadmind: Unauthorized request: iprop_full_resync_1, client={}",
                 unparse(client, crealm)
@@ -574,7 +585,7 @@ impl Program for State {
 struct Kadm5 {
     realm: String,
     store: Db,
-    acl: Arc<Vec<AclEntry>>,
+    auth: Arc<Kadm5AuthModules>,
     keysalts: Vec<(i32, krb5_rs::crypto::SaltType)>,
     history_enctype: i32,
     /// Realm `max_life`, `max_renewable_life` and
@@ -585,6 +596,19 @@ struct Kadm5 {
     expiration: Option<krb5_rs::types::KerberosTime>,
     /// `default_principal_flags`.
     flags: u32,
+}
+
+/// `stub_cleanup`'s `auth_end`, run when a kadm5 call returns.
+struct AuthEnd<'a>(&'a Kadm5AuthModules);
+
+impl Drop for AuthEnd<'_> {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
+fn auth_princ<'a>(name: &'a PrincipalName, realm: &'a str) -> Princ<'a> {
+    Princ { name, realm }
 }
 
 /// The authenticated caller of one kadm5 call (`stub_setup`).
@@ -640,11 +664,19 @@ fn clamp_keepold(caller: &Caller<'_>, name: &PrincipalName, realm: &str, keepold
 }
 
 impl Kadm5 {
-    /// The `acl` kadm5_auth module; callers also apply the `self` module
-    /// (`auth_self.c`), which grants reading one's own principal, strings
-    /// and policy.
-    fn acl(&self, caller: &Caller<'_>, op: u32, target: Option<(&PrincipalName, &str)>) -> bool {
-        acl_check(&self.acl, op, (&caller.client, &caller.crealm), target).is_some()
+    /// `auth` (`kadmin/server/auth.c`): ask the kadm5_auth modules.
+    fn permits(&self, caller: &Caller<'_>, req: &Request<'_>) -> bool {
+        self.permits_restr(caller, req).is_some()
+    }
+
+    /// `auth_restrict`: also the restrictions the modules impose.
+    fn permits_restr(
+        &self,
+        caller: &Caller<'_>,
+        req: &Request<'_>,
+    ) -> Option<Vec<AclRestrictions>> {
+        self.auth
+            .authorize(auth_princ(&caller.client, &caller.crealm), req)
     }
 
     fn parse(&self, name: &str) -> Option<(PrincipalName, String)> {
@@ -698,7 +730,12 @@ impl Kadm5 {
         let op = "kadm5_get_principal";
         let own = caller.is(&name, &realm);
         if (caller.changepw && !own)
-            || !(own || self.acl(caller, ACL_INQUIRE, Some((&name, &realm))))
+            || !self.permits(
+                caller,
+                &Request::GetPrinc {
+                    target: auth_princ(&name, &realm),
+                },
+            )
         {
             caller.log_unauth(op, &target);
             return kadm5::gprinc_ret(api, code::AUTH_GET, None);
@@ -716,8 +753,14 @@ impl Kadm5 {
         };
         let target = unparse(&name, &realm);
         let op = "kadm5_get_strings";
-        let own = caller.is(&name, &realm);
-        if caller.changepw || !(own || self.acl(caller, ACL_INQUIRE, Some((&name, &realm)))) {
+        if caller.changepw
+            || !self.permits(
+                caller,
+                &Request::GetStrs {
+                    target: auth_princ(&name, &realm),
+                },
+            )
+        {
             caller.log_unauth(op, &target);
             return kadm5::gstrings_ret(api, code::AUTH_GET, &[]);
         }
@@ -741,7 +784,12 @@ impl Kadm5 {
             "kadm5_get_policies"
         };
         let target = exp.unwrap_or("*");
-        if caller.changepw || !self.acl(caller, ACL_LIST, None) {
+        let req = if princs {
+            Request::ListPrincs
+        } else {
+            Request::ListPols
+        };
+        if caller.changepw || !self.permits(caller, &req) {
             caller.log_unauth(op, target);
             return kadm5::names_ret(api, code::AUTH_LIST, &[]);
         }
@@ -788,7 +836,12 @@ impl Kadm5 {
             .and_then(|e| PrincipalEnt::from_entry(&e, kadm5::mask::PRINCIPAL_NORMAL_MASK, 1).ok())
             .and_then(|e| e.policy);
         let own = matches!((&cpolicy, name), (Some(c), Some(n)) if c.as_slice() == n.as_bytes());
-        if (caller.changepw && !own) || !(own || self.acl(caller, ACL_INQUIRE, None)) {
+        let cp = cpolicy.as_deref().map(String::from_utf8_lossy);
+        let req = Request::GetPol {
+            policy: name.unwrap_or(""),
+            client_policy: cp.as_deref(),
+        };
+        if (caller.changepw && !own) || !self.permits(caller, &req) {
             caller.log_unauth(op, target);
             return kadm5::gpol_ret(api, code::AUTH_GET, None);
         }
@@ -814,7 +867,7 @@ impl Kadm5 {
 fn principal_options(
     rec: &kadm5::PrincipalEnt,
     mask: i32,
-    restr: Option<&AclRestrictions>,
+    restr: &[AclRestrictions],
 ) -> (PrincipalOptions, u32) {
     use kmask as m;
     let mut ent = RestrictedEntry {
@@ -829,7 +882,7 @@ fn principal_options(
         max_renewable_life: rec.max_renewable_life as i32,
     };
     let mut mask = mask as u32;
-    if let Some(r) = restr {
+    for r in restr {
         r.impose(&mut ent, &mut mask, unix_now() as i32);
     }
     let on = |b: i32| mask & b as u32 != 0;
@@ -1275,9 +1328,13 @@ impl Kadm5 {
         let (name, realm, target) = self.name(princ)?;
         let locked = self.lockdown(&name, &realm)?;
         let own = caller.is(&name, &realm);
-        if (caller.changepw && !own)
-            || !(own || self.acl(caller, ACL_CHANGEPW, Some((&name, &realm))))
-        {
+        let target_p = auth_princ(&name, &realm);
+        let req = if op == "kadm5_randkey_principal" {
+            Request::Chrand { target: target_p }
+        } else {
+            Request::Cpw { target: target_p }
+        };
+        if (caller.changepw && !own) || !self.permits(caller, &req) {
             caller.log_unauth(op, &target);
             return Err(code::AUTH_CHANGEPW);
         }
@@ -1409,7 +1466,14 @@ impl Kadm5 {
             Ok(v) => v,
             Err(c) => return (c, Vec::new()),
         };
-        if caller.changepw || !self.acl(caller, ACL_EXTRACT, Some((&name, &realm))) {
+        if caller.changepw
+            || !self.permits(
+                caller,
+                &Request::Extract {
+                    target: auth_princ(&name, &realm),
+                },
+            )
+        {
             caller.log_unauth(op, &target);
             return (code::AUTH_EXTRACT, Vec::new());
         }
@@ -1454,8 +1518,13 @@ impl Kadm5 {
         };
         let prime = format!("{starget} to {dtarget}");
         if caller.changepw
-            || !self.acl(caller, ACL_DELETE, Some((&sname, &srealm)))
-            || !self.acl(caller, ACL_ADD, Some((&dname, &drealm)))
+            || !self.permits(
+                caller,
+                &Request::RenPrinc {
+                    src: auth_princ(&sname, &srealm),
+                    dest: auth_princ(&dname, &drealm),
+                },
+            )
         {
             caller.log_unauth(op, &prime);
             return code::AUTH_INSUFFICIENT;
@@ -1501,8 +1570,13 @@ impl Kadm5 {
         };
         let prime = format!("{atarget} to {ttarget}");
         if caller.changepw
-            || !self.acl(caller, ACL_ADD, Some((&aname, &arealm)))
-            || !self.acl(caller, ACL_MODIFY, Some((&tname, &trealm)))
+            || !self.permits(
+                caller,
+                &Request::AddAlias {
+                    alias: auth_princ(&aname, &arealm),
+                    target: auth_princ(&tname, &trealm),
+                },
+            )
         {
             caller.log_unauth(op, &prime);
             return code::AUTH_INSUFFICIENT;
@@ -1541,23 +1615,6 @@ impl Kadm5 {
         c
     }
 
-    /// `stub_auth_restr`: the ACL check that also yields restrictions.
-    fn acl_restr(
-        &self,
-        caller: &Caller<'_>,
-        op: u32,
-        name: &PrincipalName,
-        realm: &str,
-    ) -> Option<Option<AclRestrictions>> {
-        acl_check(
-            &self.acl,
-            op,
-            (&caller.client, &caller.crealm),
-            Some((name, realm)),
-        )
-        .map(|r| r.cloned())
-    }
-
     fn create_principal(
         &self,
         caller: &Caller<'_>,
@@ -1573,7 +1630,12 @@ impl Kadm5 {
             Ok(v) => v,
             Err(c) => return c,
         };
-        let restr = match self.acl_restr(caller, ACL_ADD, &name, &realm) {
+        let req = Request::AddPrinc {
+            target: auth_princ(&name, &realm),
+            mask: mask as u32,
+            ent: rec,
+        };
+        let restr = match self.permits_restr(caller, &req) {
             Some(r) if !caller.changepw => r,
             _ => {
                 caller.log_unauth(op, &target);
@@ -1604,7 +1666,7 @@ impl Kadm5 {
             } else {
                 Vec::new()
             };
-            let (mut opts, mask) = principal_options(rec, mask, restr.as_ref());
+            let (mut opts, mask) = principal_options(rec, mask, &restr);
             let mask = mask as i32;
             if mask & m::ATTRIBUTES == 0 {
                 opts.attributes = AttrChange {
@@ -1642,7 +1704,12 @@ impl Kadm5 {
             Ok(v) => v,
             Err(c) => return c,
         };
-        let restr = match self.acl_restr(caller, ACL_MODIFY, &name, &realm) {
+        let req = Request::ModPrinc {
+            target: auth_princ(&name, &realm),
+            mask: mask as u32,
+            ent: rec,
+        };
+        let restr = match self.permits_restr(caller, &req) {
             Some(r) if !caller.changepw => r,
             _ => {
                 caller.log_unauth(op, &target);
@@ -1687,7 +1754,7 @@ impl Kadm5 {
             } else {
                 Vec::new()
             };
-            let (opts, _) = principal_options(rec, mask, restr.as_ref());
+            let (opts, _) = principal_options(rec, mask, &restr);
             let admin = match self.admin_with(caller, &[], tl) {
                 Ok(a) => a,
                 Err(c) => return c,
@@ -1713,7 +1780,14 @@ impl Kadm5 {
             Ok(v) => v,
             Err(c) => return c,
         };
-        if caller.changepw || !self.acl(caller, ACL_SETKEY, Some((&name, &realm))) {
+        if caller.changepw
+            || !self.permits(
+                caller,
+                &Request::SetKey {
+                    target: auth_princ(&name, &realm),
+                },
+            )
+        {
             caller.log_unauth(op, &target);
             return code::AUTH_SETKEY;
         }
@@ -1845,7 +1919,14 @@ impl Kadm5 {
             Ok(v) => v,
             Err(c) => return c,
         };
-        if caller.changepw || !self.acl(caller, ACL_MODIFY, Some((&name, &realm))) {
+        if caller.changepw
+            || !self.permits(
+                caller,
+                &Request::PurgeKeys {
+                    target: auth_princ(&name, &realm),
+                },
+            )
+        {
             caller.log_unauth(op, &target);
             return code::AUTH_MODIFY;
         }
@@ -1874,7 +1955,14 @@ impl Kadm5 {
             Ok(v) => v,
             Err(c) => return c,
         };
-        if caller.changepw || !self.acl(caller, ACL_DELETE, Some((&name, &realm))) {
+        if caller.changepw
+            || !self.permits(
+                caller,
+                &Request::DelPrinc {
+                    target: auth_princ(&name, &realm),
+                },
+            )
+        {
             caller.log_unauth(op, &target);
             return code::AUTH_DELETE;
         }
@@ -1905,7 +1993,16 @@ impl Kadm5 {
             Ok(v) => v,
             Err(c) => return c,
         };
-        if caller.changepw || !self.acl(caller, ACL_MODIFY, Some((&name, &realm))) {
+        if caller.changepw
+            || !self.permits(
+                caller,
+                &Request::SetStr {
+                    target: auth_princ(&name, &realm),
+                    key: key.unwrap_or(""),
+                    value,
+                },
+            )
+        {
             caller.log_unauth(op, &target);
             return code::AUTH_MODIFY;
         }
@@ -1940,7 +2037,12 @@ impl Kadm5 {
     ) -> u32 {
         let op = "kadm5_create_policy";
         let target = rec.policy.as_deref().unwrap_or("(null)");
-        if caller.changepw || !self.acl(caller, ACL_ADD, None) {
+        let req = Request::AddPol {
+            policy: rec.policy.as_deref().unwrap_or(""),
+            mask: mask as u32,
+            ent: rec,
+        };
+        if caller.changepw || !self.permits(caller, &req) {
             caller.log_unauth(op, target);
             return code::AUTH_ADD;
         }
@@ -1990,7 +2092,12 @@ impl Kadm5 {
     ) -> u32 {
         let op = "kadm5_modify_policy";
         let target = rec.policy.as_deref().unwrap_or("(null)");
-        if caller.changepw || !self.acl(caller, ACL_MODIFY, None) {
+        let req = Request::ModPol {
+            policy: rec.policy.as_deref().unwrap_or(""),
+            mask: mask as u32,
+            ent: rec,
+        };
+        if caller.changepw || !self.permits(caller, &req) {
             caller.log_unauth(op, target);
             return code::AUTH_MODIFY;
         }
@@ -2042,7 +2149,14 @@ impl Kadm5 {
     fn delete_policy(&self, caller: &Caller<'_>, name: Option<&str>) -> u32 {
         let op = "kadm5_delete_policy";
         let target = name.unwrap_or("(null)");
-        if caller.changepw || !self.acl(caller, ACL_DELETE, None) {
+        if caller.changepw
+            || !self.permits(
+                caller,
+                &Request::DelPol {
+                    policy: name.unwrap_or(""),
+                },
+            )
+        {
             caller.log_unauth(op, target);
             return code::AUTH_DELETE;
         }
@@ -2114,6 +2228,7 @@ impl Program for Kadm5 {
         if proc_ == kadm5::proc_::NULL {
             return gss.reply(xid, seq, &[]).map_err(|e| e.to_string());
         }
+        let _end = AuthEnd(&self.auth);
         if let Some(parsed) = kadm5::WriteArgs::decode(proc_, args) {
             let Ok(parsed) = parsed else {
                 return err(gss, AcceptStat::GarbageArgs);
@@ -2336,8 +2451,8 @@ async fn main() {
     let r = |key: &str| kdc_conf.get_string(&["realms", &realm, key]);
     let acl_file =
         r("acl_file").map_or_else(|| Path::new(KDC_DIR).join("kadm5.acl"), PathBuf::from);
-    let acl = load_acl(&acl_file, &realm).unwrap_or_else(|e| die(e));
-    let acl = Arc::new(acl);
+    let profiles: Vec<&Profile> = krb5.iter().chain([&kdc_conf]).collect();
+    let acl = Arc::new(auth::load(&profiles, &realm, &acl_file).unwrap_or_else(|e| die(e)));
     let iprop_port = cfg.iprop.enabled.then(|| match r("iprop_port") {
         Some(p) => p
             .trim()
@@ -2428,7 +2543,7 @@ async fn main() {
             store: store.clone(),
             ulog: Ulog::map(&cfg.iprop.logfile, cfg.iprop.ulogsize)
                 .unwrap_or_else(|e| die(format!("{e} mapping update log"))),
-            acl: acl.clone(),
+            auth: acl.clone(),
             kdb_util: args.kdb_util.unwrap_or_else(|| sibling("krb5-rs-kdb")),
             kprop: args.kprop.unwrap_or_else(|| sibling("krb5-rs-kprop")),
             kprop_port: args.kprop_port,
@@ -2441,7 +2556,7 @@ async fn main() {
     let kadm5 = Arc::new(Kadm5 {
         realm: realm.clone(),
         store: db.clone(),
-        acl: acl.clone(),
+        auth: acl.clone(),
         keysalts: cfg.supported_keysalts.clone(),
         history_enctype: cfg.master_key_type,
         max_life: cfg.kdc.max_life,
@@ -2458,7 +2573,7 @@ async fn main() {
         admin: AdminOps::new(db, cfg.supported_keysalts.clone())
             .with_history_enctype(cfg.master_key_type),
         realm,
-        acl,
+        auth: acl,
         replay: ReplayCache::default(),
         clockskew: cfg.kdc.clockskew,
     });
@@ -2539,7 +2654,7 @@ struct Kpasswd {
     realm: String,
     admin: AdminOps<Db>,
     keys: DbKeys,
-    acl: Arc<Vec<AclEntry>>,
+    auth: Arc<Kadm5AuthModules>,
     replay: ReplayCache,
     clockskew: Duration,
 }
@@ -2547,7 +2662,14 @@ struct Kpasswd {
 impl Kpasswd {
     async fn handle(&self, local: &SocketAddr, remote: &SocketAddr, req: &[u8]) -> Option<Vec<u8>> {
         let authorize = |c: &PrincipalName, cr: &str, t: &PrincipalName, tr: &str| {
-            acl_check(&self.acl, ACL_CHANGEPW, (c, cr), Some((t, tr))).is_some()
+            self.auth
+                .authorize(
+                    auth_princ(c, cr),
+                    &Request::Cpw {
+                        target: auth_princ(t, tr),
+                    },
+                )
+                .is_some()
         };
         let svc = Service {
             realm: &self.realm,
