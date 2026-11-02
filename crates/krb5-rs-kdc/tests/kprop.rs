@@ -307,12 +307,22 @@ fn alive(pid: libc::pid_t) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// The daemon's pid, once it has written its pid file: like MIT, it does so
+/// after the parent has exited.
 fn read_pid(path: &Path) -> libc::pid_t {
-    std::fs::read_to_string(path)
-        .expect("pid file")
-        .trim()
-        .parse()
-        .expect("pid")
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.ends_with('\n') {
+            return text.trim().parse().expect("pid");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no pid file at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn wait_gone(pid: libc::pid_t) {
