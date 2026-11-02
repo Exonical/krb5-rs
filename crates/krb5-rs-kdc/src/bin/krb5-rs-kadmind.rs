@@ -2230,6 +2230,7 @@ impl Program for Kadm5 {
         if proc_ == kadm5::proc_::NULL {
             return gss.reply(xid, seq, &[]).map_err(|e| e.to_string());
         }
+        let _serial = auth::serialize_request();
         let _end = AuthEnd(&self.auth);
         if let Some(parsed) = kadm5::WriteArgs::decode(proc_, args) {
             let Ok(parsed) = parsed else {

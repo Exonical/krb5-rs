@@ -15,8 +15,9 @@
  * kadm5_auth_plugin.h: principals are passed as unparsed strings and no
  * krb5_context is given, because krb5-rs-kadmind has no MIT library context.
  *
- * kadmind serves requests on one thread, so a module is never called
- * concurrently.
+ * kadmind never runs two module callbacks at once, and handles each kadm5
+ * request, from its first authorize call to end, before the next, as MIT's
+ * single-threaded kadmind does.
  */
 #ifndef KRB5_RS_KADM5_AUTH_PLUGIN_H
 #define KRB5_RS_KADM5_AUTH_PLUGIN_H

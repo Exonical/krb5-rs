@@ -353,7 +353,7 @@ async fn schpw_util_wrapper<S: AdminStore>(
             return e;
         }
     }
-    if !is_self && !authorize(client, crealm, target, trealm) {
+    if !authorize(client, crealm, target, trealm) {
         return (KPASSWD_ACCESSDENIED, "Unauthorized request".into());
     }
     chpass_util(admin, target, trealm, password).await
@@ -628,8 +628,13 @@ mod tests {
             run(&bob, &alice, false, "alice-pw-2", allow).await.0,
             KPASSWD_SUCCESS
         );
+        // A self-change is authorized too (`OP_CPW`), like any other.
         assert_eq!(
-            run(&bob, &bob, true, "bob-pw-2", deny).await.0,
+            run(&bob, &bob, true, "bob-pw-2", deny).await,
+            (KPASSWD_ACCESSDENIED, "Unauthorized request".into())
+        );
+        assert_eq!(
+            run(&bob, &bob, true, "bob-pw-2", allow).await.0,
             KPASSWD_SUCCESS
         );
         let (code, text) = run(&bob, &alice, true, "alice-pw-2", allow).await;
@@ -639,7 +644,7 @@ mod tests {
             KPASSWD_HARDERROR
         );
         assert_eq!(
-            run(&ghost, &ghost, true, "ghost-pw", deny).await.0,
+            run(&ghost, &ghost, true, "ghost-pw", allow).await.0,
             KPASSWD_HARDERROR
         );
     }
