@@ -226,6 +226,59 @@ fn update_loads_log_each_principal_and_policies_reset_the_log() {
     kdb_ok(&primary, &["getprinc", "carol"], "");
 }
 
+/// A dump of `bob` and `alice` where `bob` carries 80000 bytes of TL data: too
+/// large for any ulog block (`kdb_log.c:203-222`).
+fn oversized_dump(dir: &TempDir, primary: &Path) -> String {
+    let path = dir.path("big.dump");
+    kdb_ok(
+        primary,
+        &["dump", &path.to_string_lossy(), "(alice|bob)@IPROP\\.TEST"],
+        "",
+    );
+    let text = std::fs::read_to_string(&path).expect("dump");
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            let mut f: Vec<String> = line.split('\t').map(str::to_string).collect();
+            if f.len() > 6 && f[0] == "princ" && f[6] == format!("bob@{REALM}") {
+                f[3] = (f[3].parse::<u32>().expect("tl count") + 2).to_string();
+                for kind in ["32766", "32767"] {
+                    let tl = [kind.to_string(), "40000".to_string(), "ab".repeat(40000)];
+                    f.splice(15..15, tl);
+                }
+            }
+            f.join("\t")
+        })
+        .collect();
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write dump");
+    path.to_string_lossy().to_string()
+}
+
+#[test]
+fn update_load_too_large_for_the_log_changes_nothing() {
+    let dir = TempDir::new("oversized");
+    let primary = write_conf(&dir, "primary", true);
+    kdb_ok(&primary, &["create", "-s"], MASTER);
+    kdb_ok(&primary, &["addprinc", "-randkey", "alice"], "");
+    kdb_ok(&primary, &["addprinc", "-randkey", "bob"], "");
+    let dump = oversized_dump(&dir, &primary);
+    kdb_ok(&primary, &["cpw", "-randkey", "alice"], "");
+    let header = kproplog(&dir, &primary, &["-h"]);
+    let before = kdb_ok(&primary, &["getprinc", "alice"], "");
+
+    let out = kdb(&primary, &["load", "-update", &dump], "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("ulog overflow"),
+        "{stderr}"
+    );
+    assert_eq!(kdb_ok(&primary, &["getprinc", "alice"], ""), before);
+    assert_eq!(
+        field(&kproplog(&dir, &primary, &["-h"]), "Last serial #"),
+        field(&header, "Last serial #")
+    );
+}
+
 #[test]
 fn iprop_options_need_iprop_enable() {
     let dir = TempDir::new("off");
