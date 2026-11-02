@@ -86,9 +86,22 @@ fn qualify_shortname(c: &HostCanonicalization, host: &str) -> Option<String> {
 }
 
 /// The getaddrinfo(AI_CANONNAME) name, then the getnameinfo(NI_NAMEREQD)
-/// name with `rdns`, looked up with hickory-resolver (the crate has no
-/// unsafe code for libc's resolver).
-#[cfg(feature = "dns")]
+/// name with `rdns`, from the system resolver as in MIT (sn2princ.c:100-121).
+/// The lookup blocks, so it runs on Tokio's blocking pool when a runtime is
+/// active and inline otherwise.
+#[cfg(any(unix, not(feature = "dns")))]
+async fn dns_canonical_name(host: &str, rdns: bool) -> Option<String> {
+    let host = host.to_string();
+    let lookup = move || crate::locate::dns_canonical(&host, rdns);
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => rt.spawn_blocking(lookup).await.ok().flatten(),
+        Err(_) => lookup(),
+    }
+}
+
+/// Without libc's resolver, the CNAME target, then the PTR name with
+/// `rdns`, looked up with hickory-resolver.
+#[cfg(all(not(unix), feature = "dns"))]
 async fn dns_canonical_name(host: &str, rdns: bool) -> Option<String> {
     use hickory_resolver::proto::rr::RData;
     let resolver = hickory_resolver::Resolver::builder_tokio().ok()?.build();
@@ -116,12 +129,6 @@ async fn dns_canonical_name(host: &str, rdns: bool) -> Option<String> {
         }
     }
     Some(canon)
-}
-
-/// Without a DNS resolver the lookup fails, as getaddrinfo would.
-#[cfg(not(feature = "dns"))]
-async fn dns_canonical_name(_host: &str, _rdns: bool) -> Option<String> {
-    None
 }
 
 /// `expand_hostname` (sn2princ.c).
@@ -211,6 +218,42 @@ mod tests {
         assert_eq!(split_trailer("host:8080"), ("host", ":8080"));
         assert_eq!(split_trailer("host:"), ("host:", ""));
         assert_eq!(split_trailer("a:b:c"), ("a:b:c", ""));
+    }
+
+    /// Polls a future to completion without any async runtime.
+    #[cfg(unix)]
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::sync::Arc::new(Unpark(std::thread::current())).into();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut f = std::pin::pin!(f);
+        loop {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+            std::thread::park();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dns_step_runs_without_a_tokio_runtime() {
+        let c = HostCanonicalization {
+            qualify_shortname: Some("example.test".into()),
+            rdns: false,
+            ..Default::default()
+        };
+        let p = PrincipalName::new_srv_hst("host", "localhost");
+        let mut it = CanonPrinc::new(&p);
+        let first = block_on(it.next(&c)).expect("non-DNS candidate");
+        assert_eq!(first.to_string(), "host/localhost.example.test");
+        let second = block_on(it.next(&c)).expect("DNS candidate");
+        assert_eq!(second.to_string(), "host/localhost");
     }
 
     #[tokio::test]
