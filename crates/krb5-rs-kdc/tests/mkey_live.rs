@@ -285,13 +285,15 @@ keys_of "$A" bob "$BASE/bob.kt" > /dev/null
 # --- krb5-rs rotates, MIT reads and finishes the rotation ---------------
 B="$BASE/rs"
 write_profile "$B" 18889
-printf '%s\n' "$MASTER" | rs_util "$B" create -s >/dev/null
+printf '%s\n%s\n' "$MASTER" "$MASTER" | rs_util "$B" create -s >/dev/null
 printf '%s\n' carol-password-1 | rs_util "$B" addprinc carol >/dev/null
 printf '%s\n' dave-password-1 | rs_util "$B" addprinc dave >/dev/null
 printf '%s\n%s\n' "$SECOND" "$SECOND" | rs_util "$B" add_mkey -s > "$BASE/b.rs.add"
 printf '%s\n' "Creating new master key for master key principal 'K/M@$REALM'" \
   'You will be prompted for a new database Master Password.' \
-  'It is important that you NOT FORGET this password.' > "$BASE/b.expected.add"
+  'It is important that you NOT FORGET this password.' \
+  'Enter KDC database master key: ' \
+  'Re-enter KDC database master key to verify: ' > "$BASE/b.expected.add"
 same "$BASE/b.expected.add" "$BASE/b.rs.add"
 mit_util "$B" list_mkeys > "$BASE/b.mit.list"
 rs_util "$B" list_mkeys > "$BASE/b.rs.list"

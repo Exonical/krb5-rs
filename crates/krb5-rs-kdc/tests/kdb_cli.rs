@@ -110,7 +110,7 @@ impl Drop for Env {
 #[test]
 fn create_addprinc_getprinc_ktadd_listprincs_end_to_end() {
     let env = Env::new("e2e");
-    env.ok(&["create", "-s"], "master-password\n");
+    env.ok(&["create", "-s"], "master-password\nmaster-password\n");
     assert!(env.dir.join("stash").exists(), "create -s writes the stash");
 
     let out = env.ok(&["addprinc", "alice"], "alice-password\n");
@@ -159,7 +159,7 @@ fn create_addprinc_getprinc_ktadd_listprincs_end_to_end() {
 #[test]
 fn modprinc_cpw_and_delprinc_change_the_database() {
     let env = Env::new("mod");
-    env.ok(&["create", "-s"], "master\n");
+    env.ok(&["create", "-s"], "master\nmaster\n");
     env.ok(&["addprinc", "bob"], "pw1\n");
     env.ok(&["modprinc", "+requires_preauth", "bob"], "");
     let out = env.ok(&["getprinc", "bob"], "");
@@ -176,11 +176,11 @@ fn errors_exit_non_zero() {
     let env = Env::new("err");
     // No database yet.
     assert_eq!(env.run(&["listprincs"], "").status.code(), Some(1));
-    env.ok(&["create", "-s"], "master\n");
+    env.ok(&["create", "-s"], "master\nmaster\n");
     assert_eq!(env.run(&["getprinc", "nobody"], "").status.code(), Some(1));
     // Usage errors.
-    assert_eq!(env.run(&["bogus"], "").status.code(), Some(2));
-    assert_eq!(env.run(&[], "").status.code(), Some(2));
+    assert_eq!(env.run(&["bogus"], "").status.code(), Some(1));
+    assert_eq!(env.run(&[], "").status.code(), Some(1));
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn global_master_password_file_opens_file_database_without_a_stash() {
     std::fs::write(&wrong, "not-the-master\n").expect("wrong master file");
 
     let master_path = master.to_string_lossy().into_owned();
-    env.ok(&["create"], "master-secret\n");
+    env.ok(&["create"], "master-secret\nmaster-secret\n");
     env.ok(
         &["--master-password-file", &master_path, "addprinc", "alice"],
         "alice-password\n",
@@ -293,7 +293,7 @@ fn init_falls_back_to_the_global_master_password_file() {
 #[test]
 fn policy_commands_and_principal_policy_options() {
     let env = Env::new("policy");
-    env.ok(&["create", "-s"], "master\n");
+    env.ok(&["create", "-s"], "master\nmaster\n");
 
     let out = env.ok(
         &[
@@ -402,7 +402,7 @@ fn file_store_master_key_rotation_add_use_update_and_purge() {
 }
 
 fn rotate_master_keys(env: &Env) {
-    env.ok(&["create", "-s"], "master-password\n");
+    env.ok(&["create", "-s"], "master-password\nmaster-password\n");
     env.ok(&["addprinc", "alice"], "alice-password\n");
 
     let out = env.ok(&["list_mkeys"], "");
@@ -501,7 +501,7 @@ fn rotate_master_keys(env: &Env) {
 #[test]
 fn stash_rewrites_from_the_existing_stash() {
     let env = Env::new("stash_reuse");
-    env.ok(&["create", "-s"], "master-password\n");
+    env.ok(&["create", "-s"], "master-password\nmaster-password\n");
     let out = env.ok(&["stash"], "");
     assert_eq!(out, "Using existing stashed keys to update stash file.\n");
     let other = env.dir.join("other.stash");
@@ -515,7 +515,7 @@ fn stash_rewrites_from_the_existing_stash() {
 #[test]
 fn purge_mkeys_refuses_to_drop_the_stashed_key() {
     let env = Env::new("mkey_stash");
-    env.ok(&["create", "-s"], "master-password\n");
+    env.ok(&["create", "-s"], "master-password\nmaster-password\n");
     env.ok(&["add_mkey"], "second-password\nsecond-password\n");
     env.ok(&["use_mkey", "2"], "");
     env.ok(&["update_princ_encryption", "-f"], "");

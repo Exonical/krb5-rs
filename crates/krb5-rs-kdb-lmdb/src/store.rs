@@ -266,7 +266,7 @@ impl LmdbStore {
         let expiration = config.default_principal_expiration;
         if main_path(database_name).exists() {
             return Err(StoreError::conflict(format!(
-                "database {}.mdb already exists",
+                "LMDB file {}.mdb already exists",
                 database_name.display()
             )));
         }
@@ -418,7 +418,7 @@ impl LmdbStore {
         }
         if main_path(database_name).exists() {
             return Err(StoreError::conflict(format!(
-                "database {}.mdb already exists",
+                "LMDB file {}.mdb already exists",
                 database_name.display()
             )));
         }
@@ -497,12 +497,36 @@ impl LmdbStore {
         }
         if !main.exists() {
             return Err(StoreError::not_found(format!(
-                "klmdb environment {} does not exist",
+                "LMDB file {} does not exist",
                 main.display()
             )));
         }
         let store = Self::open_environments(database_name, realm, master, options, false)?;
         store.verify_master()?;
+        store.with_ulog(config)
+    }
+
+    /// Open the database without a master key, as `kdb5_util` does after
+    /// "proceeding without master key" (`kdb5_util.c:440-458`). Only
+    /// operations that leave keys encrypted, such as [`Self::dump_entries`],
+    /// work; anything that needs the master-key list fails.
+    pub fn open_without_master(config: &krb5_rs::kdc::RealmConfig) -> Result<Self, StoreError> {
+        let options = LmdbOptions::from_db_module(
+            &config.db_module,
+            config.kdc.disable_lockout,
+            config.kdc.disable_last_success,
+        )?;
+        let database_name = &config.database_name;
+        let main = main_path(database_name);
+        if !main.exists() {
+            return Err(StoreError::not_found(format!(
+                "LMDB file {} does not exist",
+                main.display()
+            )));
+        }
+        let none = EncryptionKey::new(0, Vec::new());
+        let realm = config.kdc.realm.as_str();
+        let store = Self::open_environments(database_name, realm, &none, options, false)?;
         store.with_ulog(config)
     }
 
@@ -1404,7 +1428,7 @@ impl LmdbStore {
         let main = main_path(database_name);
         if update && !main.exists() {
             return Err(StoreError::not_found(format!(
-                "klmdb environment {} does not exist",
+                "LMDB file {} does not exist",
                 main.display()
             )));
         }
