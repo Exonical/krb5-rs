@@ -37,6 +37,9 @@ const IPROP_FULL_RESYNC_EXT: u32 = 3;
 /// `MAX_BACKOFF` (`include/iprop_hdr.h:30`).
 const MAX_BACKOFF: u32 = 300;
 
+#[path = "../daemonize.rs"]
+mod daemonize;
+
 struct Args {
     file: PathBuf,
     database: Option<String>,
@@ -741,9 +744,20 @@ fn iprop_params(args: &Args, profile: &Profile, realm: &str, hosts: &[String]) -
     })
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
     let args = parse_args();
+    let inetd = stdin_socket();
+    if inetd.is_none() && !args.debug && !args.nodaemon {
+        daemonize::fork().unwrap_or_else(|e| die(format!("{e} while spawning daemon process")));
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| die(format!("{e} while initializing")))
+        .block_on(run(args, inetd));
+}
+
+async fn run(args: Args, inetd: Option<std::net::TcpStream>) {
     let profile = krb5_profile();
     let realm = args
         .realm
@@ -768,7 +782,6 @@ async fn main() {
     let temp = with_suffix(&args.file, ".temp");
     let hosts = kprop::HostCanon::from_profile(&profile).candidates(&host);
     let iprop = iprop_params(&args, &profile, &realm, &hosts);
-    let inetd = stdin_socket();
     let state = Server {
         args,
         realm,
@@ -788,6 +801,8 @@ async fn main() {
         state.serve_one(sock).await;
         return;
     }
+    // MIT daemonizes before writing the pid file (kpropd.c:276-288).
+    daemonize::detach().unwrap_or_else(|e| die(format!("{e} while spawning daemon process")));
     if let Some(pid_file) = &state.args.pid_file {
         write_pid_file(pid_file);
     }

@@ -301,3 +301,130 @@ fn kprop_refuses_a_dump_newer_than_its_dump_ok_stamp() {
     assert!(!out.status.success());
     assert!(text(&out).contains("more recent than"), "{}", text(&out));
 }
+
+fn alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// The daemon's pid, once it has written its pid file: like MIT, it does so
+/// after the parent has exited.
+fn read_pid(path: &Path) -> libc::pid_t {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.ends_with('\n') {
+            return text.trim().parse().expect("pid");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no pid file at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_gone(pid: libc::pid_t) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "{pid} did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn kpropd_daemonizes_unless_dash_d() {
+    let r = realm("daemon");
+    let acl_file = r.dir.path("kpropd.acl");
+    std::fs::write(&acl_file, format!("host/{}@{REALM}\n", r.host)).expect("acl");
+    let pid_file = r.dir.path("kpropd.pid");
+    let port = free_port();
+    let out = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kpropd"))
+        .args(["-t", "-P", &port.to_string(), "-r", REALM])
+        .args(["-s", &r.keytab.to_string_lossy()])
+        .args(["-a", &acl_file.to_string_lossy()])
+        .args(["-f", &r.dir.path("from_master").to_string_lossy()])
+        .args(["-p", env!("CARGO_BIN_EXE_krb5-rs-kdb")])
+        .arg(format!("--pid-file={}", pid_file.display()))
+        .env("KRB5_KDC_PROFILE", &r.replica)
+        .env("KRB5_CONFIG", &r.krb5)
+        .output()
+        .expect("run krb5-rs-kpropd");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(out.stdout.is_empty(), "{}", text(&out));
+    let pid = read_pid(&pid_file);
+    assert!(alive(pid));
+    // `-t` serves one connection, so retry kprop itself until it listens.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let push = kprop(&r, port);
+        if push.status.success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", text(&push));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    wait_gone(pid);
+    kdb_ok(&r.replica, &["getprinc", "alice"], "");
+}
+
+fn kadmind_conf(dir: &TempDir, stash: &Path, port: u16) -> PathBuf {
+    let acl = dir.path("kadm5.acl");
+    std::fs::write(&acl, format!("*/admin@{REALM} *\n")).expect("acl");
+    let conf = dir.path("kadmind.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "[realms]\n {REALM} = {{\n  database_name = {}\n  key_stash_file = {}\n  \
+             acl_file = {}\n  kadmind_port = {port}\n  kpasswd_port = {}\n  \
+             supported_enctypes = aes256-cts-hmac-sha1-96:normal\n }}\n",
+            slash(&dir.path("primary").join("principal")),
+            slash(stash),
+            slash(&acl),
+            free_port(),
+        ),
+    )
+    .expect("kdc.conf");
+    conf
+}
+
+fn kadmind(conf: &Path, pid_file: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_krb5-rs-kadmind"))
+        .args(["-r", REALM, "-P", &pid_file.to_string_lossy()])
+        .env("KRB5_KDC_PROFILE", conf)
+        .env("KRB5_CONFIG", "/nonexistent")
+        .output()
+        .expect("run krb5-rs-kadmind")
+}
+
+#[test]
+fn kadmind_daemonizes_unless_nofork() {
+    let dir = TempDir::new("kadmind_daemon");
+    kdb_ok(&write_conf(&dir, "primary"), &["create", "-s"], MASTER);
+    let port = free_port();
+    let pid_file = dir.path("kadmind.pid");
+
+    let out = kadmind(&kadmind_conf(&dir, &dir.path("stash"), port), &pid_file);
+    assert!(out.status.success(), "{}", text(&out));
+    let pid = read_pid(&pid_file);
+    assert!(alive(pid));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "kadmind did not listen");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // SAFETY: plain kill of the daemon started above.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    wait_gone(pid);
+
+    // Startup errors still reach the terminal before it detaches.
+    let missing = dir.path("missing-stash");
+    let out = kadmind(&kadmind_conf(&dir, &missing, port), &pid_file);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("while reading master key"),
+        "{}",
+        text(&out)
+    );
+}

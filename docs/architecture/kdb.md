@@ -385,8 +385,12 @@ replica's serial (`ulog_get_entries`); `IPROP_FULL_RESYNC[_EXT]` runs
 `crates/krb5-rs-kdc/tests/kadmind_live.rs` has MIT 1.22.2 kpropd follow it
 through a full resync and then incremental updates.
 
-Deviations: the process stays in the foreground (`-nofork` is implied) and
-`-P` writes its pid; klmdb only.
+kadmind forks into the background once its sockets and ACL are set up, as
+MIT does (`ovsec_kadmd.c:507`), unless `-nofork` is given; `-P` then writes
+the daemon's pid. Startup errors before that point still reach the
+terminal, and the command exits with the daemon's status.
+
+Deviations: klmdb only.
 
 ACL restrictions (the fourth `kadm5.acl` field) are parsed and validated like
 `auth_acl.c` `parse_restrictions`: `[+-]flag`, `-clearpolicy`, `-policy POL`
@@ -644,8 +648,10 @@ an exclusive lock, renames it to `<file>`, runs
 acknowledges only after the load succeeds, so a failed load is a failed
 propagation on the primary.
 
-Deviations: iprop mode is described in §kpropd iprop mode; kpropd does not daemonize (`-D` or a
-supervisor), and `--pid-file` writes the pid of the foreground process.
+Standalone kpropd forks into the background unless `-d` or `-D` is given, as
+MIT does (`kpropd.c:276-288`), and `--pid-file` writes the daemon's pid.
+
+Deviations: iprop mode is described in §kpropd iprop mode.
 krb5-rs-only additions: `krb5-rs-kprop --interval SECS [--watch PATH] [--kdb PROGRAM]
 host...` dumps and pushes forever (the cron job, for shell-less images), and
 `krb5-rs-kdc --wait-for-database` lets a replica start before its first push.
