@@ -9,7 +9,8 @@
 
 use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use krb5_rs::kdc::kdb::kadm5_auth::{
     module_order, Kadm5Auth, Kadm5AuthModules, Princ, Request, SelfModule, Verdict,
@@ -187,9 +188,30 @@ struct DynModule {
     _lib: libloading::Library,
 }
 
-// SAFETY: kadmind serves every request on one thread (a tokio `LocalSet`),
-// so a module is never called concurrently, as in MIT's single-threaded
-// kadmind.
+/// Held across every call into a shared-library module, so no two module
+/// callbacks run at once, as in MIT's single-threaded kadmind.
+static CALLS: Mutex<()> = Mutex::new(());
+
+/// Held across a whole kadm5 request (authorization through `end`), and
+/// across kpasswd's and iprop's authorization, once a shared-library module
+/// is loaded, so requests reach modules one at a time as in MIT.
+static REQUESTS: Mutex<()> = Mutex::new(());
+
+static DYNAMIC: AtomicBool = AtomicBool::new(false);
+
+fn calls() -> MutexGuard<'static, ()> {
+    CALLS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Serialize one kadm5 request when shared-library modules are loaded.
+pub fn serialize_request() -> Option<MutexGuard<'static, ()>> {
+    DYNAMIC
+        .load(Ordering::Acquire)
+        .then(|| REQUESTS.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+// SAFETY: every use of `data` and the vtable functions holds `CALLS`, so a
+// module is never called concurrently from any thread.
 unsafe impl Send for DynModule {}
 // SAFETY: see `Send`.
 unsafe impl Sync for DynModule {}
@@ -197,6 +219,7 @@ unsafe impl Sync for DynModule {}
 impl Drop for DynModule {
     fn drop(&mut self) {
         if let Some(fini) = self.vt.fini {
+            let _calls = calls();
             // SAFETY: fini is the module's own function, given its own data.
             unsafe { fini(self.data) };
         }
@@ -220,6 +243,7 @@ impl Kadm5Auth for DynModule {
         let Some(f) = self.vt.authorize else {
             return (Verdict::NoHandle, None);
         };
+        let _calls = calls();
         let p = |p: Princ<'_>| Some(cstr(&unparse(p.name, p.realm)));
         let s = |s: &str| Some(cstr(s));
         let (mut p1, mut p2, mut s1, mut s2) = (None, None, None, None);
@@ -342,6 +366,7 @@ impl Kadm5Auth for DynModule {
 
     fn end(&self) {
         if let Some(end) = self.vt.end {
+            let _calls = calls();
             // SAFETY: end is the module's own function, given its own data.
             unsafe { end(self.data) };
         }
@@ -366,6 +391,7 @@ fn plugin_values(profiles: &[&Profile], key: &str) -> Vec<String> {
 
 /// Load a shared-library module, or `Ok(None)` when MIT would skip it.
 fn load_dyn(name: &str, path: &Path, acl_file: &Path) -> Result<Option<DynModule>, String> {
+    let _calls = calls();
     // SAFETY: loading a configured kadm5_auth module runs its initializers,
     // which the administrator chose to trust, as with MIT's plugins.
     let lib = match unsafe { libloading::Library::new(path) } {
@@ -453,6 +479,7 @@ pub fn load(
     for name in order {
         if let Some((_, path)) = paths.iter().find(|(n, _)| *n == name) {
             if let Some(m) = load_dyn(&name, path, acl_file)? {
+                DYNAMIC.store(true, Ordering::Release);
                 modules.push(Box::new(m));
             }
         } else if name == "acl" {

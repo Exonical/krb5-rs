@@ -393,6 +393,7 @@ fn unparse(name: &PrincipalName, realm: &str) -> String {
 impl State {
     /// `iprop_get_updates_1_svc` (`ipropd_svc.c`).
     fn get_updates(&self, client: &PrincipalName, crealm: &str, last: &Last) -> Vec<u8> {
+        let _serial = auth::serialize_request();
         let mut w = XdrWriter::default();
         if !self
             .auth
@@ -434,6 +435,7 @@ impl State {
     /// -c` and send it to the client's host with `kprop`, in the
     /// background.
     fn full_resync(&self, client: &PrincipalName, crealm: &str, vers: u32) -> Vec<u8> {
+        let _serial = auth::serialize_request();
         let status = if !self
             .auth
             .authorize(auth_princ(client, crealm), &Request::Iprop)
@@ -2230,6 +2232,7 @@ impl Program for Kadm5 {
         if proc_ == kadm5::proc_::NULL {
             return gss.reply(xid, seq, &[]).map_err(|e| e.to_string());
         }
+        let _serial = auth::serialize_request();
         let _end = AuthEnd(&self.auth);
         if let Some(parsed) = kadm5::WriteArgs::decode(proc_, args) {
             let Ok(parsed) = parsed else {
@@ -2668,6 +2671,8 @@ struct Kpasswd {
 impl Kpasswd {
     async fn handle(&self, local: &SocketAddr, remote: &SocketAddr, req: &[u8]) -> Option<Vec<u8>> {
         let authorize = |c: &PrincipalName, cr: &str, t: &PrincipalName, tr: &str| {
+            // Not across an await: the guard drops when the closure returns.
+            let _serial = auth::serialize_request();
             self.auth
                 .authorize(
                     auth_princ(c, cr),
