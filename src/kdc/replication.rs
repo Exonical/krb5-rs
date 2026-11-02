@@ -18,12 +18,13 @@ use super::db::{KeyEntry, PrincipalAttributes, PrincipalEntry};
 use super::kdb::master::{decrypt_key, encrypt_key};
 use super::kdb::mit::mkey::{entry_mkvno, MasterKeys};
 use super::kdb::mit::{
-    key_data_with_salt, key_salt_from_data, merge_record, record_without_keys, unparse_name,
-    CONSTRAINED_DELEGATION_ACL, LAST_ADMIN_UNLOCK, LAST_PWD_CHANGE,
+    history_from_tl_data, key_data_with_salt, key_salt_from_data, merge_record,
+    record_without_keys, set_history_tl_data, unparse_name, CONSTRAINED_DELEGATION_ACL,
+    LAST_ADMIN_UNLOCK, LAST_PWD_CHANGE,
 };
 use super::kdb::mit::{MitEntry, TlData, ACTKVNO, MKEY_AUX, MKVNO, MOD_PRINC};
 use super::policy::{kerberos_time, ts};
-use super::store::{Policy, PrincipalRecord, StoreError};
+use super::store::{PasswordHistory, Policy, PrincipalRecord, StoreError};
 use crate::types::{EncryptionKey, PrincipalName};
 
 /// A CockroachDB hybrid logical clock timestamp, the decimal
@@ -278,6 +279,17 @@ impl StoredPrincipal {
         };
         sp.tl_data = previous.tl_data.clone();
         Ok(sp)
+    }
+
+    /// The kadm5 password history kept in the stored `KRB5_TL_KADM_DATA`.
+    pub fn password_history(&self) -> Result<PasswordHistory, StoreError> {
+        history_from_tl_data(&self.tl_data)
+    }
+
+    /// Record a password change's history, as `kdb_put_entry` writes
+    /// `osa_princ_ent_rec` (`lib/kadm5/srv/svr_principal.c:1317-1333`).
+    pub fn set_password_history(&mut self, history: &PasswordHistory) -> Result<(), StoreError> {
+        set_history_tl_data(&mut self.tl_data, history)
     }
 
     fn with_keys(

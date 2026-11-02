@@ -18,7 +18,7 @@ use krb5_rs::kdc::replication::{
 };
 use krb5_rs::kdc::{
     AdminStore, AuthState, AuthStateUpdate, AuthoritativeState, LockoutReport, LockoutReporter,
-    PrincipalAttributes, PrincipalStore, StoreErrorKind,
+    Policy, PrincipalAttributes, PrincipalStore, StoreErrorKind,
 };
 use krb5_rs::types::PrincipalName;
 use krb5_rs_kdb_cockroach::run_sql;
@@ -642,6 +642,52 @@ async fn the_realm_needs_the_right_master_key_and_exists_once() {
         leaked[0], "0",
         "the master key must not be stored in the clear"
     );
+    db.drop_db().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the CockroachDB test cluster"]
+async fn password_changes_keep_mit_history() {
+    let (db, store) = TestDb::with_realm("pw_history").await;
+    let o = ops(&store);
+    o.add_policy(Policy {
+        name: "hist".into(),
+        pw_history_num: 3,
+        ..Policy::default()
+    })
+    .await
+    .expect("policy");
+    let opts = PrincipalOptions {
+        policy: Some(Some("hist".into())),
+        ..PrincipalOptions::default()
+    };
+    o.add_principal(&name("alice"), REALM, Some("pw-0"), &opts)
+        .await
+        .expect("alice");
+    for pw in ["pw-a", "pw-b", "pw-c"] {
+        o.change_password(&name("alice"), REALM, Some(pw), false)
+            .await
+            .expect(pw);
+    }
+    // pw_history_num 3 keeps the two previous passwords plus the current.
+    for pw in ["pw-a", "pw-b", "pw-c"] {
+        let error = o
+            .change_password(&name("alice"), REALM, Some(pw), false)
+            .await
+            .expect_err(pw);
+        assert_eq!(error.message(), "Cannot reuse password", "{pw}");
+    }
+    let history = store
+        .get_record(&name("alice"), REALM)
+        .await
+        .expect("read")
+        .expect("alice")
+        .password_history
+        .expect("history");
+    assert_eq!(history.old_keys.len(), 2);
+    o.change_password(&name("alice"), REALM, Some("pw-0"), false)
+        .await
+        .expect("dropped out of the history");
     db.drop_db().await;
 }
 
