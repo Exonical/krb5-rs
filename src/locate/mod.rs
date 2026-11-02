@@ -3,7 +3,7 @@
 
 #[cfg(any(
     feature = "kdc",
-    all(feature = "client", any(unix, not(feature = "dns")))
+    all(feature = "client", any(unix, windows, not(feature = "dns")))
 ))]
 mod canon;
 mod dns;
@@ -14,7 +14,7 @@ mod uri;
 
 #[cfg(any(
     feature = "kdc",
-    all(feature = "client", any(unix, not(feature = "dns")))
+    all(feature = "client", any(unix, windows, not(feature = "dns")))
 ))]
 pub(crate) use canon::dns_canonical;
 pub use dns::{make_lookup_name, sort_srv, DnsResolver, SrvRecord, UriRecord};

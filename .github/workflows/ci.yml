@@ -26,6 +26,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Hosts-file names for the Winsock canonicalization test
+        shell: pwsh
+        run: Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "127.0.0.1 hostsreal.example.test hostsalias"
+      - run: cargo test -p krb5-rs --no-default-features --features client,dns --lib -- --include-ignored locate::canon dns_step_runs_without_a_tokio_runtime
+
   clippy:
     runs-on: ubuntu-latest
     steps:

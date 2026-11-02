@@ -54,10 +54,13 @@ p521 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"], optional = true 
 crypto-bigint = { version = "0.7", optional = true }
 rasn-pkix = { version = "0.28", optional = true }
 
-# getaddrinfo(AI_CANONNAME) host-name canonicalization (kprop).
+# getaddrinfo(AI_CANONNAME) host-name canonicalization (client, kprop).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 hickory-proto = "0.25.2"
