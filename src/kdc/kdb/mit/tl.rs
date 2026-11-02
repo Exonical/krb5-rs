@@ -309,7 +309,7 @@ pub fn history_key_matches(
 /// MIT computes NORMAL, NOREALM, and ONLYREALM salts from the principal.
 /// SPECIAL stores its bytes. V4, AFS3, and other salt types remain available
 /// verbatim; MIT reports `KRB5_KDB_BAD_SALTTYPE` only when asked to compute one.
-fn key_salt_from_data(
+pub fn key_salt_from_data(
     data: &KeyData,
     principal: &PrincipalName,
     realm: &str,
@@ -365,22 +365,42 @@ fn key_data_from_entry(
     let etype = i16::try_from(key.key.keytype)
         .map_err(|_| StoreError::backend("MIT enctype exceeds i16"))?;
     let encrypted = encrypt_key(master, &key.key)?;
-    let (ver, salt_field) = match &key.salt {
+    Ok(key_data_with_salt(
+        kvno,
+        etype,
+        encrypted,
+        key.salt.as_deref(),
+        &entry.name,
+        &entry.realm,
+    ))
+}
+
+/// MIT key-data for an already encrypted key, with the salt field
+/// `krb5_dbe_encrypt_key_data` writes for `salt` (`None`: the normal salt).
+pub fn key_data_with_salt(
+    kvno: u16,
+    etype: i16,
+    encrypted: Vec<u8>,
+    salt: Option<&[u8]>,
+    principal: &PrincipalName,
+    realm: &str,
+) -> KeyData {
+    let (ver, salt_field) = match salt {
         None => (1, None),
-        Some(salt) if *salt == salt_bytes(&entry.name, &entry.realm, SaltType::Normal) => (1, None),
-        Some(salt) if *salt == salt_bytes(&entry.name, &entry.realm, SaltType::NoRealm) => {
-            (2, Some((2, salt.clone())))
+        Some(salt) if salt == salt_bytes(principal, realm, SaltType::Normal) => (1, None),
+        Some(salt) if salt == salt_bytes(principal, realm, SaltType::NoRealm) => {
+            (2, Some((2, salt.to_vec())))
         }
-        Some(salt) if *salt == salt_bytes(&entry.name, &entry.realm, SaltType::OnlyRealm) => {
-            (2, Some((3, salt.clone())))
+        Some(salt) if salt == salt_bytes(principal, realm, SaltType::OnlyRealm) => {
+            (2, Some((3, salt.to_vec())))
         }
-        Some(salt) => (2, Some((4, salt.clone()))),
+        Some(salt) => (2, Some((4, salt.to_vec()))),
     };
     let mut fields = vec![(etype, encrypted)];
     if let Some(salt) = salt_field {
         fields.push(salt);
     }
-    Ok(KeyData { ver, kvno, fields })
+    KeyData { ver, kvno, fields }
 }
 
 fn reusable_key_data(

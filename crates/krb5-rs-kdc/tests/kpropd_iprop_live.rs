@@ -45,6 +45,17 @@ fn binary_directory() -> PathBuf {
 #[test]
 #[ignore = "requires the MIT container of the Compose stack"]
 fn krb5_rs_kpropd_follows_mit_kadmind() {
+    follow_mit_kadmind("klmdb");
+}
+
+#[test]
+#[ignore = "requires the MIT container of the Compose stack"]
+fn krb5_rs_kpropd_replays_into_the_file_store() {
+    follow_mit_kadmind("krb5-rs-file");
+}
+
+/// The replica's database is `db_library = library`.
+fn follow_mit_kadmind(library: &str) {
     let c = container();
     let mkdir = container_run(
         &["exec", &c, "mkdir", "-p", "/tmp/kpropd-iprop-live/bin"],
@@ -63,7 +74,8 @@ fn krb5_rs_kpropd_follows_mit_kadmind() {
         let out = container_run(&["cp", &path, &dest], "");
         assert!(out.status.success(), "cp {name}: {out:?}");
     }
-    let out = container_run(&["exec", "-i", &c, "bash", "-s"], SCRIPT);
+    let script = format!("RLIB={library}\n{SCRIPT}");
+    let out = container_run(&["exec", "-i", &c, "bash", "-s"], &script);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("KPROPD_IPROP_LIVE_OK"),
@@ -84,7 +96,7 @@ trap stop EXIT
 rm -rf "$B/p" "$B/r" "$B"/*.conf "$B"/*.log "$B"/*.acl "$B/kt" "$B/stash" "$B"/*.pid "$B"/*.dump
 mkdir -p "$B/p" "$B/r"
 H=$(hostname | tr 'A-Z' 'a-z')
-realm_conf() { # file dbdir
+realm_conf() { # file dbdir db_library
   cat > "$1" <<EOF
 [kdcdefaults]
  kdc_ports = 18890
@@ -104,15 +116,15 @@ realm_conf() { # file dbdir
  }
 [dbmodules]
  $R = {
-  db_library = klmdb
+  db_library = $3
   database_name = $2/principal
  }
 [logging]
  admin_server = FILE:$B/kadmind-mit.log
 EOF
 }
-realm_conf "$B/p.conf" "$B/p"
-realm_conf "$B/r.conf" "$B/r"
+realm_conf "$B/p.conf" "$B/p" klmdb
+realm_conf "$B/r.conf" "$B/r" "$RLIB"
 cat > "$B/krb5.conf" <<EOF
 [libdefaults]
  default_realm = $R

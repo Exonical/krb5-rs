@@ -263,19 +263,33 @@ pub fn parse_listen_addresses(s: &str, default_port: u16) -> Result<Vec<SocketAd
 }
 
 impl RealmConfig {
-    /// Apply `-x` database arguments as klmdb's `configure_context` does:
-    /// `dbname=PATH` replaces `database_name`, `temporary` and `merge_nra`
-    /// are returned, and anything else is refused.
+    /// Apply `-x` database arguments as the module's `configure_context`
+    /// does: `dbname=PATH` replaces `database_name`, `temporary` and
+    /// `merge_nra` are returned, and anything else is refused
+    /// (`plugins/kdb/lmdb/kdb_lmdb.c:146-168`). The file store takes db2's
+    /// arguments (`plugins/kdb/db2/kdb_db2.c:222-247`): `hash=`, `unlockiter`
+    /// and `lockiter` choose db2 access methods and change nothing there.
     pub fn apply_db_args(&mut self, args: &[String]) -> Result<DbArgs, String> {
+        let db2 = self.db_module.library.as_deref() == Some("krb5-rs-file");
         let mut flags = DbArgs::default();
         for arg in args {
-            match arg.as_str() {
-                "temporary" => flags.temporary = true,
-                "merge_nra" => flags.merge_nra = true,
-                _ => match arg.strip_prefix("dbname=") {
-                    Some(path) => self.database_name = PathBuf::from(path),
-                    None => return Err(format!("Unsupported argument \"{arg}\" for LMDB")),
-                },
+            // `get_db_opt`: an option is the text before `=`.
+            let (opt, val) = match arg.split_once('=') {
+                Some((opt, val)) => (Some(opt), val),
+                None => (None, arg.as_str()),
+            };
+            match (opt, val) {
+                (Some("dbname"), path) => self.database_name = PathBuf::from(path),
+                (None, "temporary") => flags.temporary = true,
+                (None, "merge_nra") => flags.merge_nra = true,
+                (Some("hash"), _) | (None, "unlockiter" | "lockiter") if db2 => {}
+                _ if db2 => {
+                    return Err(format!(
+                        "Unsupported argument \"{}\" for db2",
+                        opt.unwrap_or(val)
+                    ))
+                }
+                _ => return Err(format!("Unsupported argument \"{arg}\" for LMDB")),
             }
         }
         Ok(flags)
@@ -857,6 +871,35 @@ mod db_args_tests {
         assert_eq!(
             cfg.apply_db_args(&["nolock".to_string()]),
             Err("Unsupported argument \"nolock\" for LMDB".to_string())
+        );
+    }
+
+    #[test]
+    fn db_args_are_parsed_like_db2_for_the_file_store() {
+        let profile = Profile::parse(
+            "[realms]\n R = {\n  database_name = /a/principal\n  database_module = f\n }\n\
+             [dbmodules]\n f = {\n  db_library = krb5-rs-file\n }\n",
+        )
+        .expect("profile");
+        let mut cfg = RealmConfig::from_profiles(&profile, None, "R").expect("config");
+        let args = [
+            "temporary",
+            "hash=true",
+            "unlockiter",
+            "lockiter",
+            "dbname=/b/principal",
+        ]
+        .map(String::from);
+        let flags = cfg.apply_db_args(&args).expect("db args");
+        assert!(flags.temporary && !flags.merge_nra);
+        assert_eq!(cfg.database_name, PathBuf::from("/b/principal"));
+        assert_eq!(
+            cfg.apply_db_args(&["nolock".to_string()]),
+            Err("Unsupported argument \"nolock\" for db2".to_string())
+        );
+        assert_eq!(
+            cfg.apply_db_args(&["mapsize=1".to_string()]),
+            Err("Unsupported argument \"mapsize\" for db2".to_string())
         );
     }
 }

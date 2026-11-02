@@ -18,10 +18,10 @@ use super::db::{KeyEntry, PrincipalAttributes, PrincipalEntry};
 use super::kdb::master::{decrypt_key, encrypt_key};
 use super::kdb::mit::mkey::{entry_mkvno, MasterKeys};
 use super::kdb::mit::{
-    merge_record, record_without_keys, unparse_name, CONSTRAINED_DELEGATION_ACL, LAST_ADMIN_UNLOCK,
-    LAST_PWD_CHANGE,
+    key_data_with_salt, key_salt_from_data, merge_record, record_without_keys, unparse_name,
+    CONSTRAINED_DELEGATION_ACL, LAST_ADMIN_UNLOCK, LAST_PWD_CHANGE,
 };
-use super::kdb::mit::{KeyData, MitEntry, TlData, ACTKVNO, MKEY_AUX, MKVNO, MOD_PRINC};
+use super::kdb::mit::{MitEntry, TlData, ACTKVNO, MKEY_AUX, MKVNO, MOD_PRINC};
 use super::policy::{kerberos_time, ts};
 use super::store::{Policy, PrincipalRecord, StoreError};
 use crate::types::{EncryptionKey, PrincipalName};
@@ -348,28 +348,33 @@ impl StoredPrincipal {
     /// with the stored master key version as `KRB5_TL_MKVNO`.
     pub fn to_raw(&self) -> Result<MitEntry, StoreError> {
         let mut tl_data = self.tl_data.clone();
-        if let Some(mkvno) = self.keys.first().map(|k| k.mkvno).filter(|v| *v != 1) {
-            let mkvno = u16::try_from(mkvno)
-                .map_err(|_| StoreError::corrupt("master key version out of range"))?;
-            tl_data.push(TlData {
-                kind: MKVNO,
-                data: mkvno.to_le_bytes().to_vec(),
-            });
+        if let Some(mkvno) = self.keys.first().map(|k| k.mkvno) {
+            let data = u16::try_from(mkvno)
+                .map_err(|_| StoreError::corrupt("master key version out of range"))?
+                .to_le_bytes()
+                .to_vec();
+            // A stored `KRB5_TL_MKVNO` (as MIT writes it) follows the keys;
+            // otherwise version 1 is implied, as in `krb5_dbe_get_mkvno`.
+            match tl_data.iter_mut().find(|t| t.kind == MKVNO) {
+                Some(t) => t.data = data,
+                None if mkvno != 1 => tl_data.push(TlData { kind: MKVNO, data }),
+                None => {}
+            }
         }
         let key_data = self
             .keys
             .iter()
             .map(|k| {
-                Ok(KeyData {
-                    ver: 1,
-                    kvno: u16::try_from(k.kvno)
+                Ok(key_data_with_salt(
+                    u16::try_from(k.kvno)
                         .map_err(|_| StoreError::corrupt("kvno exceeds MIT's 16 bits"))?,
-                    fields: vec![(
-                        i16::try_from(k.enctype)
-                            .map_err(|_| StoreError::corrupt("enctype exceeds i16"))?,
-                        k.enc_key.clone(),
-                    )],
-                })
+                    i16::try_from(k.enctype)
+                        .map_err(|_| StoreError::corrupt("enctype exceeds i16"))?,
+                    k.enc_key.clone(),
+                    k.salt.as_deref(),
+                    &self.name,
+                    &self.realm,
+                ))
             })
             .collect::<Result<_, StoreError>>()?;
         Ok(MitEntry {
@@ -397,7 +402,8 @@ impl StoredPrincipal {
     /// Take back the keys, master key version, `KRB5_TL_ACTKVNO`,
     /// `KRB5_TL_MKEY_AUX` and `KRB5_TL_MOD_PRINC` time of an entry from
     /// [`StoredPrincipal::to_raw`] after a master-key command changed it.
-    /// A key keeps its salt when its kvno and enctype are unchanged.
+    /// A key takes the salt of its key-data, and keeps its string-to-key
+    /// parameters when its kvno and enctype are unchanged.
     pub fn apply_raw(&mut self, raw: &MitEntry) -> Result<(), StoreError> {
         let mkvno = u32::from(entry_mkvno(raw)?);
         let mut keys = Vec::with_capacity(raw.key_data.len());
@@ -416,7 +422,7 @@ impl StoredPrincipal {
                 enctype,
                 mkvno,
                 enc_key: blob.clone(),
-                salt: old.and_then(|k| k.salt.clone()),
+                salt: key_salt_from_data(data, &raw.principal, &raw.realm)?,
                 s2kparams: old.and_then(|k| k.s2kparams.clone()),
             });
         }
@@ -501,7 +507,7 @@ impl StoredPrincipal {
             .filter(|t| {
                 !matches!(
                     t.kind,
-                    LAST_PWD_CHANGE | LAST_ADMIN_UNLOCK | CONSTRAINED_DELEGATION_ACL | MKVNO
+                    LAST_PWD_CHANGE | LAST_ADMIN_UNLOCK | CONSTRAINED_DELEGATION_ACL
                 )
             })
             .cloned()

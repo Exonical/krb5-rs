@@ -1,4 +1,5 @@
-//! The database kadmind administers: klmdb, or CockroachDB when
+//! The database kadmind administers: klmdb, the file store when
+//! `db_library = krb5-rs-file`, or CockroachDB when
 //! `db_library = krb5-rs-cockroach` (MIT's kadmind goes through whichever
 //! KDB module `db_library` names).
 
@@ -7,6 +8,7 @@ use std::sync::Arc;
 
 use krb5_rs::kdc::kdb::mit::mkey::MasterKeys;
 use krb5_rs::kdc::kdb::mit::{MitEntry, MitPolicy, TlData};
+use krb5_rs::kdc::kdb::{FileCaller, FileStore};
 use krb5_rs::kdc::store::{AdminStore, Policy, PrincipalRecord, StoreError};
 use krb5_rs::kdc::PrincipalEntry;
 use krb5_rs::types::{KerberosTime, PrincipalName};
@@ -17,6 +19,7 @@ use krb5_rs_kdb_lmdb::{CallerStore, LmdbStore};
 #[derive(Clone)]
 pub enum Db {
     Lmdb(Arc<LmdbStore>),
+    File(Arc<FileStore>),
     #[cfg(feature = "cockroach")]
     Cockroach(CockroachStore),
 }
@@ -39,12 +42,13 @@ where
 }
 
 impl Db {
-    /// The klmdb store, which iprop needs.
-    pub fn lmdb(&self) -> Option<&Arc<LmdbStore>> {
+    /// Whether iprop can log this database's changes (klmdb and the file
+    /// store; CockroachDB replicates itself).
+    pub fn has_ulog(&self) -> bool {
         match self {
-            Db::Lmdb(s) => Some(s),
+            Db::Lmdb(_) | Db::File(_) => true,
             #[cfg(feature = "cockroach")]
-            Db::Cockroach(_) => None,
+            Db::Cockroach(_) => false,
         }
     }
 
@@ -56,6 +60,7 @@ impl Db {
     ) -> Result<Option<PrincipalEntry>, StoreError> {
         match self {
             Db::Lmdb(s) => s.principal_sync(name, realm),
+            Db::File(s) => FileStore::get_record(s, name, realm).map(|r| r.map(|r| r.entry)),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => {
                 wait(AdminStore::get_record(s, name, realm)).map(|r| r.map(|r| r.entry))
@@ -70,6 +75,7 @@ impl Db {
     ) -> Result<Option<MitEntry>, StoreError> {
         match self {
             Db::Lmdb(s) => s.raw_entry(name, realm),
+            Db::File(s) => s.mit_entry(name, realm),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.raw_entry(name, realm)),
         }
@@ -78,6 +84,7 @@ impl Db {
     pub fn raw_policy(&self, name: &str) -> Result<Option<MitPolicy>, StoreError> {
         match self {
             Db::Lmdb(s) => s.raw_policy(name),
+            Db::File(s) => s.mit_policy(name),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.raw_policy(name)),
         }
@@ -86,6 +93,7 @@ impl Db {
     pub fn create_raw(&self, raw: &MitEntry) -> Result<(), StoreError> {
         match self {
             Db::Lmdb(s) => s.create_raw(raw),
+            Db::File(s) => s.create_mit(raw),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.create_raw(raw)),
         }
@@ -99,6 +107,7 @@ impl Db {
     {
         match self {
             Db::Lmdb(s) => s.rename_raw(name, realm, f),
+            Db::File(s) => s.rename_mit(name, realm, f),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.rename_raw(name, realm, f)),
         }
@@ -111,6 +120,7 @@ impl Db {
     {
         match self {
             Db::Lmdb(s) => s.update_raw(name, realm, f),
+            Db::File(s) => s.update_mit(name, realm, f),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.update_raw(name, realm, f)),
         }
@@ -119,6 +129,7 @@ impl Db {
     pub fn raw_entries(&self) -> Result<Vec<MitEntry>, StoreError> {
         match self {
             Db::Lmdb(s) => s.raw_entries(),
+            Db::File(s) => s.mit_entries(),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.raw_entries()),
         }
@@ -127,6 +138,10 @@ impl Db {
     pub fn policy_names_sync(&self) -> Result<Vec<String>, StoreError> {
         match self {
             Db::Lmdb(s) => s.policy_names_sync(),
+            Db::File(s) => Ok(FileStore::list_policies(s)?
+                .into_iter()
+                .map(|p| p.name)
+                .collect()),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => Ok(wait(AdminStore::list_policies(s))?
                 .into_iter()
@@ -138,6 +153,7 @@ impl Db {
     pub fn master_key_list(&self) -> Result<MasterKeys, StoreError> {
         match self {
             Db::Lmdb(s) => s.master_key_list(),
+            Db::File(s) => s.master_key_list(),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => Ok(s.master_keys()),
         }
@@ -147,6 +163,7 @@ impl Db {
     pub fn as_caller(&self, modifier: Vec<u8>) -> CallerDb {
         match self {
             Db::Lmdb(s) => CallerDb::Lmdb(s.as_caller(modifier)),
+            Db::File(s) => CallerDb::File(s.as_caller(modifier)),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => {
                 CallerDb::Cockroach(s.as_caller(modifier.clone(), Vec::new()), modifier)
@@ -158,6 +175,7 @@ impl Db {
 #[derive(Clone)]
 pub enum CallerDb {
     Lmdb(CallerStore),
+    File(FileCaller),
     /// The caller's store and the modifier it was made for.
     #[cfg(feature = "cockroach")]
     Cockroach(CockroachStore, Vec<u8>),
@@ -168,6 +186,7 @@ impl CallerDb {
     pub fn with_tl_data(self, tl: Vec<TlData>) -> Self {
         match self {
             CallerDb::Lmdb(s) => CallerDb::Lmdb(s.with_tl_data(tl)),
+            CallerDb::File(s) => CallerDb::File(s.with_tl_data(tl)),
             #[cfg(feature = "cockroach")]
             CallerDb::Cockroach(s, modifier) => {
                 CallerDb::Cockroach(s.as_caller(modifier.clone(), tl), modifier)
@@ -177,7 +196,7 @@ impl CallerDb {
 }
 
 macro_rules! delegate_admin_store {
-    ($ty:ident, $lmdb:pat => $l:expr, $crdb:pat => $c:expr) => {
+    ($ty:ident, $lmdb:pat => $l:expr, $file:pat => $f:expr, $crdb:pat => $c:expr) => {
         impl AdminStore for $ty {
             fn get_record(
                 &self,
@@ -187,6 +206,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.get_record(name, realm).await,
+                        $file => $f.get_record(name, realm).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.get_record(name, realm).await,
                     }
@@ -201,6 +221,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.create_principal(entry, last_pwd_change).await,
+                        $file => $f.create_principal(entry, last_pwd_change).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.create_principal(entry, last_pwd_change).await,
                     }
@@ -219,6 +240,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.update_principal(name, realm, f).await,
+                        $file => $f.update_principal(name, realm, f).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.update_principal(name, realm, f).await,
                     }
@@ -233,6 +255,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.delete_principal(name, realm).await,
+                        $file => $f.delete_principal(name, realm).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.delete_principal(name, realm).await,
                     }
@@ -245,6 +268,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.list_principals().await,
+                        $file => $f.list_principals().await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.list_principals().await,
                     }
@@ -258,6 +282,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.get_policy(name).await,
+                        $file => $f.get_policy(name).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.get_policy(name).await,
                     }
@@ -271,6 +296,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.create_policy(policy).await,
+                        $file => $f.create_policy(policy).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.create_policy(policy).await,
                     }
@@ -288,6 +314,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.update_policy(name, f).await,
+                        $file => $f.update_policy(name, f).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.update_policy(name, f).await,
                     }
@@ -301,6 +328,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.delete_policy(name).await,
+                        $file => $f.delete_policy(name).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.delete_policy(name).await,
                     }
@@ -313,6 +341,7 @@ macro_rules! delegate_admin_store {
                 async move {
                     match self {
                         $lmdb => $l.list_policies().await,
+                        $file => $f.list_policies().await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.list_policies().await,
                     }
@@ -322,5 +351,10 @@ macro_rules! delegate_admin_store {
     };
 }
 
-delegate_admin_store!(Db, Db::Lmdb(s) => (**s), Db::Cockroach(s) => s);
-delegate_admin_store!(CallerDb, CallerDb::Lmdb(s) => s, CallerDb::Cockroach(s, _) => s);
+delegate_admin_store!(Db, Db::Lmdb(s) => (**s), Db::File(s) => s.admin(), Db::Cockroach(s) => s);
+delegate_admin_store!(
+    CallerDb,
+    CallerDb::Lmdb(s) => s,
+    CallerDb::File(s) => s,
+    CallerDb::Cockroach(s, _) => s
+);

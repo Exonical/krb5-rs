@@ -35,6 +35,14 @@ fn slash(p: &Path) -> String {
 
 /// A klmdb realm under `dir/name`; primary and replica share the stash.
 fn write_conf(dir: &TempDir, name: &str, iprop: bool) -> PathBuf {
+    write_conf_for(dir, name, iprop, None)
+}
+
+/// [`write_conf`] for the database module `db_library` names.
+fn write_conf_for(dir: &TempDir, name: &str, iprop: bool, library: Option<&str>) -> PathBuf {
+    let module = library.map_or_else(String::new, |l| {
+        format!("  database_module = m\n }}\n[dbmodules]\n m = {{\n  db_library = {l}\n")
+    });
     let db = dir.path(name);
     std::fs::create_dir_all(&db).expect("db dir");
     let conf = dir.path(&format!("{name}.conf"));
@@ -42,7 +50,7 @@ fn write_conf(dir: &TempDir, name: &str, iprop: bool) -> PathBuf {
         &conf,
         format!(
             "[realms]\n {REALM} = {{\n  database_name = {}\n  key_stash_file = {}\n  \
-             supported_enctypes = aes256-cts-hmac-sha1-96:normal\n  iprop_enable = {iprop}\n }}\n",
+             supported_enctypes = aes256-cts-hmac-sha1-96:normal\n  iprop_enable = {iprop}\n{module} }}\n",
             slash(&db.join("principal")),
             slash(&dir.path("stash")),
         ),
@@ -107,8 +115,17 @@ fn field(log: &str, name: &str) -> String {
 
 #[test]
 fn admin_changes_are_logged_and_iprop_dumps_carry_the_serial() {
-    let dir = TempDir::new("log");
-    let primary = write_conf(&dir, "primary", true);
+    admin_changes_are_logged("log", None);
+}
+
+#[test]
+fn file_store_admin_changes_are_logged_like_db2() {
+    admin_changes_are_logged("file_log", Some("krb5-rs-file"));
+}
+
+fn admin_changes_are_logged(tag: &str, library: Option<&str>) {
+    let dir = TempDir::new(tag);
+    let primary = write_conf_for(&dir, "primary", true, library);
     kdb_ok(&primary, &["create", "-s"], MASTER);
     kdb_ok(&primary, &["addprinc", "alice"], "alice-password\n");
     kdb_ok(&primary, &["addprinc", "-randkey", "bob"], "");
@@ -175,7 +192,7 @@ fn admin_changes_are_logged_and_iprop_dumps_carry_the_serial() {
     );
     assert!(fresh.contains(&format!("carol@{REALM}")));
 
-    let replica = write_conf(&dir, "replica", true);
+    let replica = write_conf_for(&dir, "replica", true, library);
     kdb_ok(&replica, &["load", "-i", &dump_s], "");
     let replica_header = kproplog(&dir, &replica, &["-h"]);
     assert_eq!(
