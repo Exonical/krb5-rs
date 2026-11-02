@@ -344,8 +344,14 @@ kpropd only receives kprop pushes, the default.
 `crates/krb5-rs-kdc/tests/kpropd_iprop_live.rs` has it follow MIT 1.22.2
 `kadmind -proponly`.
 
-Deviations: kpropd requires `iprop_port` instead of looking the service up
-with the portmapper; `-x` is accepted and ignored; klmdb only.
+Without `iprop_port`, kpropd connects to port 0, which fails and backs off,
+as in MIT: the default `iprop_port` is 0 (`alt_prof.c:699`) and kadm5's
+`connect_to_server` uses it as is, with no portmapper lookup. `-x` takes
+klmdb `db_args` (`dbname=PATH`, `temporary`, `merge_nra`; anything else is
+`Unsupported argument "..." for LMDB`) for the database the update log is
+replayed into, as MIT passes them to `ulog_replay` (`kpropd.c:891`).
+`krb5-rs-kadmind -x` and `krb5-rs-kdb -x` take the same arguments.
+Deviation: klmdb only.
 Deliberate retry deviations from MIT `do_iprop`: a failed
 `IPROP_GET_UPDATES` or `IPROP_FULL_RESYNC[_EXT]` call waits the same
 `2 << n` backoff before reconnecting instead of reconnecting at once, and a
@@ -358,8 +364,9 @@ Busy reply to a resync request clears the resync timer, so the next
 `krb5-rs-kadmind -proponly` serves the log like MIT `kadmind -proponly`
 (`src/kadmin/server/ovsec_kadmd.c`, `ipropd_svc.c`): `-proponly` refuses to
 start without `iprop_enable`; without `-proponly` the iprop service runs
-alongside kpasswd when `iprop_enable` is set. iprop requires `iprop_port`
-(listening on `iprop_listen` if set). Program 100423 version 1 runs over
+alongside kpasswd when `iprop_enable` is set. Without `iprop_port` (MIT's default of 0)
+the system picks the iprop port, as with MIT; `iprop_listen` overrides
+both. Program 100423 version 1 runs over
 RPCSEC_GSS (§ONC RPC and RPCSEC_GSS) with service keys read from the klmdb
 database; calls whose service principal is not `kiprop/<host>@REALM` are
 rejected as too weak. The client must hold the `p` permission in `acl_file`
@@ -375,7 +382,7 @@ replica's serial (`ulog_get_entries`); `IPROP_FULL_RESYNC[_EXT]` runs
 through a full resync and then incremental updates.
 
 Deviations: the process stays in the foreground (`-nofork` is implied) and
-`-P` writes its pid; `-x` is not supported; klmdb only.
+`-P` writes its pid; klmdb only.
 
 ACL restrictions (the fourth `kadm5.acl` field) are parsed and validated like
 `auth_acl.c` `parse_restrictions`: `[+-]flag`, `-clearpolicy`, `-policy POL`

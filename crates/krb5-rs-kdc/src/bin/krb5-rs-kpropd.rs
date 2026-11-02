@@ -14,7 +14,7 @@ use krb5_rs::gssapi::krb5::{GssFlags, Krb5Initiator};
 use krb5_rs::kdc::kdb::kprop::{self, ErrorParties, ReplayCache, KPROP_SERVICE};
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
 use krb5_rs::kdc::kdb::read_stash;
-use krb5_rs::kdc::RealmConfig;
+use krb5_rs::kdc::{RealmConfig, StoreError};
 use krb5_rs::keytab::{key_for_principal, FileKeytab};
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::{AsExchange, AsExchangeConfig, StepResult};
@@ -50,6 +50,8 @@ struct Args {
     runonce: bool,
     pid_file: Option<PathBuf>,
     admin_server: Option<String>,
+    /// `-x`: database arguments for the iprop replay (`ulog_replay`).
+    db_args: Vec<String>,
 }
 
 struct Server {
@@ -152,6 +154,7 @@ fn parse_args() -> Args {
         runonce: false,
         pid_file: None,
         admin_server: None,
+        db_args: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -191,6 +194,7 @@ fn parse_args() -> Args {
                         's' => args.keytab = Some(value),
                         'a' => args.acl = PathBuf::from(value),
                         'A' => args.admin_server = Some(value),
+                        'x' => args.db_args.push(value),
                         _ => {}
                     }
                     break;
@@ -601,7 +605,12 @@ impl Server {
                             "Got incremental updates (sno={} sec={} usec={})",
                             lastentry.sno, lastentry.time.seconds, lastentry.time.useconds
                         ));
-                        let replayed = LmdbStore::open(&ip.cfg, &master)
+                        // kpropd.c:891: ulog_replay opens the database with -x.
+                        let mut replay_cfg = ip.cfg.clone();
+                        let replayed = replay_cfg
+                            .apply_db_args(&self.args.db_args)
+                            .map_err(StoreError::backend)
+                            .and_then(|_| LmdbStore::open(&replay_cfg, &master))
                             .and_then(|store| store.replay_updates(&updates));
                         match replayed {
                             Ok(()) => self.debug(format!(
@@ -701,7 +710,9 @@ fn iprop_params(args: &Args, profile: &Profile, realm: &str, hosts: &[String]) -
                 .parse::<u16>()
                 .unwrap_or_else(|_| die(format!("invalid iprop_port {p}")))
         })
-        .unwrap_or_else(|| die("iprop_port must be set when iprop_enable is true"));
+        // MIT's default iprop_port is 0 (alt_prof.c:699), and kadm5's
+        // connect_to_server uses it as is: there is no portmapper lookup.
+        .unwrap_or(0);
     let deltat = |key: &str, default: i32| {
         kdc_conf
             .get_deltat(&["realms", realm, key], default)

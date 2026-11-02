@@ -571,3 +571,26 @@ fn stash_reports_a_missing_file_store_database() {
     assert!(!stderr.contains("Cannot read password"), "{stderr}");
     assert!(!String::from_utf8_lossy(&out.stdout).contains("Enter KDC"));
 }
+
+/// `-x dbname=PATH` opens another database and unknown `-x` arguments are
+/// refused, as klmdb's `configure_context` does.
+#[test]
+fn db_args_select_a_database_and_refuse_unknown_arguments() {
+    let env = Env::new("db_args");
+    env.ok(&["create", "-s"], "master\nmaster\n");
+    let other = Env::new("db_args_other");
+    other.ok(&["create", "-s"], "master\nmaster\n");
+    other.ok(&["addprinc", "-randkey", "alice"], "");
+    let dbname = format!("dbname={}", other.dir.join("principal").display());
+    let listed = env.ok(&["-x", &dbname, "listprincs"], "");
+    assert!(listed.contains(&format!("alice@{REALM}")), "{listed}");
+    assert!(!env.ok(&["listprincs"], "").contains("alice@"));
+    let bad = env.run(&["listprincs", "-x", "nolock"], "");
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr)
+            .contains("Unsupported argument \"nolock\" for LMDB while initializing database"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
