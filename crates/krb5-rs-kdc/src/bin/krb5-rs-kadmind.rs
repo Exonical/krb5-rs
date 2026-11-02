@@ -40,6 +40,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[path = "kadmind/auth.rs"]
 mod auth;
+#[path = "../daemonize.rs"]
+mod daemonize;
 #[path = "kadmind/db.rs"]
 mod db;
 use db::{CallerDb, Db};
@@ -77,6 +79,7 @@ fn sibling(name: &str) -> PathBuf {
 struct Args {
     realm: Option<String>,
     proponly: bool,
+    nofork: bool,
     pid_file: Option<PathBuf>,
     kdb_util: Option<PathBuf>,
     dump_file: Option<PathBuf>,
@@ -101,7 +104,8 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "-r" => a.realm = Some(val()),
             "-proponly" => a.proponly = true,
-            "-nofork" | "-W" => {}
+            "-nofork" => a.nofork = true,
+            "-W" => {}
             "-port" => a.port = Some(val().parse().unwrap_or_else(|_| usage())),
             "-P" => a.pid_file = Some(PathBuf::from(val())),
             "-p" => a.kdb_util = Some(PathBuf::from(val())),
@@ -2428,9 +2432,19 @@ fn listen_addrs(listen: Option<String>, port: u16) -> Vec<SocketAddr> {
     out
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args = parse_args();
+    if !args.nofork {
+        daemonize::fork().unwrap_or_else(|e| die(format!("{e} while spawning daemon process")));
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| die(format!("{e} while initializing")))
+        .block_on(kadmind(args));
+}
+
+async fn kadmind(args: Args) {
     let config = std::env::var_os("KRB5_KDC_PROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(KDC_DIR).join("kdc.conf"));
@@ -2533,6 +2547,8 @@ async fn main() {
     {
         die("no sockets set up?");
     }
+    // MIT daemonizes once the sockets and ACL are set up (ovsec_kadmd.c:507).
+    daemonize::detach().unwrap_or_else(|e| die(format!("{e} while spawning daemon process")));
     if let Some(pid_file) = &args.pid_file {
         if let Err(e) = std::fs::write(pid_file, format!("{}\n", std::process::id())) {
             die(format!(

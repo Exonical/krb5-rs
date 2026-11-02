@@ -277,7 +277,6 @@ primary can be MIT `kadmind` or `krb5-rs-kadmind -proponly`. Push-only
 replication stays the default.
 
 Deliberate deviations:
-`krb5-rs-kpropd` never forks into the background (use `-D` or a supervisor).
 The `kprop_*` kdc.conf keys of the earlier krb5-rs pull protocol
 (`KRB5RS-PROP-1`) were removed; configurations that still set them fail with
 an error pointing at `krb5-rs-kprop`/`krb5-rs-kpropd`.
