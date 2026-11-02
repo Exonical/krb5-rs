@@ -6,11 +6,14 @@
 //! `modprinc`, `getprinc`, `listprincs`, `ktadd`, `dump`, `load`. See `usage()`.
 //!
 //! The master password and principal passwords are read from stdin, one
-//! line each, with prompts on stderr; they are never taken from the command
-//! line. Input is not hidden when stdin is a terminal.
+//! line each; they are never taken from the command line. Master-key
+//! prompts go to stdout like MIT's prompter, other prompts to stderr. Input
+//! is not hidden when stdin is a terminal. Errors are printed the way
+//! `kdb5_util`'s `com_err(progname, ...)` prints them.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use krb5_rs::kdc::kdb::admin::{
     format_policy, format_principal, parse_lifetime, parse_principal, parse_time, AdminOps,
@@ -24,7 +27,7 @@ use krb5_rs::kdc::kdb::mit::dump::{
 use krb5_rs::kdc::kdb::mit::mkey::MasterKeys;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Time, Ulog, UpdateStatus};
 use krb5_rs::kdc::kdb::mit::{unparse_name, MitEntry, MitPolicy};
-use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, write_stash, FileStore};
+use krb5_rs::kdc::kdb::{master_key_from_password, write_stash, FileStore};
 use krb5_rs::kdc::{
     default_realm, AdminStore, IpropConfig, RealmConfig, StoreError, StoreErrorKind,
 };
@@ -50,7 +53,7 @@ fn print_usage() {
 
 fn usage() -> ! {
     print_usage();
-    std::process::exit(2);
+    std::process::exit(1);
 }
 
 fn help() -> ! {
@@ -58,9 +61,65 @@ fn help() -> ! {
     std::process::exit(0);
 }
 
+/// `kdb5_util`'s `exit_status`: bumped when a step fails but the command
+/// goes on, and added to the exit code of a later failure.
+static EXIT_STATUS: AtomicI32 = AtomicI32::new(0);
+
+fn exit_status() -> i32 {
+    EXIT_STATUS.load(Ordering::Relaxed)
+}
+
+fn bump_exit_status() {
+    EXIT_STATUS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// MIT's `progname`: the base name of argv[0].
+fn progname() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::args_os()
+            .next()
+            .and_then(|a| {
+                Path::new(&a)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "krb5-rs-kdb".into())
+    })
+}
+
+/// `msg` as com_err prints an error code's message: without the
+/// `StoreError` prefix and without " (os error N)" after strerror text.
+fn com_err_text(msg: &str) -> String {
+    const OS: &str = " (os error ";
+    let msg = msg.replace("principal store error: ", "");
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg.as_str();
+    while let Some(i) = rest.find(OS) {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + OS.len()..];
+        match tail.find(')') {
+            Some(j) if j > 0 && tail[..j].bytes().all(|b| b.is_ascii_digit()) => {
+                rest = &tail[j + 1..];
+            }
+            _ => {
+                out.push_str(OS);
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `com_err(progname, ...)`.
+fn com_err(msg: impl std::fmt::Display) {
+    eprintln!("{}: {}", progname(), com_err_text(&msg.to_string()));
+}
+
 fn fail(msg: impl std::fmt::Display) -> ! {
-    eprintln!("krb5-rs-kdb: {msg}");
-    std::process::exit(1);
+    com_err(msg);
+    std::process::exit(exit_status() + 1);
 }
 
 fn ok<T, E: std::fmt::Display>(r: Result<T, E>) -> T {
@@ -76,6 +135,53 @@ fn read_line(prompt: &str) -> String {
     line.trim_end_matches(['\r', '\n']).to_string()
 }
 
+/// `krb5_prompter_posix`: the prompt and ": " on stdout, a newline after the
+/// answer. `context` completes "Cannot read password while ...".
+fn read_password(prompt: &str, context: &str) -> String {
+    print!("{prompt}: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line).unwrap_or(0);
+    println!();
+    if read == 0 {
+        fail(format!("Cannot read password while {context}"));
+    }
+    line.trim_end_matches(['\r', '\n']).to_string()
+}
+
+/// `kdb5_create` (`kdb5_create.c:196-220`): announce the database, then
+/// read the master password twice, or once from the password file (`-P`).
+fn create_master_key(
+    cfg: &RealmConfig,
+    realm: &str,
+    master_password_file: Option<&str>,
+) -> krb5_rs::types::EncryptionKey {
+    println!(
+        "Initializing database '{}' for realm '{realm}',",
+        cfg.database_name.display()
+    );
+    println!("master key name 'K/M@{realm}'");
+    let password = match master_password_file {
+        Some(path) => read_secret_file(path),
+        None => {
+            println!("You will be prompted for the database Master Password.");
+            println!("It is important that you NOT FORGET this password.");
+            let context = "reading master key from keyboard";
+            let password = read_password("Enter KDC database master key", context);
+            let again = read_password("Re-enter KDC database master key to verify", context);
+            if password != again {
+                fail(format!("Password mismatch while {context}"));
+            }
+            password
+        }
+    };
+    ok(master_key_from_password(
+        realm,
+        &password,
+        cfg.master_key_type,
+    ))
+}
+
 /// First line of a secret file; secrets never come from argv.
 fn read_secret_file(path: &str) -> String {
     let text = ok(std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}")));
@@ -86,19 +192,70 @@ fn read_secret_file(path: &str) -> String {
     line.to_string()
 }
 
+/// The master key, or exit after [`fetch_master`]'s warnings.
 fn master_key(
     cfg: &RealmConfig,
     realm: &str,
     master_password_file: Option<&str>,
 ) -> krb5_rs::types::EncryptionKey {
-    match master_password_file {
-        Some(path) => ok(master_key_from_password(
+    fetch_master(cfg, realm, master_password_file)
+        .unwrap_or_else(|| std::process::exit(exit_status()))
+}
+
+fn fetch_master(
+    cfg: &RealmConfig,
+    realm: &str,
+    master_password_file: Option<&str>,
+) -> Option<krb5_rs::types::EncryptionKey> {
+    fetch_master_kvno(cfg, realm, master_password_file).map(|(_, key)| key)
+}
+
+/// `open_db_and_mkey`'s master key (`kdb5_util.c:405-450`), with the stash's
+/// kvno: from the password file (`-P`) or the stash. Without either, warns
+/// as MIT does and returns `None`.
+fn fetch_master_kvno(
+    cfg: &RealmConfig,
+    realm: &str,
+    master_password_file: Option<&str>,
+) -> Option<(Option<u32>, krb5_rs::types::EncryptionKey)> {
+    if let Some(path) = master_password_file {
+        let key = ok(master_key_from_password(
             realm,
             &read_secret_file(path),
             cfg.master_key_type,
-        )),
-        None => ok(read_stash(&cfg.key_stash_file, realm)),
+        ));
+        return Some((None, key));
     }
+    let stash = &cfg.key_stash_file;
+    let fetched = std::fs::metadata(stash)
+        .map_err(|e| com_err_text(&e.to_string()))
+        .and_then(|_| read_stash_kvno(stash, realm).map_err(|e| com_err_text(e.message())));
+    match fetched {
+        Ok((kvno, key)) => Some((Some(kvno), key)),
+        Err(reason) => {
+            com_err(format!(
+                "Can not fetch master key (error: {reason}). while reading master key"
+            ));
+            com_err("Warning: proceeding without master key");
+            bump_exit_status();
+            None
+        }
+    }
+}
+
+/// `KRB5_KDB_BADMASTERKEY`, from `krb5_db_fetch_mkey_list`.
+const BAD_MASTER: &str = "Unable to decrypt latest master key with the provided master key";
+
+/// `krb5_db_fetch_mkey_list` failing in `open_db_and_mkey`
+/// (`kdb5_util.c:452-458`): warn and go on when `e` is a wrong master key.
+fn no_master_list(e: &StoreError) -> bool {
+    if e.message() != BAD_MASTER {
+        return false;
+    }
+    com_err(format!("{BAD_MASTER}\n while getting master key list"));
+    com_err("Warning: proceeding without master key list");
+    bump_exit_status();
+    true
 }
 
 /// `kdb5_stash` (`kdb5_stash.c:66-132`): `stash [-f keyfile]` rewrites the
@@ -117,27 +274,39 @@ fn stash_source<T>(
         _ => usage(),
     };
     if master_password_file.is_none() {
-        if let Ok(opened) = read_stash(&cfg.key_stash_file, realm).and_then(|k| open(&k)) {
-            println!("Using existing stashed keys to update stash file.");
-            return (keyfile, opened);
+        if let Some(key) = fetch_master(cfg, realm, None) {
+            match open(&key) {
+                Ok(opened) => {
+                    println!("Using existing stashed keys to update stash file.");
+                    return (keyfile, opened);
+                }
+                // A stash that no longer opens the database: ask for the
+                // password, as MIT's kdb5_stash does without a key list.
+                Err(e) => {
+                    no_master_list(&e);
+                }
+            }
         }
     }
-    let key = match master_password_file {
-        Some(path) => ok(master_key_from_password(
-            realm,
-            &read_secret_file(path),
-            cfg.master_key_type,
-        )),
-        None => {
-            let password = read_line(&format!("Enter KDC database master key for {realm}: "));
-            ok(master_key_from_password(
-                realm,
-                &password,
-                cfg.master_key_type,
-            ))
-        }
+    let password = match master_password_file {
+        Some(path) => read_secret_file(path),
+        None => read_password("Enter KDC database master key", "reading master key"),
     };
-    (keyfile, ok(open(&key)))
+    let key = ok(master_key_from_password(
+        realm,
+        &password,
+        cfg.master_key_type,
+    ));
+    let opened = match open(&key) {
+        Ok(opened) => opened,
+        Err(e) if e.message() == BAD_MASTER => {
+            fail(format!("{BAD_MASTER}\n while getting master key list"))
+        }
+        Err(e) => fail(e),
+    };
+    // kdb5_stash.c:135: a stash written with the password succeeds.
+    EXIT_STATUS.store(0, Ordering::Relaxed);
+    (keyfile, opened)
 }
 
 /// Idempotent bootstrap: create the database (and stash) if missing, then
@@ -274,6 +443,11 @@ fn principal_options(args: Vec<String>, randkey: &mut bool) -> (PrincipalOptions
 }
 
 fn main() {
+    run();
+    std::process::exit(exit_status());
+}
+
+fn run() {
     let mut config: Option<PathBuf> = std::env::var_os("KRB5_KDC_PROFILE").map(PathBuf::from);
     let mut krb5_config: Option<PathBuf> = std::env::var_os("KRB5_CONFIG").map(PathBuf::from);
     let mut realm: Option<String> = None;
@@ -319,14 +493,20 @@ fn main() {
     }
 
     let config = config.unwrap_or_else(|| PathBuf::from("/usr/local/var/krb5kdc/kdc.conf"));
-    let kdc_conf =
-        ok(Profile::load(&config).map_err(|e| format!("reading {}: {e}", config.display())));
+    // A missing kdc.conf leaves the defaults, as in MIT's profile library.
+    let kdc_conf = if config.exists() {
+        ok(Profile::load(&config).map_err(|e| format!("reading {}: {e}", config.display())))
+    } else {
+        ok(Profile::parse(""))
+    };
     let krb5 = krb5_config
         .filter(|p| p.exists())
         .map(|p| ok(Profile::load(&p)));
     let realm = realm
         .or_else(|| default_realm(&kdc_conf, krb5.as_ref()))
-        .unwrap_or_else(|| fail("no realm given and no default realm found"));
+        .unwrap_or_else(|| {
+            fail("Configuration file does not specify default realm while getting default realm")
+        });
     let mut cfg = ok(RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm));
     if let Some(database) = database {
         if kdc_conf
@@ -367,19 +547,15 @@ fn main() {
         }
         "create" => {
             let stash = args.iter().any(|a| a == "-s");
-            let password = read_line(&format!("Enter KDC database master key for {realm}: "));
-            let key = ok(master_key_from_password(
-                &realm,
-                &password,
-                cfg.master_key_type,
-            ));
+            let key = create_master_key(&cfg, &realm, master_password_file.as_deref());
             let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
-            let store = ok(FileStore::create_with(
-                &cfg.database_name,
-                &realm,
-                &key,
-                &etypes,
-            ));
+            let store = FileStore::create_with(&cfg.database_name, &realm, &key, &etypes)
+                .unwrap_or_else(|e| {
+                    fail(format!(
+                        "{e} while creating database '{}'",
+                        cfg.database_name.display()
+                    ))
+                });
             let admin =
                 krb5_rs::kdc::kdb::admin::Admin::new(&store, cfg.supported_keysalts.clone());
             for (name, attrs, life) in ADMIN_PRINCS {
@@ -646,7 +822,7 @@ fn load_command(
         }
         let header = IpropHeader::parse(line).unwrap_or_else(|message| {
             if !message.is_empty() {
-                eprintln!("krb5-rs-kdb: {message}");
+                com_err(message);
             }
             std::process::exit(1)
         });
@@ -675,10 +851,7 @@ fn load_command(
             {
                 eprintln!("{line}");
             }
-            eprintln!(
-                "krb5-rs-kdb: error processing line {} of {file}",
-                error.line
-            );
+            com_err(format!("error processing line {} of {file}", error.line));
             fail(format!("{} restore failed", restore_name(version)));
         }
     };
@@ -704,7 +877,7 @@ fn load_command(
         }
     }
     if let Err(e) = store(&entries, &policies, update, iprop_load) {
-        eprintln!("krb5-rs-kdb: {e}");
+        com_err(e);
         fail(format!("{} restore failed", restore_name(version)));
     }
     if let Some(cfg) = iprop {
@@ -794,13 +967,14 @@ fn klmdb_command(
                 [flag] if flag == "-s" => true,
                 _ => usage(),
             };
-            let master = master_key_or_prompt(cfg, realm, global_master_password_file);
+            let master = create_master_key(cfg, realm, global_master_password_file);
             create_klmdb(rt, cfg, realm, &master);
             if stash {
                 ok(write_stash(&cfg.key_stash_file, realm, &master));
             }
         }
         "stash" => {
+            require_klmdb(cfg);
             let (keyfile, store) =
                 stash_source(&args, cfg, realm, global_master_password_file, |k| {
                     LmdbStore::open(cfg, k)
@@ -809,18 +983,30 @@ fn klmdb_command(
             ok(write_stash_list(&keyfile, realm, &keys.keys));
         }
         "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
+            require_klmdb(cfg);
             mkey_command(cmd, args, cfg, realm, global_master_password_file, |k| {
                 LmdbStore::open(cfg, k)
             });
         }
-        "dump" => dump_command(args, iprop, || {
-            let master = master_key(cfg, realm, global_master_password_file);
-            LmdbStore::open(cfg, &master)?.dump_entries()
-        }),
+        "dump" => {
+            require_klmdb(cfg);
+            let store = match fetch_master(cfg, realm, global_master_password_file) {
+                Some(key) => match LmdbStore::open(cfg, &key) {
+                    Ok(store) => Some(store),
+                    Err(e) if no_master_list(&e) => None,
+                    Err(e) => fail(e),
+                },
+                None => None,
+            };
+            // Without a master key MIT still dumps: the keys stay encrypted.
+            let store = store.unwrap_or_else(|| ok(LmdbStore::open_without_master(cfg)));
+            dump_command(args, iprop, || store.dump_entries());
+        }
         "load" => load_command(args, iprop, |entries, policies, update, merge_nra| {
             LmdbStore::load_dump(cfg, entries, policies, update, merge_nra)
         }),
         _ => {
+            require_klmdb(cfg);
             let master = master_key(cfg, realm, global_master_password_file);
             let store = ok(LmdbStore::open(cfg, &master));
             let admin = Blocking::new(
@@ -845,33 +1031,24 @@ fn klmdb_command(
     fail("db_library klmdb needs a krb5-rs-kdb built with the `klmdb` feature");
 }
 
+/// `krb5_db_open` in `open_db_and_mkey` (`kdb5_util.c:378-383`): the
+/// database must exist before the master key is read.
+#[cfg(feature = "klmdb")]
+fn require_klmdb(cfg: &RealmConfig) {
+    let mdb = appended_path(&cfg.database_name, ".mdb");
+    if !mdb.exists() && !ok(FileStore::has_database_magic(&cfg.database_name)) {
+        fail(format!(
+            "LMDB file {} does not exist while initializing database",
+            mdb.display()
+        ));
+    }
+}
+
 #[cfg(feature = "klmdb")]
 fn appended_path(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
-}
-
-#[cfg(feature = "klmdb")]
-fn read_master_from_prompt(cfg: &RealmConfig, realm: &str) -> krb5_rs::types::EncryptionKey {
-    let password = read_line(&format!("Enter KDC database master key for {realm}: "));
-    ok(master_key_from_password(
-        realm,
-        &password,
-        cfg.master_key_type,
-    ))
-}
-
-#[cfg(feature = "klmdb")]
-fn master_key_or_prompt(
-    cfg: &RealmConfig,
-    realm: &str,
-    master_password_file: Option<&str>,
-) -> krb5_rs::types::EncryptionKey {
-    match master_password_file {
-        Some(path) => master_key(cfg, realm, Some(path)),
-        None => read_master_from_prompt(cfg, realm),
-    }
 }
 
 /// The admin operations, synchronously, over any store: the commands are the
@@ -1001,7 +1178,12 @@ fn create_klmdb(
 ) {
     let mut unlogged = cfg.clone();
     unlogged.iprop.enabled = false;
-    let store = ok(LmdbStore::create(&unlogged, master));
+    let store = LmdbStore::create(&unlogged, master).unwrap_or_else(|e| {
+        fail(format!(
+            "{e} while creating database '{}'",
+            cfg.database_name.display()
+        ))
+    });
     add_admin_princs(
         &Blocking::new(
             rt,
@@ -1389,7 +1571,10 @@ fn cockroach_command(
         }
         "create" => {
             let stash = args.iter().any(|a| a == "-s");
-            let password = read_line(&format!("Enter KDC database master key for {realm}: "));
+            let password = read_password(
+                "Enter KDC database master key",
+                "reading master key from keyboard",
+            );
             let key = ok(master_key_from_password(
                 realm,
                 &password,
@@ -1701,6 +1886,23 @@ impl MkeyStore for CockroachMkey<'_> {
     }
 }
 
+/// The master-key commands without a master-key list
+/// (`kdb5_mkey.c:353-370, 540-545, 866-870, 1020-1027`). MIT's `add_mkey`
+/// fails an assertion here instead.
+fn no_master_keylist(cmd: &str, args: &[String]) -> ! {
+    match cmd {
+        "use_mkey" => {
+            if args.is_empty() || args.len() > 2 {
+                usage();
+            }
+            let kvno = args[0].trim().parse::<i64>().unwrap_or(0);
+            fail(format!("Invalid argument {kvno} is an invalid KVNO value"))
+        }
+        "purge_mkeys" => fail("Database has not been initialized master keylist not initialized"),
+        _ => fail("master keylist not initialized"),
+    }
+}
+
 /// MIT `kdb5_util` master-key commands (`kadmin/dbutil/kdb5_mkey.c`).
 /// `open` opens the database with the key from the stash or password file.
 fn mkey_command<S: MkeyStore>(
@@ -1717,14 +1919,16 @@ fn mkey_command<S: MkeyStore>(
     };
     use krb5_rs::kdc::kdb::mit::set_mod_princ;
 
-    let (master, stash_kvno) = match global_master_password_file {
-        Some(path) => (master_key(cfg, realm, Some(path)), None),
-        None => {
-            let (kvno, key) = ok(read_stash_kvno(&cfg.key_stash_file, realm));
-            (key, Some(kvno))
-        }
+    let opened = fetch_master_kvno(cfg, realm, global_master_password_file).and_then(
+        |(stash_kvno, master)| match open(&master) {
+            Ok(store) => Some((store, stash_kvno)),
+            Err(e) if no_master_list(&e) => None,
+            Err(e) => fail(e),
+        },
+    );
+    let Some((store, stash_kvno)) = opened else {
+        no_master_keylist(cmd, &args)
     };
-    let store = ok(open(&master));
     let keys = ok(store.master_key_list());
     let km = km_principal();
     let fullname = format!("K/M@{realm}");
@@ -1739,8 +1943,9 @@ fn mkey_command<S: MkeyStore>(
                 match a.as_str() {
                     "-e" => {
                         let name = next(&mut it);
-                        etype = krb5_rs::crypto::enctype_from_name(&name)
-                            .unwrap_or_else(|| fail(format!("{name} is an invalid enctype")));
+                        etype = krb5_rs::crypto::enctype_from_name(&name).unwrap_or_else(|| {
+                            fail(format!("Invalid argument {name} is an invalid enctype"))
+                        });
                     }
                     "-s" => stash = true,
                     _ => usage(),
@@ -1750,8 +1955,9 @@ fn mkey_command<S: MkeyStore>(
             println!("You will be prompted for a new database Master Password.");
             println!("It is important that you NOT FORGET this password.");
             let _ = std::io::stdout().flush();
-            let password = read_line("Enter KDC database master key: ");
-            let again = read_line("Re-enter KDC database master key to verify: ");
+            let context = "reading new master key from keyboard";
+            let password = read_password("Enter KDC database master key", context);
+            let again = read_password("Re-enter KDC database master key to verify", context);
             if password != again {
                 fail("Password mismatch while reading new master key from keyboard");
             }
@@ -1764,7 +1970,7 @@ fn mkey_command<S: MkeyStore>(
             }));
             if stash {
                 if let Err(e) = write_stash_list(&cfg.key_stash_file, realm, &[(kvno, new)]) {
-                    eprintln!("krb5-rs-kdb: {e} while storing key");
+                    com_err(format!("{e} while storing key"));
                     println!("Warning: couldn't stash master key.");
                 }
             }
@@ -1775,12 +1981,16 @@ fn mkey_command<S: MkeyStore>(
             }
             let requested = args[0].trim().parse::<i64>().unwrap_or(0);
             if requested == 0 {
-                fail("0 is an invalid KVNO value");
+                fail("Invalid argument 0 is an invalid KVNO value");
             }
             let kvno = u16::try_from(requested)
                 .ok()
                 .filter(|kvno| keys.get(*kvno).is_some())
-                .unwrap_or_else(|| fail(format!("{requested} is an invalid KVNO value")));
+                .unwrap_or_else(|| {
+                    fail(format!(
+                        "Invalid argument {requested} is an invalid KVNO value"
+                    ))
+                });
             let start = match args.get(1) {
                 None => now,
                 Some(s) => krb5_rs::kdc::kdb::getdate::get_date(s)

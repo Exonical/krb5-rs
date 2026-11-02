@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const REALM: &str = "IPROP.TEST";
-const MASTER: &str = "master-password\n";
+const MASTER: &str = "master-password\nmaster-password\n";
 
 struct TempDir(PathBuf);
 

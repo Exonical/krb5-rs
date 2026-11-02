@@ -212,8 +212,25 @@ records its `mkvno`, new keys are wrapped under the active master key, and
 unchanged keys keep the wrapping they have. The same `krb5-rs-kdb` commands
 run against both, and their dumps carry each entry's master key version.
 
-Deviation: errors are reported as `krb5-rs-kdb: <message>` rather than
-com_err text.
+Errors are printed like `kdb5_util`'s `com_err`: the program's base name,
+the error text (strerror text for system errors), then the context, for
+example `krb5-rs-kdb: LMDB file /var/krb5kdc/principal.mdb does not exist
+while initializing database`. As in `open_db_and_mkey`, klmdb commands open
+the database before reading the master key; without a stash or with a wrong
+master key they warn ("proceeding without master key") and go on, so `dump`
+still writes the (still encrypted) dump and exits 1, the master-key commands
+report "master keylist not initialized" and exit 2, and `stash` asks for the
+password. `create` announces the database and asks for the password twice;
+usage errors exit 1. `crates/krb5-rs-kdc/tests/kdb_com_err_live.rs` compares
+these messages and exit codes with MIT `kdb5_util`.
+
+Deviations: `add_mkey` without a master key list fails with "master keylist
+not initialized" where MIT 1.22.2 aborts on an assertion
+(`kdb5_mkey.c:167`). The `krb5-rs-kdb`-only commands (`addprinc`,
+`getprinc`, ...) and the FileStore and CockroachDB modules keep their own
+messages after the common prefix. Without `-r`, a kdc.conf with a single
+realm names the realm even when krb5.conf has no `default_realm`, as for
+the other krb5-rs daemons; MIT then fails "while getting default realm".
 
 ### MIT dump/load
 

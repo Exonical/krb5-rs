@@ -14,7 +14,7 @@ use krb5_rs::profile::Profile;
 const LIBDEFAULTS: &str = "[libdefaults]\n dns_canonicalize_hostname = false\n";
 
 const REALM: &str = "KPROP.TEST";
-const MASTER: &str = "master-password\n";
+const MASTER: &str = "master-password\nmaster-password\n";
 
 struct TempDir(PathBuf);
 

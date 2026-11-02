@@ -398,7 +398,7 @@ stop_server
 
 RS_DIR="$BASE/rs"
 write_profile "$RS_DIR" "$MIT_PORT"
-printf '%s\n' "$MASTER" | "$RS_KDB" --config "$RS_DIR/kdc.conf" \
+printf '%s\n%s\n' "$MASTER" "$MASTER" | "$RS_KDB" --config "$RS_DIR/kdc.conf" \
   --krb5-config "$RS_DIR/krb5.conf" --realm "$REALM" create -s >/dev/null
 rs_addprinc "$RS_DIR" bob 'Bob-Initial-Password'
 printf '%s\n' "$MASTER" >/dev/null
