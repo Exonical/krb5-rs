@@ -303,9 +303,13 @@ log, as in MIT.
 - Without `iprop_enable`, `dump -i` and `load -i` fail with "Iprop not
   enabled" and no log is written; `-c` without `-i` is refused, as in MIT.
 
-Deviations: `load -update` with iprop enabled reinitializes the log instead
-of logging each loaded principal; the file store and CockroachDB never write
-a log.
+With iprop enabled, `load -update` logs each loaded principal as an update
+against its current entry, as `krb5_db_put_principal` does
+(`kdb5.c:981-1051`). Each loaded policy reinitializes the log
+(`kdb5.c:2441-2525`), so only principals after the dump's last policy stay
+logged. A full load reinitializes the log.
+
+Deviations: the file store and CockroachDB never write a log.
 
 Deliberate deviations from MIT's log handling (MIT 1.22.2 behaves
 otherwise):

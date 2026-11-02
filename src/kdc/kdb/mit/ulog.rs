@@ -1397,6 +1397,11 @@ impl Ulog {
         self.store_update(&mut hdr, upd)
     }
 
+    /// [`Ulog::init_header`] while `held` is already held.
+    pub fn init_header_locked(&self, _held: &UlogLock<'_>) -> Result<(), StoreError> {
+        self.reset().map(drop)
+    }
+
     /// `ulog_init_header` (`kdb_log.c:474-490`).
     pub fn init_header(&self) -> Result<(), StoreError> {
         let _lock = Locked::new(&self.shared, FlockOperation::LockExclusive)?;
