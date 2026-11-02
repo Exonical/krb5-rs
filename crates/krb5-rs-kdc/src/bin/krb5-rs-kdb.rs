@@ -581,7 +581,6 @@ fn run() {
             let key = create_master_key(&cfg, &realm, master_password_file.as_deref());
             let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
             let store = FileStore::create_with(&cfg.database_name, &realm, &key, &etypes)
-                .and_then(|store| store.with_iprop(&cfg.iprop))
                 .unwrap_or_else(|e| {
                     fail(format!(
                         "{e} while creating database '{}'",
@@ -596,6 +595,10 @@ fn run() {
             }
             if stash {
                 ok(write_stash(&cfg.key_stash_file, &realm, &key));
+            }
+            // As for klmdb, the new database's principals are not logged.
+            if cfg.iprop.enabled {
+                ok(Ulog::map(&cfg.iprop.logfile, cfg.iprop.ulogsize));
             }
             return;
         }
