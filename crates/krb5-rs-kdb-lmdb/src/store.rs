@@ -1418,6 +1418,7 @@ impl LmdbStore {
         policies: &[MitPolicy],
         update: bool,
         merge_nra: bool,
+        log_from: usize,
     ) -> Result<(), StoreError> {
         let options = LmdbOptions::from_db_module(
             &config.db_module,
@@ -1433,6 +1434,14 @@ impl LmdbStore {
             )));
         }
         create_parent(database_name)?;
+        // An `-update` load logs each principal like `krb5_db_put_principal`
+        // (`kdb5.c:981-1051`); a full load replaces the log afterwards.
+        let ulog = match update && config.iprop.enabled {
+            true => Some(Ulog::map(&config.iprop.logfile, config.iprop.ulogsize)?),
+            false => None,
+        };
+        let held = ulog.as_ref().map(Ulog::lock).transpose()?;
+        let mut logged = Vec::new();
         let env = open_main_env(&main, &options)?;
         let mut txn = env
             .write_txn()
@@ -1451,8 +1460,16 @@ impl LmdbStore {
                 .clear(&mut txn)
                 .map_err(|e| backend("emptying policy database", e))?;
         }
-        for entry in entries {
+        for (i, entry) in entries.iter().enumerate() {
             let (key, value) = entry.encode()?;
+            if ulog.is_some() && i >= log_from {
+                let current = principal_db
+                    .get(&txn, &key)
+                    .map_err(|e| backend("reading principal", e))?
+                    .map(|v| MitEntry::decode(&key, v))
+                    .transpose()?;
+                logged.push(update_from_entry(current.as_ref(), entry));
+            }
             principal_db
                 .put(&mut txn, &key, &value)
                 .map_err(|e| backend("loading principal", e))?;
@@ -1490,7 +1507,18 @@ impl LmdbStore {
         txn.commit().map_err(|e| backend("committing load", e))?;
         lockout_txn
             .commit()
-            .map_err(|e| backend("committing lockout load", e))
+            .map_err(|e| backend("committing lockout load", e))?;
+        if let (Some(ulog), Some(held)) = (&ulog, &held) {
+            // Each policy record reinitializes the log (`kdb5.c:2441-2525`),
+            // leaving only the principals loaded after the last one.
+            if !policies.is_empty() {
+                ulog.init_header_locked(held)?;
+            }
+            for mut update in logged {
+                ulog.add_update_locked(held, &mut update)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2115,8 +2143,8 @@ mod tests {
         config.database_name = directory.path().join("principal");
         let master = master_key_from_password("DUMP.TEST", "master-password-for-dump-fixtures", 18)
             .expect("master key");
-        assert!(LmdbStore::load_dump(&config, &entries, &policies, true, false).is_err());
-        LmdbStore::load_dump(&config, &entries, &policies, false, false).expect("load");
+        assert!(LmdbStore::load_dump(&config, &entries, &policies, true, false, 0).is_err());
+        LmdbStore::load_dump(&config, &entries, &policies, false, false, 0).expect("load");
         let dumped = {
             let store = LmdbStore::open(&config, &master).expect("open loaded database");
             let (entries, policies) = store.dump_entries().expect("dump");
@@ -2127,14 +2155,15 @@ mod tests {
             String::from_utf8_lossy(&data)
         );
 
-        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], true, false).expect("update");
+        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], true, false, 0)
+            .expect("update");
         let count = |config| {
             let store = LmdbStore::open(config, &master).expect("open");
             let (entries, policies) = store.dump_entries().expect("dump");
             (entries.len(), policies.len())
         };
         assert_eq!(count(&config), (entries.len(), policies.len()));
-        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], false, false)
+        LmdbStore::load_dump(&config, &entries[..1], &policies[..1], false, false, 0)
             .expect("replace");
         assert_eq!(count(&config), (1, 1));
     }

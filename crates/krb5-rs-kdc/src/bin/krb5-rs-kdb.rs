@@ -625,7 +625,7 @@ fn run() {
             return;
         }
         "load" => {
-            load_command(args, None, |entries, policies, update, _| {
+            load_command(args, None, |entries, policies, update, _, _| {
                 let master = master_key(&cfg, &realm, master_password_file.as_deref());
                 FileStore::load_dump(
                     &cfg.database_name,
@@ -815,12 +815,12 @@ fn private_file(path: &Path, new: bool) -> std::io::Result<std::fs::File> {
 /// parsed before the database is touched. `-hash` selects db2's hash
 /// format in MIT and is ignored here. With `iprop` set, the ulog is
 /// reinitialized after a full load and `-i` records the dump's serial number
-/// in it. Deviation: MIT logs each principal an `-update` load writes; here
-/// such a load reinitializes the ulog, so replicas resync fully.
+/// in it. An `-update` load leaves the ulog to the store, which logs each
+/// principal after the dump's last policy (`kdb5.c:981-1051, 2441-2525`).
 fn load_command(
     args: Vec<String>,
     iprop: Option<&IpropConfig>,
-    store: impl FnOnce(&[MitEntry], &[MitPolicy], bool, bool) -> Result<(), StoreError>,
+    store: impl FnOnce(&[MitEntry], &[MitPolicy], bool, bool, usize) -> Result<(), StoreError>,
 ) {
     let (mut forced, mut verbose, mut update, mut iprop_load) = (None, false, false, false);
     let mut it = args.into_iter();
@@ -889,6 +889,7 @@ fn load_command(
         eprintln!("{line}");
     }
     let (mut entries, mut policies) = (Vec::new(), Vec::new());
+    let mut log_from = 0;
     for record in records {
         match record {
             Record::Principal(entry) => {
@@ -903,18 +904,19 @@ fn load_command(
                     eprintln!("created policy {}", policy.name);
                 }
                 policies.push(policy);
+                log_from = entries.len();
             }
         }
     }
-    if let Err(e) = store(&entries, &policies, update, iprop_load) {
+    if let Err(e) = store(&entries, &policies, update, iprop_load, log_from) {
         com_err(e);
         fail(format!("{} restore failed", restore_name(version)));
     }
-    if let Some(cfg) = iprop {
+    if let Some(cfg) = iprop.filter(|_| !update) {
         let reset = Ulog::map(&cfg.logfile, cfg.ulogsize).and_then(|ulog| {
             ulog.init_header()?;
             match iprop_header {
-                Some(h) if !update => ulog.set_last(Last {
+                Some(h) => ulog.set_last(Last {
                     sno: h.sno,
                     time: Time {
                         seconds: h.seconds,
@@ -1033,9 +1035,20 @@ fn klmdb_command(
             let store = store.unwrap_or_else(|| ok(LmdbStore::open_without_master(cfg)));
             dump_command(args, iprop, || store.dump_entries());
         }
-        "load" => load_command(args, iprop, |entries, policies, update, iprop_load| {
-            LmdbStore::load_dump(cfg, entries, policies, update, iprop_load || merge_nra)
-        }),
+        "load" => load_command(
+            args,
+            iprop,
+            |entries, policies, update, iprop_load, log_from| {
+                LmdbStore::load_dump(
+                    cfg,
+                    entries,
+                    policies,
+                    update,
+                    iprop_load || merge_nra,
+                    log_from,
+                )
+            },
+        ),
         _ => {
             require_klmdb(cfg);
             let master = master_key(cfg, realm, global_master_password_file);

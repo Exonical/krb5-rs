@@ -191,6 +191,42 @@ fn admin_changes_are_logged_and_iprop_dumps_carry_the_serial() {
 }
 
 #[test]
+fn update_loads_log_each_principal_and_policies_reset_the_log() {
+    let dir = TempDir::new("update");
+    let primary = write_conf(&dir, "primary", true);
+    kdb_ok(&primary, &["create", "-s"], MASTER);
+    kdb_ok(&primary, &["addprinc", "-randkey", "alice"], "");
+    kdb_ok(&primary, &["addprinc", "-randkey", "bob"], "");
+    let bob = dir.path("bob.dump").to_string_lossy().to_string();
+    kdb_ok(&primary, &["dump", &bob, "bob@IPROP\\.TEST"], "");
+    let before: u32 = field(&kproplog(&dir, &primary, &["-h"]), "Last serial #")
+        .parse()
+        .expect("serial");
+
+    kdb_ok(&primary, &["load", "-update", &bob], "");
+    let header = kproplog(&dir, &primary, &["-h"]);
+    assert_eq!(
+        field(&header, "Last serial #"),
+        (before + 1).to_string(),
+        "{header}"
+    );
+    let tail = kproplog(&dir, &primary, &["-v", "-e", "1"]);
+    assert!(
+        tail.contains(&format!("Update principal : bob@{REALM}")),
+        "{tail}"
+    );
+
+    kdb_ok(&primary, &["addpol", "p1"], "");
+    let full = dir.path("full.dump").to_string_lossy().to_string();
+    kdb_ok(&primary, &["dump", &full], "");
+    kdb_ok(&primary, &["addprinc", "-randkey", "carol"], "");
+    kdb_ok(&primary, &["load", "-update", &full], "");
+    let log = kproplog(&dir, &primary, &["-v"]);
+    assert!(!log.contains("Update principal"), "{log}");
+    kdb_ok(&primary, &["getprinc", "carol"], "");
+}
+
+#[test]
 fn iprop_options_need_iprop_enable() {
     let dir = TempDir::new("off");
     let conf = write_conf(&dir, "kdc", false);

@@ -223,6 +223,33 @@ same_kproplog "$R" replica
 rs_kdb "$R" dump -i1 "$BASE/replica.ipropx"
 cmp "$BASE/mit.ipropx" "$BASE/replica.ipropx"
 
+# load -update logs each principal against its current entry, and each policy
+# reinitializes the log, on both replicas alike.
+same_update_log() {
+  local tag=$1
+  in_realm "$M" "$MIT_KPROPLOG" -v -v | grep -iv 'time stamp\|^Kerberos update log' > "$BASE/$tag.mit-log"
+  in_realm "$R" "$MIT_KPROPLOG" -v -v | grep -iv 'time stamp\|^Kerberos update log' > "$BASE/$tag.rs-log"
+  diff -u "$BASE/$tag.mit-log" "$BASE/$tag.rs-log"
+}
+in_realm "$P" "$KADMIN" -r "$REALM" -q "modprinc -maxlife 3h alice" >/dev/null
+in_realm "$P" "$MIT_KDB" dump "$BASE/alice.dump" 'alice@IPROP\.LIVE'
+in_realm "$P" "$MIT_KDB" dump "$BASE/wrap.dump" 'wrap[12]@IPROP\.LIVE'
+in_realm "$M" "$MIT_KDB" load -update "$BASE/alice.dump"
+rs_kdb "$R" load -update "$BASE/alice.dump"
+test "$(last_serial "$M")" = "$((SNO + 1))"
+test "$(last_serial "$R")" = "$((SNO + 1))"
+same_update_log alice
+grep -q 'Update principal : alice@IPROP.LIVE' "$BASE/alice.rs-log"
+in_realm "$P" "$KADMIN" -r "$REALM" -q "addpol p1" >/dev/null
+in_realm "$P" "$MIT_KDB" dump "$BASE/full.dump"
+in_realm "$M" "$MIT_KDB" load -update "$BASE/full.dump"
+rs_kdb "$R" load -update "$BASE/full.dump"
+same_update_log policy
+in_realm "$M" "$MIT_KDB" load -update "$BASE/wrap.dump"
+rs_kdb "$R" load -update "$BASE/wrap.dump"
+same_update_log wrap
+grep -q 'Update principal : wrap2@IPROP.LIVE' "$BASE/wrap.rs-log"
+
 echo IPROP_LIVE_OK
 "#,
     );
