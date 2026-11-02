@@ -1282,9 +1282,9 @@ impl Ulog {
         Ok(hdr)
     }
 
-    /// `resize` (`kdb_log.c:196-244`).
-    fn resize(&self, hdr: &mut Header, recsize: u32, upd: &Update) -> Result<(), StoreError> {
-        let old_block = usize::from(hdr.block);
+    /// The block size `resize` needs for a `recsize` record, or its error
+    /// (`kdb_log.c:196-222`).
+    fn block_for(&self, recsize: u32, upd: &Update) -> Result<u16, StoreError> {
         let new_block = (recsize / u32::from(ULOG_BLOCK) + 1) * u32::from(ULOG_BLOCK);
         let new_block = u16::try_from(new_block).map_err(|_| {
             StoreError::backend(format!(
@@ -1296,6 +1296,27 @@ impl Ulog {
         if new_size > MAXLOGLEN {
             return Err(StoreError::backend("ulog would exceed its maximum size"));
         }
+        Ok(new_block)
+    }
+
+    /// Whether [`Ulog::add_update`] can store `upd`; fails as it would on a
+    /// record too large for the log.
+    pub fn check_fits(&self, upd: &Update) -> Result<(), StoreError> {
+        let size = u32::try_from(upd.encode()?.len())
+            .map_err(|_| StoreError::backend("ulog update too large"))?;
+        let recsize = ENTRY_HEADER_SIZE + size;
+        let hdr = read_header(&self.shared.file)?;
+        match recsize > u32::from(hdr.block) {
+            true => self.block_for(recsize, upd).map(drop),
+            false => Ok(()),
+        }
+    }
+
+    /// `resize` (`kdb_log.c:196-244`).
+    fn resize(&self, hdr: &mut Header, recsize: u32, upd: &Update) -> Result<(), StoreError> {
+        let old_block = usize::from(hdr.block);
+        let new_block = self.block_for(recsize, upd)?;
+        let new_size = HEADER_SIZE + u64::from(self.entries) * u64::from(new_block);
         self.extend_to(new_size)?;
         let mut buf = vec![0; usize::from(new_block)];
         for i in (0..self.entries).rev() {

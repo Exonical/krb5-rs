@@ -1504,6 +1504,12 @@ impl LmdbStore {
                     .map_err(|e| backend("loading lockout state", e))?;
             }
         }
+        // Refuse the load before committing anything the log can't record.
+        if let Some(ulog) = &ulog {
+            for update in &logged {
+                ulog.check_fits(update)?;
+            }
+        }
         txn.commit().map_err(|e| backend("committing load", e))?;
         lockout_txn
             .commit()
@@ -1515,7 +1521,12 @@ impl LmdbStore {
                 ulog.init_header_locked(held)?;
             }
             for mut update in logged {
-                ulog.add_update_locked(held, &mut update)?;
+                if let Err(e) = ulog.add_update_locked(held, &mut update) {
+                    // The database already holds the load: make replicas
+                    // resync in full rather than miss the rest.
+                    ulog.init_header_locked(held)?;
+                    return Err(e);
+                }
             }
         }
         Ok(())
