@@ -557,3 +557,17 @@ fn stash_replaces_a_stale_file_store_stash() {
 fn stash_replaces_a_stale_klmdb_stash() {
     stash_replaces_a_stale_stash("stale_stash_klmdb", "klmdb");
 }
+
+/// `stash` reports a database that cannot be opened instead of asking for
+/// the master password.
+#[test]
+fn stash_reports_a_missing_file_store_database() {
+    let env = Env::new("stash_missing_db").with_library("krb5-rs-file");
+    env.ok(&["create", "-s"], "master\nmaster\n");
+    std::fs::remove_file(env.dir.join("principal")).expect("remove database");
+    let out = env.run(&["stash"], "");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("Cannot read password"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("Enter KDC"));
+}

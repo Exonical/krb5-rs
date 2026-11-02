@@ -246,6 +246,17 @@ fn fetch_master_kvno(
 /// `KRB5_KDB_BADMASTERKEY`, from `krb5_db_fetch_mkey_list`.
 const BAD_MASTER: &str = "Unable to decrypt latest master key with the provided master key";
 
+/// Whether opening a store failed only because the master key is wrong:
+/// klmdb, FileStore and CockroachDB each word it their own way.
+fn wrong_master_key(e: &StoreError) -> bool {
+    matches!(
+        e.message(),
+        BAD_MASTER
+            | "incorrect master key"
+            | "the master key does not match the database (cannot decrypt K/M)"
+    )
+}
+
 /// `krb5_db_fetch_mkey_list` failing in `open_db_and_mkey`
 /// (`kdb5_util.c:452-458`): warn and go on when `e` is a wrong master key.
 fn no_master_list(e: &StoreError) -> bool {
@@ -282,9 +293,10 @@ fn stash_source<T>(
                 }
                 // A stash that no longer opens the database: ask for the
                 // password, as MIT's kdb5_stash does without a key list.
-                Err(e) => {
+                Err(e) if wrong_master_key(&e) => {
                     no_master_list(&e);
                 }
+                Err(e) => fail(e),
             }
         }
     }
