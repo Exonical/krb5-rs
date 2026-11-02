@@ -280,8 +280,11 @@ fn stash_source<T>(
                     println!("Using existing stashed keys to update stash file.");
                     return (keyfile, opened);
                 }
-                Err(e) if no_master_list(&e) => {}
-                Err(e) => fail(e),
+                // A stash that no longer opens the database: ask for the
+                // password, as MIT's kdb5_stash does without a key list.
+                Err(e) => {
+                    no_master_list(&e);
+                }
             }
         }
     }
