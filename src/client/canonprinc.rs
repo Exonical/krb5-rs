@@ -253,7 +253,13 @@ mod tests {
         let first = block_on(it.next(&c)).expect("non-DNS candidate");
         assert_eq!(first.to_string(), "host/localhost.example.test");
         let second = block_on(it.next(&c)).expect("DNS candidate");
-        assert_eq!(second.to_string(), "host/localhost");
+        // Windows gives the machine's own name for localhost.
+        let canon = crate::locate::dns_canonical("localhost", false)
+            .map_or_else(|| "localhost".into(), |n| n.to_ascii_lowercase());
+        assert_eq!(
+            second.to_string(),
+            format!("host/{}", canon.trim_end_matches('.'))
+        );
     }
 
     #[tokio::test]
