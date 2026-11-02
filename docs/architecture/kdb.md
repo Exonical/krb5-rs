@@ -545,8 +545,12 @@ services and procedures with MIT's `auth_stat` values. The live test
 `crates/krb5-rs-kdc/tests/oncrpc_live.rs` calls MIT `kadmind -proponly`'s
 iprop program (100423, version 1) as `kiprop/<host>` with privacy.
 
-Deviations: no UDP transport; one GSS context per connection; only the
-default QOP.
+TCP only, one GSS context per connection and the default QOP are what MIT
+1.22.2 does too: kadmind's RPC listeners are stream sockets
+(`lib/apputils/net-server.c:696-699`) and the kadm5 client uses
+`clnttcp_create` (`lib/kadm5/clnt/client_init.c:282`); `svc_auth_gss.c`
+keeps one context per transport (`xp_auth`, lines 405-419) and signs and
+wraps with `GSS_C_QOP_DEFAULT` (line 230), ignoring the QOP of verified MICs.
 
 Deliberate RPCSEC_GSS server deviations from MIT `svc_auth_gss.c`:
 
