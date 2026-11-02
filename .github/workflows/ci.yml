@@ -95,6 +95,8 @@ jobs:
           done
           docker logs kadmind-smoke
           docker logs kadmind-smoke 2>&1 | grep -q 'krb5-rs-kadmind: starting'
+          # A module that fails to load is logged and skipped, as in MIT.
+          if docker logs kadmind-smoke 2>&1 | grep 'kadm5_auth module'; then exit 1; fi
           docker rm -f kadmind-smoke
 
   helm:
