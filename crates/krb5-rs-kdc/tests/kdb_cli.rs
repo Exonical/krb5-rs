@@ -534,11 +534,8 @@ fn purge_mkeys_refuses_to_drop_the_stashed_key() {
 
 /// `stash` with a stash that no longer opens the database asks for the
 /// master password and rewrites the stash.
-fn stash_replaces_a_stale_stash(tag: &str, library: Option<&str>) {
-    let with = |env: Env| match library {
-        Some(library) => env.with_library(library),
-        None => env,
-    };
+fn stash_replaces_a_stale_stash(tag: &str, library: &str) {
+    let with = |env: Env| env.with_library(library);
     let env = with(Env::new(tag));
     env.ok(&["create", "-s"], "master\nmaster\n");
     let other = with(Env::new(&format!("{tag}_other")));
@@ -552,11 +549,11 @@ fn stash_replaces_a_stale_stash(tag: &str, library: Option<&str>) {
 
 #[test]
 fn stash_replaces_a_stale_file_store_stash() {
-    stash_replaces_a_stale_stash("stale_stash_file", None);
+    stash_replaces_a_stale_stash("stale_stash_file", "krb5-rs-file");
 }
 
 #[cfg(feature = "klmdb")]
 #[test]
 fn stash_replaces_a_stale_klmdb_stash() {
-    stash_replaces_a_stale_stash("stale_stash_klmdb", Some("klmdb"));
+    stash_replaces_a_stale_stash("stale_stash_klmdb", "klmdb");
 }
