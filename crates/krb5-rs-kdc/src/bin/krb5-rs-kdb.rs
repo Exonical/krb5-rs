@@ -37,7 +37,7 @@ use krb5_rs_kdb_lmdb::LmdbStore;
 
 fn print_usage() {
     eprintln!(
-        "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] [--master-password-file PATH] [-r REALM] [-d DATABASE] <command>\n\
+        "usage: krb5-rs-kdb [--config kdc.conf] [--krb5-config krb5.conf] [--realm R] [--master-password-file PATH] [-r REALM] [-d DATABASE] [-x DB_ARG]... <command>\n\
          commands:\n  init [--master-password-file F] [--stash] [--randkey NAME]... [--password NAME=FILE]...\n  create [-s]\n  stash [-f KEYFILE]\n  add_mkey [-e ENCTYPE] [-s]\n  use_mkey KVNO [TIME]\n  list_mkeys\n  purge_mkeys [-f] [-n] [-v]\n  update_princ_encryption [-f] [-n] [-v] [PRINC-PATTERN]\n  \
          addprinc [-randkey] [{{+|-}}attr]... [-maxlife T] [-maxrenewlife T] [-expire T] [-pwexpire T] NAME\n  \
          delprinc NAME\n  cpw [-randkey] [-keepold] NAME\n  \
@@ -465,11 +465,18 @@ fn run() {
     let mut realm: Option<String> = None;
     let mut master_password_file: Option<String> = None;
     let mut database: Option<PathBuf> = None;
+    let mut db_args: Vec<String> = Vec::new();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     while let Some(first) = args.first().map(String::as_str) {
         match first {
             "--help" | "-h" => help(),
-            "--config" | "--krb5-config" | "--realm" | "-r" | "-d" | "--master-password-file" => {
+            "--config"
+            | "--krb5-config"
+            | "--realm"
+            | "-r"
+            | "-d"
+            | "-x"
+            | "--master-password-file" => {
                 if args.len() < 2 {
                     usage();
                 }
@@ -479,6 +486,7 @@ fn run() {
                     "--krb5-config" => krb5_config = Some(PathBuf::from(value)),
                     "--realm" | "-r" => realm = Some(value),
                     "-d" => database = Some(PathBuf::from(value)),
+                    "-x" => db_args.push(value),
                     _ => master_password_file = Some(value),
                 }
             }
@@ -489,15 +497,15 @@ fn run() {
         usage();
     }
     let cmd = args.remove(0);
-    // MIT kdb5_util takes -r and -d anywhere (kpropd runs `load -d DB`).
+    // MIT kdb5_util takes -r, -d and -x anywhere (kpropd runs `load -d DB`).
     let mut i = 0;
     while i < args.len() {
-        if matches!(args[i].as_str(), "-r" | "-d") && i + 1 < args.len() {
+        if matches!(args[i].as_str(), "-r" | "-d" | "-x") && i + 1 < args.len() {
             let value = args.remove(i + 1);
-            if args.remove(i) == "-r" {
-                realm = Some(value);
-            } else {
-                database = Some(PathBuf::from(value));
+            match args.remove(i).as_str() {
+                "-r" => realm = Some(value),
+                "-d" => database = Some(PathBuf::from(value)),
+                _ => db_args.push(value),
             }
         } else {
             i += 1;
@@ -531,9 +539,19 @@ fn run() {
         }
         cfg.database_name = database;
     }
+    let db_args = cfg
+        .apply_db_args(&db_args)
+        .unwrap_or_else(|e| fail(format!("{e} while initializing database")));
 
     if cfg.db_module.library.as_deref() == Some("klmdb") {
-        klmdb_command(&cmd, args, &cfg, &realm, master_password_file.as_deref());
+        klmdb_command(
+            &cmd,
+            args,
+            &cfg,
+            &realm,
+            master_password_file.as_deref(),
+            db_args.merge_nra,
+        );
         return;
     }
 
@@ -919,6 +937,7 @@ fn klmdb_command(
     cfg: &RealmConfig,
     realm: &str,
     global_master_password_file: Option<&str>,
+    merge_nra: bool,
 ) {
     if matches!(cmd, "database" | "replication") {
         fail(format!("`{cmd}` needs db_library = krb5-rs-cockroach"));
@@ -1014,8 +1033,8 @@ fn klmdb_command(
             let store = store.unwrap_or_else(|| ok(LmdbStore::open_without_master(cfg)));
             dump_command(args, iprop, || store.dump_entries());
         }
-        "load" => load_command(args, iprop, |entries, policies, update, merge_nra| {
-            LmdbStore::load_dump(cfg, entries, policies, update, merge_nra)
+        "load" => load_command(args, iprop, |entries, policies, update, iprop_load| {
+            LmdbStore::load_dump(cfg, entries, policies, update, iprop_load || merge_nra)
         }),
         _ => {
             require_klmdb(cfg);
@@ -1039,6 +1058,7 @@ fn klmdb_command(
     _cfg: &RealmConfig,
     _realm: &str,
     _global_master_password_file: Option<&str>,
+    _merge_nra: bool,
 ) {
     fail("db_library klmdb needs a krb5-rs-kdb built with the `klmdb` feature");
 }

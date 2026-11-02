@@ -57,7 +57,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: krb5-rs-kadmind [-proponly] [-r realm] [-nofork] [-port port-number] [-P pid_file] [-p path-to-kdb5_util] [-F dump-file] [-K path-to-kprop] [-k kprop-port]"
+        "Usage: krb5-rs-kadmind [-proponly] [-r realm] [-nofork] [-port port-number] [-P pid_file] [-p path-to-kdb5_util] [-F dump-file] [-K path-to-kprop] [-k kprop-port] [-x db_args]*"
     );
     std::process::exit(1);
 }
@@ -80,6 +80,8 @@ struct Args {
     kprop: Option<PathBuf>,
     kprop_port: Option<String>,
     port: Option<u16>,
+    /// `-x`: database arguments (`kadm5_init` db_args).
+    db_args: Vec<String>,
 }
 
 /// MIT's `DEFAULT_KADM5_PORT`.
@@ -103,7 +105,7 @@ fn parse_args() -> Args {
             "-F" => a.dump_file = Some(PathBuf::from(val())),
             "-K" => a.kprop = Some(PathBuf::from(val())),
             "-k" => a.kprop_port = Some(val()),
-            "-x" => die("database arguments (-x) are not supported"),
+            "-x" => a.db_args.push(val()),
             _ => usage(),
         }
     }
@@ -2328,8 +2330,10 @@ async fn main() {
         .clone()
         .or_else(|| default_realm(&kdc_conf, krb5.as_ref()))
         .unwrap_or_else(|| die("no realm given and no default realm found"));
-    let cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm)
+    let mut cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm)
         .unwrap_or_else(|e| die(format!("while initializing, {e}")));
+    cfg.apply_db_args(&args.db_args)
+        .unwrap_or_else(|e| die(format!("{e} while initializing, aborting")));
     if args.proponly && !cfg.iprop.enabled {
         die("-proponly can only be used when iprop_enable is true");
     }
@@ -2343,7 +2347,9 @@ async fn main() {
             .trim()
             .parse::<u16>()
             .unwrap_or_else(|_| die(format!("invalid iprop_port {p}"))),
-        None => die("iprop_port must be set when iprop_enable is true"),
+        // MIT's default iprop_port is 0: the system picks the port
+        // (alt_prof.c:699, loop_add_rpc_service).
+        None => 0,
     });
     let master = read_stash(&cfg.key_stash_file, &realm)
         .unwrap_or_else(|e| die(format!("{e} while reading master key")));

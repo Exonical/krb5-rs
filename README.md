@@ -276,8 +276,7 @@ arrives as a normal kprop push, when the primary no longer has them. The
 primary can be MIT `kadmind` or `krb5-rs-kadmind -proponly`. Push-only
 replication stays the default.
 
-Deliberate deviations: kpropd `-x` is accepted and ignored and iprop needs
-`iprop_port` (no portmapper lookup);
+Deliberate deviations:
 `krb5-rs-kpropd` never forks into the background (use `-D` or a supervisor).
 The `kprop_*` kdc.conf keys of the earlier krb5-rs pull protocol
 (`KRB5RS-PROP-1`) were removed; configurations that still set them fail with

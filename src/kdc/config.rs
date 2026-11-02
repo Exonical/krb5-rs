@@ -130,6 +130,16 @@ const DBMODULE_OPTION_KEYS: &[&str] = &[
     "metrics_listen",
 ];
 
+/// The klmdb `db_args` flags (`-x temporary`, `-x merge_nra`) of MIT
+/// `configure_context` (`plugins/kdb/lmdb/kdb_lmdb.c:156-168`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DbArgs {
+    /// `temporary`: write to a new database that a load promotes.
+    pub temporary: bool,
+    /// `merge_nra`: keep the existing lockout attributes on load.
+    pub merge_nra: bool,
+}
+
 /// Everything the KDC needs to know about one realm.
 ///
 /// `database_name` is the base path used by the selected database module.
@@ -253,6 +263,24 @@ pub fn parse_listen_addresses(s: &str, default_port: u16) -> Result<Vec<SocketAd
 }
 
 impl RealmConfig {
+    /// Apply `-x` database arguments as klmdb's `configure_context` does:
+    /// `dbname=PATH` replaces `database_name`, `temporary` and `merge_nra`
+    /// are returned, and anything else is refused.
+    pub fn apply_db_args(&mut self, args: &[String]) -> Result<DbArgs, String> {
+        let mut flags = DbArgs::default();
+        for arg in args {
+            match arg.as_str() {
+                "temporary" => flags.temporary = true,
+                "merge_nra" => flags.merge_nra = true,
+                _ => match arg.strip_prefix("dbname=") {
+                    Some(path) => self.database_name = PathBuf::from(path),
+                    None => return Err(format!("Unsupported argument \"{arg}\" for LMDB")),
+                },
+            }
+        }
+        Ok(flags)
+    }
+
     /// Build the configuration for `realm` (kdc/main.c `init_realm` and
     /// `initialize_realms`). `krb5_conf` supplies `[libdefaults]`
     /// `clockskew` and `permitted_enctypes`; kdc.conf is used if absent.
@@ -804,5 +832,31 @@ mod db_module_tests {
         let text = err.to_string();
         assert!(text.contains("kprop_primary, kprop_acl"), "{text}");
         assert!(text.contains("krb5-rs-kpropd"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod db_args_tests {
+    use super::*;
+
+    #[test]
+    fn db_args_are_parsed_like_klmdb() {
+        let profile = Profile::parse("[realms]\n R = {\n  database_name = /a/principal\n }\n")
+            .expect("profile");
+        let mut cfg = RealmConfig::from_profiles(&profile, None, "R").expect("config");
+        let args = ["merge_nra".to_string(), "dbname=/b/principal".to_string()];
+        let flags = cfg.apply_db_args(&args).expect("db args");
+        assert_eq!(
+            flags,
+            DbArgs {
+                temporary: false,
+                merge_nra: true
+            }
+        );
+        assert_eq!(cfg.database_name, PathBuf::from("/b/principal"));
+        assert_eq!(
+            cfg.apply_db_args(&["nolock".to_string()]),
+            Err("Unsupported argument \"nolock\" for LMDB".to_string())
+        );
     }
 }
