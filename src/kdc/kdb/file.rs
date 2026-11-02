@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use chrono::Utc;
@@ -16,11 +16,13 @@ use rasn::types::{GeneralString, OctetString};
 
 use super::format::{KdbFile, KdbKey, KdbPolicy, KdbPrincipal, KdbTlData, MAGIC, VERSION};
 use super::master::master_principal;
-use super::mit::mkey::{entry_mkvno, ActKvno, MasterKeys};
+use super::mit::mkey::MasterKeys;
+use super::mit::ulog::{entry_from_update, update_from_entry, Ulog, Update};
 use super::mit::{
-    merge_policy, new_entry, policy_from_entry, record_from_entry, unparse_name, MitEntry,
-    MitPolicy, TlData, ACTKVNO, MKEY_AUX,
+    policy_from_entry, policy_to_entry, set_mod_princ, unparse_name, update_tl_data, MitEntry,
+    MitPolicy, TlData,
 };
+use crate::kdc::config::IpropConfig;
 use crate::kdc::db::{
     random_keys, store_key, KeyEntry, PrincipalAttributes, PrincipalEntry, StoreKey,
 };
@@ -121,6 +123,61 @@ pub struct FileStore {
     /// Master-key list from `K/M`, reloaded with the cache.
     masters: RwLock<MasterKeys>,
     cache: RwLock<Cache>,
+    /// The iprop update log, when `iprop_enable` is set.
+    ulog: Option<Ulog>,
+    /// Serializes this process's writers, which `<path>.lock` would refuse.
+    gate: Mutex<()>,
+}
+
+/// Which principals a write logs to the update log.
+enum Log<'a> {
+    /// Every principal the write changed; a policy change resets the log.
+    Changes,
+    /// `load -update`: these principals, after a reset when `reset`.
+    Loaded { keys: &'a [StoreKey], reset: bool },
+    /// Nothing (`ulog_replay` stores the primary's updates itself).
+    Off,
+}
+
+fn key_of(p: &KdbPrincipal) -> StoreKey {
+    store_key(&p.name, &String::from_utf8_lossy(p.realm.as_bytes()))
+}
+
+fn name_of(p: &KdbPrincipal) -> Vec<u8> {
+    unparse_name(&p.name, &String::from_utf8_lossy(p.realm.as_bytes()))
+}
+
+fn der<T: rasn::Encode>(value: &T) -> Result<Vec<u8>, StoreError> {
+    rasn::der::encode(value).map_err(|e| err(e.to_string()))
+}
+
+/// `record` with the kadmin client's `MOD_PRINC` and tl-data, as
+/// `kadm5_create_principal`/`kadm5_modify_principal` write them
+/// (`svr_principal.c`).
+fn stamp(
+    record: KdbPrincipal,
+    caller: Option<&Caller>,
+    keys: &MasterKeys,
+) -> Result<KdbPrincipal, StoreError> {
+    let Some(caller) = caller else {
+        return Ok(record);
+    };
+    let sp = stored_of(&record);
+    let mut raw = sp.to_mit(keys)?;
+    let secs = u32::try_from(sp.mod_time.unwrap_or(0))
+        .map_err(|_| err("modification time outside u32 range"))?;
+    set_mod_princ(&mut raw, secs, &caller.modifier)?;
+    update_tl_data(&mut raw, &caller.tl);
+    let mut stamped = StoredPrincipal::from_mit(&raw, Some(&sp))?;
+    stamped.keys = sp.keys;
+    kdb_of(&stamped)
+}
+
+/// The kadmin client a write is for.
+#[derive(Clone, Debug)]
+struct Caller {
+    modifier: Vec<u8>,
+    tl: Vec<TlData>,
 }
 
 struct LockGuard(PathBuf);
@@ -265,15 +322,6 @@ fn kdb_of(sp: &StoredPrincipal) -> Result<KdbPrincipal, StoreError> {
     })
 }
 
-/// `keys` with `kvno` as the active master key, to wrap one entry's keys
-/// under the master key it already uses.
-fn active_as(keys: &MasterKeys, kvno: u16) -> MasterKeys {
-    MasterKeys {
-        keys: keys.keys.clone(),
-        actkvno: vec![ActKvno { kvno, act_time: 0 }],
-    }
-}
-
 fn is_km(p: &KdbPrincipal, km: &PrincipalName, realm: &str) -> bool {
     p.name == *km && p.realm.as_bytes() == realm.as_bytes()
 }
@@ -317,13 +365,7 @@ impl FileStore {
         if path.exists() {
             return Err(err(format!("database {} already exists", path.display())));
         }
-        let store = Self {
-            path: path.to_path_buf(),
-            realm: realm.to_string(),
-            master: master.clone(),
-            masters: RwLock::new(MasterKeys::single(master.clone())),
-            cache: RwLock::new(Cache::default()),
-        };
+        let store = Self::new(path, realm, master, MasterKeys::single(master.clone()));
         let now = kerberos_time(Utc::now().timestamp());
         let km_key = KeyEntry {
             kvno: 1,
@@ -397,15 +439,36 @@ impl FileStore {
         let keys = stored_of(km)
             .master_keys(master)
             .map_err(|_| err("incorrect master key"))?;
-        let store = Self {
-            path: path.to_path_buf(),
-            realm,
-            master: master.clone(),
-            masters: RwLock::new(keys),
-            cache: RwLock::new(Cache::default()),
-        };
+        let store = Self::new(path, &realm, master, keys);
         store.refresh(true)?;
         Ok(store)
+    }
+
+    fn new(path: &Path, realm: &str, master: &EncryptionKey, masters: MasterKeys) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            realm: realm.to_string(),
+            master: master.clone(),
+            masters: RwLock::new(masters),
+            cache: RwLock::new(Cache::default()),
+            ulog: None,
+            gate: Mutex::new(()),
+        }
+    }
+
+    /// Map the update log when `iprop_enable` is set, so every write logs its
+    /// changes as `krb5_db_put_principal` and `krb5_db_delete_principal` do
+    /// for db2 (`kdb5.c:981-1051`).
+    pub fn with_iprop(mut self, iprop: &IpropConfig) -> Result<Self, StoreError> {
+        if iprop.enabled {
+            self.ulog = Some(Ulog::map(&iprop.logfile, iprop.ulogsize)?);
+        }
+        Ok(self)
+    }
+
+    /// The update log, when iprop is enabled.
+    pub fn ulog(&self) -> Option<&Ulog> {
+        self.ulog.as_ref()
     }
 
     /// The realm this database serves.
@@ -531,34 +594,13 @@ impl FileStore {
         Ok(raws)
     }
 
-    /// Read-modify-write one principal's raw MIT entry under the write lock;
-    /// `f` returns false to leave it unchanged.
+    /// Read-modify-write one principal's raw MIT entry under the write lock
+    /// for the master-key commands; `f` returns false to leave it unchanged.
     pub fn update_raw<F>(&self, name: &PrincipalName, realm: &str, f: F) -> Result<bool, StoreError>
     where
         F: FnOnce(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError>,
     {
-        self.refresh(false)?;
-        let key = store_key(name, realm);
-        self.modify(|list| {
-            let pos = list
-                .iter()
-                .position(|p| {
-                    let r = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
-                    store_key(&p.name, &r) == key
-                })
-                .ok_or_else(|| {
-                    StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
-                })?;
-            let keys = self.masters_in(list)?;
-            let mut sp = stored_of(&list[pos]);
-            let mut raw = sp.to_raw()?;
-            if !f(&mut raw, &keys)? {
-                return Ok(false);
-            }
-            sp.apply_raw(&raw)?;
-            list[pos] = kdb_of(&sp)?;
-            Ok(true)
-        })
+        self.update_mit(name, realm, f)
     }
 
     fn read_cache(&self) -> std::sync::RwLockReadGuard<'_, Cache> {
@@ -656,13 +698,150 @@ impl FileStore {
         &self,
         f: impl FnOnce(&mut KdbFile) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
+        self.modify_file_as(Log::Changes, f)
+    }
+
+    /// [`FileStore::modify_file`], logging what `log` names. The update log
+    /// is locked before the database, and a write the log can't record is
+    /// refused before the database changes.
+    fn modify_file_as<R>(
+        &self,
+        log: Log<'_>,
+        f: impl FnOnce(&mut KdbFile) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let ulog = self.ulog.as_ref().filter(|_| !matches!(log, Log::Off));
+        let held = ulog.map(Ulog::lock).transpose()?;
         let _guard = self.lock()?;
         let (_, mut file) = read_file(&self.path)?;
+        let before = ulog.map(|_| file.clone());
         let out = f(&mut file)?;
+        let (reset, updates) = match &before {
+            Some(before) => self.changes(before, &file, &log)?,
+            None => (false, Vec::new()),
+        };
+        if let Some(ulog) = ulog {
+            for update in &updates {
+                ulog.check_fits(update)?;
+            }
+        }
         file.serial = Some(file.serial.unwrap_or(0) + 1);
         write_atomic(&self.path, &file)?;
         self.refresh(true)?;
+        if let (Some(ulog), Some(held)) = (ulog, &held) {
+            if reset {
+                ulog.init_header_locked(held)?;
+            }
+            for mut update in updates {
+                if let Err(e) = ulog.add_update_locked(held, &mut update) {
+                    // The database already changed: make replicas resync in
+                    // full rather than miss the rest.
+                    ulog.init_header_locked(held)?;
+                    return Err(e);
+                }
+            }
+        }
         Ok(out)
+    }
+
+    /// The updates `ulog_conv_2logentry` (`kdb_convert.c`) makes for a
+    /// write that turned `before` into `after`, and whether a policy change
+    /// resets the log instead (`kdb5.c:2441-2525`). A rename is a put of
+    /// the new name, then a deletion of the old one.
+    fn changes(
+        &self,
+        before: &KdbFile,
+        after: &KdbFile,
+        log: &Log<'_>,
+    ) -> Result<(bool, Vec<Update>), StoreError> {
+        let old: HashMap<StoreKey, &KdbPrincipal> =
+            before.principals.iter().map(|p| (key_of(p), p)).collect();
+        let new: HashMap<StoreKey, &KdbPrincipal> =
+            after.principals.iter().map(|p| (key_of(p), p)).collect();
+        let keys = self.masters_in(&after.principals)?;
+        let update = |p: &KdbPrincipal| -> Result<Update, StoreError> {
+            let current = old
+                .get(&key_of(p))
+                .map(|o| stored_of(o).to_mit(&keys))
+                .transpose()?;
+            Ok(update_from_entry(
+                current.as_ref(),
+                &stored_of(p).to_mit(&keys)?,
+            ))
+        };
+        match log {
+            Log::Off => Ok((false, Vec::new())),
+            Log::Loaded { keys, reset } => {
+                let updates = keys
+                    .iter()
+                    .filter_map(|k| new.get(k))
+                    .map(|p| update(p))
+                    .collect::<Result<_, _>>()?;
+                Ok((*reset, updates))
+            }
+            Log::Changes => {
+                if der(&before.policies)? != der(&after.policies)? {
+                    return Ok((true, Vec::new()));
+                }
+                let mut updates = Vec::new();
+                for p in &after.principals {
+                    let same = match old.get(&key_of(p)) {
+                        Some(o) => der(*o)? == der(p)?,
+                        None => false,
+                    };
+                    if !same {
+                        updates.push(update(p)?);
+                    }
+                }
+                for p in &before.principals {
+                    if !new.contains_key(&key_of(p)) {
+                        updates.push(Update::deletion(name_of(p)));
+                    }
+                }
+                Ok((false, updates))
+            }
+        }
+    }
+
+    /// `ulog_replay` (`lib/kdb/kdb_log.c:401-476`): apply updates received
+    /// from the primary without logging them as new changes, then store each
+    /// one in the log with its primary serial number. On failure the log is
+    /// reinitialized, so the next poll asks for a full resync.
+    pub fn replay_updates(&self, updates: &[Update]) -> Result<(), StoreError> {
+        let ulog = self
+            .ulog
+            .as_ref()
+            .ok_or_else(|| StoreError::backend("Iprop not enabled"))?;
+        let result = updates.iter().filter(|u| u.commit).try_for_each(|upd| {
+            self.modify_file_as(Log::Off, |file| self.replay(file, upd))?;
+            ulog.store_replayed(upd)
+        });
+        if result.is_err() {
+            let _ = ulog.init_header();
+        }
+        result
+    }
+
+    fn replay(&self, file: &mut KdbFile, upd: &Update) -> Result<(), StoreError> {
+        let pos = file
+            .principals
+            .iter()
+            .position(|p| name_of(p) == upd.princ_name);
+        let current = pos.map(|i| file.principals.remove(i));
+        if upd.deleted {
+            return Ok(());
+        }
+        let keys = self.masters_in(&file.principals)?;
+        let current = current.as_ref().map(stored_of);
+        let mit = current.as_ref().map(|sp| sp.to_mit(&keys)).transpose()?;
+        let entry = entry_from_update(mit, upd)?;
+        let record = kdb_of(&StoredPrincipal::from_mit(&entry, current.as_ref())?)?;
+        let key = key_of(&record);
+        match file.principals.iter().position(|p| key_of(p) == key) {
+            Some(i) => file.principals[i] = record,
+            None => file.principals.push(record),
+        }
+        Ok(())
     }
 
     /// Insert or replace a principal (modification time set to now; the
@@ -784,62 +963,153 @@ impl FileStore {
         Ok((records, policies))
     }
 
-    /// Principals and policies as MIT dump entries in klmdb key order.
-    /// Deviation: the file store keeps only what [`PrincipalRecord`] and
-    /// [`Policy`] model (no lockout state, string attributes, password
-    /// history), so only that is dumped.
+    /// Principals and policies as MIT dump entries in klmdb key order, keys
+    /// as stored. Deviation: the file store keeps no lockout state, so
+    /// `last_success`, `last_failed` and `fail_auth_count` dump as 0.
     pub fn dump_entries(&self) -> Result<(Vec<MitEntry>, Vec<MitPolicy>), StoreError> {
-        let (_, policies) = self.export_records()?;
-        let creator = unparse_name(&PrincipalName::new_principal("db_creation"), &self.realm);
+        let entries = self.mit_entries()?;
+        let policies = self.list_policies()?;
+        Ok((entries, policies.iter().map(policy_to_entry).collect()))
+    }
+
+    /// Every principal as the MIT entry kadmind and iprop see, keys still
+    /// encrypted, in klmdb key order.
+    pub fn mit_entries(&self) -> Result<Vec<MitEntry>, StoreError> {
+        self.refresh(false)?;
         let keys = self.master_keys();
         let raws: Vec<KdbPrincipal> = self.read_cache().records.values().cloned().collect();
         let mut entries = raws
             .iter()
-            .map(|raw| {
-                let sp = stored_of(raw);
-                let mkvno = sp.keys.first().map_or(Ok(1), |k| {
-                    u16::try_from(k.mkvno).map_err(|_| err("master key version out of range"))
-                })?;
-                let mut entry = new_entry(
-                    &self.decrypt_record(raw)?,
-                    &active_as(&keys, mkvno),
-                    &creator,
-                )?;
-                entry.tl_data.extend(sp.tl_data);
-                Ok(entry)
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?;
-        entries.sort_by_cached_key(|e| unparse_name(&e.principal, &e.realm));
-        let policies = policies
-            .iter()
-            .map(|policy| {
-                let mut entry = MitPolicy {
-                    name: String::new(),
-                    pw_min_life: 0,
-                    pw_max_life: 0,
-                    pw_min_length: 0,
-                    pw_min_classes: 0,
-                    pw_history_num: 0,
-                    pw_max_fail: 0,
-                    pw_failcnt_interval: 0,
-                    pw_lockout_duration: 0,
-                    attributes: 0,
-                    max_life: 0,
-                    max_renewable_life: 0,
-                    allowed_keysalts: None,
-                    tl_data: Vec::new(),
-                };
-                merge_policy(&mut entry, policy).map(|()| entry)
-            })
+            .map(|raw| stored_of(raw).to_mit(&keys))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((entries, policies))
+        entries.sort_by_cached_key(|e| unparse_name(&e.principal, &e.realm));
+        Ok(entries)
+    }
+
+    /// The MIT entry for `name`, keys still encrypted
+    /// (`krb5_db_get_principal`).
+    pub fn mit_entry(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<MitEntry>, StoreError> {
+        self.refresh(false)?;
+        let raw = self
+            .read_cache()
+            .records
+            .get(&store_key(name, realm))
+            .cloned();
+        raw.map(|r| stored_of(&r).to_mit(&self.master_keys()))
+            .transpose()
+    }
+
+    /// The policy `name` as an MIT policy record (`krb5_db_get_policy`).
+    pub fn mit_policy(&self, name: &str) -> Result<Option<MitPolicy>, StoreError> {
+        Ok(self.get_policy(name)?.as_ref().map(policy_to_entry))
+    }
+
+    /// Store a new MIT entry, such as an alias (`kdb_put_entry` of a fresh
+    /// `krb5_db_entry`); `Conflict` if the name is taken.
+    pub fn create_mit(&self, raw: &MitEntry) -> Result<(), StoreError> {
+        let record = kdb_of(&StoredPrincipal::from_mit(raw, None)?)?;
+        let key = key_of(&record);
+        self.modify(|list| {
+            if list.iter().any(|p| key_of(p) == key) {
+                return Err(StoreError::conflict(format!(
+                    "Principal or policy already exists: {}",
+                    String::from_utf8_lossy(&name_of(&record))
+                )));
+            }
+            list.push(record);
+            Ok(())
+        })
+    }
+
+    fn position(
+        list: &[KdbPrincipal],
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<usize, StoreError> {
+        let key = store_key(name, realm);
+        list.iter().position(|p| key_of(p) == key).ok_or_else(|| {
+            StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
+        })
+    }
+
+    /// Read-modify-write one principal's MIT entry under the write lock, as
+    /// `krb5_db_get_principal` + `krb5_db_put_principal`; `f` returns false
+    /// to leave it unchanged.
+    pub fn update_mit<F>(&self, name: &PrincipalName, realm: &str, f: F) -> Result<bool, StoreError>
+    where
+        F: FnOnce(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError>,
+    {
+        self.modify(|list| {
+            let pos = Self::position(list, name, realm)?;
+            let keys = self.masters_in(list)?;
+            let sp = stored_of(&list[pos]);
+            let mut raw = sp.to_mit(&keys)?;
+            if !f(&mut raw, &keys)? {
+                return Ok(false);
+            }
+            list[pos] = kdb_of(&StoredPrincipal::from_mit(&raw, Some(&sp))?)?;
+            Ok(true)
+        })
+    }
+
+    /// `krb5_db_def_rename_principal` (`lib/kdb/kdb_default.c:516-551`):
+    /// `f` turns the source entry into the renamed one, which is stored and
+    /// the source deleted in one write.
+    pub fn rename_mit<F>(&self, name: &PrincipalName, realm: &str, f: F) -> Result<(), StoreError>
+    where
+        F: FnOnce(MitEntry, &MasterKeys) -> Result<MitEntry, StoreError>,
+    {
+        self.modify(|list| {
+            let pos = Self::position(list, name, realm)?;
+            let keys = self.masters_in(list)?;
+            let sp = stored_of(&list[pos]);
+            let renamed = f(sp.to_mit(&keys)?, &keys)?;
+            let record = kdb_of(&StoredPrincipal::from_mit(&renamed, Some(&sp))?)?;
+            let key = key_of(&record);
+            if list.iter().any(|p| key_of(p) == key) {
+                return Err(StoreError::conflict(format!(
+                    "Principal or policy already exists: {}",
+                    String::from_utf8_lossy(&name_of(&record))
+                )));
+            }
+            list.remove(pos);
+            list.push(record);
+            Ok(())
+        })
+    }
+
+    /// This store, writing principals for the kadmin client `modifier` (an
+    /// unparsed principal) as the klmdb store's `CallerStore` does.
+    pub fn as_caller(self: &Arc<Self>, modifier: Vec<u8>) -> FileCaller {
+        FileCaller {
+            store: Arc::clone(self),
+            caller: Some(Caller {
+                modifier,
+                tl: Vec::new(),
+            }),
+        }
+    }
+
+    /// This store as an [`AdminStore`] writing for no kadmin client.
+    pub fn admin(self: &Arc<Self>) -> FileCaller {
+        FileCaller {
+            store: Arc::clone(self),
+            caller: None,
+        }
     }
 
     /// Load dump records. Without `update` the new database is written to
     /// `<path>~` and renamed over `path`, like MIT's db2 temporary database
     /// (`plugins/kdb/db2/kdb_db2.c:298,1419-1460`). `master` must open the
-    /// dump's `K/M`; each entry keeps its master key version. Fields the file
-    /// store does not model are dropped.
+    /// dump's `K/M`; entries keep their keys as dumped. With `log` (the
+    /// iprop settings and the index of the first principal after the dump's
+    /// last policy), an `update` load logs each principal from there, after
+    /// resetting the log if the dump has policies, as `krb5_db_put_principal`
+    /// and `krb5_db_create_policy` do (`kdb5.c:981-1051, 2441-2525`).
     pub fn load_dump(
         path: &Path,
         realm: &str,
@@ -847,46 +1117,31 @@ impl FileStore {
         entries: &[MitEntry],
         policies: &[MitPolicy],
         update: bool,
+        log: Option<(&IpropConfig, usize)>,
     ) -> Result<(), StoreError> {
         let km_name = master_principal()?;
         let dumped_km = entries
             .iter()
             .find(|e| e.principal == km_name && e.realm == realm);
-        let store = if update {
-            Self::open(path, master)?
-        } else {
-            Self {
-                path: path.to_path_buf(),
-                realm: realm.to_string(),
-                master: master.clone(),
-                masters: RwLock::new(MasterKeys::single(master.clone())),
-                cache: RwLock::new(Cache::default()),
-            }
+        let store = match (update, log) {
+            (true, Some((iprop, _))) => Self::open(path, master)?.with_iprop(iprop)?,
+            (true, None) => Self::open(path, master)?,
+            (false, _) => Self::new(path, realm, master, MasterKeys::single(master.clone())),
         };
-        let keys = match dumped_km {
-            Some(km) => MasterKeys::fetch(km, master)?,
-            None => store.master_keys(),
-        };
+        if let Some(km) = dumped_km {
+            MasterKeys::fetch(km, master)?;
+        }
         let mut principals = Vec::with_capacity(entries.len());
         for entry in entries {
-            let record = record_from_entry(entry, &keys)?;
-            let mut sp = StoredPrincipal::from_entry(
-                &record.entry,
-                record.last_pwd_change.as_ref().map(ts),
-                record.mod_time.as_ref().map(ts),
-                &active_as(&keys, entry_mkvno(entry)?),
-            )?;
-            sp.tl_data = entry
-                .tl_data
-                .iter()
-                .filter(|t| matches!(t.kind, ACTKVNO | MKEY_AUX))
-                .cloned()
-                .collect();
-            principals.push((
-                store_key(&record.entry.name, &record.entry.realm),
-                kdb_of(&sp)?,
-            ));
+            let record = kdb_of(&StoredPrincipal::from_mit(entry, None)?)?;
+            principals.push((key_of(&record), record));
         }
+        let loaded: Vec<StoreKey> = principals
+            .iter()
+            .skip(log.map_or(0, |(_, from)| from))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let reset = !policies.is_empty();
         let policies = policies
             .iter()
             .map(|p| policy_to_record(&policy_from_entry(p)))
@@ -913,7 +1168,11 @@ impl FileStore {
             }
         };
         if update {
-            return store.modify_file(|file| {
+            let log = Log::Loaded {
+                keys: &loaded,
+                reset,
+            };
+            return store.modify_file_as(log, |file| {
                 merge(file);
                 Ok(())
             });
@@ -942,15 +1201,26 @@ impl FileStore {
         entry: PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
+        self.create_record_as(entry, last_pwd_change, None)
+    }
+
+    fn create_record_as(
+        &self,
+        entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
+        caller: Option<&Caller>,
+    ) -> Result<(), StoreError> {
         let key = store_key(&entry.name, &entry.realm);
         self.modify(|list| {
+            let keys = self.masters_in(list)?;
             let record = self.to_record(
                 &entry,
                 last_pwd_change,
                 Some(kerberos_time(Utc::now().timestamp())),
                 None,
-                &self.masters_in(list)?,
+                &keys,
             )?;
+            let record = stamp(record, caller, &keys)?;
             let exists = list.iter().any(|p| {
                 let realm = String::from_utf8_lossy(p.realm.as_bytes()).to_string();
                 store_key(&p.name, &realm) == key
@@ -971,7 +1241,17 @@ impl FileStore {
         &self,
         name: &PrincipalName,
         realm: &str,
+        f: impl FnMut(&mut PrincipalRecord) -> Result<(), StoreError>,
+    ) -> Result<PrincipalRecord, StoreError> {
+        self.update_record_as(name, realm, f, None)
+    }
+
+    fn update_record_as(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
         mut f: impl FnMut(&mut PrincipalRecord) -> Result<(), StoreError>,
+        caller: Option<&Caller>,
     ) -> Result<PrincipalRecord, StoreError> {
         let key = store_key(name, realm);
         self.modify(|list| {
@@ -988,13 +1268,14 @@ impl FileStore {
             let mut rec = self.decrypt_with(&list[pos], &keys)?;
             f(&mut rec)?;
             rec.mod_time = Some(kerberos_time(Utc::now().timestamp()));
-            list[pos] = self.to_record(
+            let record = self.to_record(
                 &rec.entry,
                 rec.last_pwd_change,
                 rec.mod_time,
                 Some(&list[pos]),
                 &keys,
             )?;
+            list[pos] = stamp(record, caller, &keys)?;
             Ok(rec)
         })
     }
@@ -1163,6 +1444,113 @@ impl AdminStore for FileStore {
     }
 }
 
+/// A [`FileStore`] writing for one kadmin client: new and modified
+/// principals record it in `MOD_PRINC` and get its tl-data.
+#[derive(Clone)]
+pub struct FileCaller {
+    store: Arc<FileStore>,
+    caller: Option<Caller>,
+}
+
+impl FileCaller {
+    /// Also add the client's tl-data to principals it creates or modifies.
+    pub fn with_tl_data(mut self, tl: Vec<TlData>) -> Self {
+        if let Some(caller) = &mut self.caller {
+            caller.tl = tl;
+        }
+        self
+    }
+}
+
+impl AdminStore for FileCaller {
+    fn get_record(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl std::future::Future<Output = Result<Option<PrincipalRecord>, StoreError>> + Send {
+        std::future::ready(FileStore::get_record(&self.store, name, realm))
+    }
+
+    fn create_principal(
+        &self,
+        entry: PrincipalEntry,
+        last_pwd_change: Option<KerberosTime>,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(self.store.create_record_as(
+            entry,
+            last_pwd_change,
+            self.caller.as_ref(),
+        ))
+    }
+
+    fn update_principal<F>(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<PrincipalRecord, StoreError>> + Send
+    where
+        F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send + 'static,
+    {
+        std::future::ready(
+            self.store
+                .update_record_as(name, realm, f, self.caller.as_ref()),
+        )
+    }
+
+    fn delete_principal(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+        std::future::ready(self.store.delete(name, realm))
+    }
+
+    fn list_principals(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<PrincipalRecord>, StoreError>> + Send {
+        std::future::ready(self.store.list_records())
+    }
+
+    fn get_policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Policy>, StoreError>> + Send {
+        std::future::ready(FileStore::get_policy(&self.store, name))
+    }
+
+    fn create_policy(
+        &self,
+        policy: Policy,
+    ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+        std::future::ready(self.store.create_policy_record(policy))
+    }
+
+    fn update_policy<F>(
+        &self,
+        name: &str,
+        f: F,
+    ) -> impl std::future::Future<Output = Result<Policy, StoreError>> + Send
+    where
+        F: FnMut(&mut Policy) -> Result<(), StoreError> + Send + 'static,
+    {
+        std::future::ready(self.store.update_policy_record(name, f))
+    }
+
+    fn delete_policy(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+        std::future::ready(FileStore::delete_policy(&self.store, name))
+    }
+
+    fn list_policies(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<Policy>, StoreError>> + Send {
+        std::future::ready(FileStore::list_policies(&self.store))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,8 +1649,11 @@ mod tests {
         let master = master_key_from_password(realm, "master-password-for-dump-fixtures", 18)
             .expect("master");
         let path = temp("dump");
-        assert!(FileStore::load_dump(&path, realm, &master, &entries, &policies, true).is_err());
-        FileStore::load_dump(&path, realm, &master, &entries, &policies, false).expect("load");
+        assert!(
+            FileStore::load_dump(&path, realm, &master, &entries, &policies, true, None).is_err()
+        );
+        FileStore::load_dump(&path, realm, &master, &entries, &policies, false, None)
+            .expect("load");
         assert!(!path.with_file_name("principal~").exists());
 
         let store = FileStore::open(&path, &master).expect("open");
@@ -1283,20 +1674,111 @@ mod tests {
         assert_eq!(reread.len(), entries.len() + policies.len());
 
         drop(store);
-        FileStore::load_dump(&path, realm, &master, &entries[1..2], &[], true).expect("update");
+        FileStore::load_dump(&path, realm, &master, &entries[1..2], &[], true, None)
+            .expect("update");
         let (after_update, after_update_policies) = FileStore::open(&path, &master)
             .expect("open")
             .dump_entries()
             .expect("dump");
         assert_eq!(after_update.len(), entries.len());
         assert_eq!(after_update_policies.len(), policies.len());
-        FileStore::load_dump(&path, realm, &master, &entries[..2], &[], false).expect("replace");
+        FileStore::load_dump(&path, realm, &master, &entries[..2], &[], false, None)
+            .expect("replace");
         let (replaced, replaced_policies) = FileStore::open(&path, &master)
             .expect("open")
             .dump_entries()
             .expect("dump");
         assert_eq!(names(&replaced), names(&entries[..2]));
         assert!(replaced_policies.is_empty());
+    }
+
+    #[test]
+    fn writes_log_their_changes_and_replicas_replay_them() {
+        use crate::kdc::kdb::mit::ulog::UpdateStatus;
+        let path = temp("ulog");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let iprop = IpropConfig {
+            enabled: true,
+            logfile: path.with_extension("ulog"),
+            ulogsize: 100,
+        };
+        let primary = FileStore::create(&path, "R", &master)
+            .expect("create")
+            .with_iprop(&iprop)
+            .expect("ulog");
+        let replica_path = path.with_file_name("replica");
+        let (entries, policies) = primary.dump_entries().expect("dump");
+        FileStore::load_dump(
+            &replica_path,
+            "R",
+            &master,
+            &entries,
+            &policies,
+            false,
+            None,
+        )
+        .expect("load");
+        let replica = FileStore::open(&replica_path, &master)
+            .expect("open")
+            .with_iprop(&IpropConfig {
+                logfile: replica_path.with_extension("ulog"),
+                ..iprop.clone()
+            })
+            .expect("replica ulog");
+        let log = primary.ulog().expect("ulog");
+        let start = log.get_last().expect("last");
+        let (alice, bob) = (
+            PrincipalName::new_principal("alice"),
+            PrincipalName::new_principal("bob"),
+        );
+        let changed = Some(kerberos_time(1_700_000_000));
+        primary
+            .create_record(user("alice"), changed)
+            .expect("alice");
+        primary.create_record(user("bob"), changed).expect("bob");
+        primary
+            .update_record(&alice, "R", |r| {
+                r.entry.max_life = Some(std::time::Duration::from_secs(3600));
+                Ok(())
+            })
+            .expect("modify");
+        assert!(primary.delete(&bob, "R").expect("delete"));
+
+        let (status, updates, _) = log.get_entries(&start).expect("entries");
+        assert_eq!(status, UpdateStatus::Ok);
+        let names: Vec<_> = updates
+            .iter()
+            .map(|u| (u.princ_name.clone(), u.deleted))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (b"alice@R".to_vec(), false),
+                (b"bob@R".to_vec(), false),
+                (b"alice@R".to_vec(), false),
+                (b"bob@R".to_vec(), true),
+            ]
+        );
+        replica.replay_updates(&updates).expect("replay");
+        assert_eq!(
+            replica.mit_entry(&alice, "R").expect("replica alice"),
+            primary.mit_entry(&alice, "R").expect("primary alice")
+        );
+        assert_eq!(replica.mit_entry(&bob, "R").expect("bob"), None);
+        let replica_log = replica.ulog().expect("replica ulog");
+        assert_eq!(
+            replica_log.get_last().expect("last").sno,
+            log.get_last().expect("last").sno
+        );
+
+        primary
+            .create_policy_record(Policy {
+                name: "p".into(),
+                ..Policy::default()
+            })
+            .expect("policy");
+        let header = log.header().expect("header");
+        assert_eq!((header.num, header.last_sno), (1, 1));
     }
 
     #[test]

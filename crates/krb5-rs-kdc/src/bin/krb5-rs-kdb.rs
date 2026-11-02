@@ -356,7 +356,7 @@ fn init(
     let key = master_key(cfg, realm, Some(master_file));
     let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
     let store = if cfg.database_name.exists() {
-        ok(FileStore::open(&cfg.database_name, &key))
+        ok(open_file(cfg, &key))
     } else {
         let store = ok(FileStore::create_with(
             &cfg.database_name,
@@ -570,6 +570,7 @@ fn run() {
         fail(format!("`{cmd}` needs db_library = krb5-rs-cockroach"));
     }
 
+    let iprop = cfg.iprop.enabled.then_some(&cfg.iprop);
     match cmd.as_str() {
         "init" => {
             init(args, &cfg, &realm, master_password_file.as_deref());
@@ -580,6 +581,7 @@ fn run() {
             let key = create_master_key(&cfg, &realm, master_password_file.as_deref());
             let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
             let store = FileStore::create_with(&cfg.database_name, &realm, &key, &etypes)
+                .and_then(|store| store.with_iprop(&cfg.iprop))
                 .unwrap_or_else(|e| {
                     fail(format!(
                         "{e} while creating database '{}'",
@@ -613,19 +615,21 @@ fn run() {
                 &cfg,
                 &realm,
                 master_password_file.as_deref(),
-                |k| FileStore::open(&cfg.database_name, k),
+                |k| open_file(&cfg, k),
             );
             return;
         }
         "dump" => {
-            dump_command(args, None, || {
+            dump_command(args, iprop, || {
                 let master = master_key(&cfg, &realm, master_password_file.as_deref());
                 FileStore::open(&cfg.database_name, &master)?.dump_entries()
             });
             return;
         }
         "load" => {
-            load_command(args, None, |entries, policies, update, _, _| {
+            // db2 has no lockout records to merge (`merge_nra` is ignored,
+            // `kdb_db2.c:234`).
+            load_command(args, iprop, |entries, policies, update, _, log_from| {
                 let master = master_key(&cfg, &realm, master_password_file.as_deref());
                 FileStore::load_dump(
                     &cfg.database_name,
@@ -634,6 +638,7 @@ fn run() {
                     entries,
                     policies,
                     update,
+                    iprop.map(|c| (c, log_from)),
                 )
             });
             return;
@@ -642,7 +647,7 @@ fn run() {
     }
 
     let master = master_key(&cfg, &realm, master_password_file.as_deref());
-    let store = ok(FileStore::open(&cfg.database_name, &master));
+    let store = ok(open_file(&cfg, &master));
     let admin = Blocking::new(
         runtime(),
         &store,
@@ -650,6 +655,14 @@ fn run() {
         cfg.master_key_type,
     );
     run_admin(&admin, &cmd, args, &realm);
+}
+
+/// The file store, logging writes to the update log when iprop is enabled.
+fn open_file(
+    cfg: &RealmConfig,
+    master: &krb5_rs::types::EncryptionKey,
+) -> Result<FileStore, StoreError> {
+    FileStore::open(&cfg.database_name, master)?.with_iprop(&cfg.iprop)
 }
 
 type DumpEntries = (Vec<MitEntry>, Vec<MitPolicy>);

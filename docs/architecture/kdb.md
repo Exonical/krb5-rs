@@ -267,16 +267,16 @@ Deviations:
   §MIT iprop update log.
 - `e_data` is always written empty, as klmdb never stores it
   (`plugins/kdb/lmdb/marshal.c`).
-- The file store keeps only what its record model has: string attributes
-  other than `krb5rs_allowed_to_delegate_from`, password history, policy
-  tl-data, MIT tl-data and the lockout fields (`last_success`,
-  `last_failed`, `fail_auth_count`; the file store keeps lockout counters in
-  memory, see section 8) are dropped on load and dumped as zero.
+- The file store keeps each principal's keys as dumped and its MIT tl-data
+  (string attributes, password history, `MOD_PRINC`, aliases). It has no
+  lockout fields (`last_success`, `last_failed`, `fail_auth_count`; its
+  lockout counters are in memory, see section 8): they are dropped on load
+  and dumped as zero.
 
 ### MIT iprop update log
 
-With `iprop_enable = true` in the realm (klmdb only), every principal change
-made through the klmdb store is appended to MIT's update log
+With `iprop_enable = true` in the realm, every principal change made through
+the klmdb store or the file store is appended to MIT's update log
 (`src/lib/kdb/kdb_log.c`, `kdb_log.h`, `iprop.x`; code in
 `src/kdc/kdb/mit/ulog.rs`). The file is `iprop_logfile` (default
 `<database_name>.ulog`) and holds `iprop_ulogsize` entries (default 1000;
@@ -309,7 +309,13 @@ against its current entry, as `krb5_db_put_principal` does
 (`kdb5.c:2441-2525`), so only principals after the dump's last policy stay
 logged. A full load reinitializes the log.
 
-Deviations: the file store and CockroachDB never write a log.
+The file store logs like MIT's db2 module, which goes through the same
+`kdb5.c` calls: each write logs the principals it changed (a rename as a put
+of the new name, then a deletion), a policy change reinitializes the log,
+and `dump -i`, `load -i`, `load -update`, `krb5-rs-kpropd` replay and
+`krb5-rs-kadmind -proponly` work on it as on klmdb. A write the log can't
+record is refused before the database changes. Deviation: CockroachDB never
+writes a log; it replicates to its KDCs itself.
 
 Deliberate deviations from MIT's log handling (MIT 1.22.2 behaves
 otherwise):
@@ -354,8 +360,12 @@ as in MIT: the default `iprop_port` is 0 (`alt_prof.c:699`) and kadm5's
 klmdb `db_args` (`dbname=PATH`, `temporary`, `merge_nra`; anything else is
 `Unsupported argument "..." for LMDB`) for the database the update log is
 replayed into, as MIT passes them to `ulog_replay` (`kpropd.c:891`).
-`krb5-rs-kadmind -x` and `krb5-rs-kdb -x` take the same arguments.
-Deviation: klmdb only.
+`krb5-rs-kadmind -x` and `krb5-rs-kdb -x` take the same arguments. With
+`db_library = krb5-rs-file` they take db2's instead (`kdb_db2.c:222-247`):
+`dbname=PATH`, `temporary`, `merge_nra`, `hash=...`, `unlockiter` and
+`lockiter`; anything else is `Unsupported argument "..." for db2`. The file
+store has no db2 access methods or lockout records, so `hash`, the
+iteration locks and `merge_nra` change nothing, as `merge_nra` does in db2.
 Deliberate retry deviations from MIT `do_iprop`: a failed
 `IPROP_GET_UPDATES` or `IPROP_FULL_RESYNC[_EXT]` call waits the same
 `2 << n` backoff before reconnecting instead of reconnecting at once, and a
@@ -390,7 +400,10 @@ MIT does (`ovsec_kadmd.c:507`), unless `-nofork` is given; `-P` then writes
 the daemon's pid. Startup errors before that point still reach the
 terminal, and the command exits with the daemon's status.
 
-Deviations: klmdb only.
+kadmind administers klmdb, the file store (`db_library = krb5-rs-file`, as
+MIT's kadmind does db2) and CockroachDB. On the file store, principals keep
+their MIT tl-data, so the modifier in `MOD_PRINC`, string attributes and
+aliases read back as on klmdb.
 
 ACL restrictions (the fourth `kadm5.acl` field) are parsed and validated like
 `auth_acl.c` `parse_restrictions`: `[+-]flag`, `-clearpolicy`, `-policy POL`
@@ -536,7 +549,7 @@ MIT tl-data in the `principals.tl_data` column, so the modifier in
 (`KRB5_TL_ALIAS_TARGET`, no keys) read back as on klmdb; renaming an alias
 fails with `KRB5_KDB_ALIAS_UNSUPPORTED`, as in `kdb5.c`. Every write reads
 `K/M` and the principal in one serializable transaction, retried on conflict.
-iprop needs klmdb: kadmind refuses `iprop_enable` with CockroachDB, which
+iprop needs klmdb or the file store: kadmind refuses `iprop_enable` with CockroachDB, which
 replicates to the KDCs itself. The live test
 `crates/krb5-rs-kdc/tests/kadmin_cockroach_live.rs` runs MIT 1.22.2 `kadmin`
 (principals, strings, policies, aliases, rename, `cpw`, `delprinc`) and

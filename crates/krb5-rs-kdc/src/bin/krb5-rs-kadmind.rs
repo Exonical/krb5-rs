@@ -381,7 +381,7 @@ impl KeySource for DbKeys {
 
 struct State {
     realm: String,
-    store: Arc<LmdbStore>,
+    store: Db,
     ulog: Ulog,
     auth: Arc<Kadm5AuthModules>,
     kdb_util: PathBuf,
@@ -573,7 +573,7 @@ trait Program: Send + Sync + 'static {
 
 impl Program for State {
     fn keys(&self) -> (Db, String) {
-        (Db::Lmdb(self.store.clone()), self.realm.clone())
+        (self.store.clone(), self.realm.clone())
     }
 
     fn dispatch(
@@ -2503,6 +2503,11 @@ async fn kadmind(args: Args) {
         Some("krb5-rs-cockroach") => die(
             "db_library krb5-rs-cockroach needs a krb5-rs-kadmind built with the `cockroach` feature",
         ),
+        Some("krb5-rs-file") => Db::File(Arc::new(
+            krb5_rs::kdc::kdb::FileStore::open(&cfg.database_name, &master)
+                .and_then(|store| store.with_iprop(&cfg.iprop))
+                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+        )),
         _ => Db::Lmdb(Arc::new(
             LmdbStore::open(&cfg, &master)
                 .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
@@ -2560,12 +2565,12 @@ async fn kadmind(args: Args) {
     let local = tokio::task::LocalSet::new();
     let mut tasks = tokio::task::JoinSet::new();
     if iprop_port.is_some() {
-        let Some(store) = db.lmdb() else {
-            die("iprop needs db_library klmdb");
-        };
+        if !db.has_ulog() {
+            die("iprop needs db_library klmdb or krb5-rs-file");
+        }
         let state = Arc::new(State {
             realm: realm.clone(),
-            store: store.clone(),
+            store: db.clone(),
             ulog: Ulog::map(&cfg.iprop.logfile, cfg.iprop.ulogsize)
                 .unwrap_or_else(|e| die(format!("{e} mapping update log"))),
             auth: acl.clone(),

@@ -45,6 +45,17 @@ fn binary_directory() -> PathBuf {
 #[test]
 #[ignore = "requires the MIT container of the Compose stack"]
 fn mit_kpropd_follows_krb5_rs_kadmind() {
+    mit_kpropd_follows("klmdb");
+}
+
+#[test]
+#[ignore = "requires the MIT container of the Compose stack"]
+fn mit_kpropd_follows_krb5_rs_kadmind_on_the_file_store() {
+    mit_kpropd_follows("krb5-rs-file");
+}
+
+/// The primary's database is `db_library = library`.
+fn mit_kpropd_follows(library: &str) {
     let c = container();
     let mkdir = container_run(&["exec", &c, "mkdir", "-p", "/tmp/kadmind-live/bin"], "");
     assert!(mkdir.status.success(), "{mkdir:?}");
@@ -65,7 +76,8 @@ fn mit_kpropd_follows_krb5_rs_kadmind() {
         let out = container_run(&["cp", &path, &dest], "");
         assert!(out.status.success(), "cp {name}: {out:?}");
     }
-    let out = container_run(&["exec", "-i", &c, "bash", "-s"], SCRIPT);
+    let script = format!("PLIB={library}\n{SCRIPT}");
+    let out = container_run(&["exec", "-i", &c, "bash", "-s"], &script);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("KADMIND_LIVE_OK"),
@@ -86,7 +98,7 @@ trap stop EXIT
 rm -rf "$B/p" "$B/r" "$B"/*.conf "$B"/*.log "$B"/*.acl "$B/kt" "$B/stash" "$B"/*.pid
 mkdir -p "$B/p" "$B/r"
 H=$(hostname | tr 'A-Z' 'a-z')
-realm_conf() { # file dbdir
+realm_conf() { # file dbdir db_library
   cat > "$1" <<EOF
 [kdcdefaults]
  kdc_ports = 18889
@@ -104,13 +116,13 @@ realm_conf() { # file dbdir
  }
 [dbmodules]
  $R = {
-  db_library = klmdb
+  db_library = $3
   database_name = $2/principal
  }
 EOF
 }
-realm_conf "$B/p.conf" "$B/p"
-realm_conf "$B/r.conf" "$B/r"
+realm_conf "$B/p.conf" "$B/p" "$PLIB"
+realm_conf "$B/r.conf" "$B/r" klmdb
 cat > "$B/krb5.conf" <<EOF
 [libdefaults]
  default_realm = $R
@@ -130,9 +142,15 @@ r() { KRB5_KDC_PROFILE=$B/r.conf "$@"; }
 wait_port() { for _ in $(seq 1 100); do (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 fail() { echo "FAIL: $*"; for l in "$B"/*.log; do echo "== $l"; cat "$l"; done; exit 1; }
 
-p kdb5_util create -r $R -s -P master-password >/dev/null
-for n in kiprop/$H host/$H alice; do p kadmin.local -r $R -q "addprinc -randkey $n" >/dev/null; done
-p kadmin.local -r $R -q "ktadd -k $B/kt kiprop/$H host/$H" >/dev/null
+if [ "$PLIB" = klmdb ]; then
+  p kdb5_util create -r $R -s -P master-password >/dev/null
+  for n in kiprop/$H host/$H alice; do p kadmin.local -r $R -q "addprinc -randkey $n" >/dev/null; done
+  p kadmin.local -r $R -q "ktadd -k $B/kt kiprop/$H host/$H" >/dev/null
+else
+  printf 'master-password\nmaster-password\n' | p $BIN/krb5-rs-kdb -r $R create -s >/dev/null
+  for n in kiprop/$H host/$H alice; do p $BIN/krb5-rs-kdb -r $R addprinc -randkey $n >/dev/null; done
+  p $BIN/krb5-rs-kdb -r $R ktadd -k $B/kt kiprop/$H host/$H >/dev/null
+fi
 echo "kiprop/$H@$R p" > "$B/kadm5.acl"
 echo "host/$H@$R" > "$B/kpropd.acl"
 p $BIN/krb5-rs-kdc --realm $R > "$B/kdc.log" 2>&1 &

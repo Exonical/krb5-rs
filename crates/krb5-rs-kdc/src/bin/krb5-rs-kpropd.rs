@@ -613,8 +613,7 @@ impl Server {
                         let replayed = replay_cfg
                             .apply_db_args(&self.args.db_args)
                             .map_err(StoreError::backend)
-                            .and_then(|_| LmdbStore::open(&replay_cfg, &master))
-                            .and_then(|store| store.replay_updates(&updates));
+                            .and_then(|_| replay(&replay_cfg, &master, &updates));
                         match replayed {
                             Ok(()) => self.debug(format!(
                                 "Incremental updates: {} updates / {} us",
@@ -680,6 +679,20 @@ fn kdc_profile() -> Option<Profile> {
         Profile::load(&path)
             .unwrap_or_else(|e| die(format!("{e} while reading {}", path.display())))
     })
+}
+
+/// `ulog_replay` into the database `db_library` names.
+fn replay(
+    cfg: &RealmConfig,
+    master: &krb5_rs::types::EncryptionKey,
+    updates: &[krb5_rs::kdc::kdb::mit::ulog::Update],
+) -> Result<(), StoreError> {
+    match cfg.db_module.library.as_deref() {
+        Some("krb5-rs-file") => krb5_rs::kdc::kdb::FileStore::open(&cfg.database_name, master)?
+            .with_iprop(&cfg.iprop)?
+            .replay_updates(updates),
+        _ => LmdbStore::open(cfg, master)?.replay_updates(updates),
+    }
 }
 
 fn iprop_params(args: &Args, profile: &Profile, realm: &str, hosts: &[String]) -> Option<Iprop> {
