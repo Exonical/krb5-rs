@@ -1,4 +1,6 @@
-# krb5-rs KDC: static musl binaries in a distroless nonroot image.
+# krb5-rs KDC: dynamically linked glibc binaries in a distroless nonroot
+# image. Like MIT's builds, krb5-rs-kadmind can then dlopen kadm5_auth
+# modules ([plugins] kadm5_auth module = name:path); static musl cannot.
 #
 # Build (context = repository root):
 #   podman build -f deploy/docker/Dockerfile -t krb5-rs-kdc .
@@ -16,15 +18,12 @@ ARG DESCRIPTION="Pure Rust Kerberos V5 KDC and database administration tool"
 # rust:1.99.0-bookworm (index digest)
 FROM docker.io/library/rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS build
 
-ARG TARGET=x86_64-unknown-linux-musl
 ARG FEATURES
-RUN rustup target add "$TARGET"
-RUN apt-get update \
- && apt-get install -y --no-install-recommends musl-tools \
- && if [ -n "$FEATURES" ]; then \
-      apt-get install -y --no-install-recommends cmake; \
-    fi \
- && rm -rf /var/lib/apt/lists/*
+RUN if [ -n "$FEATURES" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends cmake \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock README.md LICENSE ./
@@ -34,17 +33,18 @@ COPY crates ./crates
 
 # The default build includes the klmdb module (LMDB C library).
 # FEATURES=cockroach additionally enables rustls/aws-lc-rs and Turso's
-# simsimd; all variants are built statically for musl.
-ENV RUSTFLAGS="-C target-feature=+crt-static -C strip=symbols"
-RUN export CC_x86_64_unknown_linux_musl=musl-gcc \
- && cargo build --locked --release -p krb5-rs-kdc --target "$TARGET" ${FEATURES:+--features "$FEATURES"} \
+# simsimd. Binaries link glibc (bookworm, as in the runtime image)
+# dynamically.
+ENV RUSTFLAGS="-C strip=symbols"
+RUN cargo build --locked --release -p krb5-rs-kdc ${FEATURES:+--features "$FEATURES"} \
  && mkdir -p /out/data \
- && cp "target/$TARGET/release/krb5-rs-kdc" "target/$TARGET/release/krb5-rs-kdb" \
-      "target/$TARGET/release/krb5-rs-kprop" "target/$TARGET/release/krb5-rs-kpropd" \
-      "target/$TARGET/release/krb5-rs-kproplog" "target/$TARGET/release/krb5-rs-kadmind" /out/
+ && cp target/release/krb5-rs-kdc target/release/krb5-rs-kdb \
+      target/release/krb5-rs-kprop target/release/krb5-rs-kpropd \
+      target/release/krb5-rs-kproplog target/release/krb5-rs-kadmind /out/
 
-# gcr.io/distroless/static-debian12:nonroot (index digest)
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+# gcr.io/distroless/cc-debian12:nonroot (index digest): glibc, libgcc_s and
+# libstdc++ for dynamically linked binaries.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 ARG DESCRIPTION
 
 ARG VERSION=0.1.0

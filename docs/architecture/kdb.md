@@ -602,9 +602,10 @@ Deviations:
   unparsed strings and there is no `krb5_context`, so modules built against
   MIT's `kadm5_auth_plugin.h` do not load. The callbacks, opcodes, return
   codes and restrictions are MIT's.
-- Modules need a dynamically linked krb5-rs-kadmind. The static musl binaries
-  (the container image) cannot load shared libraries, so configuring a module
-  there stops kadmind at startup.
+- Modules need a dynamically linked krb5-rs-kadmind, as MIT's kadmind is.
+  The container image (`deploy/docker/Dockerfile`) links glibc dynamically and
+  loads them; static musl builds cannot load shared libraries, so
+  configuring a module there stops kadmind at startup.
 
 The test modules in `crates/krb5-rs-kdc/tests/fixtures/kadm5_auth_test.c`
 port MIT's `plugins/kadm5_auth/test/main.c` (`welcomer`, `bouncer`) and run

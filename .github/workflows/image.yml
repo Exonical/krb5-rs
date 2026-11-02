@@ -49,8 +49,7 @@ jobs:
         with:
           context: .
           file: deploy/docker/Dockerfile
-          # amd64 only: the Dockerfile builds x86_64-unknown-linux-musl.
-          # An arm64 image needs an aarch64-unknown-linux-musl target (follow-up).
+          # amd64 only for now; the glibc build stage would also build arm64.
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

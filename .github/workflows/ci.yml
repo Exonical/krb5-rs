@@ -75,6 +75,27 @@ jobs:
             --build-arg "FEATURES=${{ matrix.features }}" \
             --build-arg "DESCRIPTION=${{ matrix.description }}" \
             -t "localhost/krb5-rs-kdc:ci-${{ matrix.name }}" .
+      - name: kadmind in the image loads a kadm5_auth module
+        run: |
+          IMAGE="localhost/krb5-rs-kdc:ci-${{ matrix.name }}"
+          W=$(mktemp -d) && chmod 777 "$W"
+          docker run --rm -v "$PWD/crates/krb5-rs-kdc:/k:ro" -v "$W:/out" \
+            "$(sed -n 's/^FROM \(.*rust.*\) AS build$/\1/p' deploy/docker/Dockerfile)" \
+            cc -shared -fPIC -I /k/include -o /out/kadm5_auth_test.so /k/tests/fixtures/kadm5_auth_test.c
+          printf '[realms]\n SMOKE.TEST = {\n  database_name = /w/principal\n  key_stash_file = /w/stash\n  acl_file = /w/kadm5.acl\n  kadmind_port = 18749\n  kpasswd_port = 18464\n }\n[plugins]\n kadm5_auth = {\n  module = welcomer:/w/kadm5_auth_test.so\n }\n' > "$W/kdc.conf"
+          touch "$W/kadm5.acl" && chmod 666 "$W/kdc.conf" "$W/kadm5.acl"
+          printf 'm\nm\n' | docker run -i --rm -v "$W:/w" --entrypoint /usr/local/bin/krb5-rs-kdb \
+            "$IMAGE" --config /w/kdc.conf -r SMOKE.TEST create -s >/dev/null
+          # As PID 1, kadmind ignores SIGTERM: run it detached and remove it.
+          docker run -d --name kadmind-smoke -v "$W:/w" -e KRB5_KDC_PROFILE=/w/kdc.conf -e KRB5_CONFIG=/dev/null \
+            --entrypoint /usr/local/bin/krb5-rs-kadmind "$IMAGE" -nofork -r SMOKE.TEST
+          for _ in $(seq 30); do
+            docker logs kadmind-smoke 2>&1 | grep -q 'krb5-rs-kadmind: starting' && break
+            sleep 1
+          done
+          docker logs kadmind-smoke
+          docker logs kadmind-smoke 2>&1 | grep -q 'krb5-rs-kadmind: starting'
+          docker rm -f kadmind-smoke
 
   helm:
     runs-on: ubuntu-latest
@@ -251,7 +272,7 @@ jobs:
       - name: Build static binaries for the klmdb interop test
         run: |
           # klmdb_live copies these into the MIT container (LMDB is C, so
-          # musl-gcc builds it), as deploy/docker/Dockerfile does.
+          # musl-gcc builds it).
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
           rustup target add x86_64-unknown-linux-musl

@@ -60,7 +60,7 @@ echo secret | krb5-rs-kdb --config kdc.conf addprinc alice
 krb5-rs-kdc --config kdc.conf
 ```
 
-`deploy/docker/Dockerfile` builds a static, distroless, nonroot image with both binaries (`podman build -f deploy/docker/Dockerfile .`). The container user cannot bind port 88: configure `kdc_ports = 8888` and map 88 to 8888 outside.
+`deploy/docker/Dockerfile` builds a distroless, nonroot image with dynamically linked glibc binaries, so krb5-rs-kadmind can load kadm5_auth modules (`podman build -f deploy/docker/Dockerfile .`). The container user cannot bind port 88: configure `kdc_ports = 8888` and map 88 to 8888 outside.
 
 ### Store interfaces, policies and lockout
 
