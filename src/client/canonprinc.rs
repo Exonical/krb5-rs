@@ -89,7 +89,7 @@ fn qualify_shortname(c: &HostCanonicalization, host: &str) -> Option<String> {
 /// name with `rdns`, from the system resolver as in MIT (sn2princ.c:100-121).
 /// The lookup blocks, so it runs on Tokio's blocking pool when a runtime is
 /// active and inline otherwise.
-#[cfg(any(unix, not(feature = "dns")))]
+#[cfg(any(unix, windows, not(feature = "dns")))]
 async fn dns_canonical_name(host: &str, rdns: bool) -> Option<String> {
     let host = host.to_string();
     let lookup = move || crate::locate::dns_canonical(&host, rdns);
@@ -99,9 +99,9 @@ async fn dns_canonical_name(host: &str, rdns: bool) -> Option<String> {
     }
 }
 
-/// Without libc's resolver, the CNAME target, then the PTR name with
-/// `rdns`, looked up with hickory-resolver.
-#[cfg(all(not(unix), feature = "dns"))]
+/// Without a system resolver binding, the CNAME target, then the PTR name
+/// with `rdns`, looked up with hickory-resolver.
+#[cfg(all(not(any(unix, windows)), feature = "dns"))]
 async fn dns_canonical_name(host: &str, rdns: bool) -> Option<String> {
     use hickory_resolver::proto::rr::RData;
     let resolver = hickory_resolver::Resolver::builder_tokio().ok()?.build();
@@ -221,7 +221,7 @@ mod tests {
     }
 
     /// Polls a future to completion without any async runtime.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         struct Unpark(std::thread::Thread);
         impl std::task::Wake for Unpark {
@@ -240,7 +240,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn dns_step_runs_without_a_tokio_runtime() {
         let c = HostCanonicalization {
@@ -253,7 +253,13 @@ mod tests {
         let first = block_on(it.next(&c)).expect("non-DNS candidate");
         assert_eq!(first.to_string(), "host/localhost.example.test");
         let second = block_on(it.next(&c)).expect("DNS candidate");
-        assert_eq!(second.to_string(), "host/localhost");
+        // Windows gives the machine's own name for localhost.
+        let canon = crate::locate::dns_canonical("localhost", false)
+            .map_or_else(|| "localhost".into(), |n| n.to_ascii_lowercase());
+        assert_eq!(
+            second.to_string(),
+            format!("host/{}", canon.trim_end_matches('.'))
+        );
     }
 
     #[tokio::test]
