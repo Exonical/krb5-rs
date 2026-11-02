@@ -425,7 +425,8 @@ release), so rerun `init` after upgrading before starting kadmind. The live test
 `crates/krb5-rs-kdc/tests/kpasswd_live.rs` runs MIT 1.22.2 `kpasswd` over UDP
 and TCP and `krb5_set_password_using_ccache` against it.
 
-Deviations: authorization uses only `acl_file` (no kadm5_auth plugins).
+Authorization goes through the kadm5_auth modules as `OP_CPW`, as in MIT
+`schpw.c`.
 Like the admin RPC service below, it runs on klmdb or CockroachDB.
 
 ### kadm5 admin RPC service
@@ -451,10 +452,10 @@ literal member together with `\` (there is no bracket negation); it is then
 matched in linear time per `*`. Escapes that MIT's BRE would read as groups,
 intervals or back-references (`\(`, `\{`, `\1`) are taken as literals.
 `get_principal` reports the live `last_success`, `last_failed` and failure
-count from `lockout.mdb`, as `krb5_db_get_principal` does. Authorization combines MIT's two
-default kadm5_auth modules: `self` (`auth_self.c`: one's own principal and
-strings, and one's own policy) and `acl` (`acl_file`, the `i` and `l`
-permissions). A `kadmin/changepw` ticket may only read its own principal and
+count from `lockout.mdb`, as `krb5_db_get_principal` does. Authorization goes
+through the kadm5_auth modules (see below); by default these are MIT's `acl`
+(`acl_file`, the `i` and `l` permissions) and `self` (`auth_self.c`: one's own
+principal and strings, and one's own policy). A `kadmin/changepw` ticket may only read its own principal and
 policy, as in `server_stubs.c`. Requests and denials are logged in MIT's
 `Request: ...` / `Unauthorized request: ...` format. The live test
 `crates/krb5-rs-kdc/tests/kadmin_live.rs` checks that MIT 1.22.2 `kadmin`
@@ -527,8 +528,53 @@ replicates to the KDCs itself. The live test
 `kpasswd` against it, and `kinit` against a CockroachDB KDC reading the same
 realm.
 
-Deviations: no kadm5_auth plugins beyond the built-in `self` and `acl`
-behavior.
+#### kadm5_auth modules
+
+Every kadm5 call, kpasswd change and iprop request asks the kadm5_auth modules,
+as MIT's `kadmin/server/auth.c` does. The built-in modules are `acl`
+(`auth_acl.c`) and `self` (`auth_self.c`). Shared-library modules are
+configured in krb5.conf or kdc.conf like MIT's:
+
+```
+[plugins]
+    kadm5_auth = {
+        module = mymod:/usr/local/lib/krb5/plugins/kadm5_auth/mymod.so
+        enable_only = mymod
+        enable_only = acl
+        disable = self
+    }
+```
+
+- `module = name:path` loads `path` (relative paths are under
+  `[libdefaults] plugin_base_dir`, default `/usr/local/lib/krb5/plugins`) and
+  calls its `kadm5_auth_<name>_initvt`. A module that fails to load, or whose
+  `init` returns `KRB5_PLUGIN_NO_HANDLE`, is skipped; any other `init` error
+  stops kadmind.
+- Configured modules come first, then `acl` and `self`; the first module of
+  a name wins. `disable` removes modules, and `enable_only` keeps and orders
+  only the modules it names (`lib/krb5/krb/plugin.c`).
+- A module authorizes (0), has no opinion (`KRB5_PLUGIN_NO_HANDLE`) or
+  refuses (anything else). One refusal denies the request; otherwise at least
+  one module must authorize it (`auth.c:182-202`).
+- For `addprinc` and `modprinc`, every module's restrictions are imposed, as
+  `auth_restrict` does (`auth.c:268-305`).
+- Each module's `end` runs after every kadm5 call (`stub_cleanup`).
+- The operations and their arguments are MIT's `OP_*` (`auth.h`).
+
+Deviations:
+
+- The module ABI is krb5-rs's own, in
+  `crates/krb5-rs-kdc/include/krb5-rs/kadm5_auth_plugin.h`: principals are
+  unparsed strings and there is no `krb5_context`, so modules built against
+  MIT's `kadm5_auth_plugin.h` do not load. The callbacks, opcodes, return
+  codes and restrictions are MIT's.
+- Modules need a dynamically linked krb5-rs-kadmind. The static musl binaries
+  (the container image) cannot load shared libraries, so configuring a module
+  there stops kadmind at startup.
+
+The test modules in `crates/krb5-rs-kdc/tests/fixtures/kadm5_auth_test.c`
+port MIT's `plugins/kadm5_auth/test/main.c` (`welcomer`, `bouncer`) and run
+MIT's `t_kadm5_auth.py` cases.
 
 ### ONC RPC and RPCSEC_GSS
 

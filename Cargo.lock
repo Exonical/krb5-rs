@@ -1782,6 +1782,7 @@ dependencies = [
  "krb5-rs-kdb-lmdb",
  "krb5-rs-kdb-turso",
  "libc",
+ "libloading",
  "prometheus-client",
  "regex",
  "sha2",
