@@ -192,9 +192,9 @@ struct DynModule {
 /// callbacks run at once, as in MIT's single-threaded kadmind.
 static CALLS: Mutex<()> = Mutex::new(());
 
-/// Held across a whole kadm5 request (authorization through `end`) once a
-/// shared-library module is loaded, so requests reach modules one at a time
-/// as in MIT.
+/// Held across a whole kadm5 request (authorization through `end`), and
+/// across kpasswd's and iprop's authorization, once a shared-library module
+/// is loaded, so requests reach modules one at a time as in MIT.
 static REQUESTS: Mutex<()> = Mutex::new(());
 
 static DYNAMIC: AtomicBool = AtomicBool::new(false);

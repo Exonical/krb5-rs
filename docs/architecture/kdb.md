@@ -567,8 +567,9 @@ configured in krb5.conf or kdc.conf like MIT's:
   `auth_restrict` does (`auth.c:268-305`).
 - Each module's `end` runs after every kadm5 call (`stub_cleanup`).
 - As in MIT's single-threaded kadmind, module callbacks never run at once,
-  and once a shared-library module is loaded kadmind handles one kadm5
-  request at a time.
+  and once a shared-library module is loaded kadmind handles one kadm5,
+  kpasswd or iprop request at a time. As in MIT, `end` runs only after kadm5
+  calls, not after kpasswd (`misc.c`) or iprop (`ipropd_svc.c`).
 - kpasswd asks the modules (`OP_CPW`) for self-changes too, after the
   initial-ticket and minimum-life checks (`misc.c:13-57`).
 - The operations and their arguments are MIT's `OP_*` (`auth.h`).
