@@ -542,10 +542,12 @@ impl FileStore {
         r: &KdbPrincipal,
         keys: &MasterKeys,
     ) -> Result<PrincipalRecord, StoreError> {
+        let sp = stored_of(r);
+        let history = sp.password_history()?;
         Ok(PrincipalRecord {
-            entry: stored_of(r).into_entry(keys)?,
+            entry: sp.into_entry(keys)?,
             last_pwd_change: to_time(&r.last_pwd_change),
-            password_history: None,
+            password_history: Some(history),
             mod_time: to_time(&r.mod_time),
             mod_by: None,
         })
@@ -1268,13 +1270,18 @@ impl FileStore {
             let mut rec = self.decrypt_with(&list[pos], &keys)?;
             f(&mut rec)?;
             rec.mod_time = Some(kerberos_time(Utc::now().timestamp()));
-            let record = self.to_record(
+            let mut record = self.to_record(
                 &rec.entry,
                 rec.last_pwd_change,
                 rec.mod_time,
                 Some(&list[pos]),
                 &keys,
             )?;
+            if let Some(history) = &rec.password_history {
+                let mut sp = stored_of(&record);
+                sp.set_password_history(history)?;
+                record = kdb_of(&sp)?;
+            }
             list[pos] = stamp(record, caller, &keys)?;
             Ok(rec)
         })
@@ -1621,6 +1628,59 @@ mod tests {
         };
         assert_eq!(mkvno("carol"), Some(2));
         assert_eq!(mkvno("alice"), Some(2));
+    }
+
+    #[test]
+    fn password_changes_keep_mit_history_like_db2() {
+        use crate::crypto::SaltType;
+        use crate::kdc::kdb::admin::{Admin, PrincipalOptions};
+        let path = temp("history");
+        let master = master_key_from_password("R", "master", 18).expect("master");
+        let store = FileStore::create(&path, "R", &master).expect("create");
+        let admin = Admin::new(&store, vec![(18, SaltType::Normal)]);
+        admin
+            .add_policy(Policy {
+                name: "hist".into(),
+                pw_history_num: 3,
+                ..Policy::default()
+            })
+            .expect("policy");
+        let alice = PrincipalName::new_principal("alice");
+        let opts = PrincipalOptions {
+            policy: Some(Some("hist".into())),
+            ..PrincipalOptions::default()
+        };
+        admin
+            .add_principal(&alice, "R", Some("pw-0"), &opts)
+            .expect("add");
+        let cpw = |pw: &str| admin.change_password(&alice, "R", Some(pw), false);
+        for pw in ["pw-a", "pw-b", "pw-c"] {
+            cpw(pw).expect(pw);
+        }
+        // pw_history_num 3 keeps the two previous passwords plus the current.
+        for pw in ["pw-a", "pw-b", "pw-c"] {
+            let error = cpw(pw).expect_err(pw);
+            assert_eq!(error.kind(), StoreErrorKind::Rejected, "{pw}: {error}");
+            assert_eq!(error.message(), "Cannot reuse password");
+        }
+        // The history is kept in the file and dumped in KADM_DATA.
+        let reopened = FileStore::open(&path, &master).expect("reopen");
+        let history = reopened
+            .get_record(&alice, "R")
+            .expect("read")
+            .expect("alice")
+            .password_history
+            .expect("history");
+        assert_eq!(history.old_keys.len(), 2);
+        let (entries, _) = reopened.dump_entries().expect("dump");
+        let entry = entries
+            .iter()
+            .find(|e| e.principal == alice)
+            .expect("alice dumped");
+        let dumped = crate::kdc::kdb::mit::record_without_keys(entry).expect("record");
+        assert_eq!(dumped.password_history, Some(history));
+        assert_eq!(dumped.entry.policy.as_deref(), Some("hist"));
+        cpw("pw-0").expect("dropped out of the history");
     }
 
     #[test]

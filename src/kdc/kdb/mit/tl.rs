@@ -260,6 +260,49 @@ fn policy_and_history_from_tl(
     Ok((Some(name), history))
 }
 
+/// The kadm5 password history kept in `KRB5_TL_KADM_DATA` among `tl`
+/// (empty without one), for stores that keep MIT tl-data beside their own
+/// fields.
+pub fn history_from_tl_data(tl: &[TlData]) -> Result<PasswordHistory, StoreError> {
+    let Some(t) = tl.iter().find(|t| t.kind == KADM_DATA) else {
+        return Ok(PasswordHistory::default());
+    };
+    let osa = OsaPrincipalData::decode(&t.data)?;
+    Ok(PasswordHistory {
+        admin_history_kvno: osa.admin_history_kvno,
+        old_key_next: osa.old_key_next,
+        old_keys: osa.old_keys,
+    })
+}
+
+/// Store `history` in the `KRB5_TL_KADM_DATA` among `tl`, keeping its other
+/// fields (the policy is written from the store's own field on output).
+pub fn set_history_tl_data(
+    tl: &mut Vec<TlData>,
+    history: &PasswordHistory,
+) -> Result<(), StoreError> {
+    let at = tl.iter().position(|t| t.kind == KADM_DATA);
+    if at.is_none() && *history == PasswordHistory::default() {
+        return Ok(());
+    }
+    let mut osa = match at {
+        Some(i) => OsaPrincipalData::decode(&tl[i].data)?,
+        None => OsaPrincipalData::default(),
+    };
+    osa.admin_history_kvno = history.admin_history_kvno;
+    osa.old_key_next = history.old_key_next;
+    osa.old_keys = history.old_keys.clone();
+    let data = osa.encode()?;
+    match at {
+        Some(i) => tl[i].data = data,
+        None => tl.push(TlData {
+            kind: KADM_DATA,
+            data,
+        }),
+    }
+    Ok(())
+}
+
 /// A kadm5 password-history entry for `entry`'s current password: each key
 /// of the highest kvno, re-encrypted in the history key with its salt
 /// (`create_history_entry`, `lib/kadm5/srv/svr_principal.c:1003-1062`). MIT

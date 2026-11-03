@@ -1027,12 +1027,13 @@ impl CockroachStore {
 
     fn record_of(&self, sp: StoredPrincipal) -> Result<PrincipalRecord, StoreError> {
         let (last_pwd_change, mod_time) = (sp.last_pwd_change, sp.mod_time);
+        let history = sp.password_history()?;
         Ok(PrincipalRecord {
             entry: sp.into_entry(&self.master_keys())?,
             last_pwd_change: last_pwd_change.map(kt),
             mod_time: mod_time.map(kt),
             mod_by: None,
-            password_history: None,
+            password_history: Some(history),
         })
     }
 
@@ -1426,12 +1427,13 @@ impl AdminStore for CockroachStore {
                             })?;
                     let (last_pwd, mod_time) = (sp.last_pwd_change, sp.mod_time);
                     let previous = sp.clone();
+                    let history = sp.password_history()?;
                     let mut rec = PrincipalRecord {
                         entry: sp.into_entry(master)?,
                         last_pwd_change: last_pwd.map(kt),
                         mod_time: mod_time.map(kt),
                         mod_by: None,
-                        password_history: None,
+                        password_history: Some(history),
                     };
                     let unlock_before = rec.entry.last_admin_unlock.map(|t| t.timestamp());
                     {
@@ -1441,13 +1443,16 @@ impl AdminStore for CockroachStore {
                     let unlocked =
                         rec.entry.last_admin_unlock.map(|t| t.timestamp()) != unlock_before;
                     let now = now_unix();
-                    let sp = StoredPrincipal::from_update(
+                    let mut sp = StoredPrincipal::from_update(
                         &rec.entry,
                         rec.last_pwd_change.map(|t| t.timestamp()),
                         Some(now),
                         master,
                         &previous,
                     )?;
+                    if let Some(history) = &rec.password_history {
+                        sp.set_password_history(history)?;
+                    }
                     let sp = stamp(sp, caller, master, now)?;
                     write_principal(&tx, &sp, false).await?;
                     if unlocked {

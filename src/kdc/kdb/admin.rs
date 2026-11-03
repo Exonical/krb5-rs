@@ -1313,11 +1313,11 @@ mod tests {
         admin
             .change_password(&alice, "R", Some("Another-pw2"), false)
             .expect("new password");
-        // The file store keeps no history, so only the current password is
-        // refused.
-        admin
-            .change_password(&alice, "R", Some("Longer-pw1"), false)
-            .expect("no deep history on the file store");
+        // The previous password is in the history, as on db2.
+        rejected_with(
+            admin.change_password(&alice, "R", Some("Longer-pw1"), false),
+            PASS_REUSE,
+        );
         // Without a policy any password goes.
         let bob = PrincipalName::new_principal("bob");
         admin

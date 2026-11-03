@@ -144,16 +144,15 @@ MIT does (`lib/kadm5/srv/svr_principal.c:364-412, 601-634, 1219-1497`).
 Rejections use MIT's messages ("Password is too short", "Password does not
 contain enough character classes", "Cannot reuse password").
 
-Deeper history needs storage for old keys, which only klmdb has (in
-`KRB5_TL_KADM_DATA`): there `cpw` also refuses the passwords kept by
+Deeper history is kept in `KRB5_TL_KADM_DATA` by every store (klmdb, the
+file store and CockroachDB): `cpw` also refuses the passwords kept by
 `pw_history_num` and adds the old password to the queue exactly as MIT's
 `add_to_history` (`svr_principal.c:1091-1208`), so MIT and krb5-rs tools
 share one history. History keys are encrypted in the `kadmin/history`
 principal's key, created on first use like MIT's `create_hist`
 (`lib/kadm5/srv/server_kdb.c:141-223`), including MIT's 64-second `max_life`
 (it stores `KRB5_KDB_DISALLOW_ALL_TIX` there) and initial kvno 2;
-`kadmin/history` itself cannot be given a password. The file and CockroachDB
-stores check only the current password.
+`kadmin/history` itself cannot be given a password.
 
 `security_epoch` is a krb5-rs extension and is not persisted in MIT klmdb;
 loaded principals and policies use epoch zero. MIT key-data has no
