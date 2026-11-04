@@ -112,15 +112,17 @@ pub(super) async fn https_conn(
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 8192];
     loop {
-        match stream.read(&mut chunk).await {
+        // service_https_read: a reply reaching the limit kills the connection.
+        let room = (MAX_KDC_RESPONSE_SIZE - buf.len()).min(chunk.len());
+        if room == 0 {
+            return dead(&tx);
+        }
+        match stream.read(&mut chunk[..room]).await {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             // SSL_OP_IGNORE_UNEXPECTED_EOF: a missing close_notify is fine.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(_) => return dead(&tx),
-        }
-        if buf.len() >= MAX_KDC_RESPONSE_SIZE {
-            return dead(&tx);
         }
     }
     match parse_response(&buf) {
@@ -165,13 +167,16 @@ pub(super) fn load_anchors(anchors: &[String]) -> Option<RootCertStore> {
         store.add_parsable_certificates(native.certs);
     } else {
         for a in anchors {
-            load_anchor(&mut store, a)?;
+            load_anchor(&mut store, a, 0)?;
         }
     }
     Some(store)
 }
 
-fn load_anchor(store: &mut RootCertStore, location: &str) -> Option<()> {
+/// How many `ENV:` indirections an anchor may take, so `FOO=ENV:FOO` fails.
+const MAX_ANCHOR_ENV_DEPTH: usize = 16;
+
+fn load_anchor(store: &mut RootCertStore, location: &str, depth: usize) -> Option<()> {
     if let Some(path) = location.strip_prefix("FILE:") {
         load_anchor_file(store, std::path::Path::new(path))
     } else if let Some(path) = location.strip_prefix("DIR:") {
@@ -185,7 +190,10 @@ fn load_anchor(store: &mut RootCertStore, location: &str) -> Option<()> {
         }
         found.then_some(())
     } else if let Some(var) = location.strip_prefix("ENV:") {
-        load_anchor(store, &std::env::var(var).ok()?)
+        if depth >= MAX_ANCHOR_ENV_DEPTH {
+            return None;
+        }
+        load_anchor(store, &std::env::var(var).ok()?, depth + 1)
     } else {
         None
     }
@@ -417,6 +425,12 @@ pub(super) fn check_cert_name_or_ip(der: &[u8], expected: &str) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cyclic_env_anchor_fails_instead_of_overflowing() {
+        std::env::set_var("KRB5RS_TEST_ANCHOR_CYCLE", "ENV:KRB5RS_TEST_ANCHOR_CYCLE");
+        assert!(load_anchors(&["ENV:KRB5RS_TEST_ANCHOR_CYCLE".to_string()]).is_none());
+    }
 
     #[test]
     fn domain_match_like_openssl_c() {

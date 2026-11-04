@@ -209,3 +209,12 @@ fn k5login_like_mit() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn utf8_principals_match_auth_to_local_names() {
+    let p = conf(
+        "[realms]\n KRBTEST.COM = {\n  auth_to_local_names = {\n   jos\u{e9} = jose\n  }\n }\n",
+    );
+    ok(&p, "jos\u{e9}@KRBTEST.COM", "jose");
+    ok(&p, "\u{fc}ser@KRBTEST.COM", "\u{fc}ser");
+}

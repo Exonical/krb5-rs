@@ -295,7 +295,7 @@ async fn anchor_locations_like_mit() {
 
 /// Our client gets a TGT from MIT's KDC through a KKDCP proxy.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the MIT KDC container (docker compose -f docker-compose.test.yml up -d)"]
 async fn kinit_through_proxy_against_mit_kdc() {
     let (port, seen) = start_proxy_to("proxy-san.pem", Some(common::kdc::kdc_addr_str())).await;
     let conf = format!(

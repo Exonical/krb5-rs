@@ -264,7 +264,7 @@ impl<'a> Localauth<'a> {
             return Userok::NoHandle;
         }
         let princname = crate::ccache::unparse_name(aname, realm);
-        let Ok(mut f) = std::fs::File::open(&filename) else {
+        let Ok(f) = std::fs::File::open(&filename) else {
             return deny;
         };
         // The file must be owned by the user or by root.
@@ -275,14 +275,14 @@ impl<'a> Localauth<'a> {
         if !owner_ok {
             return deny;
         }
-        let mut buf = Vec::new();
-        if std::io::Read::read_to_end(&mut f, &mut buf).is_err() {
-            return deny;
-        }
-        if fgets_lines(&buf).any(|l| l == princname.as_bytes()) {
-            Userok::Accept
-        } else {
-            deny
+        // Read line by line, as MIT's fgets loop does.
+        let mut r = std::io::BufReader::new(f);
+        loop {
+            match fgets_line(&mut r) {
+                Ok(Some(l)) if l == princname.as_bytes() => return Userok::Accept,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return deny,
+            }
         }
     }
 }
@@ -340,32 +340,32 @@ const BUFSIZ: usize = 8192;
 /// the newline removed; the rest of an overlong line is skipped, and a line
 /// ends at a NUL for `strcmp`.
 #[cfg(unix)]
-fn fgets_lines(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut pos = 0;
-    std::iter::from_fn(move || {
-        if pos >= buf.len() {
-            return None;
+fn fgets_line(r: &mut impl std::io::BufRead) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    let mut read_any = false;
+    loop {
+        let avail = r.fill_buf()?;
+        if avail.is_empty() {
+            break;
         }
-        let rest = &buf[pos..];
-        let window = &rest[..rest.len().min(BUFSIZ - 1)];
-        let line = match window.iter().position(|&c| c == b'\n') {
-            Some(i) => {
-                pos += i + 1;
-                &window[..i]
-            }
-            None => {
-                pos += window.len();
-                if let Some(i) = buf[pos..].iter().position(|&c| c == b'\n') {
-                    pos += i + 1;
-                } else {
-                    pos = buf.len();
-                }
-                window
-            }
+        read_any = true;
+        let (take, done) = match avail.iter().position(|&c| c == b'\n') {
+            Some(i) => (i, true),
+            None => (avail.len(), false),
         };
-        let end = line.iter().position(|&c| c == 0).unwrap_or(line.len());
-        Some(&line[..end])
-    })
+        let room = (BUFSIZ - 1).saturating_sub(line.len());
+        line.extend_from_slice(&avail[..take.min(room)]);
+        r.consume(take + usize::from(done));
+        if done {
+            break;
+        }
+    }
+    if !read_any {
+        return Ok(None);
+    }
+    let end = line.iter().position(|&c| c == 0).unwrap_or(line.len());
+    line.truncate(end);
+    Ok(Some(line))
 }
 
 /// `k5_getpwnam_r`: the home directory and UID of `name`.
