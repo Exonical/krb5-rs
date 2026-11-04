@@ -11,13 +11,16 @@
 //! is not hidden when stdin is a terminal. Errors are printed the way
 //! `kdb5_util`'s `com_err(progname, ...)` prints them.
 
+#[path = "kadmind/modules.rs"]
+mod modules;
+
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use krb5_rs::kdc::kdb::admin::{
-    format_policy, format_principal, parse_lifetime, parse_principal, parse_time, AdminOps,
-    AttrChange, PolicyChange, PrincipalOptions,
+    format_policy, format_principal, parse_lifetime, parse_principal, parse_time, AdminModules,
+    AdminOps, AttrChange, PolicyChange, PrincipalOptions,
 };
 use krb5_rs::kdc::kdb::master::{read_stash_kvno, write_stash_list};
 use krb5_rs::kdc::kdb::mit::dump::{
@@ -27,6 +30,7 @@ use krb5_rs::kdc::kdb::mit::dump::{
 use krb5_rs::kdc::kdb::mit::mkey::MasterKeys;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Time, Ulog, UpdateStatus};
 use krb5_rs::kdc::kdb::mit::{unparse_name, MitEntry, MitPolicy};
+use krb5_rs::kdc::kdb::pwqual::PwQualModules;
 use krb5_rs::kdc::kdb::{master_key_from_password, write_stash, FileStore};
 use krb5_rs::kdc::{
     default_realm, AdminStore, IpropConfig, RealmConfig, StoreError, StoreErrorKind,
@@ -64,6 +68,20 @@ fn help() -> ! {
 /// `kdb5_util`'s `exit_status`: bumped when a step fails but the command
 /// goes on, and added to the exit code of a later failure.
 static EXIT_STATUS: AtomicI32 = AtomicI32::new(0);
+
+/// The password quality and kadm5_hook modules of the principal commands,
+/// which are kadmin.local's (`kadm5_init`); other commands run none, as
+/// `kdb5_util` does.
+static ADMIN_MODULES: std::sync::Mutex<Option<AdminModules>> = std::sync::Mutex::new(None);
+
+fn admin_modules() -> std::sync::MutexGuard<'static, Option<AdminModules>> {
+    ADMIN_MODULES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The principal commands, which run the kadm5 modules.
+const KADM5_COMMANDS: [&str; 4] = ["addprinc", "delprinc", "cpw", "modprinc"];
 
 fn exit_status() -> i32 {
     EXIT_STATUS.load(Ordering::Relaxed)
@@ -456,6 +474,8 @@ fn principal_options(args: Vec<String>, randkey: &mut bool) -> (PrincipalOptions
 
 fn main() {
     run();
+    // kadm5_destroy: close the modules (their `fini`) before exiting.
+    drop(admin_modules().take());
     std::process::exit(exit_status());
 }
 
@@ -542,6 +562,19 @@ fn run() {
     let db_args = cfg
         .apply_db_args(&db_args)
         .unwrap_or_else(|e| fail(format!("{e} while initializing database")));
+    if KADM5_COMMANDS.contains(&cmd.as_str()) {
+        let profiles: Vec<&Profile> = krb5.iter().chain([&kdc_conf]).collect();
+        let dict_file = kdc_conf
+            .get_string(&["realms", &realm, "dict_file"])
+            .map(PathBuf::from);
+        let m = modules::load(
+            &profiles,
+            dict_file.as_deref(),
+            modules::logger("krb5-rs-kdb"),
+        )
+        .unwrap_or_else(|e| fail(e));
+        *admin_modules() = Some(m);
+    }
 
     if cfg.db_module.library.as_deref() == Some("klmdb") {
         klmdb_command(
@@ -1259,7 +1292,12 @@ impl<S: AdminStore> Blocking<S> {
     ) -> Self {
         Self {
             rt,
-            ops: AdminOps::new(store, keysalts).with_history_enctype(master_key_type),
+            ops: AdminOps::new(store, keysalts)
+                .with_history_enctype(master_key_type)
+                .with_modules(admin_modules().clone().unwrap_or_else(|| AdminModules {
+                    pwqual: std::sync::Arc::new(PwQualModules::none()),
+                    hooks: std::sync::Arc::default(),
+                })),
         }
     }
 

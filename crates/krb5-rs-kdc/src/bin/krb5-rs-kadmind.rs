@@ -11,10 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use krb5_rs::gssapi::krb5::Krb5Acceptor;
-use krb5_rs::kdc::kdb::admin::{AdminOps, AttrChange, PolicyChange, PrincipalOptions};
+use krb5_rs::kdc::kdb::admin::{
+    AdminModules, AdminOps, AttrChange, PolicyChange, PrincipalOptions,
+};
 use krb5_rs::kdc::kdb::kadm5::mask as kmask;
 use krb5_rs::kdc::kdb::kadm5::{self, code, PrincipalEnt, ReadArgs, KADM_PROG, KADM_VERS};
 use krb5_rs::kdc::kdb::kadm5_auth::{Kadm5AuthModules, Princ, Request};
+use krb5_rs::kdc::kdb::kadm5_hook::Stage;
 use krb5_rs::kdc::kdb::kpasswd::{process_request, Service, KPASSWD_PORT};
 use krb5_rs::kdc::kdb::kprop::ReplayCache;
 use krb5_rs::kdc::kdb::master::encrypt_key;
@@ -44,6 +47,8 @@ mod auth;
 mod daemonize;
 #[path = "kadmind/db.rs"]
 mod db;
+#[path = "kadmind/modules.rs"]
+mod modules;
 use db::{CallerDb, Db};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -594,6 +599,8 @@ struct Kadm5 {
     realm: String,
     store: Db,
     auth: Arc<Kadm5AuthModules>,
+    /// Password quality and kadm5_hook modules.
+    modules: AdminModules,
     keysalts: Vec<(i32, krb5_rs::crypto::SaltType)>,
     history_enctype: i32,
     /// Realm `max_life`, `max_renewable_life` and
@@ -1004,23 +1011,16 @@ fn unix_now() -> u32 {
 
 /// The kadm5 code for a store failure; `unknown` for a missing entry.
 fn store_code(e: &StoreError, unknown: u32) -> u32 {
-    const REJECTED: [(&str, u32); 5] = [
-        (ALIAS_UNSUPPORTED, KDB_ALIAS_UNSUPPORTED),
-        ("Password is too short", code::PASS_Q_TOOSHORT),
-        (
-            "Password does not contain enough character classes",
-            code::PASS_Q_CLASS,
-        ),
-        ("Cannot reuse password", code::PASS_REUSE),
-        ("Cannot change protected principal", code::PROTECT_PRINCIPAL),
-    ];
     let c = match e.kind() {
+        _ if e.code().is_some() => e.code().unwrap_or(code::FAILURE),
         StoreErrorKind::NotFound => unknown,
         StoreErrorKind::Conflict => code::DUP,
-        StoreErrorKind::Rejected => REJECTED
-            .iter()
-            .find(|(t, _)| e.message().contains(t))
-            .map_or(code::FAILURE, |(_, c)| *c),
+        StoreErrorKind::Rejected if e.message().contains(ALIAS_UNSUPPORTED) => {
+            KDB_ALIAS_UNSUPPORTED
+        }
+        StoreErrorKind::Rejected => {
+            krb5_rs::kdc::kdb::admin::rejection_code(e).unwrap_or(code::FAILURE)
+        }
         _ => code::FAILURE,
     };
     if c == code::FAILURE {
@@ -1144,7 +1144,8 @@ impl Kadm5 {
                 .with_tl_data(tl),
             keysalts,
         )
-        .with_history_enctype(self.history_enctype))
+        .with_history_enctype(self.history_enctype)
+        .with_modules(self.modules.clone()))
     }
 
     /// Administration as `caller`, who is recorded as the modifier.
@@ -1155,6 +1156,7 @@ impl Kadm5 {
             self.keysalts.clone(),
         )
         .with_history_enctype(self.history_enctype)
+        .with_modules(self.modules.clone())
     }
 
     fn name(&self, princ: Option<&str>) -> Result<(PrincipalName, String, String), u32> {
@@ -1546,18 +1548,25 @@ impl Kadm5 {
             Ok(false) if srealm != drealm => code::FAILURE,
             Ok(false) => {
                 let modifier = caller.client_name.clone().into_bytes();
-                let res = self.store.rename_raw(&sname, &srealm, |mut e, _| {
-                    if tl_bytes(&e, ALIAS_TARGET).is_some() {
-                        return Err(StoreError::rejected(ALIAS_UNSUPPORTED));
-                    }
-                    specialize_salt(&mut e);
-                    e.principal = dname.clone();
-                    e.realm = drealm.clone();
-                    set_mod_princ(&mut e, unix_now(), &modifier)?;
-                    Ok(e)
+                let hooks = &self.modules.hooks;
+                let res = hooks.rename(Stage::Precommit, &starget, &dtarget);
+                let res = res.and_then(|()| {
+                    self.store.rename_raw(&sname, &srealm, |mut e, _| {
+                        if tl_bytes(&e, ALIAS_TARGET).is_some() {
+                            return Err(StoreError::rejected(ALIAS_UNSUPPORTED));
+                        }
+                        specialize_salt(&mut e);
+                        e.principal = dname.clone();
+                        e.realm = drealm.clone();
+                        set_mod_princ(&mut e, unix_now(), &modifier)?;
+                        Ok(e)
+                    })
                 });
                 match res {
-                    Ok(()) => code::OK,
+                    Ok(()) => {
+                        let _ = hooks.rename(Stage::Postcommit, &starget, &dtarget);
+                        code::OK
+                    }
                     Err(e) => store_code(&e, code::UNK_PRINC),
                 }
             }
@@ -1613,9 +1622,20 @@ impl Kadm5 {
                 key_data: Vec::new(),
             };
             match set_mod_princ(&mut e, unix_now(), caller.client_name.as_bytes())
+                .and_then(|()| {
+                    self.modules
+                        .hooks
+                        .alias(Stage::Precommit, &atarget, &ttarget)
+                })
                 .and_then(|()| self.store.create_raw(&e))
             {
-                Ok(()) => code::OK,
+                Ok(()) => {
+                    let _ = self
+                        .modules
+                        .hooks
+                        .alias(Stage::Postcommit, &atarget, &ttarget);
+                    code::OK
+                }
                 Err(e) => store_code(&e, code::UNK_PRINC),
             }
         };
@@ -1694,7 +1714,10 @@ impl Kadm5 {
             }
             match self.admin_with(caller, ks, tl) {
                 Err(c) => c,
-                Ok(a) => match run(a.add_principal(&name, &realm, passwd, &opts)) {
+                Ok(a) => match run(a
+                    .with_request_mask(mask)
+                    .add_principal(&name, &realm, passwd, &opts))
+                {
                     Ok(()) => code::OK,
                     Err(e) => store_code(&e, code::UNK_POLICY),
                 },
@@ -1767,7 +1790,10 @@ impl Kadm5 {
                 Ok(a) => a,
                 Err(c) => return c,
             };
-            match run(admin.modify_principal(&name, &realm, &opts)) {
+            match run(admin
+                .with_request_mask(mask)
+                .modify_principal(&name, &realm, &opts))
+            {
                 Ok(()) => code::OK,
                 Err(e) => store_code(&e, code::UNK_PRINC),
             }
@@ -2474,6 +2500,13 @@ async fn kadmind(args: Args) {
         r("acl_file").map_or_else(|| Path::new(KDC_DIR).join("kadm5.acl"), PathBuf::from);
     let profiles: Vec<&Profile> = krb5.iter().chain([&kdc_conf]).collect();
     let acl = Arc::new(auth::load(&profiles, &realm, &acl_file).unwrap_or_else(|e| die(e)));
+    let dict_file = r("dict_file").map(PathBuf::from);
+    let modules = modules::load(
+        &profiles,
+        dict_file.as_deref(),
+        modules::logger("krb5-rs-kadmind"),
+    )
+    .unwrap_or_else(|e| die(e));
     let iprop_port = cfg.iprop.enabled.then(|| match r("iprop_port") {
         Some(p) => p
             .trim()
@@ -2587,6 +2620,7 @@ async fn kadmind(args: Args) {
         realm: realm.clone(),
         store: db.clone(),
         auth: acl.clone(),
+        modules: modules.clone(),
         keysalts: cfg.supported_keysalts.clone(),
         history_enctype: cfg.master_key_type,
         max_life: cfg.kdc.max_life,
@@ -2601,7 +2635,8 @@ async fn kadmind(args: Args) {
             realm: realm.clone(),
         },
         admin: AdminOps::new(db, cfg.supported_keysalts.clone())
-            .with_history_enctype(cfg.master_key_type),
+            .with_history_enctype(cfg.master_key_type)
+            .with_modules(modules),
         realm,
         auth: acl,
         replay: ReplayCache::default(),

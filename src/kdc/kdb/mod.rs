@@ -12,12 +12,14 @@ mod format;
 pub mod getdate;
 pub mod kadm5;
 pub mod kadm5_auth;
+pub mod kadm5_hook;
 #[cfg(feature = "tokio")]
 pub mod kpasswd;
 #[cfg(feature = "tokio")]
 pub mod kprop;
 pub mod master;
 pub mod mit;
+pub mod pwqual;
 pub mod restrictions;
 
 pub use crate::kdc::store::PrincipalRecord;

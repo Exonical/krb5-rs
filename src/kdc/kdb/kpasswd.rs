@@ -8,7 +8,8 @@ use std::time::Duration;
 use chrono::{Timelike, Utc};
 use rasn::prelude::*;
 
-use super::admin::{AdminOps, PASS_Q_CLASS, PASS_Q_TOOSHORT, PASS_REUSE};
+use super::admin::{rejection_code, AdminOps};
+use super::kadm5::code;
 use super::kprop::{error_code, host_address, ReplayCache};
 use super::mit::parse_name_with_default;
 use crate::kdc::store::{AdminStore, StoreErrorKind};
@@ -45,6 +46,10 @@ const KRB_ERR_GENERIC: i32 = 60;
 const ADDRTYPE_DIRECTIONAL: i32 = 3;
 
 const PASSWORD_NOT_CHANGED: &str = "Password not changed.";
+const PASSWORD_IN_DICTIONARY: &str =
+    "New password was found in a dictionary of possible passwords and\n\
+     therefore may be easily guessed. Please choose another password.\n\
+     See the kpasswd man page for help in choosing a good password.";
 const WHILE_TRYING_TO_CHANGE: &str = "while trying to change password.";
 const PASSWORD_REUSE: &str =
     "New password was used previously. Please choose a different password.";
@@ -307,26 +312,37 @@ async fn chpass_util<S: AdminStore>(
         Ok(_) => return (KPASSWD_SUCCESS, String::new()),
         Err(e) => e,
     };
-    if e.kind() == StoreErrorKind::Rejected && e.message() == PASS_REUSE {
-        return (KPASSWD_SOFTERROR, PASSWORD_REUSE.into());
-    }
-    let quality = e.kind() == StoreErrorKind::Rejected
-        && (e.message() == PASS_Q_TOOSHORT || e.message() == PASS_Q_CLASS);
-    if !quality {
+    let Some(c) = rejection_code(&e) else {
         return (KPASSWD_HARDERROR, not_changed(e.message()));
+    };
+    let status = match c {
+        code::PASS_Q_TOOSHORT
+        | code::PASS_REUSE
+        | code::PASS_Q_CLASS
+        | code::PASS_Q_DICT
+        | code::PASS_Q_GENERIC
+        | code::PASS_TOOSOON => KPASSWD_SOFTERROR,
+        _ => KPASSWD_HARDERROR,
+    };
+    let text = code::message(c);
+    match c {
+        code::PASS_REUSE => return (status, PASSWORD_REUSE.into()),
+        code::PASS_Q_DICT => return (status, PASSWORD_IN_DICTIONARY.into()),
+        code::PASS_Q_TOOSHORT | code::PASS_Q_CLASS => {}
+        _ => return (status, not_changed(&text)),
     }
-    let policy = match admin.get_principal(name, realm).await {
-        Ok(rec) => match rec.entry.policy.as_deref() {
-            Some(p) => admin.get_policy(p).await.ok(),
-            None => None,
-        },
-        Err(_) => None,
+    let Ok(rec) = admin.get_principal(name, realm).await else {
+        return (status, not_changed(&text));
     };
-    let Some(policy) = policy else {
-        return (KPASSWD_SOFTERROR, not_changed(e.message()));
+    let Some(policy) = rec.entry.policy.as_deref() else {
+        // chpass_util.c:177-185: a module refused without a policy.
+        return (status, format!("{text}\n\n{PASSWORD_NOT_CHANGED}"));
     };
-    if e.message() == PASS_Q_TOOSHORT {
-        (KPASSWD_SOFTERROR, too_short(policy.pw_min_length))
+    let Ok(policy) = admin.get_policy(policy).await else {
+        return (status, not_changed(&text));
+    };
+    if c == code::PASS_Q_TOOSHORT {
+        (status, too_short(policy.pw_min_length))
     } else {
         (KPASSWD_SOFTERROR, too_few_classes(policy.pw_min_classes))
     }
