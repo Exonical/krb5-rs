@@ -652,11 +652,17 @@ impl AsExchange {
                     if self.preauth_failed.contains(&t) {
                         continue;
                     }
-                    if let Some(out) =
-                        self.spake_process(pa.padata_value.as_ref(), body_der, &hint())?
-                    {
-                        self.selected_preauth_type = Some(t);
-                        return Ok(out);
+                    if self.config.spake_groups.is_empty() {
+                        continue;
+                    }
+                    match self.spake_process(pa.padata_value.as_ref(), body_der, &hint())? {
+                        Some(out) => {
+                            self.selected_preauth_type = Some(t);
+                            return Ok(out);
+                        }
+                        // preauth2.c:704-709 — a real mechanism that fails
+                        // is not tried again.
+                        None => self.preauth_failed.push(t),
                     }
                 }
                 t if t == PaDataType::EncTimestamp as i32 => {

@@ -59,6 +59,21 @@ sed -e 's/kdc_ports = 88$/kdc_ports = 8888/' \
     awk '{ print } /pkinit_anchors/ { print "        pkinit_require_freshness = true" }' \
     > /etc/krb5kdc/kdc-fresh.conf
 
+# KDCs on the same database with SPAKE enabled (MIT disables it on the KDC
+# until spake_preauth_groups is set): 8889 (published 10191) waits for the
+# client's support message, 8890 (published 10192) sends an optimistic P-256
+# challenge.
+for spec in "8889:" "8890:P-256"; do
+    port=${spec%%:*}
+    challenge=${spec#*:}
+    {
+        sed -e "s/kdc_ports = 88$/kdc_ports = $port/" \
+            -e "s/kdc_tcp_ports = 88$/kdc_tcp_ports = $port/" /etc/krb5kdc/kdc.conf | \
+            awk -v c="$challenge" '{ print } /^\[kdcdefaults\]/ && c != "" { print "    spake_preauth_kdc_challenge = " c }'
+        printf '[libdefaults]\n    spake_preauth_groups = edwards25519 P-256 P-384 P-521\n'
+    } > "/etc/krb5kdc/kdc-spake-$port.conf"
+done
+
 # Create KDC database
 mkdir -p /var/lib/krb5kdc
 # -W reads password from stdin; kdb5_util prompts twice (enter + verify)
@@ -112,6 +127,10 @@ fi
 
 # Freshness-requiring KDC (same database, other port and kdc.conf).
 KRB5_KDC_PROFILE=/etc/krb5kdc/kdc-fresh.conf krb5kdc -n &
+
+# SPAKE-enabled KDCs (same database).
+KRB5_KDC_PROFILE=/etc/krb5kdc/kdc-spake-8889.conf krb5kdc -n &
+KRB5_KDC_PROFILE=/etc/krb5kdc/kdc-spake-8890.conf krb5kdc -n &
 
 # Start KDC in foreground
 exec krb5kdc -n
