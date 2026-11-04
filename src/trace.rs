@@ -293,9 +293,11 @@ mod tests {
         let a = "0.0.0.0:88".parse().expect("addr");
         assert_eq!(raddr(true, &a), "stream 0.0.0.0:88");
         assert_eq!(raddr(false, &a), "dgram 0.0.0.0:88");
-        let e = std::io::Error::from_raw_os_error(2);
         #[cfg(unix)]
-        assert_eq!(errno(&e), "2/No such file or directory");
+        {
+            let e = std::io::Error::from_raw_os_error(2);
+            assert_eq!(errno(&e), "2/No such file or directory");
+        }
         assert_eq!(data(b"a\x01b"), "a\\x01b");
     }
 
