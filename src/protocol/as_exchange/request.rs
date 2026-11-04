@@ -15,6 +15,14 @@ impl AsExchange {
         &mut self,
         preauth_padata: Option<Vec<PaData>>,
     ) -> Result<(Vec<u8>, KdcReqBody), Krb5Error> {
+        let req_body = self.new_req_body()?;
+        self.build_as_req_from(req_body, preauth_padata)
+    }
+
+    /// The body of the next request, with a fresh nonce (MIT
+    /// get_in_tkt.c:1273-1287 encodes it before running preauth, which
+    /// SPAKE hashes).
+    pub(super) fn new_req_body(&mut self) -> Result<KdcReqBody, Krb5Error> {
         // Generate random nonce. Mask to 31 bits — MIT KDC decodes nonce
         // as signed krb5_int32, rejecting DER-encoded values >= 2^31.
         self.nonce = rand::random::<u32>() & 0x7FFF_FFFF;
@@ -81,7 +89,15 @@ impl AsExchange {
             enc_authorization_data: None,
             additional_tickets: None,
         };
+        Ok(req_body)
+    }
 
+    /// Assemble the AS-REQ around `req_body` and `preauth_padata`.
+    pub(super) fn build_as_req_from(
+        &mut self,
+        req_body: KdcReqBody,
+        preauth_padata: Option<Vec<PaData>>,
+    ) -> Result<(Vec<u8>, KdcReqBody), Krb5Error> {
         #[cfg(feature = "pkinit")]
         let preauth_padata = self
             .fill_pkinit(preauth_padata.clone(), &req_body)?
