@@ -1023,13 +1023,16 @@ impl FileStore {
                 store_key(&p.name, &realm) == key
             });
             let keys = self.masters_in(list)?;
+            // A whole-entry write that sets a new unlock time is an unlock.
+            let unlock = entry.last_admin_unlock.as_ref().map(|t| t.timestamp())
+                != pos.and_then(|i| list[i].last_admin_unlock.as_ref().map(ts));
             let record = self.to_record(
                 &entry,
                 last_pwd_change,
                 Some(kerberos_time(Utc::now().timestamp())),
                 pos.map(|i| &list[i]),
                 &keys,
-                false,
+                unlock,
             )?;
             match pos {
                 Some(i) => list[i] = record,
