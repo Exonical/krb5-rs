@@ -5,10 +5,108 @@
 //! The built-in modules are MIT's, in MIT's order: `default` (type
 //! `DEFAULT`), `rule` (type `RULE`), `names` (`auth_to_local_names`),
 //! `auth_to_local`, `k5login` and `an2ln`. `[plugins] localauth`
-//! `disable` and `enable_only` apply as in MIT.
+//! `disable` and `enable_only` apply as in MIT. Modules configured as
+//! `module = name:unix:path=...` run as separate processes over
+//! [`crate::plugin::rpc`] (see [`serve_localauth`]) and come first.
 
+use std::io::{self, Read, Write};
+use std::sync::Arc;
+
+use crate::plugin::rpc::{self, Message, PLUGIN_NO_HANDLE};
+use crate::plugin::{self as plugins, Configured};
 use crate::profile::Profile;
 use crate::types::PrincipalName;
+
+/// `KRB5_LNAME_NOTRANS`.
+pub const LNAME_NOTRANS: i32 = rpc::ERROR_TABLE_BASE_KRB5 + 176;
+/// `KRB5_CONFIG_BADFORMAT`.
+pub const CONFIG_BADFORMAT: i32 = rpc::ERROR_TABLE_BASE_KRB5 + 136;
+/// `KRB5_PLUGIN_BAD_MODULE_SPEC`.
+const PLUGIN_BAD_MODULE_SPEC: i32 = -1_750_600_192 + 1;
+/// [`rpc::call::INITIALIZE`]'s string for a localauth module.
+pub const LOCALAUTH_HANDSHAKE: &str = "KRB5RS-LOCALAUTH-V-1";
+
+/// localauth call numbers.
+pub mod call {
+    pub use crate::plugin::rpc::call::{FINALIZE, INITIALIZE};
+    /// `an2ln_types`: answered with `as` types (empty for an untyped module).
+    pub const AN2LN_TYPES: u32 = 3;
+    /// `userok`: `s` principal, `s` local name; answered empty to allow.
+    pub const USEROK: u32 = 4;
+    /// `an2ln`: `s` type, `s` residual, `s` principal; answered with `s`.
+    pub const AN2LN: u32 = 5;
+}
+
+/// A localauth module (`krb5_localauth_vtable`). Principals are passed
+/// unparsed with their realm. `userok` returns `Ok` to allow,
+/// `PLUGIN_NO_HANDLE` for no opinion, or another code to deny; `an2ln`
+/// returns [`LNAME_NOTRANS`] for no mapping, or another code to stop.
+pub trait LocalauthModule: Send + Sync {
+    /// The module name.
+    fn name(&self) -> &str;
+    /// `an2ln_types`: the `auth_to_local` types this module handles. A
+    /// typed module is reached only through `auth_to_local`.
+    fn an2ln_types(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// `init`.
+    fn init(&self) -> Result<(), i32> {
+        Ok(())
+    }
+    /// `fini`.
+    fn fini(&self) {}
+    /// `userok`.
+    fn userok(&self, _aname: &str, _lname: &str) -> Result<(), i32> {
+        Err(PLUGIN_NO_HANDLE)
+    }
+    /// `an2ln`.
+    fn an2ln(
+        &self,
+        _type: Option<&str>,
+        _residual: Option<&str>,
+        _aname: &str,
+    ) -> Result<String, i32> {
+        Err(LNAME_NOTRANS)
+    }
+}
+
+/// Serve a localauth module on `stream`.
+pub fn serve_localauth<S: Read + Write>(stream: S, module: &dyn LocalauthModule) -> io::Result<()> {
+    rpc::serve(stream, LOCALAUTH_HANDSHAKE, |req| {
+        let mut answer = Message::new(req.call);
+        let res = match req.call {
+            call::INITIALIZE => module.init(),
+            call::FINALIZE => {
+                module.fini();
+                Ok(())
+            }
+            call::AN2LN_TYPES => {
+                req.finish()?;
+                answer.put_strs(&module.an2ln_types());
+                Ok(())
+            }
+            call::USEROK => {
+                let aname = req.get_str()?.unwrap_or_default();
+                let lname = req.get_str()?.unwrap_or_default();
+                req.finish()?;
+                module.userok(&aname, &lname)
+            }
+            call::AN2LN => {
+                let ty = req.get_str()?;
+                let residual = req.get_str()?;
+                let aname = req.get_str()?.unwrap_or_default();
+                req.finish()?;
+                module
+                    .an2ln(ty.as_deref(), residual.as_deref(), &aname)
+                    .map(|l| {
+                        answer.put_str(Some(&l));
+                    })
+            }
+            _ => Err(PLUGIN_NO_HANDLE),
+        };
+        Ok(res.map(|()| answer).map_err(|c| (c, None)))
+    })
+}
 
 /// localauth errors, with MIT's com_err text.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -19,6 +117,19 @@ pub enum LocalauthError {
     /// `KRB5_CONFIG_BADFORMAT`.
     #[error("Improper format of Kerberos configuration file")]
     BadFormat,
+    /// Another com_err code, from a module or from loading the modules.
+    #[error("localauth error {0}")]
+    Code(i32),
+}
+
+impl LocalauthError {
+    fn from_code(code: i32) -> Self {
+        match code {
+            LNAME_NOTRANS => NoTranslation,
+            CONFIG_BADFORMAT => BadFormat,
+            c => LocalauthError::Code(c),
+        }
+    }
 }
 
 use LocalauthError::{BadFormat, NoTranslation};
@@ -27,7 +138,7 @@ use LocalauthError::{BadFormat, NoTranslation};
 const MAX_USERNAME: usize = 65;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Module {
+enum Builtin {
     Default,
     Rule,
     Names,
@@ -36,35 +147,91 @@ enum Module {
     An2ln,
 }
 
-impl Module {
-    const ALL: [Module; 6] = [
-        Module::Default,
-        Module::Rule,
-        Module::Names,
-        Module::AuthToLocal,
-        Module::K5login,
-        Module::An2ln,
+impl Builtin {
+    const ALL: [Builtin; 6] = [
+        Builtin::Default,
+        Builtin::Rule,
+        Builtin::Names,
+        Builtin::AuthToLocal,
+        Builtin::K5login,
+        Builtin::An2ln,
     ];
 
     fn name(self) -> &'static str {
         match self {
-            Module::Default => "default",
-            Module::Rule => "rule",
-            Module::Names => "names",
-            Module::AuthToLocal => "auth_to_local",
-            Module::K5login => "k5login",
-            Module::An2ln => "an2ln",
+            Builtin::Default => "default",
+            Builtin::Rule => "rule",
+            Builtin::Names => "names",
+            Builtin::AuthToLocal => "auth_to_local",
+            Builtin::K5login => "k5login",
+            Builtin::An2ln => "an2ln",
         }
     }
 
     /// `an2ln_types`: typed modules are reached only via `auth_to_local`.
     fn an2ln_type(self) -> Option<&'static str> {
         match self {
-            Module::Default => Some("DEFAULT"),
-            Module::Rule => Some("RULE"),
+            Builtin::Default => Some("DEFAULT"),
+            Builtin::Rule => Some("RULE"),
             _ => None,
         }
     }
+}
+
+enum Module {
+    Builtin(Builtin),
+    Remote {
+        conn: Arc<rpc::Conn>,
+        types: Vec<String>,
+    },
+}
+
+impl Module {
+    fn types(&self) -> Vec<&str> {
+        match self {
+            Module::Builtin(b) => b.an2ln_type().into_iter().collect(),
+            Module::Remote { types, .. } => types.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// localauth.c `load_localauth_modules`: a module that can't be reached,
+/// or whose `an2ln_types` conflict with an earlier module's, is skipped.
+fn load_modules(profile: &Profile) -> Result<Vec<Module>, i32> {
+    let names = Builtin::ALL.map(Builtin::name);
+    let list =
+        plugins::configured(&[profile], "localauth", &names).map_err(|_| PLUGIN_BAD_MODULE_SPEC)?;
+    let mut modules: Vec<Module> = Vec::new();
+    for c in list {
+        let m = match c {
+            Configured::Builtin(n) => match Builtin::ALL.iter().find(|b| b.name() == n) {
+                Some(&b) => Module::Builtin(b),
+                None => continue,
+            },
+            Configured::Remote(n, path) => {
+                let Some(conn) = plugins::remote(LOCALAUTH_HANDSHAKE, &n, &path) else {
+                    continue;
+                };
+                let types = match conn.call(&Message::new(call::AN2LN_TYPES)) {
+                    Ok(Ok(mut a)) => match a.get_strs() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    },
+                    _ => continue,
+                };
+                Module::Remote { conn, types }
+            }
+        };
+        // check_conflict
+        let conflict = m
+            .types()
+            .iter()
+            .any(|t| modules.iter().any(|o| o.types().contains(t)));
+        if !conflict {
+            modules.push(m);
+        }
+    }
+    Ok(modules)
 }
 
 enum Userok {
@@ -77,30 +244,21 @@ enum Userok {
 /// The localauth modules of a profile, in MIT's order.
 pub struct Localauth<'a> {
     profile: &'a Profile,
-    modules: Vec<Module>,
+    modules: Result<Vec<Module>, i32>,
 }
 
 impl<'a> Localauth<'a> {
-    /// Load the built-in modules, filtered by `[plugins] localauth`
-    /// `disable` and `enable_only` (plugin.c `configure_interface`).
+    /// Load the modules, filtered by `[plugins] localauth` `disable` and
+    /// `enable_only` (plugin.c `configure_interface`).
     pub fn new(profile: &'a Profile) -> Self {
-        let get = |k: &str| profile.get_values(&["plugins", "localauth", k]);
-        let mut modules: Vec<Module> = Module::ALL.to_vec();
-        let disable = get("disable");
-        modules.retain(|m| !disable.iter().any(|d| d == m.name()));
-        let enable = get("enable_only");
-        if !enable.is_empty() {
-            let mut v = Vec::new();
-            for e in &enable {
-                if let Some(m) = modules.iter().copied().find(|m| m.name() == e) {
-                    if !v.contains(&m) {
-                        v.push(m);
-                    }
-                }
-            }
-            modules = v;
+        Localauth {
+            profile,
+            modules: load_modules(profile),
         }
-        Localauth { profile, modules }
+    }
+
+    fn modules(&self) -> &[Module] {
+        self.modules.as_deref().unwrap_or_default()
     }
 
     /// `krb5_aname_to_localname`: the first untyped module that maps the
@@ -110,11 +268,14 @@ impl<'a> Localauth<'a> {
         aname: &PrincipalName,
         realm: &str,
     ) -> Result<String, LocalauthError> {
-        for &m in &self.modules {
-            if m.an2ln_type().is_some() {
+        if let Err(c) = self.modules {
+            return Err(LocalauthError::from_code(c));
+        }
+        for m in self.modules() {
+            if !m.types().is_empty() {
                 continue;
             }
-            match self.an2ln(m, None, aname, realm) {
+            match self.an2ln(m, None, None, aname, realm) {
                 Ok(l) => return Ok(l),
                 Err(NoTranslation) => {}
                 Err(e) => return Err(e),
@@ -126,8 +287,11 @@ impl<'a> Localauth<'a> {
     /// `krb5_kuserok`: false if any module denies, else true if one
     /// accepts.
     pub fn kuserok(&self, aname: &PrincipalName, realm: &str, lname: &str) -> bool {
+        if self.modules.is_err() {
+            return false;
+        }
         let mut accepted = false;
-        for &m in &self.modules {
+        for m in self.modules() {
             match self.userok(m, aname, realm, lname) {
                 Userok::Accept => accepted = true,
                 Userok::NoHandle => {}
@@ -139,24 +303,56 @@ impl<'a> Localauth<'a> {
 
     fn an2ln(
         &self,
-        m: Module,
+        m: &Module,
+        ty: Option<&str>,
         residual: Option<&str>,
         aname: &PrincipalName,
         realm: &str,
     ) -> Result<String, LocalauthError> {
+        let m = match m {
+            Module::Builtin(b) => *b,
+            Module::Remote { conn, .. } => {
+                let mut req = Message::new(call::AN2LN);
+                req.put_str(ty)
+                    .put_str(residual)
+                    .put_str(Some(&crate::ccache::unparse_name(aname, realm)));
+                return match conn.call(&req) {
+                    Ok(Ok(mut a)) => match a.get_str() {
+                        Ok(Some(l)) => Ok(l),
+                        _ => Err(NoTranslation),
+                    },
+                    Ok(Err((c, _))) => Err(LocalauthError::from_code(c)),
+                    // A module that has gone away has no translation.
+                    Err(_) => Err(NoTranslation),
+                };
+            }
+        };
         match m {
-            Module::Default => self.an2ln_default(aname, realm),
-            Module::Rule => an2ln_rule(residual, aname, realm),
-            Module::Names => self.an2ln_names(aname),
-            Module::AuthToLocal => self.an2ln_auth_to_local(aname, realm),
-            Module::K5login | Module::An2ln => Err(NoTranslation),
+            Builtin::Default => self.an2ln_default(aname, realm),
+            Builtin::Rule => an2ln_rule(residual, aname, realm),
+            Builtin::Names => self.an2ln_names(aname),
+            Builtin::AuthToLocal => self.an2ln_auth_to_local(aname, realm),
+            Builtin::K5login | Builtin::An2ln => Err(NoTranslation),
         }
     }
 
-    fn userok(&self, m: Module, aname: &PrincipalName, realm: &str, lname: &str) -> Userok {
+    fn userok(&self, m: &Module, aname: &PrincipalName, realm: &str, lname: &str) -> Userok {
+        let m = match m {
+            Module::Builtin(b) => *b,
+            Module::Remote { conn, .. } => {
+                let mut req = Message::new(call::USEROK);
+                req.put_str(Some(&crate::ccache::unparse_name(aname, realm)))
+                    .put_str(Some(lname));
+                return match conn.call(&req) {
+                    Ok(Ok(_)) => Userok::Accept,
+                    Ok(Err((PLUGIN_NO_HANDLE, _))) | Err(_) => Userok::NoHandle,
+                    Ok(Err(_)) => Userok::Deny,
+                };
+            }
+        };
         match m {
-            Module::K5login => self.userok_k5login(aname, realm, lname),
-            Module::An2ln => match self.aname_to_localname(aname, realm) {
+            Builtin::K5login => self.userok_k5login(aname, realm, lname),
+            Builtin::An2ln => match self.aname_to_localname(aname, realm) {
                 Ok(l) if l.len() < MAX_USERNAME && l == lname => Userok::Accept,
                 _ => Userok::NoHandle,
             },
@@ -206,13 +402,8 @@ impl<'a> Localauth<'a> {
                 Some((t, r)) => (t, Some(r)),
                 None => (v.as_str(), None),
             };
-            ret = match self
-                .modules
-                .iter()
-                .copied()
-                .find(|m| m.an2ln_type() == Some(ty))
-            {
-                Some(m) => self.an2ln(m, residual, aname, realm),
+            ret = match self.modules().iter().find(|m| m.types().contains(&ty)) {
+                Some(m) => self.an2ln(m, Some(ty), residual, aname, realm),
                 None => Err(BadFormat),
             };
         }

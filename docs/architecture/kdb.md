@@ -1006,9 +1006,10 @@ transactions stay short to limit MVCC version retention. Replication applies
 small batches in `BEGIN CONCURRENT` transactions and retries on conflict.
 There is no extra cache layer unless benchmarks justify one.
 
-### hostrealm and certauth modules
+### hostrealm, localauth and certauth modules
 
-hostrealm (client and KDC, `krb5_rs::locate`) and certauth (PKINIT KDC,
+hostrealm (client and KDC, `krb5_rs::locate`), localauth
+(`krb5_rs::localauth`) and certauth (PKINIT KDC,
 `krb5_rs::pkinit::certauth`) modules use the same socket RPC and
 configuration as kdcpolicy, with MIT's built-in modules after the configured
 ones, as in MIT's plugin order:
@@ -1021,6 +1022,16 @@ ones, as in MIT's plugin order:
   `host_realm`, `fallback_realm` and `default_realm`, each answered with
   `as` realms. The connection is opened once per process, like MIT's
   per-context module handles.
+- **localauth:** built-ins `default`, `rule`, `names`, `auth_to_local`,
+  `k5login` and `an2ln`. The handshake is `KRB5RS-LOCALAUTH-V-1`. Call 3
+  is `an2ln_types` (answered with `as` types; empty for an untyped module),
+  call 4 is `userok` (`s` principal, `s` local name; success allows,
+  `PLUGIN_NO_HANDLE` has no opinion, any other code denies) and call 5 is
+  `an2ln` (`s` type, `s` residual, `s` principal; answered with `s` local
+  name, or `KRB5_LNAME_NOTRANS`). As in `localauth.c`, typed modules are
+  reached only through `auth_to_local`, a module whose types conflict with
+  an earlier module's is skipped, and a malformed module spec makes
+  `krb5_aname_to_localname` fail and `krb5_kuserok` deny.
 - **certauth:** built-ins `pkinit_san`, `pkinit_eku` and `dbmatch`.
   `authorize` (call 3: `ay` certificate, `s` client principal) is answered
   with `i` result code and `as` indicators. At least one module must
