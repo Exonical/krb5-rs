@@ -606,6 +606,44 @@ fn file_store_dump_mkey_convert_rewraps_every_key() {
     dump_mkey_convert(&Env::new("mkey_convert_file").with_library("krb5-rs-file"));
 }
 
+/// `dump -mkey_convert` with a stash that no longer opens the database
+/// warns, reads the master key from the keyboard, writes the dump, and
+/// exits nonzero, as MIT's `open_db_and_mkey` does (`kdb5_util.c:452-458`).
+fn dump_mkey_convert_with_a_stale_stash(tag: &str, library: &str) {
+    let with = |env: Env| env.with_library(library);
+    let env = with(Env::new(tag));
+    env.ok(&["create", "-s"], "master\nmaster\n");
+    let other = with(Env::new(&format!("{tag}_other")));
+    other.ok(&["create", "-s"], "other\nother\n");
+    std::fs::copy(other.dir.join("stash"), env.dir.join("stash")).expect("copy stash");
+    let dump = env.dir.join("dump");
+    let out = env.run(
+        &["dump", "-mkey_convert", &dump.to_string_lossy()],
+        "master\nnew\nnew\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("while getting master key list")
+            && stderr.contains("Warning: proceeding without master key list"),
+        "{stderr}"
+    );
+    assert!(std::fs::read(&dump)
+        .unwrap_or_else(|e| panic!("{e}: {stderr}"))
+        .starts_with(b"kdb5_util load_dump"));
+}
+
+#[test]
+fn file_store_dump_mkey_convert_with_a_stale_stash_warns() {
+    dump_mkey_convert_with_a_stale_stash("stale_convert_file", "krb5-rs-file");
+}
+
+#[cfg(feature = "klmdb")]
+#[test]
+fn dump_mkey_convert_with_a_stale_stash_warns() {
+    dump_mkey_convert_with_a_stale_stash("stale_convert_klmdb", "klmdb");
+}
+
 /// `kdb5_util dump -mkey_convert` / `-new_mkey_file` (`dump.c:83-129,
 /// 1246-1293`): the dump's keys are under a new master key, which opens the
 /// loaded database, and the principals' keys are unchanged.

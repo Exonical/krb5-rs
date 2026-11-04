@@ -260,7 +260,7 @@ fn wrong_master_key(e: &StoreError) -> bool {
 /// `krb5_db_fetch_mkey_list` failing in `open_db_and_mkey`
 /// (`kdb5_util.c:452-458`): warn and go on when `e` is a wrong master key.
 fn no_master_list(e: &StoreError) -> bool {
-    if e.message() != BAD_MASTER {
+    if !wrong_master_key(e) {
         return false;
     }
     com_err(format!("{BAD_MASTER}\n while getting master key list"));
@@ -1167,8 +1167,13 @@ fn klmdb_command(
                 let keys = match (convert, valid_master_key) {
                     (false, _) => None,
                     (true, true) => Some(store.master_key_list()?),
+                    // The environment is already open, so verify the key
+                    // against its K/M rather than opening it again.
                     (true, false) => Some(keyboard_master(realm, etype, |k| {
-                        LmdbStore::open(cfg, k)?.master_key_list()
+                        let km = store
+                            .raw_entry(&km_principal(), realm)?
+                            .ok_or_else(|| StoreError::backend(BAD_MASTER))?;
+                        MasterKeys::fetch(&km, k)
                     })),
                 };
                 Ok((store.dump_entries()?, keys))
