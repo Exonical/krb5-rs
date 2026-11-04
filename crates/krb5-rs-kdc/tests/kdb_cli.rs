@@ -720,3 +720,106 @@ fn dump_mkey_convert(env: &Env) {
     );
     assert_eq!(alice_key(&path("before.kt")), alice_key(&path("third.kt")));
 }
+
+/// Build `tests/fixtures/<src>.c` into `dir`.
+#[cfg(unix)]
+fn fixture_module(dir: &Path, src: &str) -> PathBuf {
+    let so = dir.join(format!("{src}.so"));
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args(["-shared", "-fPIC", "-I"])
+        .arg(root.join("include"))
+        .arg("-o")
+        .arg(&so)
+        .arg(root.join(format!("tests/fixtures/{src}.c")))
+        .output()
+        .expect("run cc");
+    assert!(out.status.success(), "{out:?}");
+    so
+}
+
+/// MIT's `t_pwqual.py` and `t_kadm5_hook.py` through the principal
+/// commands.
+#[cfg(unix)]
+#[test]
+fn pwqual_and_kadm5_hook_modules_like_mit() {
+    if cfg!(target_feature = "crt-static") {
+        return;
+    }
+    let env = Env::new("pwqual");
+    let pwqual = fixture_module(&env.dir, "pwqual_test");
+    let hook = fixture_module(&env.dir, "kadm5_hook_test");
+    let dict = env.dir.join("dict");
+    std::fs::write(&dict, "birds\nbees\napples\noranges\n").unwrap();
+    let conf = std::fs::read_to_string(&env.conf).unwrap().replace(
+        "  supported_enctypes",
+        &format!("  dict_file = {}\n  supported_enctypes", dict.display()),
+    ) + &format!(
+        "[plugins]\n pwqual = {{\n  module = combo:{}\n }}\n kadm5_hook = {{\n  module = test:{}\n }}\n",
+        pwqual.display(),
+        hook.display()
+    );
+    std::fs::write(&env.conf, conf).unwrap();
+    env.ok(&["create", "-s"], "master\nmaster\n");
+    env.ok(&["addpol", "pol"], "");
+    let refused = |args: &[&str], stdin: &str, msg: &str| {
+        let out = env.run(args, stdin);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {text}");
+        assert!(text.contains(msg), "{args:?}: {text}");
+    };
+    env.ok(&["addprinc", "p2"], "birds\nbirds\n");
+    refused(
+        &["addprinc", "-policy", "pol", "p3"],
+        "birds\nbirds\n",
+        "Password is in the password dictionary",
+    );
+    env.ok(&["addprinc", "p4"], "p4\np4\n");
+    refused(
+        &["addprinc", "-policy", "pol", "p5"],
+        "p5\np5\n",
+        "Password may not match principal name",
+    );
+    refused(
+        &["addprinc", "p6"],
+        "birdsoranges\nbirdsoranges\n",
+        "Password may not be a pair of dictionary words",
+    );
+    refused(
+        &["cpw", "p2"],
+        "applesbees\napplesbees\n",
+        "Password may not be a pair of dictionary words",
+    );
+    let out = env.ok(&["addprinc", "-randkey", "test"], "");
+    assert!(out.contains("init\n"), "{out}");
+    assert!(
+        out.contains("create: stage precommit principal test@KDB.TEST"),
+        "{out}"
+    );
+    assert!(
+        out.contains("create: stage postcommit principal test@KDB.TEST"),
+        "{out}"
+    );
+    assert!(out.contains("fini\n"), "{out}");
+    let out = env.ok(&["cpw", "p2"], "newpass\nnewpass\n");
+    assert!(
+        out.contains("chpass: stage precommit principal p2@KDB.TEST"),
+        "{out}"
+    );
+    let out = env.ok(&["modprinc", "+requires_preauth", "p2"], "");
+    assert!(
+        out.contains("modify: stage postcommit principal p2@KDB.TEST"),
+        "{out}"
+    );
+    let out = env.ok(&["delprinc", "p2"], "");
+    assert!(
+        out.contains("remove: stage precommit principal p2@KDB.TEST"),
+        "{out}"
+    );
+    // Other commands run no modules, as kdb5_util doesn't.
+    assert!(!env.ok(&["listprincs"], "").contains("init\n"));
+}

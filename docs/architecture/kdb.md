@@ -610,6 +610,60 @@ The test modules in `crates/krb5-rs-kdc/tests/fixtures/kadm5_auth_test.c`
 port MIT's `plugins/kadm5_auth/test/main.c` (`welcomer`, `bouncer`) and run
 MIT's `t_kadm5_auth.py` cases.
 
+#### Password quality and kadm5_hook modules
+
+kadmind (remote kadmin and kpasswd) and `krb5-rs-kdb`'s principal commands
+(`addprinc`, `cpw`, `modprinc`, `delprinc`, like `kadmin.local`) run MIT's
+password quality (`lib/kadm5/srv/pwqual.c`) and kadm5_hook
+(`lib/kadm5/srv/kadm5_hook.c`) modules. Other `krb5-rs-kdb` commands run
+none, as `kdb5_util` does.
+
+```
+[realms]
+    EXAMPLE.COM = {
+        dict_file = /usr/share/dict/words
+    }
+[plugins]
+    pwqual = {
+        module = mymod:pwqual/mymod.so
+        disable = hesiod
+    }
+    kadm5_hook = {
+        module = myhook:kadm5_hook/myhook.so
+    }
+```
+
+- Passwords pass the policy's length and character-class checks first, then
+  each password quality module in order; the first refusal is returned and
+  logged with the module and principal (`server_misc.c:73-130`).
+- The built-in modules are MIT's, in MIT's order: `dict` refuses, for
+  principals with a policy, a password in `dict_file` (one word per
+  newline-terminated line, compared case-insensitively; a missing file is
+  logged and ignored), `empty` refuses an empty password for every principal,
+  `hesiod` does nothing (MIT built without Hesiod), and `princ` refuses, for
+  principals with a policy, the realm or any component of the principal name.
+  Refusals use MIT's codes (`KADM5_PASS_Q_DICT`, `KADM5_PASS_Q_TOOSHORT`) and
+  messages, and kpasswd reports them as MIT's soft errors.
+- `module = name:path` loads `pwqual_<name>_initvt` or
+  `kadm5_hook_<name>_initvt`; configured modules come before the built-ins,
+  and `disable` and `enable_only` apply as for kadm5_auth. A module that fails
+  to load or whose `initvt` fails is skipped; a pwqual module whose `open`
+  fails or a kadm5_hook module whose `init` fails stops the program.
+- Hooks run before (`PRECOMMIT`) and after (`POSTCOMMIT`) addprinc, modprinc,
+  delprinc, cpw, randkey, renprinc and alias creation. A precommit error
+  aborts the operation with the module's code; a postcommit error is logged
+  and ignored (`svr_principal.c`). `fini` and `close` run when the program
+  exits, and module callbacks never run at once.
+
+Deviations: the module ABIs are krb5-rs's own, in
+`crates/krb5-rs-kdc/include/krb5-rs/pwqual_plugin.h` and
+`kadm5_hook_plugin.h` (unparsed principal strings, no `krb5_context`, a
+pwqual module writes its message into a buffer), so modules built against
+MIT's headers do not load; as with kadm5_auth, static builds cannot load
+modules. The test modules in `tests/fixtures/pwqual_test.c` and
+`kadm5_hook_test.c` port MIT's `plugins/pwqual/test` (`combo`) and
+`plugins/kadm5_hook/test` and run `t_pwqual.py` and `t_kadm5_hook.py`'s cases.
+
 ### ONC RPC and RPCSEC_GSS
 
 `krb5_rs::rpc` (feature `tokio`) is ONC RPC version 2 over TCP with MIT's

@@ -48,6 +48,7 @@ pub enum StoreErrorKind {
 pub struct StoreError {
     kind: StoreErrorKind,
     message: String,
+    code: Option<u32>,
 }
 
 impl StoreError {
@@ -56,7 +57,20 @@ impl StoreError {
         Self {
             kind,
             message: message.into(),
+            code: None,
         }
+    }
+
+    /// The same error carrying MIT error `code` (a kadm5 or com_err code).
+    #[must_use]
+    pub fn with_code(mut self, code: u32) -> Self {
+        self.code = Some(code);
+        self
+    }
+
+    /// The MIT error code, when the error carries one.
+    pub fn code(&self) -> Option<u32> {
+        self.code
     }
 
     /// A [`StoreErrorKind::Backend`] error.

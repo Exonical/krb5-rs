@@ -3,11 +3,16 @@
 //! lib/kadm5/str_conv.c).
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use super::file::FileStore;
+use super::kadm5::code;
+use super::kadm5::mask as kmask;
+use super::kadm5_hook::{HookPrinc, Kadm5Hooks, KeySaltTuple, Stage};
+use super::pwqual::PwQualModules;
 use crate::crypto::{enctype_name, SaltType};
 use crate::kdc::db::{keys_from_password, random_keys, PrincipalAttributes, PrincipalEntry};
 use crate::kdc::kdb::mit::{history_entry, history_key_matches, KeyData};
@@ -17,6 +22,32 @@ use crate::kdc::store::{
 };
 use crate::keytab::{FileKeytab, Keytab, KeytabEntry};
 use crate::types::{EncryptionKey, KerberosString, KerberosTime, PrincipalName};
+
+/// The kadm5 code of a refused administrative change: the code the error
+/// carries, or, for stores that only report MIT's text, the code of that
+/// text.
+#[must_use]
+pub fn rejection_code(e: &StoreError) -> Option<u32> {
+    if let Some(c) = e.code() {
+        return Some(c);
+    }
+    if e.kind() != StoreErrorKind::Rejected {
+        return None;
+    }
+    [
+        (PASS_Q_TOOSHORT, code::PASS_Q_TOOSHORT),
+        (PASS_Q_CLASS, code::PASS_Q_CLASS),
+        (PASS_REUSE, code::PASS_REUSE),
+        (PROTECT_PRINCIPAL, code::PROTECT_PRINCIPAL),
+    ]
+    .iter()
+    .find(|(t, _)| e.message().contains(t))
+    .map(|(_, c)| *c)
+}
+
+fn unparse(name: &PrincipalName, realm: &str) -> String {
+    String::from_utf8_lossy(&super::mit::unparse_name(name, realm)).into_owned()
+}
 
 fn err(msg: impl Into<String>) -> StoreError {
     StoreError::backend(msg)
@@ -37,7 +68,7 @@ const DEFAULT_HISTORY_ENCTYPE: i32 = 18;
 /// and everything else, including space and non-ASCII bytes).
 pub fn check_password(password: &str, policy: &Policy) -> Result<(), StoreError> {
     if password.len() < policy.pw_min_length as usize {
-        return Err(StoreError::rejected(PASS_Q_TOOSHORT));
+        return Err(StoreError::rejected(PASS_Q_TOOSHORT).with_code(code::PASS_Q_TOOSHORT));
     }
     let mut classes = [false; 5];
     for byte in password.bytes() {
@@ -51,7 +82,7 @@ pub fn check_password(password: &str, policy: &Policy) -> Result<(), StoreError>
         classes[class] = true;
     }
     if (classes.iter().filter(|&&c| c).count() as u32) < policy.pw_min_classes {
-        return Err(StoreError::rejected(PASS_Q_CLASS));
+        return Err(StoreError::rejected(PASS_Q_CLASS).with_code(code::PASS_Q_CLASS));
     }
     Ok(())
 }
@@ -328,6 +359,31 @@ pub struct AdminOps<S: AdminStore> {
     store: S,
     keysalts: Vec<(i32, SaltType)>,
     history_enctype: i32,
+    modules: AdminModules,
+    request_mask: Option<i32>,
+    requested_ks: Vec<KeySaltTuple>,
+}
+
+/// The password quality and kadm5_hook modules administration runs
+/// (`kadm5_init`'s `qual_handles` and `hook_handles`,
+/// `server_init.c:356-372`).
+#[derive(Debug, Clone, Default)]
+pub struct AdminModules {
+    /// Password quality modules; by default MIT's built-ins without a
+    /// dictionary.
+    pub pwqual: Arc<PwQualModules>,
+    /// kadm5_hook modules; none by default.
+    pub hooks: Arc<Kadm5Hooks>,
+}
+
+fn unix_secs(t: Option<Option<KerberosTime>>) -> u32 {
+    t.flatten()
+        .map_or(0, |t| u32::try_from(t.timestamp()).unwrap_or(u32::MAX))
+}
+
+fn duration_secs(d: Option<Option<Duration>>) -> u32 {
+    d.flatten()
+        .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
 }
 
 impl<S: AdminStore> AdminOps<S> {
@@ -338,6 +394,108 @@ impl<S: AdminStore> AdminOps<S> {
             store,
             keysalts,
             history_enctype: DEFAULT_HISTORY_ENCTYPE,
+            modules: AdminModules::default(),
+            request_mask: None,
+            requested_ks: Vec::new(),
+        }
+    }
+
+    /// Run `modules` instead of MIT's unconfigured defaults.
+    #[must_use]
+    pub fn with_modules(mut self, modules: AdminModules) -> Self {
+        self.modules = modules;
+        self
+    }
+
+    /// The `KADM5_*` mask of the kadm5 request being served, which
+    /// create and modify hooks see; otherwise it is derived from the
+    /// [`PrincipalOptions`].
+    #[must_use]
+    pub fn with_request_mask(mut self, mask: i32) -> Self {
+        self.request_mask = Some(mask);
+        self
+    }
+
+    /// The key/salt tuples the kadm5 request named, which create and chpass
+    /// hooks see; none (the default) when it named none, even though keys
+    /// are then made for the realm's `supported_enctypes`.
+    #[must_use]
+    pub fn with_requested_keysalts(mut self, ks: Vec<KeySaltTuple>) -> Self {
+        self.requested_ks = ks;
+        self
+    }
+
+    /// The modules this administration runs.
+    pub fn modules(&self) -> &AdminModules {
+        &self.modules
+    }
+
+    /// `passwd_check` (`server_misc.c:107-138`): the policy's checks, then
+    /// every password quality module.
+    fn passwd_check(
+        &self,
+        password: &str,
+        policy: Option<&Policy>,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<(), StoreError> {
+        if let Some(policy) = policy {
+            check_password(password, policy)?;
+        }
+        self.modules
+            .pwqual
+            .check(password, policy.map(|p| p.name.as_str()), name, realm)
+    }
+
+    fn ks_tuples(&self) -> Vec<KeySaltTuple> {
+        self.requested_ks.clone()
+    }
+
+    /// The requested entry a create or modify hook sees.
+    fn hook_princ(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        opts: &PrincipalOptions,
+        create: bool,
+        current: PrincipalAttributes,
+    ) -> HookPrinc {
+        let derived = {
+            let mut m = if create { kmask::PRINCIPAL } else { 0 };
+            if opts.attributes != AttrChange::default() {
+                m |= kmask::ATTRIBUTES;
+            }
+            if opts.max_life.is_some() {
+                m |= kmask::MAX_LIFE;
+            }
+            if opts.max_renewable_life.is_some() {
+                m |= kmask::MAX_RLIFE;
+            }
+            if opts.expiration.is_some() {
+                m |= kmask::PRINC_EXPIRE_TIME;
+            }
+            if opts.pw_expiration.is_some() {
+                m |= kmask::PW_EXPIRATION;
+            }
+            if opts.unlock {
+                m |= kmask::FAIL_AUTH_COUNT;
+            }
+            match opts.policy {
+                Some(Some(_)) => m |= kmask::POLICY,
+                Some(None) => m |= kmask::POLICY_CLR,
+                None => {}
+            }
+            m
+        };
+        HookPrinc {
+            principal: unparse(name, realm),
+            mask: self.request_mask.unwrap_or(derived),
+            attributes: opts.attributes.apply(current).bits(),
+            max_life: duration_secs(opts.max_life),
+            max_renewable_life: duration_secs(opts.max_renewable_life),
+            princ_expire_time: unix_secs(opts.expiration),
+            pw_expiration: unix_secs(opts.pw_expiration),
+            policy: opts.policy.clone().flatten(),
         }
     }
 
@@ -486,8 +644,8 @@ impl<S: AdminStore> AdminOps<S> {
             Some(Some(name)) => self.policy_named(Some(name)).await?,
             _ => None,
         };
-        if let (Some(pw), Some(policy)) = (password, &policy) {
-            check_password(pw, policy)?;
+        if let Some(pw) = password {
+            self.passwd_check(pw, policy.as_ref(), name, realm)?;
         }
         let keys = match password {
             Some(pw) => keys_from_password(name, realm, pw, 1, &self.keysalts),
@@ -519,9 +677,15 @@ impl<S: AdminStore> AdminOps<S> {
             }
         }
         entry.security_epoch = 1;
+        let hooks = &self.modules.hooks;
+        let ent = self.hook_princ(name, realm, opts, true, PrincipalAttributes::empty());
+        let ks = self.ks_tuples();
+        hooks.create(Stage::Precommit, &ent, &ks, password)?;
         self.store
             .create_principal(entry, Some(kerberos_time(now)))
-            .await
+            .await?;
+        let _ = hooks.create(Stage::Postcommit, &ent, &ks, password);
+        Ok(())
     }
 
     fn etypes(&self) -> Vec<i32> {
@@ -540,11 +704,16 @@ impl<S: AdminStore> AdminOps<S> {
         name: &PrincipalName,
         realm: &str,
     ) -> Result<(), StoreError> {
-        if self.store.delete_principal(name, realm).await? {
-            Ok(())
-        } else {
-            Err(missing(format!("Principal {name}@{realm}")))
+        // svr_principal.c:532-546: the hooks run once the entry is found.
+        self.require(name, realm).await?;
+        let hooks = &self.modules.hooks;
+        let princ = unparse(name, realm);
+        hooks.remove(Stage::Precommit, &princ)?;
+        if !self.store.delete_principal(name, realm).await? {
+            return Err(missing(format!("Principal {name}@{realm}")));
         }
+        let _ = hooks.remove(Stage::Postcommit, &princ);
+        Ok(())
     }
 
     /// `cpw` (`kadm5_chpass_principal_3`, `svr_principal.c:1219-1360`, and
@@ -581,20 +750,25 @@ impl<S: AdminStore> AdminOps<S> {
         let history_target = is_history_principal(name);
         // svr_principal.c:1247-1249, 1430-1438.
         if history_target && (password.is_some() || keep_old > 0) {
-            return Err(StoreError::rejected(PROTECT_PRINCIPAL));
+            return Err(StoreError::rejected(PROTECT_PRINCIPAL).with_code(code::PROTECT_PRINCIPAL));
         }
         let current = self.require(name, realm).await?;
         let policy_name = current.entry.policy.clone();
         let policy = self.policy_named(policy_name.as_deref()).await?;
         let mut hist = None;
-        if let (Some(pw), Some(policy)) = (password, &policy) {
+        if let Some(pw) = password {
             // MIT fetches (creating) the history key before checking the
             // password (svr_principal.c:1269-1284).
-            if current.password_history.is_some() {
+            if policy.is_some() && current.password_history.is_some() {
                 hist = Some(self.history_keys(realm).await?);
             }
-            check_password(pw, policy)?;
+            self.passwd_check(pw, policy.as_ref(), name, realm)?;
         }
+        let hooks = self.modules.hooks.clone();
+        let princ = unparse(name, realm);
+        let ks = self.ks_tuples();
+        hooks.chpass(Stage::Precommit, &princ, keep_old > 0, &ks, password)?;
+        let hook_password = password.map(str::to_owned);
 
         let keysalts = self.keysalts.clone();
         let mut etypes = self.etypes();
@@ -637,7 +811,7 @@ impl<S: AdminStore> AdminOps<S> {
                         })
                     });
                     if reused {
-                        return Err(StoreError::rejected(PASS_REUSE));
+                        return Err(StoreError::rejected(PASS_REUSE).with_code(code::PASS_REUSE));
                     }
                     if let (true, Some(history), Some((hist_keys, hist_kvno))) = (
                         policy.pw_history_num > 1,
@@ -650,7 +824,9 @@ impl<S: AdminStore> AdminOps<S> {
                                     .any(|new| history_key_matches(data, hist_keys, &new.key))
                             })
                         {
-                            return Err(StoreError::rejected(PASS_REUSE));
+                            return Err(
+                                StoreError::rejected(PASS_REUSE).with_code(code::PASS_REUSE)
+                            );
                         }
                         let entry = history_entry(&rec.entry, &hist_keys[0])?;
                         if !entry.is_empty() {
@@ -694,7 +870,16 @@ impl<S: AdminStore> AdminOps<S> {
                 Ok(())
             })
             .await
-            .map(|updated| updated.entry.current_kvno().unwrap_or(0))
+            .map(|updated| {
+                let _ = hooks.chpass(
+                    Stage::Postcommit,
+                    &princ,
+                    keep_old > 0,
+                    &ks,
+                    hook_password.as_deref(),
+                );
+                updated.entry.current_kvno().unwrap_or(0)
+            })
     }
 
     /// `modprinc` (`kadm5_modify_principal`, `svr_principal.c:601-634`):
@@ -711,6 +896,10 @@ impl<S: AdminStore> AdminOps<S> {
             Some(Some(name)) => self.policy_named(Some(name)).await?,
             _ => None,
         };
+        let hooks = &self.modules.hooks;
+        let current = self.require(name, realm).await?.entry.attributes;
+        let ent = self.hook_princ(name, realm, opts, false, current);
+        hooks.modify(Stage::Precommit, &ent)?;
         let opts = opts.clone();
         self.store
             .update_principal(name, realm, move |rec| {
@@ -734,6 +923,7 @@ impl<S: AdminStore> AdminOps<S> {
                 Ok(())
             })
             .await?;
+        let _ = hooks.modify(Stage::Postcommit, &ent);
         Ok(())
     }
 

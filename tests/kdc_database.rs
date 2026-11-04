@@ -857,3 +857,127 @@ fn policies_persist_and_follow_mit_kadmin_rules() {
         .expect("record")
         .is_some());
 }
+
+/// What kadm5_hook modules see (`t_kadm5_hook.py`): the request's key/salt
+/// tuples only, flags after clears, and the unlock bit for `-unlock`.
+#[tokio::test]
+async fn kadm5_hooks_see_the_request_like_mit() {
+    use krb5_rs::kdc::kdb::admin::{AdminModules, AdminOps};
+    use krb5_rs::kdc::kdb::kadm5_hook::{HookPrinc, Kadm5Hook, Kadm5Hooks, KeySaltTuple, Stage};
+    use std::sync::Mutex;
+
+    type Seen = Arc<Mutex<Vec<(String, i64, u32, Vec<KeySaltTuple>)>>>;
+    struct Record(Seen);
+    impl Kadm5Hook for Record {
+        fn name(&self) -> &str {
+            "record"
+        }
+        fn chpass(
+            &self,
+            stage: Stage,
+            _princ: &str,
+            _keepold: bool,
+            ks: &[KeySaltTuple],
+            _password: Option<&str>,
+        ) -> Result<(), u32> {
+            if stage == Stage::Precommit {
+                let seen = ("chpass".into(), 0, 0, ks.to_vec());
+                self.0.lock().expect("lock").push(seen);
+            }
+            Ok(())
+        }
+        fn create(
+            &self,
+            stage: Stage,
+            ent: &HookPrinc,
+            ks: &[KeySaltTuple],
+            _password: Option<&str>,
+        ) -> Result<(), u32> {
+            if stage == Stage::Precommit {
+                let seen = (
+                    "create".into(),
+                    i64::from(ent.mask),
+                    ent.attributes,
+                    ks.to_vec(),
+                );
+                self.0.lock().expect("lock").push(seen);
+            }
+            Ok(())
+        }
+        fn modify(&self, stage: Stage, ent: &HookPrinc) -> Result<(), u32> {
+            if stage == Stage::Precommit {
+                let seen = (
+                    "modify".into(),
+                    i64::from(ent.mask),
+                    ent.attributes,
+                    Vec::new(),
+                );
+                self.0.lock().expect("lock").push(seen);
+            }
+            Ok(())
+        }
+    }
+
+    let (_dir, store) = setup();
+    let seen = Seen::default();
+    let modules = AdminModules {
+        hooks: Arc::new(Kadm5Hooks::new(
+            vec![Box::new(Record(Arc::clone(&seen)))],
+            Arc::new(|_: &str| {}),
+        )),
+        ..AdminModules::default()
+    };
+    let ops = || AdminOps::new(&store, keysalts()).with_modules(modules.clone());
+    let preauth = PrincipalAttributes::REQUIRES_PRE_AUTH.bits();
+    let fwd = PrincipalAttributes::DISALLOW_FORWARDABLE.bits();
+    let mut add = PrincipalOptions::default();
+    add.attributes.add_spec("+requires_preauth").expect("flag");
+    add.attributes.add_spec("-allow_forwardable").expect("flag");
+    ops()
+        .add_principal(&name("h"), REALM, Some("pw-one-Two3"), &add)
+        .await
+        .expect("addprinc");
+    let mut clear = PrincipalOptions::default();
+    clear
+        .attributes
+        .add_spec("-requires_preauth")
+        .expect("flag");
+    ops()
+        .modify_principal(&name("h"), REALM, &clear)
+        .await
+        .expect("modprinc");
+    let unlock = PrincipalOptions {
+        unlock: true,
+        ..PrincipalOptions::default()
+    };
+    ops()
+        .modify_principal(&name("h"), REALM, &unlock)
+        .await
+        .expect("modprinc -unlock");
+    ops()
+        .change_password_keeping(&name("h"), REALM, None, 0)
+        .await
+        .expect("randkey");
+    ops()
+        .with_requested_keysalts(vec![(18, 0)])
+        .change_password_keeping(&name("h"), REALM, None, 0)
+        .await
+        .expect("randkey -e");
+    let seen = seen.lock().expect("lock").clone();
+    let (principal, attributes, fail_auth_count) = (0x0001, 0x0010, 0x01_0000);
+    assert_eq!(
+        seen,
+        [
+            (
+                "create".into(),
+                principal | attributes,
+                preauth | fwd,
+                vec![]
+            ),
+            ("modify".into(), attributes, fwd, vec![]),
+            ("modify".into(), fail_auth_count, fwd, vec![]),
+            ("chpass".into(), 0, 0, vec![]),
+            ("chpass".into(), 0, 0, vec![(18, 0)]),
+        ]
+    );
+}
