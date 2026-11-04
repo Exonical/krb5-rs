@@ -639,9 +639,9 @@ fn run() {
                 };
                 let store = match opened {
                     Some(store) => store,
-                    None => keyboard_master(&realm, etype, |k| {
-                        FileStore::open(&cfg.database_name, k)
-                    }),
+                    None => {
+                        keyboard_master(&realm, etype, |k| FileStore::open(&cfg.database_name, k))
+                    }
                 };
                 let keys = if convert {
                     Some(store.master_key_list()?)
