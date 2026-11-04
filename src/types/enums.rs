@@ -102,6 +102,7 @@ pub enum PaDataType {
     EncryptedChallenge = 138,
     ReqEncPaRep = 149,
     AsFreshness = 150,
+    Spake = 151,
     SupportedEtypes = 165,
     PacOptions = 167,
 }
@@ -124,6 +125,7 @@ impl TryFrom<i32> for PaDataType {
             138 => Ok(Self::EncryptedChallenge),
             149 => Ok(Self::ReqEncPaRep),
             150 => Ok(Self::AsFreshness),
+            151 => Ok(Self::Spake),
             165 => Ok(Self::SupportedEtypes),
             167 => Ok(Self::PacOptions),
             other => Err(other),

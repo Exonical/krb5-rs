@@ -2,12 +2,14 @@
 //! draft-ietf-kitten-krb-spake-preauth): group arithmetic, transcript hash
 //! and key derivation shared by the client and the KDC.
 
+mod asn1;
 mod groups;
 mod iana;
 #[cfg(test)]
 mod vectors;
 
-pub use groups::Group;
+pub use asn1::{PaSpake, SpakeChallenge, SpakeFactor, SpakeResponse, SpakeSupport};
+pub use groups::{Group, InvalidElement};
 
 use crate::crypto::{find_etype, fx_cf2, prf_plus, CryptoError};
 use crate::types::EncryptionKey;
