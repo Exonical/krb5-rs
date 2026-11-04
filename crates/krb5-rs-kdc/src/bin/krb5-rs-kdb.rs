@@ -47,7 +47,7 @@ fn print_usage() {
          database migrate [--create-roles] [--multi-region --primary-region R --regions R1,R2,...]   (CockroachDB)\n  \
          replication status | prune --older-than D | wait-applied --since TS [--timeout D] [--live-within D]   (CockroachDB)\n  \
          getprinc NAME\n  listprincs\n  ktadd -k PATH [-norandkey] NAME...\n  \
-         dump [-b7|-r13|-r18] [-verbose] [FILE [NAME-REGEX]...]\n  load [-b7|-r13|-r18] [-verbose] [-update] [-hash] FILE"
+         dump [-b7|-r13|-r18] [-verbose] [-mkey_convert] [-new_mkey_file STASH] [FILE [NAME-REGEX]...]\n  load [-b7|-r13|-r18] [-verbose] [-update] [-hash] FILE"
     );
 }
 
@@ -623,9 +623,32 @@ fn run() {
             return;
         }
         "dump" => {
-            dump_command(args, iprop, || {
-                let master = master_key(&cfg, &realm, master_password_file.as_deref());
-                FileStore::open(&cfg.database_name, &master)?.dump_entries()
+            let etype = cfg.master_key_type;
+            dump_command(args, iprop, &realm, etype, |convert| {
+                let opened = match fetch_master(&cfg, &realm, master_password_file.as_deref()) {
+                    Some(key) => match FileStore::open(&cfg.database_name, &key) {
+                        Ok(store) => Some(store),
+                        Err(e) if convert && wrong_master_key(&e) => {
+                            no_master_list(&e);
+                            None
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    None if convert => None,
+                    None => std::process::exit(exit_status()),
+                };
+                let store = match opened {
+                    Some(store) => store,
+                    None => keyboard_master(&realm, etype, |k| {
+                        FileStore::open(&cfg.database_name, k)
+                    }),
+                };
+                let keys = if convert {
+                    Some(store.master_key_list()?)
+                } else {
+                    None
+                };
+                Ok((store.dump_entries()?, keys))
             });
             return;
         }
@@ -671,16 +694,21 @@ fn open_file(
 type DumpEntries = (Vec<MitEntry>, Vec<MitPolicy>);
 
 /// `kdb5_util dump` (`kadmin/dbutil/dump.c:1137-1362`). `iprop` is set
-/// when `iprop_enable` is. Deviation: `-rev` and `-recurse` are accepted and
-/// ignored (klmdb iterates in key order); `-mkey_convert`/`-new_mkey_file`
-/// are not supported.
+/// when `iprop_enable` is. `read(mkey_convert)` returns the entries, and
+/// with `-mkey_convert` the master-key list. Deviation: `-rev` and
+/// `-recurse` are accepted and ignored (klmdb iterates in key order).
 fn dump_command(
     args: Vec<String>,
     iprop: Option<&IpropConfig>,
-    read: impl FnOnce() -> Result<DumpEntries, StoreError>,
+    realm: &str,
+    master_key_type: i32,
+    read: impl FnOnce(bool) -> Result<(DumpEntries, Option<MasterKeys>), StoreError>,
 ) {
+    use krb5_rs::kdc::kdb::mit::mkey::{add_new_mkey, convert_entry, next_kvno};
+
     let mut version = DumpVersion::R111;
     let mut verbose = false;
+    let (mut mkey_convert, mut new_mkey_file) = (false, None);
     let (mut iprop_dump, mut conditional) = (None, false);
     let mut it = args.into_iter().peekable();
     while let Some(arg) = it.next_if(|a| a.starts_with('-') && a != "-") {
@@ -692,7 +720,11 @@ fn dump_command(
             "-c" => conditional = true,
             "-rev" | "-recurse" => {}
             "-verbose" => verbose = true,
-            "-mkey_convert" | "-new_mkey_file" => fail("master key conversion is not supported"),
+            "-mkey_convert" => mkey_convert = true,
+            "-new_mkey_file" => {
+                new_mkey_file = it.next();
+                mkey_convert = true;
+            }
             a if a.starts_with("-i") => {
                 if iprop.is_none() {
                     fail("Iprop not enabled");
@@ -721,6 +753,14 @@ fn dump_command(
             return;
         }
     }
+    let ((entries, policies), keys) = ok(read(mkey_convert));
+    let is_km = |e: &MitEntry| e.principal == km_principal() && e.realm == realm;
+    let convert = keys.map(|keys| {
+        let new = new_master_key(realm, master_key_type, new_mkey_file.as_deref());
+        // `get_next_kvno(master_entry)`, before K/M itself is converted.
+        let kvno = entries.iter().find(|e| is_km(e)).map_or(1, next_kvno);
+        (keys, new, kvno)
+    });
     let (mut out, policy_version) = match (iprop_dump, &ulog) {
         (Some(extensible), Some(ulog)) => {
             let last = ulog
@@ -736,10 +776,33 @@ fn dump_command(
         }
         _ => (version.header().as_bytes().to_vec(), version),
     };
-    let (entries, policies) = ok(read());
-    for entry in &entries {
+    let dump_name = match iprop_dump {
+        Some(true) => "Kerberos iprop extensible version",
+        Some(false) => "Kerberos iprop version",
+        None => version.name(),
+    };
+    for mut entry in entries {
         let name = unparse_name(&entry.principal, &entry.realm);
-        let name = String::from_utf8_lossy(&name);
+        let name = String::from_utf8_lossy(&name).into_owned();
+        // `master_key_convert` (`dump.c:83-129`) runs on every entry, before
+        // the name match.
+        if let Some((keys, new, kvno)) = &convert {
+            let converted = if is_km(&entry) {
+                add_new_mkey(&mut entry, keys, new).map(drop)
+            } else {
+                convert_entry(&mut entry, keys, *kvno, new)
+            };
+            if let Err(e) = converted {
+                com_err(format!(
+                    "{} while converting {name} to new master key",
+                    e.message()
+                ));
+                if file.is_none() {
+                    let _ = std::io::stdout().write_all(&out);
+                }
+                fail(format!("{} performing {dump_name} dump", e.message()));
+            }
+        }
         if !names.is_empty() && !names.iter().any(|r| r.is_match(&name)) {
             continue;
         }
@@ -750,7 +813,7 @@ fn dump_command(
             replicated.fail_auth_count = 0;
             out.extend(principal_record(&replicated, DumpVersion::R111));
         } else {
-            out.extend(principal_record(entry, version));
+            out.extend(principal_record(&entry, version));
         }
         if verbose {
             eprintln!("{name}");
@@ -766,6 +829,48 @@ fn dump_command(
         Some(file) => ok(write_dump_file(Path::new(&file), &out)
             .map_err(|e| format!("{e} while opening {file} for writing"))),
     }
+}
+
+/// `dump -mkey_convert` without a valid master key reads it once from the
+/// keyboard (`dump.c:1247-1261`).
+fn keyboard_master<T>(
+    realm: &str,
+    etype: i32,
+    open: impl FnOnce(&krb5_rs::types::EncryptionKey) -> Result<T, StoreError>,
+) -> T {
+    let password = read_password("Enter KDC database master key", "reading master key");
+    let key = ok(master_key_from_password(realm, &password, etype));
+    open(&key).unwrap_or_else(|e| {
+        com_err(format!("{} while verifying master key", e.message()));
+        std::process::exit(1)
+    })
+}
+
+/// `dump -mkey_convert`'s new master key (`dump.c:1263-1290`): the newest
+/// key of the `-new_mkey_file` stash, else a password read twice.
+fn new_master_key(realm: &str, etype: i32, file: Option<&str>) -> krb5_rs::types::EncryptionKey {
+    let Some(file) = file else {
+        println!("Please enter new master key....");
+        let context = "reading new master key";
+        let password = read_password("Enter KDC database master key", context);
+        let again = read_password("Re-enter KDC database master key to verify", context);
+        if password != again {
+            com_err(format!("Password mismatch while {context}"));
+            std::process::exit(1);
+        }
+        return ok(master_key_from_password(realm, &password, etype));
+    };
+    let fetched = std::fs::metadata(file)
+        .map_err(|e| com_err_text(&e.to_string()))
+        .and_then(|_| {
+            read_stash_kvno(Path::new(file), realm).map_err(|e| com_err_text(e.message()))
+        });
+    fetched.map(|(_, key)| key).unwrap_or_else(|reason| {
+        com_err(format!(
+            "Can not fetch master key (error: {reason}). while reading new master key"
+        ));
+        std::process::exit(1)
+    })
 }
 
 /// `current_dump_sno_in_ulog` (`kadmin/dbutil/dump.c:1107-1135`).
@@ -1047,9 +1152,20 @@ fn klmdb_command(
                 },
                 None => None,
             };
+            let valid_master_key = store.is_some();
             // Without a master key MIT still dumps: the keys stay encrypted.
             let store = store.unwrap_or_else(|| ok(LmdbStore::open_without_master(cfg)));
-            dump_command(args, iprop, || store.dump_entries());
+            let etype = cfg.master_key_type;
+            dump_command(args, iprop, realm, etype, |convert| {
+                let keys = match (convert, valid_master_key) {
+                    (false, _) => None,
+                    (true, true) => Some(store.master_key_list()?),
+                    (true, false) => Some(keyboard_master(realm, etype, |k| {
+                        LmdbStore::open(cfg, k)?.master_key_list()
+                    })),
+                };
+                Ok((store.dump_entries()?, keys))
+            });
         }
         "load" => load_command(
             args,
