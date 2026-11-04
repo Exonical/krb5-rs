@@ -34,6 +34,7 @@ pub mod locate;
 pub mod pac;
 #[cfg(feature = "pkinit")]
 pub mod pkinit;
+pub mod plugin;
 pub mod profile;
 pub mod protocol;
 pub mod spake;

@@ -53,9 +53,10 @@ pub struct ServerConfig {
     pub accept_secondary_eku: bool,
     /// `pkinit_require_freshness` (default false).
     pub require_freshness: bool,
-    /// `pkinit_indicator` values (stored; authentication indicators are not
-    /// issued).
+    /// `pkinit_indicator` values.
     pub indicators: Vec<String>,
+    /// certauth modules in order (`[plugins] certauth`).
+    pub certauth: Vec<super::certauth::CertauthModule>,
 }
 
 impl ServerConfig {
@@ -71,6 +72,7 @@ impl ServerConfig {
             accept_secondary_eku: false,
             require_freshness: false,
             indicators: Vec::new(),
+            certauth: super::certauth::builtin_modules(),
         }
     }
 
@@ -146,6 +148,10 @@ pub struct Verified {
     pub supported_kdfs: Option<Vec<Kdf>>,
     /// A valid freshness token was presented.
     pub valid_freshness: bool,
+    /// A certauth module asked for the hw-authent flag.
+    pub hw_authent: bool,
+    /// Authentication indicators from certauth modules.
+    pub certauth_indicators: Vec<String>,
 }
 
 pub(super) fn identifiers_of(certs: &[&Cert]) -> Vec<ExternalPrincipalIdentifier> {
@@ -274,33 +280,65 @@ fn client_eku_ok(cfg: &ServerConfig, cert: &Cert) -> bool {
     found && cert.has_digital_signature_ku()
 }
 
-/// `authorize_cert` (:331-401) over the built-in certauth modules
-/// (pkinit_san, pkinit_eku).
+/// `authorize_cert` (:331-401): at least one module must authorize and
+/// none refuse; returns the hw-authent request and the modules' indicators.
 fn authorize_cert(
     cfg: &ServerConfig,
     cert: &Cert,
     client: &PrincipalName,
     realm: &str,
-) -> Result<(), PkinitError> {
-    let mut accepted = false;
-    match verify_client_san(cfg, cert, client, realm) {
-        SanResult::Match => accepted = true,
-        SanResult::NoHandle => {}
-        SanResult::Mismatch => {
-            return Err(PkinitError::new(
-                KDC_ERR_CLIENT_NAME_MISMATCH,
-                "certificate does not match the client principal",
-            ))
+) -> Result<(bool, Vec<String>), PkinitError> {
+    use super::certauth::{CertauthModule, CERTAUTH_HWAUTH, CERTAUTH_HWAUTH_PASS};
+    use crate::plugin::rpc::{ERROR_TABLE_BASE_KRB5, PLUGIN_NO_HANDLE};
+    let (mut accepted, mut hwauth) = (false, false);
+    let mut inds = Vec::new();
+    let unparsed = crate::ccache::unparse_name(client, realm);
+    for m in &cfg.certauth {
+        let (code, ais) = match m {
+            CertauthModule::PkinitSan => (
+                match verify_client_san(cfg, cert, client, realm) {
+                    SanResult::Match => 0,
+                    SanResult::NoHandle => PLUGIN_NO_HANDLE,
+                    SanResult::Mismatch => ERROR_TABLE_BASE_KRB5 + KDC_ERR_CLIENT_NAME_MISMATCH,
+                },
+                Vec::new(),
+            ),
+            CertauthModule::PkinitEku => (
+                if cfg.require_eku && !client_eku_ok(cfg, cert) {
+                    ERROR_TABLE_BASE_KRB5 + KDC_ERR_INCONSISTENT_KEY_PURPOSE
+                } else {
+                    PLUGIN_NO_HANDLE
+                },
+                Vec::new(),
+            ),
+            CertauthModule::Dbmatch => (PLUGIN_NO_HANDLE, Vec::new()),
+            CertauthModule::Module(m) => m.authorize(cert.der(), &unparsed),
+        };
+        match code {
+            0 => accepted = true,
+            CERTAUTH_HWAUTH => (accepted, hwauth) = (true, true),
+            CERTAUTH_HWAUTH_PASS => hwauth = true,
+            PLUGIN_NO_HANDLE => {}
+            c => {
+                let proto = c.wrapping_sub(ERROR_TABLE_BASE_KRB5);
+                let (code, msg) = match proto {
+                    KDC_ERR_CLIENT_NAME_MISMATCH => {
+                        (proto, "certificate does not match the client principal")
+                    }
+                    KDC_ERR_INCONSISTENT_KEY_PURPOSE => (
+                        proto,
+                        "client certificate has no acceptable extended key usage",
+                    ),
+                    0..=127 => (proto, "certificate refused by a certauth module"),
+                    _ => (KDC_ERR_PREAUTH_FAILED, "certauth module failed"),
+                };
+                return Err(PkinitError::new(code, msg));
+            }
         }
-    }
-    if cfg.require_eku && !client_eku_ok(cfg, cert) {
-        return Err(PkinitError::new(
-            KDC_ERR_INCONSISTENT_KEY_PURPOSE,
-            "client certificate has no acceptable extended key usage",
-        ));
+        inds.extend(ais);
     }
     if accepted {
-        Ok(())
+        Ok((hwauth, inds))
     } else {
         Err(PkinitError::new(
             KDC_ERR_CLIENT_NAME_MISMATCH,
@@ -338,12 +376,17 @@ pub fn verify(
     })?;
 
     let signer = verified.signer;
+    let mut hw_authent = false;
+    let mut certauth_indicators = Vec::new();
     match &signer {
-        Some(cert) => authorize_cert(cfg, cert, req.client, req.realm).map_err(|e| Failure {
-            e_data: edata_for(cfg, e.code, Some(cert)),
-            code: e.code,
-            message: e.message,
-        })?,
+        Some(cert) => {
+            (hw_authent, certauth_indicators) = authorize_cert(cfg, cert, req.client, req.realm)
+                .map_err(|e| Failure {
+                    e_data: edata_for(cfg, e.code, Some(cert)),
+                    code: e.code,
+                    message: e.message,
+                })?;
+        }
         None if !(is_anonymous_name(req.client) && req.client_realm == ANONYMOUS_REALM) => {
             return Err(preauth(
                 "Pkinit request not signed, but client not anonymous.",
@@ -416,6 +459,8 @@ pub fn verify(
         client_dh,
         supported_kdfs,
         valid_freshness,
+        hw_authent,
+        certauth_indicators,
     })
 }
 

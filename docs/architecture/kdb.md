@@ -1006,6 +1006,36 @@ transactions stay short to limit MVCC version retention. Replication applies
 small batches in `BEGIN CONCURRENT` transactions and retries on conflict.
 There is no extra cache layer unless benchmarks justify one.
 
+### hostrealm and certauth modules
+
+hostrealm (client and KDC, `krb5_rs::locate`) and certauth (PKINIT KDC,
+`krb5_rs::pkinit::certauth`) modules use the same socket RPC and
+configuration as kdcpolicy, with MIT's built-in modules after the configured
+ones, as in MIT's plugin order:
+
+- **hostrealm:** built-ins `profile`, `dns` and `domain`.
+  `krb5_get_host_realm`, `krb5_get_fallback_host_realm` and
+  `krb5_get_default_realm` ask each module in turn, as in `hostrealm.c`.
+  `PLUGIN_NO_HANDLE` defers to the next module, and any other code stops
+  the lookup. The handshake is `KRB5RS-HOSTREALM-V-1`. Calls 3, 4 and 5 are
+  `host_realm`, `fallback_realm` and `default_realm`, each answered with
+  `as` realms. The connection is opened once per process, like MIT's
+  per-context module handles.
+- **certauth:** built-ins `pkinit_san`, `pkinit_eku` and `dbmatch`.
+  `authorize` (call 3: `ay` certificate, `s` client principal) is answered
+  with `i` result code and `as` indicators. At least one module must
+  authorize, and none may refuse. `KRB5_CERTAUTH_HWAUTH` and
+  `KRB5_CERTAUTH_HWAUTH_PASS` set the hw-authent ticket flag, and module
+  indicators come before `pkinit_indicator`, as in `authorize_cert`. The
+  handshake is `KRB5RS-CERTAUTH-V-1`.
+
+Differences from MIT:
+- Modules run as separate processes, so certauth modules don't get the
+  client's database entry.
+- The `dns` hostrealm module declines, because krb5-rs does no TXT
+  lookups. The Windows `registry` module isn't implemented.
+- `dbmatch` passes, because `pkinit_cert_match` isn't implemented.
+
 ### kdcpolicy and audit modules
 
 krb5-rs-kdc runs MIT's KDC policy (`kdc/policy.c`) and audit

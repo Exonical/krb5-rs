@@ -3,73 +3,28 @@
 //! ([`krb5_rs::kdc::plugins::rpc`]), the way p11-kit remotes PKCS #11
 //! modules.
 
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use krb5_rs::kdc::kdb::kadm5_auth::module_order;
 use krb5_rs::kdc::plugins::rpc::{self, InitError, PLUGIN_NO_HANDLE, PLUGIN_VER_NOTSUPP};
 use krb5_rs::kdc::plugins::{Audit, KdcPolicy};
+use krb5_rs::plugin;
 use krb5_rs::profile::Profile;
-
-/// MIT's default `plugin_base_dir` (`$(libdir)/krb5/plugins`).
-const PLUGIN_BASE_DIR: &str = "/usr/local/lib/krb5/plugins";
-/// How long one module call may take before the KDC gives up on it.
-const TIMEOUT: Duration = Duration::from_secs(30);
-
-fn plugin_values(profiles: &[&Profile], iface: &str, key: &str) -> Vec<String> {
-    profiles
-        .iter()
-        .flat_map(|p| p.get_values(&["plugins", iface, key]))
-        .collect()
-}
-
-/// A module's socket: `unix:path=/run/x.sock`, as in p11-kit's
-/// `P11_KIT_SERVER_ADDRESS`, or a path, relative ones under
-/// `plugin_base_dir`.
-fn socket_path(base: &str, addr: &str) -> PathBuf {
-    match addr.strip_prefix("unix:path=") {
-        Some(p) => PathBuf::from(p),
-        None => Path::new(base).join(addr),
-    }
-}
 
 /// The enabled modules of `iface` in MIT's order, with their sockets.
 fn configured(profiles: &[&Profile], iface: &str) -> Result<Vec<(String, PathBuf)>, String> {
-    let base = profiles
-        .iter()
-        .find_map(|p| p.get_string(&["libdefaults", "plugin_base_dir"]))
-        .unwrap_or_else(|| PLUGIN_BASE_DIR.into());
-    let mut socks: Vec<(String, PathBuf)> = Vec::new();
-    for m in plugin_values(profiles, iface, "module") {
-        let Some((name, addr)) = m.split_once(':') else {
-            return Err(format!("Invalid module specifier {m}"));
-        };
-        socks.push((name.to_string(), socket_path(&base, addr)));
-    }
-    let names: Vec<String> = socks.iter().map(|(n, _)| n.clone()).collect();
-    let order = module_order(
-        &names,
-        &[],
-        &plugin_values(profiles, iface, "enable_only"),
-        &plugin_values(profiles, iface, "disable"),
-    );
-    Ok(order
+    Ok(plugin::configured(profiles, iface, &[])?
         .into_iter()
-        .filter_map(|n| socks.iter().find(|(p, _)| *p == n).cloned())
+        .filter_map(|c| match c {
+            plugin::Configured::Remote(n, p) => Some((n, p)),
+            plugin::Configured::Builtin(_) => None,
+        })
         .collect())
 }
 
-#[cfg(unix)]
-fn connector(path: PathBuf) -> rpc::Connect {
-    rpc::unix_connector(path, TIMEOUT)
-}
-
-#[cfg(not(unix))]
-fn connector(_path: PathBuf) -> rpc::Connect {
-    let _ = TIMEOUT;
-    Box::new(|| Err(std::io::Error::other("module sockets need Unix")))
-}
+use plugin::connector;
 
 /// The configured modules.
 pub type Modules = (Vec<Arc<dyn KdcPolicy>>, Vec<Arc<dyn Audit>>);

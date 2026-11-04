@@ -438,7 +438,7 @@ impl RealmConfig {
         };
         #[cfg(feature = "pkinit")]
         {
-            kdc.pkinit = pkinit_settings(kdc_conf, realm)?;
+            kdc.pkinit = pkinit_settings(kdc_conf, krb5_conf, realm)?;
         }
 
         let database_name = module_value("database_name")
@@ -501,6 +501,7 @@ impl RealmConfig {
 #[cfg(feature = "pkinit")]
 fn pkinit_settings(
     kdc_conf: &Profile,
+    krb5_conf: Option<&Profile>,
     realm: &str,
 ) -> Result<Option<std::sync::Arc<crate::pkinit::server::ServerConfig>>, ConfigError> {
     use crate::pkinit::cms::Identity;
@@ -569,6 +570,9 @@ fn pkinit_settings(
         }
     }
     server.indicators = all("pkinit_indicator");
+    // load_certauth_plugins, from the KDC's profile (krb5.conf, kdc.conf).
+    let profiles: Vec<&Profile> = krb5_conf.into_iter().chain([kdc_conf]).collect();
+    server.certauth = crate::pkinit::certauth::load(&profiles).map_err(invalid)?;
     Ok(Some(std::sync::Arc::new(server)))
 }
 

@@ -20,7 +20,10 @@ pub(crate) use canon::dns_canonical;
 pub use dns::{make_lookup_name, sort_srv, DnsResolver, SrvRecord, UriRecord};
 #[cfg(feature = "dns")]
 pub use hickory::HickoryResolver;
-pub use hostrealm::{default_realm, fallback_host_realm, host_realm, realm_domain};
+pub use hostrealm::{
+    default_realm, fallback_host_realm, get_default_realm, get_fallback_host_realm, get_host_realm,
+    host_realm, realm_domain, serve_hostrealm, HostRealm,
+};
 pub use uri::{is_string_numeric, parse_host_string, parse_uri_fields, parse_uri_if_https};
 
 use crate::profile::Profile;
