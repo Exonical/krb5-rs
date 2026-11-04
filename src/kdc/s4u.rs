@@ -404,6 +404,7 @@ impl<S: PrincipalStore> Kdc<S> {
             keys: Vec::new(),
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            require_auth: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,

@@ -699,9 +699,18 @@ impl<S: PrincipalStore> Kdc<S> {
         if times.starttime == times.authtime {
             times.starttime = 0;
         }
+        // Indicators from the subject ticket, not for S4U2Self, where the
+        // client didn't authenticate (do_tgs_req.c:761-769, 894-902).
+        let indicators = if s4u2self.is_none() {
+            let inds = super::cammac::get_auth_indicators(subject_tkt, &local_tgt);
+            super::cammac::check_indicators(server.require_auth.as_deref(), &inds)?;
+            inds
+        } else {
+            Vec::new()
+        };
         // check_kdcpolicy_tgs (do_tgs_req.c:919-925).
         self.check_kdcpolicy(
-            &[],
+            &indicators,
             true,
             None,
             Some((&header.cname, &client_realm)),
@@ -830,6 +839,7 @@ impl<S: PrincipalStore> Kdc<S> {
                 },
                 (None, None) => S4uPac::None,
             },
+            &indicators,
         )?;
         let kvno =
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;

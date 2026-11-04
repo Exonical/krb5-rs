@@ -18,6 +18,7 @@
 
 mod as_req;
 mod authdata;
+mod cammac;
 mod config;
 mod cookie;
 mod db;
@@ -150,6 +151,9 @@ pub struct KdcConfig {
     pub spake_challenge: Option<crate::spake::Group>,
     /// Auth indicators for SPAKE (`[realms] spake_preauth_indicator`).
     pub spake_indicators: Vec<String>,
+    /// `[realms] encrypted_challenge_indicator`: asserted on a successful
+    /// encrypted challenge (kdc_preauth_ec.c:91-141).
+    pub encrypted_challenge_indicator: Option<String>,
     /// PKINIT settings; `None` leaves PKINIT off (MIT: no `pkinit_identity`).
     #[cfg(feature = "pkinit")]
     pub pkinit: Option<std::sync::Arc<crate::pkinit::server::ServerConfig>>,
@@ -180,6 +184,7 @@ impl KdcConfig {
             spake_groups: Vec::new(),
             spake_challenge: None,
             spake_indicators: Vec::new(),
+            encrypted_challenge_indicator: None,
             #[cfg(feature = "pkinit")]
             pkinit: None,
         }

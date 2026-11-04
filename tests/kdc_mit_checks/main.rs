@@ -23,6 +23,7 @@ use krb5_rs::Krb5Error;
 use rasn::types::{GeneralString, OctetString};
 
 mod as_req;
+mod authind;
 mod errors;
 mod fast;
 mod spake;
@@ -71,6 +72,8 @@ struct FixtureOptions {
     max_renewable_life: Option<Duration>,
     spake_groups: Vec<krb5_rs::spake::Group>,
     spake_challenge: Option<krb5_rs::spake::Group>,
+    spake_indicators: Vec<String>,
+    service_require_auth: Option<String>,
 }
 
 async fn first_key(store: &MemoryStore, name: &PrincipalName, etype: i32) -> EncryptionKey {
@@ -183,12 +186,18 @@ async fn fixture_with_gate(opts: FixtureOptions, gate: impl ConsistencyGate + 's
             PrincipalAttributes::empty(),
         )
         .expect("service");
+    if let Some(req) = &opts.service_require_auth {
+        let mut svc = store.get(&service(), REALM).expect("service entry");
+        svc.require_auth = Some(req.clone());
+        store.insert(svc);
+    }
     let tgs_key = first_key(&store, &krbtgt(), 18).await;
     let service_key = first_key(&store, &service(), 18).await;
 
     let mut config = KdcConfig::new(REALM);
     config.spake_groups = opts.spake_groups.clone();
     config.spake_challenge = opts.spake_challenge;
+    config.spake_indicators = opts.spake_indicators.clone();
     config.max_renewable_life = opts
         .max_renewable_life
         .unwrap_or(Duration::from_secs(7 * 24 * 3600));

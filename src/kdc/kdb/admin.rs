@@ -538,6 +538,7 @@ impl<S: AdminStore> AdminOps<S> {
                         .map_err(|e| err(e.to_string()))?,
                     allowed_to_delegate_to: Vec::new(),
                     allowed_to_delegate_from: Vec::new(),
+                    require_auth: None,
                     policy: None,
                     security_epoch: 1,
                     last_admin_unlock: None,
@@ -655,6 +656,7 @@ impl<S: AdminStore> AdminOps<S> {
         let mut entry = PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            require_auth: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,

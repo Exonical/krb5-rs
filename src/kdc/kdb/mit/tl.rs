@@ -46,6 +46,8 @@ pub const KADM5_POLICY: i32 = 0x0000_0800;
 /// krb5-rs extension; only LDAP implements the delegation methods
 /// (`lib/kdb/kdb5.c:2726-2785`).
 const ALLOWED_TO_DELEGATE_FROM: &[u8] = b"krb5rs_allowed_to_delegate_from";
+/// `KRB5_KDB_SK_REQUIRE_AUTH`.
+const REQUIRE_AUTH: &[u8] = b"require_auth";
 
 /// A raw MIT string-attribute key/value pair.
 pub type StringAttribute = (Vec<u8>, Vec<u8>);
@@ -133,7 +135,15 @@ fn duration(value: Option<Duration>) -> Result<u32, StoreError> {
 }
 
 fn attr_pairs(entry: &MitEntry) -> Result<Vec<StringAttribute>, StoreError> {
-    let Some(bytes) = bytes_tl(entry, STRING_ATTRS) else {
+    attr_pairs_in(&entry.tl_data)
+}
+
+fn attr_pairs_in(tl_data: &[TlData]) -> Result<Vec<StringAttribute>, StoreError> {
+    let Some(bytes) = tl_data
+        .iter()
+        .find(|tl| tl.kind == STRING_ATTRS)
+        .map(|tl| tl.data.as_slice())
+    else {
         return Ok(Vec::new());
     };
     let mut result = Vec::new();
@@ -584,6 +594,17 @@ pub fn record_from_entry(
     Ok(record)
 }
 
+/// The `require_auth` string attribute in `tl_data`, if set.
+pub fn require_auth_attr(tl_data: &[TlData]) -> Result<Option<String>, StoreError> {
+    attr_pairs_in(tl_data)?
+        .into_iter()
+        .find(|(key, _)| key == REQUIRE_AUTH)
+        .map(|(_, value)| {
+            String::from_utf8(value).map_err(|_| corrupt("require_auth attribute is not UTF-8"))
+        })
+        .transpose()
+}
+
 /// [`record_from_entry`] without decrypting the keys (`entry.keys` empty),
 /// for stores that keep keys encrypted.
 pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreError> {
@@ -598,6 +619,7 @@ pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreErr
             allowed_to_delegate_from.extend(value.split(',').map(str::to_owned));
         }
     }
+    let require_auth = require_auth_attr(&entry.tl_data)?;
     let last_pwd_change =
         get_u32_tl(entry, LAST_PWD_CHANGE)?.map(|time| kerberos_time(i64::from(time)));
     let (mod_time, mod_by) = match mod_principal_data(entry)? {
@@ -624,6 +646,7 @@ pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreErr
             keys: Vec::new(),
             allowed_to_delegate_to: constrained_delegation_values(entry)?,
             allowed_to_delegate_from,
+            require_auth,
             policy,
             security_epoch: 0,
             last_admin_unlock,
@@ -893,6 +916,7 @@ mod tests {
             keys: Vec::new(),
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            require_auth: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
@@ -1229,6 +1253,7 @@ mod tests {
             }],
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            require_auth: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,

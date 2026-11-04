@@ -350,6 +350,7 @@ impl StoredPrincipal {
             keys,
             allowed_to_delegate_to: self.allowed_to_delegate_to,
             allowed_to_delegate_from: self.allowed_to_delegate_from,
+            require_auth: super::kdb::mit::require_auth_attr(&self.tl_data)?,
             policy: self.policy,
             security_epoch: self.security_epoch,
             last_admin_unlock: self.last_admin_unlock.map(kerberos_time),

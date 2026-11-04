@@ -453,6 +453,7 @@ mod tests {
 
     fn entry() -> PrincipalEntry {
         PrincipalEntry {
+            require_auth: None,
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
             policy: None,
