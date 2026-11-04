@@ -13,7 +13,7 @@ builds aws-lc and simsimd.
 - **GSSAPI/SPNEGO** — HTTP Negotiate authentication
 - **PKINIT** — X.509 certificate-based authentication, client and KDC (`pkinit` feature; DH/ECDH replies, MIT 1.22 parity)
 - **FAST** — Flexible Authentication via Secure Tunneling
-- **Credential Cache** — Read/write ccache and keytab formats
+- **Credential Cache** — Read/write ccache and keytab formats; MIT FILE, MEMORY, DIR, KEYRING (Linux) and KCM caches with `KRB5CCNAME`/`default_ccache_name` resolution and cache collections
 
 ## Why?
 

@@ -307,3 +307,56 @@ pub(crate) fn unmarshal_cred_len(
 pub fn unmarshal_cred(data: &[u8], version: u8) -> Result<CcCredential, CcError> {
     Ok(unmarshal_cred_len(data, version)?.0)
 }
+
+/// `k5_marshal_mcred`: a match credential in Heimdal's KCM format, with
+/// FILE v4 subfields.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn marshal_mcred(m: &super::MatchCred) -> Vec<u8> {
+    const CLIENT: i32 = 0x1;
+    const SERVER: i32 = 0x2;
+    const SESSION_KEY: i32 = 0x4;
+    const SECOND_TICKET: i32 = 0x10;
+    const AUTHDATA: i32 = 0x20;
+    let second = m.second_ticket.as_deref().unwrap_or_default();
+    let authdata = m.authdata.as_deref().unwrap_or_default();
+    let mut header = 0;
+    if m.client.is_some() {
+        header |= CLIENT;
+    }
+    if m.server.is_some() {
+        header |= SERVER;
+    }
+    if m.etype != 0 {
+        header |= SESSION_KEY;
+    }
+    if !second.is_empty() {
+        header |= SECOND_TICKET;
+    }
+    if !authdata.is_empty() {
+        header |= AUTHDATA;
+    }
+    let mut w = W::new(4);
+    w.i32(header);
+    if let Some((p, r)) = &m.client {
+        marshal_princ_w(&mut w, p, r, 4);
+    }
+    if let Some((p, r)) = &m.server {
+        marshal_princ_w(&mut w, p, r, 4);
+    }
+    if m.etype != 0 {
+        marshal_keyblock(&mut w, &EncryptionKey::new(m.etype, Vec::new()), 4);
+    }
+    w.i32(m.authtime as i32);
+    w.i32(m.starttime as i32);
+    w.i32(m.endtime as i32);
+    w.i32(m.renew_till as i32);
+    w.u8(u8::from(m.is_skey));
+    w.i32(m.ticket_flags as i32);
+    if !authdata.is_empty() {
+        marshal_authdata(&mut w, authdata);
+    }
+    if !second.is_empty() {
+        w.data(second);
+    }
+    w.buf
+}
