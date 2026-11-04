@@ -29,6 +29,7 @@ pub mod error;
 pub(crate) mod fsutil;
 pub mod gssapi;
 pub mod keytab;
+pub mod localauth;
 pub mod locate;
 pub mod pac;
 #[cfg(feature = "pkinit")]
