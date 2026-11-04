@@ -325,6 +325,36 @@ same "$BASE/b.mit.stash" "$BASE/b.rs.stash"
 rs_util "$B" getprinc dave | grep -q 'dave@KLMDB.LIVE'
 keys_of "$B" dave "$BASE/dave.kt" > /dev/null
 
+# --- dump -mkey_convert: each side loads the other's converted dump -----
+C="$BASE/conv"
+write_profile "$C" 18890
+mit_create "$C"
+mit_addprinc "$C" erin erin-password-1
+keys_of "$C" erin "$BASE/erin-before.kt" > "$BASE/erin-before.keys"
+N="$BASE/conv-new"
+write_profile "$N" 18891
+printf '%s\n%s\n' "$SECOND" "$SECOND" | rs_util "$N" create -s >/dev/null
+rs_util "$C" dump -new_mkey_file "$N/.k5.$REALM" "$BASE/rs-conv.dump"
+mit_util "$C" load "$BASE/rs-conv.dump"
+cp "$N/.k5.$REALM" "$C/.k5.$REALM"
+mit_util "$C" list_mkeys > "$BASE/c.mit.list"
+test "$(grep -c '^KVNO' "$BASE/c.mit.list")" = 2
+mit_admin "$C" 'getprinc erin' | grep -q 'MKey: vno 2'
+keys_of "$C" erin "$BASE/erin-rs.kt" > "$BASE/erin-rs.keys"
+same "$BASE/erin-before.keys" "$BASE/erin-rs.keys"
+printf '%s\n%s\n' "$MASTER" "$MASTER" |
+  mit_util "$C" dump -mkey_convert "$BASE/mit-conv.dump" > /dev/null
+rs_util "$C" load "$BASE/mit-conv.dump"
+printf '%s\n' "$MASTER" > "$BASE/conv.pw"
+rs_util "$C" --master-password-file "$BASE/conv.pw" stash
+rs_util "$C" list_mkeys > "$BASE/c2.rs.list"
+mit_util "$C" list_mkeys > "$BASE/c2.mit.list"
+same "$BASE/c2.mit.list" "$BASE/c2.rs.list"
+test "$(grep -c '^KVNO' "$BASE/c2.rs.list")" = 3
+mit_admin "$C" 'getprinc erin' | grep -q 'MKey: vno 3'
+keys_of "$C" erin "$BASE/erin-mit.kt" > "$BASE/erin-mit.keys"
+same "$BASE/erin-before.keys" "$BASE/erin-mit.keys"
+
 echo KLMDB_LIVE_OK
 "#,
     );
