@@ -1006,6 +1006,87 @@ transactions stay short to limit MVCC version retention. Replication applies
 small batches in `BEGIN CONCURRENT` transactions and retries on conflict.
 There is no extra cache layer unless benchmarks justify one.
 
+### kdcpolicy and audit modules
+
+krb5-rs-kdc runs MIT's KDC policy (`kdc/policy.c`) and audit
+(`kdc/kdc_audit.c`) modules. Each module is a separate process that listens
+on a Unix socket, and the KDC sends it each callback over RPC, the way p11-kit
+remotes PKCS #11 modules (see
+[go-p11-kit](https://github.com/smallstep/go-p11-kit)). They are configured as
+in MIT, with a socket in place of the shared library:
+
+```
+[plugins]
+    kdcpolicy = {
+        module = mypolicy:unix:path=/run/krb5/mypolicy.sock
+    }
+    audit = {
+        module = myaudit:myaudit.sock
+    }
+```
+
+- **Loading:** `module = name:address`, where the address is
+  `unix:path=/path` (as in p11-kit's `P11_KIT_SERVER_ADDRESS`) or a socket
+  path, relative ones under `plugin_base_dir`. `enable_only` and `disable`
+  follow MIT's plugin order; neither interface has built-in modules. A module
+  that can't be reached, or refuses the protocol or handshake (MIT's vtable
+  version check), is logged and skipped, as MIT skips a module that does not
+  load. A kdcpolicy `init` returning `KRB5_PLUGIN_NO_HANDLE` skips the module;
+  any other `init` error, or any audit `open` error, stops the KDC. `fini` and
+  `close` are sent at shutdown.
+- **Protocol** (`krb5_rs::kdc::plugins::rpc`): p11-kit's framing. One version
+  byte each way, then messages of `id`, options length and buffer length
+  (big-endian `u32`), with a call number, a type signature and the fields. The
+  first call is `INITIALIZE` with `KRB5RS-KDCPOLICY-V-1` or
+  `KRB5RS-AUDIT-V-1`; errors carry MIT com_err codes. `serve_kdcpolicy` and
+  `serve_audit` run a module written in Rust on any stream, and the module
+  docs specify the calls for other languages.
+- **kdcpolicy:** `check_as` runs after the AS ticket times are computed and
+  `check_tgs` after the TGS ones, for every module in order. The first error
+  refuses the request with that code and status (MIT's test module returns
+  `KRB5KDC_ERR_POLICY`, "LOCAL_POLICY"). Each module's lifetime and renewable
+  lifetime cap the end and renew-till times at the KDC time plus that many
+  seconds (`update_ticket_times`). TGS checks also get the header ticket's
+  client. The KDC has no authentication indicators yet, so the list is empty.
+- **audit:** `kdc_start` runs when the KDC starts serving and `kdc_stop` on
+  shutdown, after open connections finish. Every decoded AS or TGS request
+  reports `as_req` or `tgs_req` with its outcome, describing the inner request
+  for FAST. TGS requests with PA-FOR-USER or PA-S4U-X509-USER also report
+  `s4u2self`, `cname-in-addl-tkt` ones `s4u2proxy` and `enc-tkt-in-skey` ones
+  `u2u`, before `tgs_req`. The state carries:
+  - a random 31-character request ID, as in MIT;
+  - the client address and port;
+  - the status string;
+  - the S4U2Self user;
+  - MIT's ticket IDs (upper-case hex SHA-256 of the ticket ciphertext) for the
+    header, evidence and issued tickets;
+  - `LOCAL_POLICY` as the violation for a policy refusal.
+
+  Callback results are ignored, as in MIT.
+- **Concurrency and failures:** each module gets one connection, and calls on
+  it run one at a time. A broken connection is opened again (and the module
+  initialized again) on the next call. A kdcpolicy call that fails or times
+  out (30 s) refuses the request with `KRB_ERR_GENERIC`; a failed audit call
+  is ignored. Module calls block like MIT's, but on the multi-threaded Tokio
+  runtime they run through `block_in_place`, so other requests keep being
+  served.
+
+Deviations:
+- Modules are processes reached over RPC, not MIT shared libraries, so modules
+  built for MIT do not load. Static (musl) builds run modules the same way.
+- Principals are unparsed strings, and the audit state replaces MIT's
+  `krb5_kdc_req`/`krb5_kdc_rep` pointers with strings and the reply error
+  code.
+- Audit events are reported once per request, from the request and reply,
+  rather than at each of MIT's intermediate stages. Requests that do not
+  decode are not reported.
+- Unix sockets only; on other platforms a configured module is skipped as
+  unreachable.
+
+The tests port MIT's `plugins/kdcpolicy/test/main.c` and
+`plugins/audit/test/au_test.c` and run the `t_kdcpolicy.py` and `t_audit.py`
+cases against the daemon.
+
 ## 7. Consistency policy
 
 ### 7.1 Freshness

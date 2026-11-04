@@ -230,6 +230,7 @@ impl<S: PrincipalStore> Kdc<S> {
         server: &PrincipalEntry,
         subkey: Option<&EncryptionKey>,
         session: &EncryptionKey,
+        audit_user: &mut Option<String>,
     ) -> Result<Option<S4u2Self>, KdcError> {
         let padata = req.padata.as_deref();
         let find = |t: i32| padata.into_iter().flatten().find(|p| p.padata_type == t);
@@ -276,6 +277,11 @@ impl<S: PrincipalStore> Kdc<S> {
         } else {
             return Ok(None);
         }
+        // The requested user, for audit even when the lookup fails.
+        *audit_user = Some(
+            String::from_utf8_lossy(&super::kdb::mit::unparse_name(&user, &user_realm))
+                .into_owned(),
+        );
 
         let mut client = None;
         if user_realm == server.realm {

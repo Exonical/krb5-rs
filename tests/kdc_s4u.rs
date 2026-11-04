@@ -103,6 +103,15 @@ impl ConsistencyGate for RecordingGate {
 }
 
 async fn fixture_with_gate(cfg: Cfg, gate: impl ConsistencyGate + 'static) -> Fix {
+    fixture_with_modules(cfg, gate, Vec::new(), Vec::new()).await
+}
+
+async fn fixture_with_modules(
+    cfg: Cfg,
+    gate: impl ConsistencyGate + 'static,
+    policy: Vec<Arc<dyn krb5_rs::kdc::plugins::KdcPolicy>>,
+    audit: Vec<Arc<dyn krb5_rs::kdc::plugins::Audit>>,
+) -> Fix {
     let mut store = MemoryStore::new();
     let none = PrincipalAttributes::empty();
     store
@@ -144,7 +153,11 @@ async fn fixture_with_gate(cfg: Cfg, gate: impl ConsistencyGate + 'static) -> Fi
     let mut config = KdcConfig::new(REALM);
     config.max_renewable_life = std::time::Duration::from_secs(7 * 86400);
     Fix {
-        kdc: Kdc::builder(config, store).consistency(gate).build(),
+        kdc: Kdc::builder(config, store)
+            .consistency(gate)
+            .kdcpolicy(policy)
+            .audit(audit)
+            .build(),
         tgs_key,
         front_key,
         back_key,
@@ -493,6 +506,59 @@ async fn evidence(f: &Fix) -> (Credential, Credential) {
 }
 
 // ---------------------------------------------------------------- S4U2Self
+
+/// kdcpolicy gets the header ticket's client for TGS requests and audit gets
+/// the S4U2Self user (`check_kdcpolicy_tgs`, `kau_s4u2self`).
+#[tokio::test]
+async fn s4u2self_modules_see_the_ticket_client_and_the_user() {
+    use krb5_rs::kdc::plugins::{
+        Audit, AuditState, KdcPolicy, PolicyLimits, PolicyRefusal, PolicyRequest,
+    };
+    struct Seen(Arc<Mutex<Vec<String>>>);
+    impl KdcPolicy for Seen {
+        fn name(&self) -> &str {
+            "seen"
+        }
+        fn check_tgs(&self, r: &PolicyRequest) -> Result<PolicyLimits, PolicyRefusal> {
+            let tc = r.ticket_client.clone().unwrap_or_default();
+            self.0.lock().expect("lock").push(format!("check_tgs {tc}"));
+            Ok(PolicyLimits::default())
+        }
+    }
+    impl Audit for Seen {
+        fn name(&self) -> &str {
+            "seen"
+        }
+        fn s4u2self(&self, ok: bool, st: &AuditState) {
+            let user = st.s4u2self_user.clone().unwrap_or_default();
+            self.0
+                .lock()
+                .expect("lock")
+                .push(format!("s4u2self {ok} {user}"));
+        }
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let m = Arc::new(Seen(Arc::clone(&seen)));
+    let f = fixture_with_modules(Cfg::default(), AllowGate, vec![m.clone()], vec![m]).await;
+    let tgt = f.login(&front(), true).await;
+    f.s4u2self(&tgt, &alice()).await.expect("S4U2Self");
+    let nobody = PrincipalName {
+        name_type: 1,
+        name_string: vec![gs("nobody")],
+    };
+    f.s4u2self(&tgt, &nobody).await.expect_err("unknown user");
+    let unparse = |p: &PrincipalName| {
+        String::from_utf8_lossy(&krb5_rs::kdc::kdb::mit::unparse_name(p, REALM)).into_owned()
+    };
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        [
+            format!("check_tgs {}", unparse(&front())),
+            format!("s4u2self true {}", unparse(&alice())),
+            format!("s4u2self false {}", unparse(&nobody)),
+        ]
+    );
+}
 
 #[tokio::test]
 async fn s4u2self_issues_a_ticket_for_the_user_to_the_service_with_the_users_pac() {

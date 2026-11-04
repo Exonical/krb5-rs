@@ -99,6 +99,10 @@ struct Daemon {
 
 impl Daemon {
     fn start(conf: &Path, extra: &[&str]) -> Daemon {
+        Self::start_with_env(conf, extra, &[])
+    }
+
+    fn start_with_env(conf: &Path, extra: &[&str], envs: &[(&str, &Path)]) -> Daemon {
         let mut child = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
             .args([
                 "--config",
@@ -108,6 +112,7 @@ impl Daemon {
             ])
             .args(extra)
             .env_remove("RUST_LOG")
+            .envs(envs.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -639,4 +644,184 @@ async fn the_daemon_serves_from_a_turso_replica_selected_by_db_library() {
     let daemon = Daemon::start(&conf, &[]);
     assert_eq!(attempt(daemon.tcp, "alice", PASSWORD).await, Ok(()));
     assert_eq!(attempt(daemon.tcp, "nobody", PASSWORD).await, Err(6));
+}
+
+/// MIT's `plugins/kdcpolicy/test/main.c` plus a one-hour (AS) and
+/// half-hour (TGS) lifetime cap.
+#[cfg(unix)]
+struct MitPolicy;
+
+#[cfg(unix)]
+impl krb5_rs::kdc::plugins::KdcPolicy for MitPolicy {
+    fn name(&self) -> &str {
+        "test"
+    }
+    fn check_as(
+        &self,
+        r: &krb5_rs::kdc::plugins::PolicyRequest,
+    ) -> Result<krb5_rs::kdc::plugins::PolicyLimits, krb5_rs::kdc::plugins::PolicyRefusal> {
+        if r.client.as_deref().is_some_and(|c| c.starts_with("fail@")) {
+            return Err(krb5_rs::kdc::plugins::PolicyRefusal {
+                code: 12,
+                status: "LOCAL_POLICY".into(),
+            });
+        }
+        Ok(krb5_rs::kdc::plugins::PolicyLimits {
+            lifetime: 3600,
+            renew_lifetime: 7200,
+        })
+    }
+    fn check_tgs(
+        &self,
+        _r: &krb5_rs::kdc::plugins::PolicyRequest,
+    ) -> Result<krb5_rs::kdc::plugins::PolicyLimits, krb5_rs::kdc::plugins::PolicyRefusal> {
+        Ok(krb5_rs::kdc::plugins::PolicyLimits {
+            lifetime: 1800,
+            renew_lifetime: 3600,
+        })
+    }
+}
+
+/// After MIT's `plugins/audit/test/au_test.c`: one line per event.
+#[cfg(unix)]
+#[derive(Default)]
+struct AuditLog(Mutex<Vec<String>>);
+
+#[cfg(unix)]
+impl AuditLog {
+    fn push(&self, name: &str, ok: bool, st: Option<&krb5_rs::kdc::plugins::AuditState>) {
+        let line = match st {
+            None => format!("{name} {}", u8::from(ok)),
+            Some(st) => format!(
+                "{name} {} {} {} {} {} {} {}",
+                u8::from(ok),
+                st.cl_addr.map(|a| a.to_string()).unwrap_or_default(),
+                st.status.as_deref().unwrap_or("-"),
+                st.client.as_deref().unwrap_or("-"),
+                st.server.as_deref().unwrap_or("-"),
+                st.error_code,
+                st.violation,
+            ),
+        };
+        self.0.lock().expect("lock").push(line);
+    }
+}
+
+#[cfg(unix)]
+impl krb5_rs::kdc::plugins::Audit for AuditLog {
+    fn name(&self) -> &str {
+        "test"
+    }
+    fn open(&self) -> Result<(), i32> {
+        self.0.lock().expect("lock").push("open".into());
+        Ok(())
+    }
+    fn close(&self) {
+        self.0.lock().expect("lock").push("close".into());
+    }
+    fn kdc_start(&self, ok: bool) {
+        self.push("kdc_start", ok, None);
+    }
+    fn kdc_stop(&self, ok: bool) {
+        self.push("kdc_stop", ok, None);
+    }
+    fn as_req(&self, ok: bool, st: &krb5_rs::kdc::plugins::AuditState) {
+        self.push("as_req", ok, Some(st));
+    }
+    fn tgs_req(&self, ok: bool, st: &krb5_rs::kdc::plugins::AuditState) {
+        self.push("tgs_req", ok, Some(st));
+    }
+}
+
+/// MIT `t_kdcpolicy.py` and `t_audit.py` against the daemon, with the
+/// modules served over RPC from this process.
+#[cfg(unix)]
+#[tokio::test]
+async fn kdcpolicy_and_audit_modules_like_mit() {
+    use krb5_rs::kdc::plugins::rpc;
+    use std::os::unix::net::UnixListener;
+
+    let dir = TempDir::new("plugins");
+    let conf = make_realm(&dir);
+    let policy_sock = dir.path("policy.sock");
+    let audit_sock = dir.path("audit.sock");
+    let pl = UnixListener::bind(&policy_sock).expect("bind");
+    std::thread::spawn(move || {
+        for s in pl.incoming().map_while(Result::ok) {
+            std::thread::spawn(move || rpc::serve_kdcpolicy(s, &MitPolicy));
+        }
+    });
+    let log = Arc::new(AuditLog::default());
+    let al = UnixListener::bind(&audit_sock).expect("bind");
+    let l = Arc::clone(&log);
+    std::thread::spawn(move || {
+        for s in al.incoming().map_while(Result::ok) {
+            let l = Arc::clone(&l);
+            std::thread::spawn(move || rpc::serve_audit(s, &*l));
+        }
+    });
+    let mut text = std::fs::read_to_string(&conf).expect("kdc.conf");
+    text.push_str(&format!(
+        "[plugins]\n kdcpolicy = {{\n  module = test:unix:path={}\n }}\n \
+         audit = {{\n  module = test:unix:path={}\n }}\n",
+        policy_sock.display(),
+        audit_sock.display(),
+    ));
+    std::fs::write(&conf, text).expect("kdc.conf");
+    kdb_run(
+        &conf,
+        &["addprinc", "fail"],
+        "fail-password\nfail-password\n",
+    );
+    let mut daemon = Daemon::start(&conf, &[]);
+
+    let tcp = TcpTransport::new(daemon.tcp);
+    let life = |c: &Credential| {
+        c.times.endtime.timestamp() - c.times.starttime.unwrap_or(c.times.authtime).timestamp()
+    };
+    // max_life is 24h; the module caps AS at an hour and TGS at half that.
+    let tgt = as_exchange(&tcp).await.expect("AS");
+    assert!((3590..=3600).contains(&life(&tgt)), "{:?}", tgt.times);
+    let ticket = tgs_exchange(&tcp, &tgt).await.expect("TGS");
+    assert!((1790..=1800).contains(&life(&ticket)), "{:?}", ticket.times);
+    // The module refuses AS requests for "fail" (KDC_ERR_POLICY).
+    assert_eq!(attempt(daemon.tcp, "fail", "fail-password").await, Err(12));
+    daemon.wait_for_count("LOCAL_POLICY", 1);
+
+    send_signal(&daemon.child, "TERM");
+    assert!(wait_exit(&mut daemon.child, Duration::from_secs(20)).success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let lines = loop {
+        let lines = log.0.lock().expect("lock").clone();
+        if lines.last().map(String::as_str) == Some("close") || Instant::now() > deadline {
+            break lines;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(lines[..2], ["open", "kdc_start 1"], "{lines:?}");
+    assert_eq!(
+        lines[lines.len() - 2..],
+        ["kdc_stop 1", "close"],
+        "{lines:?}"
+    );
+    let has = |want: &str| lines.iter().any(|l| l == want);
+    assert!(
+        has(&format!(
+            "as_req 1 127.0.0.1 ISSUE alice@{REALM} krbtgt/{REALM}@{REALM} 0 0"
+        )),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("tgs_req 1 127.0.0.1 ISSUE ")
+                && l.contains(&format!("HTTP/server.daemon.test@{REALM}"))),
+        "{lines:?}"
+    );
+    assert!(
+        has(&format!(
+            "as_req 0 127.0.0.1 LOCAL_POLICY fail@{REALM} krbtgt/{REALM}@{REALM} 12 2"
+        )),
+        "{lines:?}"
+    );
 }

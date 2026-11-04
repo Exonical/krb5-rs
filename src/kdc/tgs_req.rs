@@ -386,6 +386,9 @@ impl<S: PrincipalStore> Kdc<S> {
         ctx.crealm = crealm;
         ctx.cname = cname;
         ctx.fast = fast_ctx;
+        if !self.audit.is_empty() {
+            ctx.audit_req = inner.clone().map(Box::new);
+        }
         let opts: KdcOptions = *body.kdc_options;
         let sname = body
             .sname
@@ -409,8 +412,18 @@ impl<S: PrincipalStore> Kdc<S> {
         // S4U2Self padata names the requested client; S4U2Proxy takes the
         // evidence ticket (do_tgs_req.c:692-756).
         let s4u2self = self
-            .process_s4u2self_req(req, &server, auth.subkey.as_ref(), &header.key)
+            .process_s4u2self_req(
+                req,
+                &server,
+                auth.subkey.as_ref(),
+                &header.key,
+                &mut ctx.s4u2self_user,
+            )
             .await?;
+        ctx.s4u2self_user = s4u2self.as_ref().map(|s| {
+            String::from_utf8_lossy(&super::kdb::mit::unparse_name(&s.user, &s.user_realm))
+                .into_owned()
+        });
         if s4u2self.is_some() {
             // Authorization data stays enabled for S4U2Self (:712-717).
             server
@@ -686,6 +699,15 @@ impl<S: PrincipalStore> Kdc<S> {
         if times.starttime == times.authtime {
             times.starttime = 0;
         }
+        // check_kdcpolicy_tgs (do_tgs_req.c:919-925).
+        self.check_kdcpolicy(
+            true,
+            None,
+            Some((&header.cname, &client_realm)),
+            &server.name,
+            kdc_time,
+            &mut times,
+        )?;
         if s4u2self.is_some() && !is_referral {
             Self::s4u2self_forwardable(&server, &mut flags);
         }
