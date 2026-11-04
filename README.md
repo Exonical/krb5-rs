@@ -17,6 +17,7 @@ builds aws-lc and simsimd.
 - **Authentication indicators** — MIT's AD-AUTHENTICATION-INDICATOR in AD-CAMMAC tickets: SPAKE, encrypted challenge (`encrypted_challenge_indicator`) and PKINIT (`pkinit_indicator`) indicators, carried to TGS requests and checked against a service's `require_auth` string attribute, as in MIT.
 - **Credential Cache** — Read/write ccache and keytab formats; MIT FILE, MEMORY, DIR, KEYRING (Linux) and KCM caches with `KRB5CCNAME`/`default_ccache_name` resolution and cache collections; MIT ccselect (`~/.k5identity`, `realm` and `hostname` modules, `[plugins] ccselect`) and `KerberosClient::get_default_credentials`, which picks the cache like a GSS initiator with the default credential
 - **Tracing** — `KRB5_TRACE` and `krb5_rs::trace::set_trace_callback`/`set_trace_filename`, with MIT's line format and message text for KDC sends and replies, initial and service credentials, and ccselect
+- **localauth** — `krb5_aname_to_localname` and `krb5_kuserok` like MIT: `auth_to_local` (`DEFAULT` and `RULE:` with POSIX regexps), `auth_to_local_names`, `.k5login` (`k5login_directory`, `k5login_authoritative`) and the `an2ln` check, with `[plugins] localauth` `disable`/`enable_only`
 
 ## Why?
 
