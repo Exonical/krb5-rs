@@ -594,3 +594,91 @@ fn db_args_select_a_database_and_refuse_unknown_arguments() {
         String::from_utf8_lossy(&bad.stderr)
     );
 }
+
+#[cfg(feature = "klmdb")]
+#[test]
+fn dump_mkey_convert_rewraps_every_key() {
+    dump_mkey_convert(&Env::new("mkey_convert"));
+}
+
+#[test]
+fn file_store_dump_mkey_convert_rewraps_every_key() {
+    dump_mkey_convert(&Env::new("mkey_convert_file").with_library("krb5-rs-file"));
+}
+
+/// `kdb5_util dump -mkey_convert` / `-new_mkey_file` (`dump.c:83-129,
+/// 1246-1293`): the dump's keys are under a new master key, which opens the
+/// loaded database, and the principals' keys are unchanged.
+fn dump_mkey_convert(env: &Env) {
+    let path = |name: &str| env.dir.join(name).to_string_lossy().into_owned();
+    let alice_key = |kt: &str| {
+        let entry = FileKeytab::new(kt)
+            .get_entry(
+                &krb5_rs::types::PrincipalName::new_principal("alice"),
+                REALM,
+                None,
+                None,
+            )
+            .expect("alice in keytab");
+        format!("{:?}", entry.key)
+    };
+    env.ok(&["create", "-s"], "master-password\nmaster-password\n");
+    env.ok(&["addprinc", "alice"], "alice-password\n");
+    env.ok(
+        &["ktadd", "-k", &path("before.kt"), "-norandkey", "alice"],
+        "",
+    );
+
+    let out = env.ok(
+        &["dump", "-mkey_convert", &path("dump")],
+        "new-password\nnew-password\n",
+    );
+    assert!(
+        out.starts_with("Please enter new master key....\n"),
+        "{out}"
+    );
+    env.ok(&["load", &path("dump")], "");
+    std::fs::write(path("new.pw"), "new-password\n").expect("password file");
+    env.ok(
+        &[
+            "--master-password-file",
+            &path("new.pw"),
+            "ktadd",
+            "-k",
+            &path("after.kt"),
+            "-norandkey",
+            "alice",
+        ],
+        "",
+    );
+    assert_eq!(alice_key(&path("before.kt")), alice_key(&path("after.kt")));
+    let list = env.ok(&["list_mkeys"], "");
+    assert_eq!(
+        list.lines().filter(|l| l.starts_with("KVNO")).count(),
+        2,
+        "{list}"
+    );
+
+    let other = Env::new(&format!(
+        "{}_other",
+        env.dir.file_name().unwrap().to_string_lossy()
+    ));
+    other.ok(&["create", "-s"], "third-password\nthird-password\n");
+    let stash = other.dir.join("stash").to_string_lossy().into_owned();
+    env.ok(&["dump", "-new_mkey_file", &stash, &path("dump2")], "");
+    env.ok(&["load", &path("dump2")], "");
+    std::fs::write(path("third.pw"), "third-password\n").expect("password file");
+    env.ok(
+        &[
+            "--master-password-file",
+            &path("third.pw"),
+            "ktadd",
+            "-k",
+            &path("third.kt"),
+            "-norandkey",
+            "alice",
+        ],
+        "",
+    );
+    assert_eq!(alice_key(&path("before.kt")), alice_key(&path("third.kt")));
+}

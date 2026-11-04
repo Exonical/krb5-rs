@@ -262,7 +262,9 @@ Deviations:
   record (`dump.c:616, 898, 907, 917`). A complete policy missing only its
   final newline is kept.
 - `-hash` is accepted and ignored; `-rev` and `-recurse` are accepted and
-  ignored on dump; `-mkey_convert` is rejected. `-i`/`-c` are described in
+  ignored on dump. `-mkey_convert` and `-new_mkey_file` rewrap every
+  dumped key under a new master key, as `master_key_convert` does
+  (`dump.c:83-129`); the database itself is unchanged. `-i`/`-c` are described in
   §MIT iprop update log.
 - `e_data` is always written empty, as klmdb never stores it
   (`plugins/kdb/lmdb/marshal.c`).
