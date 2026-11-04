@@ -1747,6 +1747,7 @@ dependencies = [
  "rasn",
  "rasn-cms",
  "rasn-pkix",
+ "regex",
  "rsa",
  "rustix 1.1.5",
  "sha1",

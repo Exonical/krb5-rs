@@ -16,6 +16,7 @@ builds aws-lc and simsimd.
 - **SPAKE** — MIT's SPAKE pre-authentication (PA-SPAKE), client and KDC: edwards25519, P-256, P-384 and P-521, MIT's encrypted PA-FX-COOKIE state, `spake_preauth_groups` / `spake_preauth_kdc_challenge` / `spake_preauth_indicator`. The client permits `edwards25519` by default (`AsExchangeConfig::spake_groups`); the KDC leaves SPAKE off until `KdcConfig::spake_groups` is set, as in MIT. Second factors are not implemented, as in MIT 1.22.
 - **Authentication indicators** — MIT's AD-AUTHENTICATION-INDICATOR in AD-CAMMAC tickets: SPAKE, encrypted challenge (`encrypted_challenge_indicator`) and PKINIT (`pkinit_indicator`) indicators, carried to TGS requests and checked against a service's `require_auth` string attribute, as in MIT.
 - **Credential Cache** — Read/write ccache and keytab formats; MIT FILE, MEMORY, DIR, KEYRING (Linux) and KCM caches with `KRB5CCNAME`/`default_ccache_name` resolution and cache collections
+- **localauth** — `krb5_aname_to_localname` and `krb5_kuserok` like MIT: `auth_to_local` (`DEFAULT` and `RULE:` with POSIX regexps), `auth_to_local_names`, `.k5login` (`k5login_directory`, `k5login_authoritative`) and the `an2ln` check, with `[plugins] localauth` `disable`/`enable_only`
 
 ## Why?
 
