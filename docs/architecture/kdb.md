@@ -992,16 +992,18 @@ in MIT, with a socket in place of the shared library:
   refuses the request with that code and status (MIT's test module returns
   `KRB5KDC_ERR_POLICY`, "LOCAL_POLICY"). Each module's lifetime and renewable
   lifetime cap the end and renew-till times at the KDC time plus that many
-  seconds (`update_ticket_times`). The KDC has no authentication indicators
-  yet, so the list is empty.
+  seconds (`update_ticket_times`). TGS checks also get the header ticket's
+  client. The KDC has no authentication indicators yet, so the list is empty.
 - **audit:** `kdc_start` runs when the KDC starts serving and `kdc_stop` on
-  shutdown. Every decoded AS or TGS request reports `as_req` or `tgs_req` with
-  its outcome. TGS requests with PA-FOR-USER or PA-S4U-X509-USER also report
+  shutdown, after open connections finish. Every decoded AS or TGS request
+  reports `as_req` or `tgs_req` with its outcome, describing the inner request
+  for FAST. TGS requests with PA-FOR-USER or PA-S4U-X509-USER also report
   `s4u2self`, `cname-in-addl-tkt` ones `s4u2proxy` and `enc-tkt-in-skey` ones
   `u2u`, before `tgs_req`. The state carries:
   - a random 31-character request ID, as in MIT;
   - the client address and port;
   - the status string;
+  - the S4U2Self user;
   - MIT's ticket IDs (upper-case hex SHA-256 of the ticket ciphertext) for the
     header, evidence and issued tickets;
   - `LOCAL_POLICY` as the violation for a policy refusal.
@@ -1011,7 +1013,9 @@ in MIT, with a socket in place of the shared library:
   it run one at a time. A broken connection is opened again (and the module
   initialized again) on the next call. A kdcpolicy call that fails or times
   out (30 s) refuses the request with `KRB_ERR_GENERIC`; a failed audit call
-  is ignored.
+  is ignored. Module calls block like MIT's, but on the multi-threaded Tokio
+  runtime they run through `block_in_place`, so other requests keep being
+  served.
 
 Deviations:
 - Modules are processes reached over RPC, not MIT shared libraries, so modules

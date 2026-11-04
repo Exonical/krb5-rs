@@ -386,6 +386,9 @@ impl<S: PrincipalStore> Kdc<S> {
         ctx.crealm = crealm;
         ctx.cname = cname;
         ctx.fast = fast_ctx;
+        if !self.audit.is_empty() {
+            ctx.audit_req = inner.clone().map(Box::new);
+        }
         let opts: KdcOptions = *body.kdc_options;
         let sname = body
             .sname
@@ -411,6 +414,10 @@ impl<S: PrincipalStore> Kdc<S> {
         let s4u2self = self
             .process_s4u2self_req(req, &server, auth.subkey.as_ref(), &header.key)
             .await?;
+        ctx.s4u2self_user = s4u2self.as_ref().map(|s| {
+            String::from_utf8_lossy(&super::kdb::mit::unparse_name(&s.user, &s.user_realm))
+                .into_owned()
+        });
         if s4u2self.is_some() {
             // Authorization data stays enabled for S4U2Self (:712-717).
             server
@@ -687,7 +694,14 @@ impl<S: PrincipalStore> Kdc<S> {
             times.starttime = 0;
         }
         // check_kdcpolicy_tgs (do_tgs_req.c:919-925).
-        self.check_kdcpolicy(true, None, &server.name, kdc_time, &mut times)?;
+        self.check_kdcpolicy(
+            true,
+            None,
+            Some((&header.cname, &client_realm)),
+            &server.name,
+            kdc_time,
+            &mut times,
+        )?;
         if s4u2self.is_some() && !is_referral {
             Self::s4u2self_forwardable(&server, &mut flags);
         }

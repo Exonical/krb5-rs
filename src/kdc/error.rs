@@ -122,6 +122,10 @@ pub(crate) struct ErrorContext {
     pub cname: Option<PrincipalName>,
     /// FAST state once an armor key exists (errors are then armored).
     pub fast: Option<super::fast::KdcFastState>,
+    /// The FAST inner request, which audit modules describe.
+    pub audit_req: Option<Box<crate::types::KdcReq>>,
+    /// The S4U2Self user, for `krb5_audit_state.s4u2self_user`.
+    pub s4u2self_user: Option<String>,
 }
 
 /// A failure bundled with the context for its KRB-ERROR.
@@ -242,6 +246,8 @@ mod tests {
             crealm: None,
             cname: None,
             fast: None,
+            audit_req: None,
+            s4u2self_user: None,
         };
         let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 731_854_900).expect("time");
         let der = build_krb_error(&KdcError::new(6, "X"), &ctx, now);
@@ -262,6 +268,8 @@ mod tests {
             crealm: None,
             cname: None,
             fast: None,
+            audit_req: None,
+            s4u2self_user: None,
         };
         let der = build_krb_error(&KdcError::new(6, "CLIENT_NOT_FOUND"), &ctx, Utc::now());
         let got: KrbErrorMsg = rasn::der::decode(&der).expect("decode");

@@ -713,24 +713,25 @@ async fn termination_signal() -> std::io::Result<&'static str> {
     Ok("ctrl-c")
 }
 
-/// The `[plugins] kdcpolicy` and `audit` modules from krb5.conf and kdc.conf.
+/// The `[plugins] kdcpolicy` and `audit` modules from krb5.conf, then
+/// kdc.conf, the order MIT's KDC profile and kadmind search them in.
 fn load_plugins(cli: &Cli, krb5_conf_explicit: bool) -> std::io::Result<plugins::Modules> {
     let mut profiles = Vec::new();
     let conf = cli
         .config
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_KDC_PROFILE));
-    if cli.keytab.is_none() && conf.exists() {
-        profiles.push(
-            Profile::load(&conf).map_err(|e| io_err(format!("reading {}: {e}", conf.display())))?,
-        );
-    }
     if let Some(p) = &cli.krb5_config {
         if krb5_conf_explicit || p.exists() {
             profiles.push(
                 Profile::load(p).map_err(|e| io_err(format!("reading {}: {e}", p.display())))?,
             );
         }
+    }
+    if cli.keytab.is_none() && conf.exists() {
+        profiles.push(
+            Profile::load(&conf).map_err(|e| io_err(format!("reading {}: {e}", conf.display())))?,
+        );
     }
     let refs: Vec<&Profile> = profiles.iter().collect();
     plugins::load(&refs).map_err(io_err)
@@ -859,10 +860,6 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
     }
 
     let _ = shutdown_tx.send(true);
-    // kau_kdc_stop (main.c:1031).
-    for m in &audit {
-        m.kdc_stop(true);
-    }
     let timeout = Duration::from_secs(cli.shutdown_timeout);
     let drained = tokio::time::timeout(timeout, async {
         while let Some(result) = tasks.join_next().await {
@@ -878,6 +875,10 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
             "shutdown timeout ({}s) reached; closing remaining connections",
             cli.shutdown_timeout
         ),
+    }
+    // kau_kdc_stop (main.c:1031), after the last request has been handled.
+    for m in &audit {
+        m.kdc_stop(true);
     }
     Ok(())
 }

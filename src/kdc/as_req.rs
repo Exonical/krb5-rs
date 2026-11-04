@@ -108,6 +108,9 @@ impl<S: PrincipalStore> Kdc<S> {
         let fast = ctx.fast.take();
         *ctx = self.request_context(request, true);
         ctx.fast = fast;
+        if !self.audit.is_empty() {
+            ctx.audit_req = inner.clone().map(Box::new);
+        }
         if request.req_body.realm.as_bytes() != self.config.realm.as_bytes() {
             return Err(KdcError::new(KDC_ERR_WRONG_REALM, "WRONG_REALM"));
         }
@@ -400,7 +403,7 @@ impl<S: PrincipalStore> Kdc<S> {
         };
 
         // check_kdcpolicy_as (do_as_req.c:214-223).
-        self.check_kdcpolicy(false, Some(cname), &server.name, kdc_time, &mut times)?;
+        self.check_kdcpolicy(false, Some(cname), None, &server.name, kdc_time, &mut times)?;
         let tkt_flags = KerberosFlags::new(flags);
         let mut part = EncTicketPart {
             flags: tkt_flags,

@@ -449,7 +449,7 @@ impl<S: PrincipalStore> Kdc<S> {
             self.process_tgs_req(&decoded, request, now, &mut ctx).await
         };
         if !self.audit.is_empty() {
-            self.kau_request(is_as, &decoded, peer, &result);
+            self.kau_request(is_as, &decoded, &ctx, peer, &result);
         }
         result.map_err(|err| Box::new(Failure { err, ctx }))
     }
@@ -459,10 +459,13 @@ impl<S: PrincipalStore> Kdc<S> {
     fn kau_request(
         &self,
         is_as: bool,
-        req: &KdcReq,
+        outer: &KdcReq,
+        ctx: &ErrorContext,
         peer: Option<std::net::SocketAddr>,
         result: &Result<Vec<u8>, KdcError>,
     ) {
+        // After FAST, the inner request is the one processed (kdc_find_fast).
+        let req = ctx.audit_req.as_deref().unwrap_or(outer);
         let realm = &self.config.realm;
         let unparse = |p: &PrincipalName| {
             String::from_utf8_lossy(&kdb::mit::unparse_name(p, realm)).into_owned()
@@ -499,7 +502,11 @@ impl<S: PrincipalStore> Kdc<S> {
             }
             return;
         }
-        st.tkt_in_id = padata
+        st.s4u2self_user = ctx.s4u2self_user.clone();
+        st.tkt_in_id = outer
+            .padata
+            .as_deref()
+            .unwrap_or_default()
             .iter()
             .find(|p| p.padata_type == 1)
             .and_then(|p| rasn::der::decode::<ApReq>(p.padata_value.as_ref()).ok())
@@ -540,6 +547,7 @@ impl<S: PrincipalStore> Kdc<S> {
         &self,
         tgs: bool,
         client: Option<&PrincipalName>,
+        ticket_client: Option<(&PrincipalName, &str)>,
         server: &PrincipalName,
         now: i64,
         times: &mut policy::Times,
@@ -552,7 +560,8 @@ impl<S: PrincipalStore> Kdc<S> {
             client: client
                 .map(|c| String::from_utf8_lossy(&kdb::mit::unparse_name(c, realm)).into_owned()),
             server: String::from_utf8_lossy(&kdb::mit::unparse_name(server, realm)).into_owned(),
-            ticket_client: None,
+            ticket_client: ticket_client
+                .map(|(c, r)| String::from_utf8_lossy(&kdb::mit::unparse_name(c, r)).into_owned()),
             auth_indicators: Vec::new(),
         };
         plugins::check_policy(
@@ -576,6 +585,8 @@ impl<S: PrincipalStore> Kdc<S> {
             crealm: None,
             cname: None,
             fast: None,
+            audit_req: None,
+            s4u2self_user: None,
         }
     }
 
@@ -600,6 +611,8 @@ impl<S: PrincipalStore> Kdc<S> {
             realm,
             sname,
             fast: None,
+            audit_req: None,
+            s4u2self_user: None,
         }
     }
 

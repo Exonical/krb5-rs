@@ -529,6 +529,10 @@ impl Conn {
     /// One call; calls run one at a time, and a broken connection is
     /// opened again (and the module initialized again) on the next call.
     fn call(&self, m: &Message) -> io::Result<Result<Message, CallError>> {
+        off_runtime(|| self.call_blocking(m))
+    }
+
+    fn call_blocking(&self, m: &Message) -> io::Result<Result<Message, CallError>> {
         let mut client = self.lock();
         if client.is_none() {
             match Client::handshake((self.connect)()?, self.handshake)? {
@@ -557,6 +561,17 @@ impl Drop for Conn {
         if let Some(c) = self.lock().as_mut() {
             let _ = c.call(&Message::new(call::FINALIZE));
         }
+    }
+}
+
+/// Run blocking module I/O without stalling a multi-threaded Tokio runtime's
+/// other tasks.
+fn off_runtime<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 
