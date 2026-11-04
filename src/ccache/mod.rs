@@ -1,11 +1,18 @@
-//! Kerberos credential caches — MIT FILE (v1-4) and MEMORY formats.
+//! Kerberos credential caches — MIT FILE (v1-4), MEMORY, DIR, KEYRING and
+//! KCM types, with MIT's name resolution and cache collections.
 //!
 //! Wire layout follows ccmarshal.c / cc_file.c; retrieval follows
 //! cc_retr.c; config entries follow ccfns.c.
 
+mod dir;
 mod file;
+#[cfg(unix)]
+pub mod kcm;
+#[cfg(target_os = "linux")]
+mod keyring;
 pub mod marshal;
 mod memory;
+mod resolve;
 mod retrieve;
 
 use bitflags::bitflags;
@@ -17,8 +24,17 @@ use crate::types::{
     PrincipalName, Ticket, TicketFlags,
 };
 
+pub use dir::DirCcache;
 pub use file::FileCcache;
+#[cfg(unix)]
+pub use kcm::KcmCcache;
+#[cfg(target_os = "linux")]
+pub use keyring::KeyringCcache;
 pub use memory::MemoryCcache;
+pub use resolve::{
+    cache_match, collection, default_cache, expand_path_tokens, have_content, new_unique, resolve,
+    split_name, AnyCcache, CcContext, DEFAULT_CCNAME,
+};
 pub use retrieve::creds_match_request;
 
 /// The realm used for ccache config entries (ccfns.c:212-228).
@@ -139,6 +155,36 @@ pub enum CcError {
     /// I/O error.
     #[error("ccache I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Malformed cache name (KRB5_CC_BADNAME).
+    #[error("{0}")]
+    BadName(String),
+    /// Unknown cache type prefix (KRB5_CC_UNKNOWN_TYPE).
+    #[error("Unknown credential cache type")]
+    UnknownType,
+    /// The cache does not exist (KRB5_FCC_NOFILE).
+    #[error("{0}")]
+    NoFile(String),
+    /// No new cache can be made in the default collection
+    /// (KRB5_DCC_CANNOT_CREATE).
+    #[error("{0}")]
+    CannotCreate(String),
+    /// Another MIT error, by its com_err name.
+    #[error("{msg}")]
+    Code {
+        /// The MIT error name, such as `KRB5_KCC_INVALID_ANCHOR`.
+        name: &'static str,
+        /// The MIT message.
+        msg: String,
+    },
+}
+
+impl CcError {
+    pub(crate) fn code(name: &'static str, msg: impl Into<String>) -> Self {
+        Self::Code {
+            name,
+            msg: msg.into(),
+        }
+    }
 }
 
 bitflags! {

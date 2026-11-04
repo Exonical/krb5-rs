@@ -34,6 +34,23 @@ impl FileCcache {
         }
     }
 
+    /// The cache file.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// `fcc_destroy`: remove the cache file.
+    pub fn destroy(&self) -> Result<(), CcError> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(CcError::NoFile(format!(
+                "No credentials cache found (filename: {})",
+                self.path.display()
+            ))),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Set the version written by `initialize` (1-4).
     pub fn with_version(mut self, version: u8) -> Self {
         self.version = version;
