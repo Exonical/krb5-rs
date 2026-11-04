@@ -310,6 +310,7 @@ pub fn unmarshal_cred(data: &[u8], version: u8) -> Result<CcCredential, CcError>
 
 /// `k5_marshal_mcred`: a match credential in Heimdal's KCM format, with
 /// FILE v4 subfields.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn marshal_mcred(m: &super::MatchCred) -> Vec<u8> {
     const CLIENT: i32 = 0x1;
     const SERVER: i32 = 0x2;

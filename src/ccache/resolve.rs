@@ -54,6 +54,7 @@ impl CcContext {
         expand_path_tokens(self.profile_default.as_deref().unwrap_or(DEFAULT_CCNAME))
     }
 
+    #[cfg(unix)]
     fn kcm_socket(&self) -> Option<&str> {
         self.kcm_socket.as_deref()
     }
@@ -123,6 +124,7 @@ pub fn split_name(name: &str) -> (&str, &str) {
 }
 
 /// `krb5_cc_resolve`.
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn resolve(ctx: &CcContext, name: &str) -> Result<AnyCcache, CcError> {
     let (ty, residual) = split_name(name);
     Ok(match ty {

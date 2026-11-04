@@ -115,7 +115,10 @@ fn dir_primary_subsidiaries_and_switch() {
     let dir = tmpdir("dir");
     let c = ctx(&format!("DIR:{}", dir.display()));
     let mut primary = default_cache(&c).unwrap();
-    assert_eq!(primary.name(), format!("DIR::{}/tkt", dir.display()));
+    assert_eq!(
+        primary.name(),
+        format!("DIR::{}", dir.join("tkt").display())
+    );
     assert_eq!(
         std::fs::read_to_string(dir.join("primary")).unwrap(),
         "tkt\n"
@@ -135,7 +138,7 @@ fn dir_primary_subsidiaries_and_switch() {
 
     let mut second = new_unique(&c, "DIR").unwrap();
     let name = second.name();
-    let file = name.rsplit('/').next().unwrap().to_string();
+    let file = name.rsplit(['/', '\\']).next().unwrap().to_string();
     assert!(file.starts_with("tkt") && file.len() == 9, "{name}");
     second.initialize(&princ(&["bob"]), REALM).unwrap();
 
