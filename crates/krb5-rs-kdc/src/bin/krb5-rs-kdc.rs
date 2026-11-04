@@ -677,6 +677,7 @@ async fn config_mode(
     Ok(Some((
         Kdc::builder(cfg.kdc, DaemonStore::File(Arc::clone(&store), metrics))
             .policies(Arc::clone(&store))
+            .auth_state(Arc::clone(&store))
             .build(),
         Listen { udp, tcp },
         parts,

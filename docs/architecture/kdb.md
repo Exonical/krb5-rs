@@ -267,10 +267,11 @@ Deviations:
 - `e_data` is always written empty, as klmdb never stores it
   (`plugins/kdb/lmdb/marshal.c`).
 - The file store keeps each principal's keys as dumped and its MIT tl-data
-  (string attributes, password history, `MOD_PRINC`, aliases). It has no
-  lockout fields (`last_success`, `last_failed`, `fail_auth_count`; its
-  lockout counters are in memory, see section 8): they are dropped on load
-  and dumped as zero.
+  (string attributes, password history, `MOD_PRINC`, aliases) and, as db2
+  does, the lockout fields `last_success`, `last_failed` and
+  `fail_auth_count` in the entry: they are dumped and loaded. `load -i` and
+  `-x merge_nra` keep the lockout fields of principals already in the
+  database (`ctx_merge_nra`, `kdb_db2.c:1404-1412`).
 
 ### MIT iprop update log
 
@@ -363,8 +364,9 @@ replayed into, as MIT passes them to `ulog_replay` (`kpropd.c:891`).
 `db_library = krb5-rs-file` they take db2's instead (`kdb_db2.c:222-247`):
 `dbname=PATH`, `temporary`, `merge_nra`, `hash=...`, `unlockiter` and
 `lockiter`; anything else is `Unsupported argument "..." for db2`. The file
-store has no db2 access methods or lockout records, so `hash`, the
-iteration locks and `merge_nra` change nothing, as `merge_nra` does in db2.
+store has no db2 access methods, so `hash` and the iteration locks change
+nothing; `merge_nra` keeps the current lockout fields on a full load, as
+db2's `krb5_db2_promote_db` does.
 Deliberate retry deviations from MIT `do_iprop`: a failed
 `IPROP_GET_UPDATES` or `IPROP_FULL_RESYNC[_EXT]` call waits the same
 `2 << n` backoff before reconnecting instead of reconnecting at once, and a
@@ -1027,8 +1029,14 @@ them per KDC under kprop and iprop, and in the shared directory with the LDAP
 module (`doc/admin/lockout.rst` "KDC replication and account lockout").
 
 - **klmdb, File, Memory (MIT kprop model).** In standalone klmdb mode the
-  three fields live in the per-environment `lockout` database; File/Memory
-  backends keep them in memory. They are never propagated.
+  three fields live in the per-environment `lockout` database. The file
+  store keeps them in each principal's entry, as db2 does
+  (`plugins/kdb/db2/lockout.c`): the KDC rewrites the file on each counted
+  failure and, unless `disable_last_success` is set, each preauthenticated
+  success, waiting up to 2 s for another writer's lock; these writes are not
+  logged for iprop. A password or key change and `modprinc -unlock` zero
+  `fail_auth_count` (`svr_principal.c:677, 1344, 1474, 1736`). The Memory
+  backend keeps them in memory. They are never propagated.
 - **CockroachDB (MIT LDAP model).** The counters live in CockroachDB
   `auth_state`, and every KDC updates them as `krb5_ldap_lockout_audit` does
   (`plugins/kdb/ldap/libkdb_ldap/lockout.c`): a failed preauthentication or

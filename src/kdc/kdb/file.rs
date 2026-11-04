@@ -29,8 +29,8 @@ use crate::kdc::db::{
 use crate::kdc::policy::{kerberos_time, ts};
 use crate::kdc::replication::{StoredKey, StoredPrincipal};
 use crate::kdc::store::{
-    AdminStore, HealthCheck, Policy, PolicyStore, PrincipalRecord, PrincipalStore, StoreError,
-    StoreErrorKind,
+    AdminStore, AuthState, AuthStateStore, AuthStateUpdate, HealthCheck, Policy, PolicyStore,
+    PrincipalRecord, PrincipalStore, StoreError, StoreErrorKind,
 };
 use crate::types::{EncryptionKey, KerberosTime, PrincipalName};
 
@@ -163,14 +163,16 @@ fn stamp(
         return Ok(record);
     };
     let sp = stored_of(&record);
-    let mut raw = sp.to_mit(keys)?;
+    let mut raw = mit_of(&record, keys)?;
     let secs = u32::try_from(sp.mod_time.unwrap_or(0))
         .map_err(|_| err("modification time outside u32 range"))?;
     set_mod_princ(&mut raw, secs, &caller.modifier)?;
     update_tl_data(&mut raw, &caller.tl);
     let mut stamped = StoredPrincipal::from_mit(&raw, Some(&sp))?;
     stamped.keys = sp.keys;
-    kdb_of(&stamped)
+    let mut out = kdb_of(&stamped)?;
+    set_lockout(&mut out, lockout_of(&record));
+    Ok(out)
 }
 
 /// The kadmin client a write is for.
@@ -181,6 +183,9 @@ struct Caller {
 }
 
 struct LockGuard(PathBuf);
+
+/// How long a lockout update waits for another writer's `<path>.lock`.
+const LOCKOUT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
@@ -319,7 +324,72 @@ fn kdb_of(sp: &StoredPrincipal) -> Result<KdbPrincipal, StoreError> {
                 })
                 .collect()
         }),
+        last_success: None,
+        last_failed: None,
+        fail_auth_count: None,
     })
+}
+
+/// A record's `last_success`, `last_failed` and `fail_auth_count`, which
+/// db2 keeps in the principal entry (`plugins/kdb/db2/lockout.c`).
+fn lockout_of(r: &KdbPrincipal) -> AuthState {
+    AuthState {
+        fail_count: r.fail_auth_count.unwrap_or(0),
+        last_failed: i64::from(r.last_failed.unwrap_or(0)),
+        last_success: i64::from(r.last_success.unwrap_or(0)),
+    }
+}
+
+fn set_lockout(r: &mut KdbPrincipal, s: AuthState) {
+    let secs = |t: i64| u32::try_from(t).ok().filter(|&t| t != 0);
+    r.fail_auth_count = (s.fail_count != 0).then_some(s.fail_count);
+    r.last_failed = secs(s.last_failed);
+    r.last_success = secs(s.last_success);
+}
+
+/// `r` as an MIT entry, keys still encrypted, lockout fields included.
+fn mit_of(r: &KdbPrincipal, keys: &MasterKeys) -> Result<MitEntry, StoreError> {
+    let mut e = stored_of(r).to_mit(keys)?;
+    let s = lockout_of(r);
+    e.fail_auth_count = s.fail_count;
+    e.last_failed = u32::try_from(s.last_failed).unwrap_or(0);
+    e.last_success = u32::try_from(s.last_success).unwrap_or(0);
+    Ok(e)
+}
+
+/// Inverse of [`mit_of`].
+fn kdb_of_mit(
+    raw: &MitEntry,
+    previous: Option<&StoredPrincipal>,
+) -> Result<KdbPrincipal, StoreError> {
+    let mut r = kdb_of(&StoredPrincipal::from_mit(raw, previous)?)?;
+    set_lockout(
+        &mut r,
+        AuthState {
+            fail_count: raw.fail_auth_count,
+            last_failed: i64::from(raw.last_failed),
+            last_success: i64::from(raw.last_success),
+        },
+    );
+    Ok(r)
+}
+
+/// Keep `previous`'s lockout fields in `record`, zeroing `fail_auth_count`
+/// when the keys change or the principal is unlocked, as
+/// `kadm5_chpass_principal`, `kadm5_randkey_principal`,
+/// `kadm5_setkey_principal` and `kadm5_modify_principal` do
+/// (`svr_principal.c:677, 1344, 1474, 1736`).
+fn carry_lockout(record: &mut KdbPrincipal, previous: &KdbPrincipal, unlock: bool) {
+    let mut state = lockout_of(previous);
+    let rekeyed = record.keys.len() != previous.keys.len()
+        || record.keys.iter().zip(&previous.keys).any(|(a, b)| {
+            (a.kvno, a.enctype, a.mkvno, a.enc_key.as_ref())
+                != (b.kvno, b.enctype, b.mkvno, b.enc_key.as_ref())
+        });
+    if rekeyed || unlock {
+        state.fail_count = 0;
+    }
+    set_lockout(record, state);
 }
 
 fn is_km(p: &KdbPrincipal, km: &PrincipalName, realm: &str) -> bool {
@@ -410,8 +480,15 @@ impl FileStore {
             keys: random_keys(1, tgt_etypes).map_err(|e| err(e.to_string()))?,
         };
         let principals = vec![
-            store.to_record(&km, Some(now), Some(now), None, &store.master_keys())?,
-            store.to_record(&tgs, Some(now), Some(now), None, &store.master_keys())?,
+            store.to_record(&km, Some(now), Some(now), None, &store.master_keys(), false)?,
+            store.to_record(
+                &tgs,
+                Some(now),
+                Some(now),
+                None,
+                &store.master_keys(),
+                false,
+            )?,
         ];
         let file = KdbFile {
             version: VERSION,
@@ -524,13 +601,18 @@ impl FileStore {
         mod_time: Option<KerberosTime>,
         previous: Option<&KdbPrincipal>,
         keys: &MasterKeys,
+        unlock: bool,
     ) -> Result<KdbPrincipal, StoreError> {
         let (pwd, modified) = (last_pwd_change.as_ref().map(ts), mod_time.as_ref().map(ts));
         let sp = match previous {
             Some(p) => StoredPrincipal::from_update(e, pwd, modified, keys, &stored_of(p))?,
             None => StoredPrincipal::from_entry(e, pwd, modified, keys)?,
         };
-        kdb_of(&sp)
+        let mut record = kdb_of(&sp)?;
+        if let Some(p) = previous {
+            carry_lockout(&mut record, p, unlock);
+        }
+        Ok(record)
     }
 
     fn decrypt_record(&self, r: &KdbPrincipal) -> Result<PrincipalRecord, StoreError> {
@@ -545,6 +627,7 @@ impl FileStore {
         let sp = stored_of(r);
         let history = sp.password_history()?;
         Ok(PrincipalRecord {
+            unlock: false,
             entry: sp.into_entry(keys)?,
             last_pwd_change: to_time(&r.last_pwd_change),
             password_history: Some(history),
@@ -679,6 +762,76 @@ impl FileStore {
             }
         })?;
         Ok(LockGuard(path))
+    }
+
+    /// [`Self::lock`], waiting up to [`LOCKOUT_LOCK_WAIT`] for another
+    /// writer, as db2's lockout update blocks on the database lock.
+    fn lock_waiting(&self) -> Result<LockGuard, StoreError> {
+        let path = sibling(&self.path, ".lock");
+        let deadline = std::time::Instant::now() + LOCKOUT_LOCK_WAIT;
+        loop {
+            match crate::fsutil::create_new_private(&path) {
+                Ok(_) => return Ok(LockGuard(path)),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return self.lock(),
+            }
+        }
+    }
+
+    /// The persisted lockout state of `name` (`krb5_db_get_principal`'s
+    /// `last_success`, `last_failed`, `fail_auth_count`); zero when absent.
+    pub fn lockout_state(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<AuthState, StoreError> {
+        self.refresh(false)?;
+        Ok(self
+            .read_cache()
+            .records
+            .get(&store_key(name, realm))
+            .map(lockout_of)
+            .unwrap_or_default())
+    }
+
+    /// `krb5_db2_lockout_audit` (`plugins/kdb/db2/lockout.c`): apply
+    /// `update` to the principal's entry and store it, without an iprop
+    /// update (the lockout fields are not replicated). A principal that no
+    /// longer exists is left alone.
+    pub fn apply_lockout(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        update: &AuthStateUpdate,
+    ) -> Result<AuthState, StoreError> {
+        let key = store_key(name, realm);
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock_waiting()?;
+        let (_, mut file) = read_file(&self.path)?;
+        let Some(record) = file.principals.iter_mut().find(|p| key_of(p) == key) else {
+            return Ok(AuthState::default());
+        };
+        let before = lockout_of(record);
+        let mut after = before;
+        after.apply(update);
+        if after == before {
+            return Ok(after);
+        }
+        set_lockout(record, after);
+        file.serial = Some(file.serial.unwrap_or(0) + 1);
+        write_atomic(&self.path, &file)?;
+        self.refresh(true)?;
+        Ok(lockout_of(
+            file.principals
+                .iter()
+                .find(|p| key_of(p) == key)
+                .expect("record present"),
+        ))
     }
 
     /// Take the write lock (`<path>.lock`) until the guard drops, so no
@@ -834,10 +987,10 @@ impl FileStore {
             return Ok(());
         }
         let keys = self.masters_in(&file.principals)?;
+        let mit = current.as_ref().map(|r| mit_of(r, &keys)).transpose()?;
         let current = current.as_ref().map(stored_of);
-        let mit = current.as_ref().map(|sp| sp.to_mit(&keys)).transpose()?;
         let entry = entry_from_update(mit, upd)?;
-        let record = kdb_of(&StoredPrincipal::from_mit(&entry, current.as_ref())?)?;
+        let record = kdb_of_mit(&entry, current.as_ref())?;
         let key = key_of(&record);
         match file.principals.iter().position(|p| key_of(p) == key) {
             Some(i) => file.principals[i] = record,
@@ -870,12 +1023,16 @@ impl FileStore {
                 store_key(&p.name, &realm) == key
             });
             let keys = self.masters_in(list)?;
+            // A whole-entry write that sets a new unlock time is an unlock.
+            let unlock = entry.last_admin_unlock.as_ref().map(|t| t.timestamp())
+                != pos.and_then(|i| list[i].last_admin_unlock.as_ref().map(ts));
             let record = self.to_record(
                 &entry,
                 last_pwd_change,
                 Some(kerberos_time(Utc::now().timestamp())),
                 pos.map(|i| &list[i]),
                 &keys,
+                unlock,
             )?;
             match pos {
                 Some(i) => list[i] = record,
@@ -966,8 +1123,7 @@ impl FileStore {
     }
 
     /// Principals and policies as MIT dump entries in klmdb key order, keys
-    /// as stored. Deviation: the file store keeps no lockout state, so
-    /// `last_success`, `last_failed` and `fail_auth_count` dump as 0.
+    /// as stored, with each entry's lockout fields as db2 dumps them.
     pub fn dump_entries(&self) -> Result<(Vec<MitEntry>, Vec<MitPolicy>), StoreError> {
         let entries = self.mit_entries()?;
         let policies = self.list_policies()?;
@@ -982,7 +1138,7 @@ impl FileStore {
         let raws: Vec<KdbPrincipal> = self.read_cache().records.values().cloned().collect();
         let mut entries = raws
             .iter()
-            .map(|raw| stored_of(raw).to_mit(&keys))
+            .map(|raw| mit_of(raw, &keys))
             .collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_cached_key(|e| unparse_name(&e.principal, &e.realm));
         Ok(entries)
@@ -1001,8 +1157,7 @@ impl FileStore {
             .records
             .get(&store_key(name, realm))
             .cloned();
-        raw.map(|r| stored_of(&r).to_mit(&self.master_keys()))
-            .transpose()
+        raw.map(|r| mit_of(&r, &self.master_keys())).transpose()
     }
 
     /// The policy `name` as an MIT policy record (`krb5_db_get_policy`).
@@ -1013,7 +1168,7 @@ impl FileStore {
     /// Store a new MIT entry, such as an alias (`kdb_put_entry` of a fresh
     /// `krb5_db_entry`); `Conflict` if the name is taken.
     pub fn create_mit(&self, raw: &MitEntry) -> Result<(), StoreError> {
-        let record = kdb_of(&StoredPrincipal::from_mit(raw, None)?)?;
+        let record = kdb_of_mit(raw, None)?;
         let key = key_of(&record);
         self.modify(|list| {
             if list.iter().any(|p| key_of(p) == key) {
@@ -1049,11 +1204,11 @@ impl FileStore {
             let pos = Self::position(list, name, realm)?;
             let keys = self.masters_in(list)?;
             let sp = stored_of(&list[pos]);
-            let mut raw = sp.to_mit(&keys)?;
+            let mut raw = mit_of(&list[pos], &keys)?;
             if !f(&mut raw, &keys)? {
                 return Ok(false);
             }
-            list[pos] = kdb_of(&StoredPrincipal::from_mit(&raw, Some(&sp))?)?;
+            list[pos] = kdb_of_mit(&raw, Some(&sp))?;
             Ok(true)
         })
     }
@@ -1069,8 +1224,8 @@ impl FileStore {
             let pos = Self::position(list, name, realm)?;
             let keys = self.masters_in(list)?;
             let sp = stored_of(&list[pos]);
-            let renamed = f(sp.to_mit(&keys)?, &keys)?;
-            let record = kdb_of(&StoredPrincipal::from_mit(&renamed, Some(&sp))?)?;
+            let renamed = f(mit_of(&list[pos], &keys)?, &keys)?;
+            let record = kdb_of_mit(&renamed, Some(&sp))?;
             let key = key_of(&record);
             if list.iter().any(|p| key_of(p) == key) {
                 return Err(StoreError::conflict(format!(
@@ -1112,6 +1267,7 @@ impl FileStore {
     /// last policy), an `update` load logs each principal from there, after
     /// resetting the log if the dump has policies, as `krb5_db_put_principal`
     /// and `krb5_db_create_policy` do (`kdb5.c:981-1051, 2441-2525`).
+    #[allow(clippy::too_many_arguments)]
     pub fn load_dump(
         path: &Path,
         realm: &str,
@@ -1119,6 +1275,7 @@ impl FileStore {
         entries: &[MitEntry],
         policies: &[MitPolicy],
         update: bool,
+        merge_nra: bool,
         log: Option<(&IpropConfig, usize)>,
     ) -> Result<(), StoreError> {
         let km_name = master_principal()?;
@@ -1135,7 +1292,7 @@ impl FileStore {
         }
         let mut principals = Vec::with_capacity(entries.len());
         for entry in entries {
-            let record = kdb_of(&StoredPrincipal::from_mit(entry, None)?)?;
+            let record = kdb_of_mit(entry, None)?;
             principals.push((key_of(&record), record));
         }
         let loaded: Vec<StoreKey> = principals
@@ -1180,7 +1337,8 @@ impl FileStore {
             });
         }
         let _guard = store.lock()?;
-        let serial = read_file(path).map_or(0, |(_, f)| f.serial.unwrap_or(0));
+        let existing = read_file(path).ok().map(|(_, f)| f);
+        let serial = existing.as_ref().map_or(0, |f| f.serial.unwrap_or(0));
         let mut file = KdbFile {
             version: VERSION,
             realm: general(realm)?,
@@ -1189,6 +1347,20 @@ impl FileStore {
             policies: None,
         };
         merge(&mut file);
+        // `ctx_merge_nra` (`kdb_db2.c:1404-1412`): keep the lockout fields
+        // of principals already in the database being replaced.
+        if let Some(existing) = existing.filter(|_| merge_nra) {
+            let old: HashMap<StoreKey, AuthState> = existing
+                .principals
+                .iter()
+                .map(|p| (key_of(p), lockout_of(p)))
+                .collect();
+            for p in &mut file.principals {
+                if let Some(state) = old.get(&key_of(p)) {
+                    set_lockout(p, *state);
+                }
+            }
+        }
         let temporary = sibling(path, "~");
         write_atomic(&temporary, &file)?;
         std::fs::rename(&temporary, path).map_err(|e| {
@@ -1221,6 +1393,7 @@ impl FileStore {
                 Some(kerberos_time(Utc::now().timestamp())),
                 None,
                 &keys,
+                false,
             )?;
             let record = stamp(record, caller, &keys)?;
             let exists = list.iter().any(|p| {
@@ -1276,11 +1449,14 @@ impl FileStore {
                 rec.mod_time,
                 Some(&list[pos]),
                 &keys,
+                rec.unlock,
             )?;
             if let Some(history) = &rec.password_history {
                 let mut sp = stored_of(&record);
                 sp.set_password_history(history)?;
+                let lockout = lockout_of(&record);
                 record = kdb_of(&sp)?;
+                set_lockout(&mut record, lockout);
             }
             list[pos] = stamp(record, caller, &keys)?;
             Ok(rec)
@@ -1355,6 +1531,25 @@ impl PolicyStore for FileStore {
         name: &str,
     ) -> impl std::future::Future<Output = Result<Option<Policy>, StoreError>> + Send {
         std::future::ready(self.get_policy(name))
+    }
+}
+
+impl AuthStateStore for FileStore {
+    fn auth_state(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> impl std::future::Future<Output = Result<AuthState, StoreError>> + Send {
+        std::future::ready(self.lockout_state(name, realm))
+    }
+
+    fn apply(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+        update: &AuthStateUpdate,
+    ) -> impl std::future::Future<Output = Result<AuthState, StoreError>> + Send {
+        std::future::ready(self.apply_lockout(name, realm, update))
     }
 }
 
@@ -1709,11 +1904,14 @@ mod tests {
         let master = master_key_from_password(realm, "master-password-for-dump-fixtures", 18)
             .expect("master");
         let path = temp("dump");
-        assert!(
-            FileStore::load_dump(&path, realm, &master, &entries, &policies, true, None).is_err()
-        );
-        FileStore::load_dump(&path, realm, &master, &entries, &policies, false, None)
-            .expect("load");
+        assert!(FileStore::load_dump(
+            &path, realm, &master, &entries, &policies, true, false, None
+        )
+        .is_err());
+        FileStore::load_dump(
+            &path, realm, &master, &entries, &policies, false, false, None,
+        )
+        .expect("load");
         assert!(!path.with_file_name("principal~").exists());
 
         let store = FileStore::open(&path, &master).expect("open");
@@ -1734,16 +1932,34 @@ mod tests {
         assert_eq!(reread.len(), entries.len() + policies.len());
 
         drop(store);
-        FileStore::load_dump(&path, realm, &master, &entries[1..2], &[], true, None)
-            .expect("update");
+        FileStore::load_dump(
+            &path,
+            realm,
+            &master,
+            &entries[1..2],
+            &[],
+            true,
+            false,
+            None,
+        )
+        .expect("update");
         let (after_update, after_update_policies) = FileStore::open(&path, &master)
             .expect("open")
             .dump_entries()
             .expect("dump");
         assert_eq!(after_update.len(), entries.len());
         assert_eq!(after_update_policies.len(), policies.len());
-        FileStore::load_dump(&path, realm, &master, &entries[..2], &[], false, None)
-            .expect("replace");
+        FileStore::load_dump(
+            &path,
+            realm,
+            &master,
+            &entries[..2],
+            &[],
+            false,
+            false,
+            None,
+        )
+        .expect("replace");
         let (replaced, replaced_policies) = FileStore::open(&path, &master)
             .expect("open")
             .dump_entries()
@@ -1774,6 +1990,7 @@ mod tests {
             &master,
             &entries,
             &policies,
+            false,
             false,
             None,
         )
@@ -1913,5 +2130,241 @@ mod tests {
         };
         assert_eq!(error.kind(), StoreErrorKind::Backend);
         assert!(error.message().contains("incorrect master key"));
+    }
+
+    fn failure(stamp: i64) -> AuthStateUpdate {
+        AuthStateUpdate::Failure {
+            stamp,
+            failcnt_interval: 0,
+            last_admin_unlock: None,
+        }
+    }
+
+    #[test]
+    fn lockout_fields_persist_in_the_entry_like_db2() {
+        let path = temp("lockout");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = FileStore::create(&path, "R", &master).expect("create");
+        let a = PrincipalName::new_principal("a");
+        store.put(user("a")).expect("put");
+        assert_eq!(
+            store.lockout_state(&a, "R").expect("state"),
+            AuthState::default()
+        );
+
+        store.apply_lockout(&a, "R", &failure(100)).expect("fail");
+        let after = store.apply_lockout(&a, "R", &failure(200)).expect("fail");
+        assert_eq!((after.fail_count, after.last_failed), (2, 200));
+
+        let reopened = FileStore::open(&path, &master).expect("open");
+        assert_eq!(reopened.lockout_state(&a, "R").expect("state"), after);
+        let raw = reopened.mit_entry(&a, "R").expect("entry").expect("a");
+        assert_eq!(
+            (raw.fail_auth_count, raw.last_failed, raw.last_success),
+            (2, 200, 0)
+        );
+        let (dumped, _) = reopened.dump_entries().expect("dump");
+        let dumped = dumped.iter().find(|e| e.principal == a).expect("a dumped");
+        assert_eq!((dumped.fail_auth_count, dumped.last_failed), (2, 200));
+
+        let success = AuthStateUpdate::Success {
+            stamp: 300,
+            clear_failures: true,
+            record_success: true,
+        };
+        reopened.apply_lockout(&a, "R", &success).expect("success");
+        let state = store.lockout_state(&a, "R").expect("state");
+        assert_eq!(
+            (state.fail_count, state.last_failed, state.last_success),
+            (0, 200, 300)
+        );
+    }
+
+    #[test]
+    fn lockout_update_of_a_missing_principal_writes_nothing() {
+        let path = temp("lockout_missing");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = FileStore::create(&path, "R", &master).expect("create");
+        let serial = store.serial();
+        let gone = PrincipalName::new_principal("gone");
+        assert_eq!(
+            store
+                .apply_lockout(&gone, "R", &failure(100))
+                .expect("apply"),
+            AuthState::default()
+        );
+        assert_eq!(store.serial(), serial);
+    }
+
+    #[test]
+    fn lockout_update_waits_for_another_writer() {
+        let path = temp("lockout_wait");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = Arc::new(FileStore::create(&path, "R", &master).expect("create"));
+        let a = PrincipalName::new_principal("a");
+        store.put(user("a")).expect("put");
+        let lock = sibling(&path, ".lock");
+        std::fs::write(&lock, b"").expect("hold lock");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::fs::remove_file(&lock).expect("release");
+        });
+        let state = store.apply_lockout(&a, "R", &failure(100)).expect("waited");
+        releaser.join().expect("join");
+        assert_eq!(state.fail_count, 1);
+    }
+
+    #[test]
+    fn rekey_and_unlock_zero_the_failure_count_other_changes_keep_it() {
+        let path = temp("lockout_admin");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = FileStore::create(&path, "R", &master).expect("create");
+        let a = PrincipalName::new_principal("a");
+        store.put(user("a")).expect("put");
+        store.apply_lockout(&a, "R", &failure(100)).expect("fail");
+
+        store
+            .update_record(&a, "R", |rec| {
+                rec.entry.max_life = Some(std::time::Duration::from_secs(3600));
+                Ok(())
+            })
+            .expect("modprinc");
+        let kept = store.lockout_state(&a, "R").expect("state");
+        assert_eq!((kept.fail_count, kept.last_failed), (1, 100));
+
+        store
+            .update_record(&a, "R", |rec| {
+                rec.entry.last_admin_unlock = Some(kerberos_time(500));
+                rec.unlock = true;
+                Ok(())
+            })
+            .expect("unlock");
+        let unlocked = store.lockout_state(&a, "R").expect("state");
+        assert_eq!((unlocked.fail_count, unlocked.last_failed), (0, 100));
+
+        store.apply_lockout(&a, "R", &failure(600)).expect("fail");
+        store
+            .update_record(&a, "R", |rec| {
+                rec.entry.keys = random_keys(2, &[18]).expect("keys");
+                Ok(())
+            })
+            .expect("cpw");
+        let rekeyed = store.lockout_state(&a, "R").expect("state");
+        assert_eq!((rekeyed.fail_count, rekeyed.last_failed), (0, 600));
+    }
+
+    #[test]
+    fn only_an_unlock_request_zeroes_a_same_second_failure_count() {
+        let path = temp("lockout_reunlock");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = FileStore::create(&path, "R", &master).expect("create");
+        let a = PrincipalName::new_principal("a");
+        store.create_record(user("a"), None).expect("a");
+        let now = Utc::now().timestamp();
+        store
+            .update_record(&a, "R", |r| {
+                r.entry.last_admin_unlock = Some(kerberos_time(now));
+                r.unlock = true;
+                Ok(())
+            })
+            .expect("unlock");
+        store.apply_lockout(&a, "R", &failure(now)).expect("fail");
+        assert_eq!(store.lockout_state(&a, "R").expect("state").fail_count, 1);
+        store
+            .update_record(&a, "R", |r| {
+                r.entry.max_life = Some(std::time::Duration::from_secs(3600));
+                Ok(())
+            })
+            .expect("ordinary edit");
+        assert_eq!(store.lockout_state(&a, "R").expect("state").fail_count, 1);
+        store
+            .update_record(&a, "R", |r| {
+                r.entry.last_admin_unlock = Some(kerberos_time(now));
+                r.unlock = true;
+                Ok(())
+            })
+            .expect("unlock again");
+        assert_eq!(store.lockout_state(&a, "R").expect("state").fail_count, 0);
+    }
+
+    #[test]
+    fn load_takes_dumped_lockout_fields_and_merge_nra_keeps_the_current_ones() {
+        let path = temp("lockout_load");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = FileStore::create(&path, "R", &master).expect("create");
+        let a = PrincipalName::new_principal("a");
+        store.put(user("a")).expect("put");
+        store.apply_lockout(&a, "R", &failure(100)).expect("fail");
+        let (mut entries, policies) = store.dump_entries().expect("dump");
+        let dumped = entries.iter_mut().find(|e| e.principal == a).expect("a");
+        dumped.fail_auth_count = 3;
+        dumped.last_failed = 700;
+        drop(store);
+
+        FileStore::load_dump(&path, "R", &master, &entries, &policies, false, true, None)
+            .expect("merge_nra load");
+        let store = FileStore::open(&path, &master).expect("open");
+        let merged = store.lockout_state(&a, "R").expect("state");
+        assert_eq!((merged.fail_count, merged.last_failed), (1, 100));
+        drop(store);
+
+        FileStore::load_dump(&path, "R", &master, &entries, &policies, false, false, None)
+            .expect("load");
+        let store = FileStore::open(&path, &master).expect("open");
+        let loaded = store.lockout_state(&a, "R").expect("state");
+        assert_eq!((loaded.fail_count, loaded.last_failed), (3, 700));
+    }
+
+    #[test]
+    fn replayed_iprop_updates_keep_the_replica_lockout_fields() {
+        let path = temp("lockout_replay");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let iprop = IpropConfig {
+            enabled: true,
+            logfile: path.with_extension("ulog"),
+            ulogsize: 100,
+        };
+        let primary = FileStore::create(&path, "R", &master)
+            .expect("create")
+            .with_iprop(&iprop)
+            .expect("ulog");
+        let a = PrincipalName::new_principal("a");
+        primary.create_record(user("a"), None).expect("a");
+        let replica_path = path.with_file_name("replica");
+        let (entries, policies) = primary.dump_entries().expect("dump");
+        FileStore::load_dump(
+            &replica_path,
+            "R",
+            &master,
+            &entries,
+            &policies,
+            false,
+            false,
+            None,
+        )
+        .expect("load");
+        let replica = FileStore::open(&replica_path, &master)
+            .expect("open")
+            .with_iprop(&IpropConfig {
+                logfile: replica_path.with_extension("ulog"),
+                ..iprop.clone()
+            })
+            .expect("replica ulog");
+        replica.apply_lockout(&a, "R", &failure(100)).expect("fail");
+
+        let log = primary.ulog().expect("ulog");
+        let start = log.get_last().expect("last");
+        primary
+            .update_record(&a, "R", |r| {
+                r.entry.max_life = Some(std::time::Duration::from_secs(3600));
+                Ok(())
+            })
+            .expect("modify");
+        let (_, updates, _) = log.get_entries(&start).expect("entries");
+        assert_eq!(updates.len(), 1);
+        replica.replay_updates(&updates).expect("replay");
+        let raw = replica.mit_entry(&a, "R").expect("entry").expect("a");
+        assert_eq!((raw.fail_auth_count, raw.last_failed), (1, 100));
+        assert_eq!(raw.max_life, 3600);
     }
 }

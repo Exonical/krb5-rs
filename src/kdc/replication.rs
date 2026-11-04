@@ -483,6 +483,7 @@ impl StoredPrincipal {
             ..self.clone()
         };
         let record = PrincipalRecord {
+            unlock: false,
             entry: keyless.into_entry(keys)?,
             last_pwd_change: self.last_pwd_change.map(kerberos_time),
             mod_time: self.mod_time.map(kerberos_time),

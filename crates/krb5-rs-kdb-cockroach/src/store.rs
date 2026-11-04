@@ -1029,6 +1029,7 @@ impl CockroachStore {
         let (last_pwd_change, mod_time) = (sp.last_pwd_change, sp.mod_time);
         let history = sp.password_history()?;
         Ok(PrincipalRecord {
+            unlock: false,
             entry: sp.into_entry(&self.master_keys())?,
             last_pwd_change: last_pwd_change.map(kt),
             mod_time: mod_time.map(kt),
@@ -1429,6 +1430,7 @@ impl AdminStore for CockroachStore {
                     let previous = sp.clone();
                     let history = sp.password_history()?;
                     let mut rec = PrincipalRecord {
+                        unlock: false,
                         entry: sp.into_entry(master)?,
                         last_pwd_change: last_pwd.map(kt),
                         mod_time: mod_time.map(kt),

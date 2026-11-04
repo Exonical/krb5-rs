@@ -611,6 +611,7 @@ pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreErr
         get_u32_tl(entry, LAST_ADMIN_UNLOCK)?.map(|time| kerberos_time(i64::from(time)));
     let (policy, password_history) = policy_and_history_from_tl(entry)?;
     Ok(PrincipalRecord {
+        unlock: false,
         entry: PrincipalEntry {
             name: entry.principal.clone(),
             realm: entry.realm.clone(),
@@ -1233,6 +1234,7 @@ mod tests {
             last_admin_unlock: None,
         };
         let record = PrincipalRecord {
+            unlock: false,
             entry,
             last_pwd_change: None,
             mod_time: Some(kerberos_time(42)),

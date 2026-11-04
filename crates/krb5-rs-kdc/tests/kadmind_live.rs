@@ -84,6 +84,9 @@ fn mit_kpropd_follows(library: &str) {
         "kadmind interop script failed\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if library == "krb5-rs-file" {
+        assert!(stdout.contains("file-store lockout ok"), "{stdout}");
+    }
 }
 
 const SCRIPT: &str = r#"
@@ -181,6 +184,28 @@ P=$(p kproplog -h | awk '/Last serial #/ {print $NF}')
 R2=$(r kproplog -h | awk '/Last serial #/ {print $NF}')
 [ "$P" = "$R2" ] || fail "serials differ: primary $P replica $R2"
 echo "incremental ok (serial $P)"
+
+if [ "$PLIB" = krb5-rs-file ]; then
+  # db2 keeps last_success, last_failed and fail_auth_count in the entry.
+  printf 'carol-pw\ncarol-pw\n' | p $BIN/krb5-rs-kdb -r $R addprinc carol >/dev/null
+  p $BIN/krb5-rs-kdb -r $R modprinc +requires_preauth carol >/dev/null
+  lockout() { p $BIN/krb5-rs-kdb -r $R dump "$B/lockout.dump" && awk -F'\t' -v n="carol@$R" '$7 == n {print $13, $14, $15}' "$B/lockout.dump"; }
+  bad_kinit() { if echo wrong-pw | kinit -c "$B/cc_bad" carol >/dev/null 2>&1; then fail "wrong password accepted"; fi; }
+  bad_kinit
+  set -- $(lockout)
+  [ "$3" = 1 ] && [ "$2" != 0 ] || fail "lockout after one failure: $*"
+  kill "$(cat $B/kdc.pid)"; sleep 0.5
+  p $BIN/krb5-rs-kdc --realm $R >> "$B/kdc.log" 2>&1 &
+  echo $! > $B/kdc.pid
+  wait_port 18889 || fail "kdc did not restart"
+  bad_kinit
+  set -- $(lockout)
+  [ "$3" = 2 ] || fail "lockout count lost across a KDC restart: $*"
+  echo carol-pw | kinit -c "$B/cc_good" carol >/dev/null || fail "carol kinit"
+  set -- $(lockout)
+  [ "$3" = 0 ] && [ "$1" != 0 ] || fail "lockout after success: $*"
+  echo "file-store lockout ok"
+fi
 
 echo KADMIND_LIVE_OK
 "#;

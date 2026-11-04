@@ -431,6 +431,9 @@ pub struct PrincipalRecord {
     /// kadm5 password history; `None` when the backend does not store it
     /// (the file and CockroachDB stores), which then ignore it on write.
     pub password_history: Option<PasswordHistory>,
+    /// The update is a kadm5 `-unlock` (`KADM5_FAIL_AUTH_COUNT`), which
+    /// zeroes a stored `fail_auth_count`. Not stored.
+    pub unlock: bool,
 }
 
 /// kadm5 password history, the `osa_princ_ent_rec` old-key queue
