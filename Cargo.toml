@@ -25,6 +25,8 @@ sha2 = "0.11"
 md-5 = "0.11"              # Legacy RC4-HMAC + GSSAPI channel bindings
 pbkdf2 = "0.13"
 subtle = "2"               # Constant-time comparison
+# SPAKE preauth edwards25519 group (MIT plugins/preauth/spake)
+curve25519-dalek = "4.1"
 rand = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 
@@ -48,9 +50,9 @@ rsa = { version = "=0.10.0-rc.18", features = ["sha2"], optional = true }
 # rsa rc.18 builds only against pkcs1 0.8.0-rc.4; rc.5 changed RsaPrivateKey
 # generics, and `^0.8.0-rc.4` would otherwise resolve to it.
 pkcs1 = { version = "=0.8.0-rc.4", optional = true }
-p256 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"], optional = true }
-p384 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"], optional = true }
-p521 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"], optional = true }
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"] }
+p384 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"] }
+p521 = { version = "0.14", features = ["ecdh", "ecdsa", "pem"] }
 crypto-bigint = { version = "0.7", optional = true }
 rasn-pkix = { version = "0.28", optional = true }
 
@@ -74,9 +76,6 @@ gssapi = []                # GSSAPI/SPNEGO mechanism
 pkinit = [
     "dep:rsa",
     "dep:pkcs1",
-    "dep:p256",
-    "dep:p384",
-    "dep:p521",
     "dep:crypto-bigint",
     "dep:rasn-pkix",
 ]  # PKINIT (X.509 + Kerberos)

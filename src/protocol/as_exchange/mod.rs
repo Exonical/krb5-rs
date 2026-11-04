@@ -86,6 +86,10 @@ pub struct AsExchangeConfig {
     /// get_in_tkt.c:1376-1384), to find the realm of the client it
     /// identifies. Default: none.
     pub subject_cert: Option<Vec<u8>>,
+    /// SPAKE groups the client permits, most preferred first
+    /// (`[libdefaults] spake_preauth_groups`; MIT default `edwards25519`).
+    /// Empty disables SPAKE.
+    pub spake_groups: Vec<crate::spake::Group>,
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -111,6 +115,7 @@ impl Default for AsExchangeConfig {
             pkinit: None,
             identify_realm: false,
             subject_cert: None,
+            spake_groups: vec![crate::spake::Group::Edwards25519],
         }
     }
 }
@@ -272,6 +277,8 @@ pub struct AsExchange {
     /// Freshness token from the KDC (RFC 8070).
     #[cfg(feature = "pkinit")]
     freshness_token: Option<Vec<u8>>,
+    /// SPAKE client state for this request (MIT `spake_client.c` reqstate).
+    spake: spake::SpakeClientState,
 }
 
 /// KDC time offset learned from a preauth error (MIT `pa_offset_state`).
@@ -320,6 +327,7 @@ impl AsExchange {
             pkinit_keypair: None,
             #[cfg(feature = "pkinit")]
             freshness_token: None,
+            spake: spake::SpakeClientState::default(),
         }
     }
 
@@ -587,9 +595,11 @@ impl AsExchange {
             }
         }
 
-        let pa = self.select_preauth(&method)?;
+        let req_body = self.new_req_body()?;
+        let body_der = rasn::der::encode(&req_body)?;
+        let pa = self.select_preauth(&method, &body_der)?;
         self.preauth_sent = true;
-        let (as_req_der, req_body) = self.build_as_req(Some(vec![pa]))?;
+        let (as_req_der, req_body) = self.build_as_req_from(req_body, Some(vec![pa]))?;
         self.last_req_body = Some(req_body);
         self.last_req_bytes = as_req_der.clone();
         Ok(StepResult::SendToKdc {
@@ -601,12 +611,13 @@ impl AsExchange {
     /// Pick the first real preauth mechanism the method data offers that we
     /// can answer (MIT `process_pa_data` walks the KDC list in order and
     /// stops at the first real mechanism that succeeds, preauth2.c:650-735).
-    fn select_preauth(&mut self, method: &[PaData]) -> Result<PaData, Krb5Error> {
-        let hint = || PreauthHint {
+    fn select_preauth(&mut self, method: &[PaData], body_der: &[u8]) -> Result<PaData, Krb5Error> {
+        let hint = PreauthHint {
             etype: self.last_preauth_etype.unwrap_or(18),
             salt: self.last_preauth_salt.clone(),
             s2kparams: self.last_s2kparams.clone(),
         };
+        let hint = || hint.clone();
         #[cfg(feature = "pkinit")]
         if self.pkinit_offered(method) {
             self.selected_preauth_type = Some(crate::pkinit::server::PA_PK_AS_REQ);
@@ -636,6 +647,23 @@ impl AsExchange {
                     let out = build_pa_encrypted_challenge(&armor_key, &as_key, ts, Some(usec))?;
                     self.selected_preauth_type = Some(t);
                     return Ok(out);
+                }
+                t if t == PaDataType::Spake as i32 => {
+                    if self.preauth_failed.contains(&t) {
+                        continue;
+                    }
+                    if self.config.spake_groups.is_empty() {
+                        continue;
+                    }
+                    match self.spake_process(pa.padata_value.as_ref(), body_der, &hint())? {
+                        Some(out) => {
+                            self.selected_preauth_type = Some(t);
+                            return Ok(out);
+                        }
+                        // preauth2.c:704-709 — a real mechanism that fails
+                        // is not tried again.
+                        None => self.preauth_failed.push(t),
+                    }
                 }
                 t if t == PaDataType::EncTimestamp as i32 => {
                     if self.preauth_failed.contains(&t) {
@@ -670,6 +698,7 @@ pub(crate) use crate::protocol::validate::now_kerberos;
 mod pkinit;
 mod reply;
 mod request;
+mod spake;
 
 #[cfg(test)]
 mod tests;

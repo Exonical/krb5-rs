@@ -48,7 +48,13 @@ impl AsExchange {
         let pkinit_key = self.pkinit_reply_key(rep)?;
         #[cfg(not(feature = "pkinit"))]
         let pkinit_key: Option<EncryptionKey> = None;
-        let as_key = match pkinit_key {
+        // spake_client.c:260 `set_as_key` — K'[0] replaces the AS key.
+        let spake_key = self
+            .spake
+            .as_key()
+            .filter(|_| self.selected_preauth_type == Some(crate::spake::PA_SPAKE))
+            .cloned();
+        let as_key = match pkinit_key.or(spake_key) {
             Some(key) => key,
             None => {
                 let (salt, s2kparams) = self.compute_reply_key_params(rep);
@@ -214,6 +220,7 @@ impl AsExchange {
         self.preauth_failed.clear();
         self.loop_count = 0;
         self.preauth_sent = false;
+        self.spake = super::spake::SpakeClientState::default();
         let do_fast = self.config.fast.required() || fast_upgrade;
         self.reset_fast_state(do_fast)?;
         let (as_req_der, req_body) = self.build_as_req(None)?;

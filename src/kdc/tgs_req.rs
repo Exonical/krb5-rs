@@ -701,6 +701,7 @@ impl<S: PrincipalStore> Kdc<S> {
         }
         // check_kdcpolicy_tgs (do_tgs_req.c:919-925).
         self.check_kdcpolicy(
+            &[],
             true,
             None,
             Some((&header.cname, &client_realm)),

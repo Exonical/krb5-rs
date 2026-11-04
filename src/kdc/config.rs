@@ -384,6 +384,24 @@ impl RealmConfig {
         kdc.disable_pac = kdc_conf.get_boolean(&["realms", realm, "disable_pac"], false)?;
         kdc.restrict_anonymous_to_tgt =
             kdc_conf.get_boolean(&["realms", realm, "restrict_anonymous_to_tgt"], false)?;
+        // spake_kdc.c `spake_init` / groups.c `group_init_state`: the KDC
+        // profile is kdc.conf over krb5.conf. A challenge group that is not
+        // permitted fails the module's initialization, disabling SPAKE.
+        let both = |path: &[&str]| {
+            kdc_conf
+                .get_string(path)
+                .or_else(|| krb5_conf.and_then(|p| p.get_string(path)))
+        };
+        kdc.spake_groups = crate::spake::parse_groups(
+            &both(&["libdefaults", "spake_preauth_groups"]).unwrap_or_default(),
+        );
+        if let Some(name) = both(&["kdcdefaults", "spake_preauth_kdc_challenge"]) {
+            match crate::spake::Group::from_name(&name).filter(|g| kdc.spake_groups.contains(g)) {
+                Some(g) => kdc.spake_challenge = Some(g),
+                None => kdc.spake_groups.clear(),
+            }
+        }
+        kdc.spake_indicators = kdc_conf.get_values(&["realms", realm, "spake_preauth_indicator"]);
         // The db2 module options live in `[dbmodules]` under the realm's
         // `database_module`, which defaults to the realm name (MIT
         // kdb5.c `get_conf_section`; kdb_db2.c:267-277).

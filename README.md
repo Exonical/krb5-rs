@@ -13,6 +13,7 @@ builds aws-lc and simsimd.
 - **GSSAPI/SPNEGO** — HTTP Negotiate authentication
 - **PKINIT** — X.509 certificate-based authentication, client and KDC (`pkinit` feature; DH/ECDH replies, MIT 1.22 parity)
 - **FAST** — Flexible Authentication via Secure Tunneling
+- **SPAKE** — MIT's SPAKE pre-authentication (PA-SPAKE), client and KDC: edwards25519, P-256, P-384 and P-521, MIT's encrypted PA-FX-COOKIE state, `spake_preauth_groups` / `spake_preauth_kdc_challenge` / `spake_preauth_indicator`. The client permits `edwards25519` by default (`AsExchangeConfig::spake_groups`); the KDC leaves SPAKE off until `KdcConfig::spake_groups` is set, as in MIT. Second factors are not implemented, as in MIT 1.22.
 - **Credential Cache** — Read/write ccache and keytab formats; MIT FILE, MEMORY, DIR, KEYRING (Linux) and KCM caches with `KRB5CCNAME`/`default_ccache_name` resolution and cache collections
 
 ## Why?
@@ -42,6 +43,7 @@ The core library is pure Rust and cross-compiles to musl.
 | [RFC 8636](https://www.rfc-editor.org/rfc/rfc8636) | PKINIT algorithm agility (KDFs, ECDH groups) | Client + KDC |
 | [RFC 8070](https://www.rfc-editor.org/rfc/rfc8070) | PKINIT freshness | Client + KDC |
 | [RFC 8062](https://www.rfc-editor.org/rfc/rfc8062) | Anonymous PKINIT (DH/ECDH only, PA-PKINIT-KX) | Client + KDC |
+| [draft-ietf-kitten-krb-spake-preauth](https://datatracker.ietf.org/doc/draft-ietf-kitten-krb-spake-preauth/) | SPAKE pre-authentication (MIT 1.22 interop) | Client + KDC |
 
 **Feature `test-pki`** (TESTING ONLY): embeds fixed RSA private keys and a certificate issuer used by the PKINIT tests and `examples/gen_pkinit_pki.rs`. Never enable it in production builds.
 

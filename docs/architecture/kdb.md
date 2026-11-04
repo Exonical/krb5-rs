@@ -1047,7 +1047,11 @@ in MIT, with a socket in place of the shared library:
   `KRB5KDC_ERR_POLICY`, "LOCAL_POLICY"). Each module's lifetime and renewable
   lifetime cap the end and renew-till times at the KDC time plus that many
   seconds (`update_ticket_times`). TGS checks also get the header ticket's
-  client. The KDC has no authentication indicators yet, so the list is empty.
+  client. The only authentication indicators are SPAKE's
+  (`spake_preauth_indicator`), passed to `check_as` after SPAKE
+  pre-authentication. Not yet like MIT: other mechanisms' indicators and
+  the AD-AUTHENTICATION-INDICATOR ticket authdata that carries them to TGS
+  requests.
 - **audit:** `kdc_start` runs when the KDC starts serving and `kdc_stop` on
   shutdown, after open connections finish. Every decoded AS or TGS request
   reports `as_req` or `tgs_req` with its outcome, describing the inner request

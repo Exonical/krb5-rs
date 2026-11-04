@@ -35,6 +35,7 @@ pub mod pac;
 pub mod pkinit;
 pub mod profile;
 pub mod protocol;
+pub mod spake;
 pub mod types;
 
 #[cfg(feature = "tokio")]

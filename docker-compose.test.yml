@@ -13,6 +13,10 @@ services:
       - "10189:10189/tcp"   # MIT GSS-API oracle (tests/kdc/gss_oracle.py)
       - "10190:8888/udp"    # KDC requiring PKINIT freshness (setup.sh)
       - "10190:8888/tcp"
+      - "10191:8889/udp"    # SPAKE KDC, no optimistic challenge (setup.sh)
+      - "10191:8889/tcp"
+      - "10192:8890/udp"    # SPAKE KDC, optimistic P-256 challenge
+      - "10192:8890/tcp"
     volumes:
       - ./tests/kdc/setup.sh:/setup.sh:ro
       - ./tests/kdc/gss_oracle.py:/gss_oracle.py:ro

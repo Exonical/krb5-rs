@@ -128,7 +128,11 @@ pub(crate) fn hint_list(
     hw_only: bool,
     armored: bool,
 ) -> Result<Vec<u8>, KdcError> {
-    hint_list_with(client, key, hw_only, armored, &[])
+    let cookie = PaData {
+        padata_type: PaDataType::FxCookie as i32,
+        padata_value: OctetString::from(b"MIT".to_vec()),
+    };
+    hint_list_with(client, key, hw_only, armored, &[], None, cookie)
 }
 
 /// [`hint_list`] with extra module hints (PKINIT's PA-PK-AS-REQ,
@@ -140,6 +144,8 @@ pub(crate) fn hint_list_with(
     hw_only: bool,
     armored: bool,
     extras: &[PaData],
+    spake: Option<PaData>,
+    cookie: PaData,
 ) -> Result<Vec<u8>, KdcError> {
     let empty = |t: PaDataType| PaData {
         padata_type: t as i32,
@@ -149,6 +155,8 @@ pub(crate) fn hint_list_with(
     if let Some(k) = key {
         list.push(etype_info2_padata(client, k)?);
         if !hw_only {
+            // MIT module order: SPAKE before encrypted challenge/timestamp.
+            list.extend(spake);
             list.push(empty(if armored {
                 PaDataType::EncryptedChallenge
             } else {
@@ -157,10 +165,7 @@ pub(crate) fn hint_list_with(
         }
     }
     list.extend(extras.iter().cloned());
-    list.push(PaData {
-        padata_type: PaDataType::FxCookie as i32,
-        padata_value: OctetString::from(b"MIT".to_vec()),
-    });
+    list.push(cookie);
     Ok(rasn::der::encode(&list)?)
 }
 

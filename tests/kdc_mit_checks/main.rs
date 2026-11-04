@@ -25,6 +25,7 @@ use rasn::types::{GeneralString, OctetString};
 mod as_req;
 mod errors;
 mod fast;
+mod spake;
 mod tgs_req;
 
 const REALM: &str = "TEST.REALM";
@@ -68,6 +69,8 @@ struct FixtureOptions {
     krbtgt_etypes: Option<Vec<i32>>,
     max_life: Option<Duration>,
     max_renewable_life: Option<Duration>,
+    spake_groups: Vec<krb5_rs::spake::Group>,
+    spake_challenge: Option<krb5_rs::spake::Group>,
 }
 
 async fn first_key(store: &MemoryStore, name: &PrincipalName, etype: i32) -> EncryptionKey {
@@ -184,6 +187,8 @@ async fn fixture_with_gate(opts: FixtureOptions, gate: impl ConsistencyGate + 's
     let service_key = first_key(&store, &service(), 18).await;
 
     let mut config = KdcConfig::new(REALM);
+    config.spake_groups = opts.spake_groups.clone();
+    config.spake_challenge = opts.spake_challenge;
     config.max_renewable_life = opts
         .max_renewable_life
         .unwrap_or(Duration::from_secs(7 * 24 * 3600));
