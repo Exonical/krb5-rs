@@ -716,6 +716,7 @@ impl<S: AdminStore> AdminOps<S> {
             .update_principal(name, realm, move |rec| {
                 let had_policy = rec.entry.policy.is_some();
                 let bumped = Self::apply_options(&mut rec.entry, &opts);
+                rec.unlock = opts.unlock;
                 let before = rec.entry.pw_expiration;
                 if opts.pw_expiration.is_none() {
                     if let Some(policy) = &new_policy {

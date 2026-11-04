@@ -303,6 +303,7 @@ impl LmdbStore {
         };
         let creator_key = unparse_name(&creator, realm);
         let km_record = PrincipalRecord {
+            unlock: false,
             entry: PrincipalEntry {
                 name: master_principal.clone(),
                 realm: realm.to_owned(),
@@ -341,6 +342,7 @@ impl LmdbStore {
             tgt_keys.push(key);
         }
         let tgt_record = PrincipalRecord {
+            unlock: false,
             entry: PrincipalEntry {
                 name: tgt_principal.clone(),
                 realm: realm.to_owned(),
@@ -873,6 +875,7 @@ impl LmdbStore {
         self.refresh_master()?;
         let key = unparse_name(&entry.name, &entry.realm);
         let record = PrincipalRecord {
+            unlock: false,
             mod_time: Some(now_time()),
             last_pwd_change,
             mod_by: Some(modifier.clone()),

@@ -379,21 +379,14 @@ fn kdb_of_mit(
 /// `kadm5_chpass_principal`, `kadm5_randkey_principal`,
 /// `kadm5_setkey_principal` and `kadm5_modify_principal` do
 /// (`svr_principal.c:677, 1344, 1474, 1736`).
-fn carry_lockout(record: &mut KdbPrincipal, previous: &KdbPrincipal) {
+fn carry_lockout(record: &mut KdbPrincipal, previous: &KdbPrincipal, unlock: bool) {
     let mut state = lockout_of(previous);
     let rekeyed = record.keys.len() != previous.keys.len()
         || record.keys.iter().zip(&previous.keys).any(|(a, b)| {
             (a.kvno, a.enctype, a.mkvno, a.enc_key.as_ref())
                 != (b.kvno, b.enctype, b.mkvno, b.enc_key.as_ref())
         });
-    let unlock = record.last_admin_unlock.as_ref().map(ts);
-    // A new unlock time, or one no earlier than the last failure (a repeat
-    // unlock in the same second): failures not after the unlock are reset,
-    // as `locked_check_p` and `krb5_db2_lockout_audit` treat them
-    // (`lockout.c:101-104, 197-202`).
-    let unlocked = unlock != previous.last_admin_unlock.as_ref().map(ts)
-        || unlock.is_some_and(|u| state.last_failed <= u);
-    if rekeyed || unlocked {
+    if rekeyed || unlock {
         state.fail_count = 0;
     }
     set_lockout(record, state);
@@ -487,8 +480,15 @@ impl FileStore {
             keys: random_keys(1, tgt_etypes).map_err(|e| err(e.to_string()))?,
         };
         let principals = vec![
-            store.to_record(&km, Some(now), Some(now), None, &store.master_keys())?,
-            store.to_record(&tgs, Some(now), Some(now), None, &store.master_keys())?,
+            store.to_record(&km, Some(now), Some(now), None, &store.master_keys(), false)?,
+            store.to_record(
+                &tgs,
+                Some(now),
+                Some(now),
+                None,
+                &store.master_keys(),
+                false,
+            )?,
         ];
         let file = KdbFile {
             version: VERSION,
@@ -601,6 +601,7 @@ impl FileStore {
         mod_time: Option<KerberosTime>,
         previous: Option<&KdbPrincipal>,
         keys: &MasterKeys,
+        unlock: bool,
     ) -> Result<KdbPrincipal, StoreError> {
         let (pwd, modified) = (last_pwd_change.as_ref().map(ts), mod_time.as_ref().map(ts));
         let sp = match previous {
@@ -609,7 +610,7 @@ impl FileStore {
         };
         let mut record = kdb_of(&sp)?;
         if let Some(p) = previous {
-            carry_lockout(&mut record, p);
+            carry_lockout(&mut record, p, unlock);
         }
         Ok(record)
     }
@@ -626,6 +627,7 @@ impl FileStore {
         let sp = stored_of(r);
         let history = sp.password_history()?;
         Ok(PrincipalRecord {
+            unlock: false,
             entry: sp.into_entry(keys)?,
             last_pwd_change: to_time(&r.last_pwd_change),
             password_history: Some(history),
@@ -1027,6 +1029,7 @@ impl FileStore {
                 Some(kerberos_time(Utc::now().timestamp())),
                 pos.map(|i| &list[i]),
                 &keys,
+                false,
             )?;
             match pos {
                 Some(i) => list[i] = record,
@@ -1387,6 +1390,7 @@ impl FileStore {
                 Some(kerberos_time(Utc::now().timestamp())),
                 None,
                 &keys,
+                false,
             )?;
             let record = stamp(record, caller, &keys)?;
             let exists = list.iter().any(|p| {
@@ -1442,6 +1446,7 @@ impl FileStore {
                 rec.mod_time,
                 Some(&list[pos]),
                 &keys,
+                rec.unlock,
             )?;
             if let Some(history) = &rec.password_history {
                 let mut sp = stored_of(&record);
@@ -2227,6 +2232,7 @@ mod tests {
         store
             .update_record(&a, "R", |rec| {
                 rec.entry.last_admin_unlock = Some(kerberos_time(500));
+                rec.unlock = true;
                 Ok(())
             })
             .expect("unlock");
@@ -2245,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_unlock_in_the_same_second_zeroes_the_failure_count() {
+    fn only_an_unlock_request_zeroes_a_same_second_failure_count() {
         let path = temp("lockout_reunlock");
         let master = master_key_from_password("R", "m", 18).expect("master");
         let store = FileStore::create(&path, "R", &master).expect("create");
@@ -2255,6 +2261,7 @@ mod tests {
         store
             .update_record(&a, "R", |r| {
                 r.entry.last_admin_unlock = Some(kerberos_time(now));
+                r.unlock = true;
                 Ok(())
             })
             .expect("unlock");
@@ -2262,7 +2269,15 @@ mod tests {
         assert_eq!(store.lockout_state(&a, "R").expect("state").fail_count, 1);
         store
             .update_record(&a, "R", |r| {
+                r.entry.max_life = Some(std::time::Duration::from_secs(3600));
+                Ok(())
+            })
+            .expect("ordinary edit");
+        assert_eq!(store.lockout_state(&a, "R").expect("state").fail_count, 1);
+        store
+            .update_record(&a, "R", |r| {
                 r.entry.last_admin_unlock = Some(kerberos_time(now));
+                r.unlock = true;
                 Ok(())
             })
             .expect("unlock again");
