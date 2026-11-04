@@ -54,6 +54,15 @@ pub(super) enum ConnAddr {
     Unix(std::path::PathBuf),
 }
 
+/// `{raddr}` for a connection: socket type and address (trace.c).
+pub(super) fn raddr(t: Transport, a: &ConnAddr) -> String {
+    match a {
+        ConnAddr::Inet(s) => crate::trace::raddr(t != Transport::Udp, s),
+        #[cfg(unix)]
+        ConnAddr::Unix(p) => format!("stream {}", p.display()),
+    }
+}
+
 /// A started connection with its running task.
 pub(super) struct LiveConn {
     /// Connection id.
@@ -62,6 +71,8 @@ pub(super) struct LiveConn {
     pub transport: Transport,
     /// UDP socket for retransmission (None for TCP).
     pub udp: Option<Arc<UdpSocket>>,
+    /// Remote address, for tracing.
+    pub addr: ConnAddr,
     /// Task handle; abort to kill the connection.
     pub task: JoinHandle<()>,
     /// TCP conn has connected and written the request (READING state).
@@ -278,13 +289,14 @@ pub(super) fn start(
         }
         _ => {
             let msg = message.to_vec();
-            tokio::spawn(tcp_conn(id, idx, conn.addr, msg, tx))
+            tokio::spawn(tcp_conn(id, idx, conn.addr.clone(), msg, tx))
         }
     };
     LiveConn {
         id,
         transport: conn.transport,
         udp: conn.udp,
+        addr: conn.addr,
         task,
         established: false,
     }
@@ -309,19 +321,27 @@ async fn tcp_conn(
     message: Vec<u8>,
     tx: UnboundedSender<ConnEvent>,
 ) {
+    let ra = raddr(Transport::Tcp, &addr);
+    crate::k5trace!("Initiating TCP connection to {ra}");
+    let fail = |e: std::io::Error| {
+        crate::k5trace!("TCP error connecting to {ra}: {}", crate::trace::errno(&e));
+        let _ = tx.send(ConnEvent::Dead(id));
+    };
     match &addr {
         ConnAddr::Inet(a) => match TcpStream::connect(a).await {
-            Ok(s) => tcp_io(id, idx, s, message, tx).await,
-            Err(_) => {
-                let _ = tx.send(ConnEvent::Dead(id));
+            Ok(s) => {
+                crate::k5trace!("Sending TCP request to {ra}");
+                tcp_io(id, idx, s, message, tx).await
             }
+            Err(e) => fail(e),
         },
         #[cfg(unix)]
         ConnAddr::Unix(p) => match tokio::net::UnixStream::connect(p).await {
-            Ok(s) => tcp_io(id, idx, s, message, tx).await,
-            Err(_) => {
-                let _ = tx.send(ConnEvent::Dead(id));
+            Ok(s) => {
+                crate::k5trace!("Sending TCP request to {ra}");
+                tcp_io(id, idx, s, message, tx).await
             }
+            Err(e) => fail(e),
         },
     }
 }

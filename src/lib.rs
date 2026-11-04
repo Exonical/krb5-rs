@@ -38,6 +38,7 @@ pub mod plugin;
 pub mod profile;
 pub mod protocol;
 pub mod spake;
+pub mod trace;
 pub mod types;
 
 #[cfg(feature = "tokio")]

@@ -7,7 +7,8 @@ use bitflags::bitflags;
 
 use super::canonprinc::CanonPrinc;
 use super::KerberosClient;
-use crate::ccache::{CcCredential, CcError, Ccache, MatchCred, MatchFlags};
+use crate::ccache::{AnyCcache, CcContext, CcCredential, CcError, Ccache, MatchCred, MatchFlags};
+use crate::profile::Profile;
 use crate::protocol::ap::ApError;
 use crate::protocol::{Credential, TgsExchange, TgsOptions};
 use crate::transport::KdcTransport;
@@ -283,6 +284,31 @@ impl<T: KdcTransport> KerberosClient<T> {
             }
         }
         Err(last.unwrap_or(invalid("no candidate server principal")))
+    }
+
+    /// [`get_credentials`](Self::get_credentials) for `server@srealm`
+    /// with no cache given: the cache comes from
+    /// [`select_cache`](crate::ccache::select_cache) (ccselect, then the
+    /// default cache), and its principal is the client, as for an MIT GSS
+    /// initiator with the default credential. Returns the cache used.
+    pub async fn get_default_credentials(
+        &self,
+        ctx: &CcContext,
+        profile: Option<&Profile>,
+        options: GcOptions,
+        server: PrincipalName,
+        srealm: &str,
+    ) -> Result<(AnyCcache, Credential), Krb5Error> {
+        let mut cache = crate::ccache::select_cache(ctx, profile, &server, srealm)?;
+        let (client, crealm) = cache.principal()?;
+        crate::k5trace!(
+            "Getting credentials {} using ccache {}",
+            crate::trace::creds(&client, &crealm, &server, srealm),
+            cache.name()
+        );
+        let req = CredsRequest::new(client, crealm, server, srealm);
+        let cred = self.get_credentials(&mut cache, options, &req).await?;
+        Ok((cache, cred))
     }
 
     /// `begin` through the referral states for one server candidate.

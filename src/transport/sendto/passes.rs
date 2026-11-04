@@ -97,6 +97,10 @@ pub(super) async fn run(
         for i in 0..live.len() {
             if live[i].transport == Transport::Udp {
                 let id = live[i].id;
+                crate::k5trace!(
+                    "Sending retry UDP request to {}",
+                    conn::raddr(live[i].transport, &live[i].addr)
+                );
                 if !conn::retransmit(&live[i], message).await {
                     kill(&mut live, id);
                     continue;
@@ -138,6 +142,12 @@ async fn start_conn(
     *next_id += 1;
     let is_udp = p.transport == Transport::Udp;
     let c = conn::start(id, p, message, tx.clone());
+    if is_udp {
+        crate::k5trace!(
+            "Sending initial UDP request to {}",
+            conn::raddr(c.transport, &c.addr)
+        );
+    }
     if is_udp && !conn::retransmit(&c, message).await {
         c.task.abort();
         return;
@@ -191,6 +201,13 @@ async fn wait_window(
                 // MIT records the responding server on receipt, before the
                 // accept verdict (krb5int_sendtokdc kdclist_add).
                 *last_reply = Some((idx, t));
+                if let Some(c) = live.iter().find(|c| c.id == id) {
+                    crate::k5trace!(
+                        "Received answer ({} bytes) from {}",
+                        data.len(),
+                        conn::raddr(c.transport, &c.addr)
+                    );
+                }
                 if accept(&data) {
                     return Some(KdcReply {
                         data,
