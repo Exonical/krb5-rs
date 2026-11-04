@@ -21,6 +21,9 @@ use crate::types::PrincipalName;
 pub const LNAME_NOTRANS: i32 = rpc::ERROR_TABLE_BASE_KRB5 + 176;
 /// `KRB5_CONFIG_BADFORMAT`.
 pub const CONFIG_BADFORMAT: i32 = rpc::ERROR_TABLE_BASE_KRB5 + 136;
+/// `KRB5_ERR_NO_SERVICE`: a module that has gone away or answered
+/// malformed data, which fails closed.
+const NO_SERVICE: i32 = rpc::ERROR_TABLE_BASE_KRB5 + 245;
 /// `KRB5_PLUGIN_BAD_MODULE_SPEC`.
 const PLUGIN_BAD_MODULE_SPEC: i32 = -1_750_600_192 + 1;
 /// [`rpc::call::INITIALIZE`]'s string for a localauth module.
@@ -213,9 +216,9 @@ fn load_modules(profile: &Profile) -> Result<Vec<Module>, i32> {
                     continue;
                 };
                 let types = match conn.call(&Message::new(call::AN2LN_TYPES)) {
-                    Ok(Ok(mut a)) => match a.get_strs() {
-                        Ok(t) => t,
-                        Err(_) => continue,
+                    Ok(Ok(mut a)) => match (a.get_strs(), a.finish()) {
+                        (Ok(t), Ok(())) => t,
+                        _ => continue,
                     },
                     _ => continue,
                 };
@@ -317,13 +320,14 @@ impl<'a> Localauth<'a> {
                     .put_str(residual)
                     .put_str(Some(&crate::ccache::unparse_name(aname, realm)));
                 return match conn.call(&req) {
-                    Ok(Ok(mut a)) => match a.get_str() {
-                        Ok(Some(l)) => Ok(l),
-                        _ => Err(NoTranslation),
+                    Ok(Ok(mut a)) => match (a.get_str(), a.finish()) {
+                        (Ok(Some(l)), Ok(())) => Ok(l),
+                        _ => Err(LocalauthError::Code(NO_SERVICE)),
                     },
                     Ok(Err((c, _))) => Err(LocalauthError::from_code(c)),
-                    // A module that has gone away has no translation.
-                    Err(_) => Err(NoTranslation),
+                    // A module that has gone away stops the mapping rather
+                    // than letting a later module map the principal.
+                    Err(_) => Err(LocalauthError::Code(NO_SERVICE)),
                 };
             }
         };
@@ -344,9 +348,11 @@ impl<'a> Localauth<'a> {
                 req.put_str(Some(&crate::ccache::unparse_name(aname, realm)))
                     .put_str(Some(lname));
                 return match conn.call(&req) {
-                    Ok(Ok(_)) => Userok::Accept,
-                    Ok(Err((PLUGIN_NO_HANDLE, _))) | Err(_) => Userok::NoHandle,
-                    Ok(Err(_)) => Userok::Deny,
+                    Ok(Ok(a)) if a.finish().is_ok() => Userok::Accept,
+                    Ok(Err((PLUGIN_NO_HANDLE, _))) => Userok::NoHandle,
+                    // A denial, a malformed answer, or a module that has
+                    // gone away: fail closed.
+                    _ => Userok::Deny,
                 };
             }
         };

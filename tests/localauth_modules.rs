@@ -74,6 +74,21 @@ impl LocalauthModule for Conflict {
     }
 }
 
+/// Allows everything, but its connection drops on the first `userok`, as
+/// if the module process died.
+struct Dies;
+impl LocalauthModule for Dies {
+    fn name(&self) -> &str {
+        "dies"
+    }
+    fn userok(&self, _: &str, _: &str) -> Result<(), i32> {
+        panic!("module died");
+    }
+    fn an2ln(&self, _: Option<&str>, _: Option<&str>, _: &str) -> Result<String, i32> {
+        panic!("module died");
+    }
+}
+
 fn listen(dir: &std::path::Path, name: &str, m: Arc<dyn LocalauthModule>) -> PathBuf {
     let path = dir.join(format!("{name}.sock"));
     let l = UnixListener::bind(&path).unwrap();
@@ -149,6 +164,19 @@ fn t_localauth_modules() {
     )
     .unwrap();
     assert_eq!(an2ln(&p, "user@KRBTEST.COM").as_deref(), Ok("user"));
+    // A module that goes away fails closed: no later module may accept or map.
+    let d = listen(&dir, "dies", Arc::new(Dies));
+    let p = Profile::parse(&format!(
+        "[libdefaults]\n default_realm = KRBTEST.COM\n\
+         [plugins]\n localauth = {{\n  module = dies:unix:path={}\n  disable = k5login\n }}\n",
+        d.display()
+    ))
+    .unwrap();
+    assert!(!userok(&p, "a@KRBTEST.COM", "a"));
+    assert_eq!(
+        an2ln(&p, "a@KRBTEST.COM"),
+        Err(LocalauthError::Code(NO_SERVICE))
+    );
     // A malformed module spec fails like MIT's load_localauth_modules.
     let p = Profile::parse("[plugins]\n localauth = {\n  module = bad\n }\n").unwrap();
     assert!(matches!(
