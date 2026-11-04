@@ -164,9 +164,22 @@ impl LocatedTransport {
             locator.locate_kdc(realm, self.use_primary(), no_udp)?
         };
         let mut last: Option<(usize, Transport)> = None;
-        let result =
-            sendto::sendto_kdc_track(&servers, message, no_udp, &self.inner.cfg, Some(&mut last))
-                .await;
+        let https = Arc::new(sendto::HttpsTarget {
+            realm: realm.to_string(),
+            anchors: self
+                .inner
+                .profile
+                .get_values(&["realms", realm, "http_anchors"]),
+        });
+        let result = sendto::sendto_kdc_track(
+            &servers,
+            message,
+            no_udp,
+            &self.inner.cfg,
+            Some(&mut last),
+            Some(https),
+        )
+        .await;
         // Record the last server that produced a reply, accepted or not
         // (MIT kdclist_add runs when a response is received).
         if let Some((idx, t)) = last {

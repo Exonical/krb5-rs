@@ -6,7 +6,22 @@
 //! behavior.
 
 mod conn;
+#[cfg(feature = "kkdcp")]
+mod https;
 mod passes;
+
+#[cfg(feature = "kkdcp")]
+pub use https::HttpsTarget;
+
+/// Without the `kkdcp` feature, HTTPS entries are skipped.
+#[cfg(not(feature = "kkdcp"))]
+#[derive(Debug, Clone, Default)]
+pub struct HttpsTarget {
+    /// Realm.
+    pub realm: String,
+    /// `http_anchors`.
+    pub anchors: Vec<String>,
+}
 
 use std::time::Duration;
 
@@ -153,7 +168,7 @@ pub async fn sendto(
         Strategy::UdpLast => (false, true),
         Strategy::NoUdp => (true, false),
     };
-    let (ready, deferred) = conn::resolve(servers, no_udp, udp_last).await;
+    let (ready, deferred) = conn::resolve(servers, no_udp, udp_last, None).await;
     passes::run(ready, deferred, message, cfg, accept, &mut None).await
 }
 
@@ -168,7 +183,7 @@ pub async fn sendto_kdc(
     no_udp: bool,
     cfg: &SendtoConfig,
 ) -> Result<KdcReply, SendtoError> {
-    sendto_kdc_track(servers, message, no_udp, cfg, None).await
+    sendto_kdc_track(servers, message, no_udp, cfg, None, None).await
 }
 
 /// `sendto_kdc` additionally reporting the `(server_index, transport)` of
@@ -180,6 +195,7 @@ pub(crate) async fn sendto_kdc_track(
     no_udp: bool,
     cfg: &SendtoConfig,
     mut last_reply: Option<&mut Option<(usize, Transport)>>,
+    https: Option<std::sync::Arc<HttpsTarget>>,
 ) -> Result<KdcReply, SendtoError> {
     let strategy = strategy_for(message.len(), no_udp, cfg.udp_preference_limit);
     let saw_svc_unavail = std::sync::atomic::AtomicBool::new(false);
@@ -201,7 +217,7 @@ pub(crate) async fn sendto_kdc_track(
         Strategy::UdpLast => (false, true),
         Strategy::NoUdp => (true, false),
     };
-    let (ready, deferred) = conn::resolve(servers, no_udp_s, udp_last).await;
+    let (ready, deferred) = conn::resolve(servers, no_udp_s, udp_last, https).await;
     let mut last = None;
     let slot = match last_reply.as_mut() {
         Some(r) => &mut **r,
