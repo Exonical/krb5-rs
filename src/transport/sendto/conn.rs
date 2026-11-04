@@ -40,6 +40,9 @@ pub(super) struct PendingConn {
     pub udp: Option<Arc<UdpSocket>>,
     /// Remote socket address (TCP; also kept for UDP bookkeeping).
     pub addr: ConnAddr,
+    /// Server name, port, path and realm, for HTTPS connections.
+    #[cfg(feature = "kkdcp")]
+    pub https: Option<Arc<super::https::HttpsPeer>>,
 }
 
 #[derive(Clone)]
@@ -71,6 +74,7 @@ fn entry_transports(
     t: Transport,
     no_udp: bool,
     udp_last: bool,
+    https: bool,
 ) -> (Vec<Transport>, Vec<Transport>) {
     match t {
         Transport::Udp => {
@@ -98,8 +102,8 @@ fn entry_transports(
                 (vec![Transport::Udp], vec![Transport::Tcp])
             }
         }
-        // KKDCP is not implemented; skip the entry like an unsupported
-        // transport rather than failing the whole request.
+        // Never deferred (resolve_server); skipped without a target.
+        Transport::Https if https => (vec![Transport::Https], Vec::new()),
         Transport::Https => (Vec::new(), Vec::new()),
     }
 }
@@ -113,17 +117,23 @@ pub(super) async fn resolve(
     servers: &[ServerEntry],
     no_udp: bool,
     udp_last: bool,
+    https: Option<Arc<super::HttpsTarget>>,
 ) -> (Vec<PendingConn>, Vec<PendingConn>) {
     let mut ready = Vec::new();
     let mut deferred = Vec::new();
     for (idx, e) in servers.iter().enumerate() {
-        let (now, later) = entry_transports(e.transport, no_udp, udp_last);
+        let (now, later) = entry_transports(
+            e.transport,
+            no_udp,
+            udp_last,
+            cfg!(feature = "kkdcp") && https.is_some(),
+        );
         for (t, is_deferred) in now
             .into_iter()
             .map(|t| (t, false))
             .chain(later.into_iter().map(|t| (t, true)))
         {
-            for conn in resolve_one(idx, e, t).await {
+            for conn in resolve_one(idx, e, t, https.as_ref()).await {
                 if is_deferred {
                     deferred.push(conn);
                 } else {
@@ -136,8 +146,15 @@ pub(super) async fn resolve(
 }
 
 /// Resolve one server entry to connections for each of its addresses.
-async fn resolve_one(idx: usize, e: &ServerEntry, t: Transport) -> Vec<PendingConn> {
-    if e.hostname.starts_with('/') {
+async fn resolve_one(
+    idx: usize,
+    e: &ServerEntry,
+    t: Transport,
+    https: Option<&Arc<super::HttpsTarget>>,
+) -> Vec<PendingConn> {
+    #[cfg(not(feature = "kkdcp"))]
+    let _ = https;
+    if e.hostname.starts_with('/') && t != Transport::Https {
         return resolve_unix(idx, e, t);
     }
     let addrs = match lookup_host((e.hostname.as_str(), e.port)).await {
@@ -165,6 +182,24 @@ async fn resolve_one(idx: usize, e: &ServerEntry, t: Transport) -> Vec<PendingCo
                     transport: Transport::Udp,
                     udp: Some(Arc::new(sock)),
                     addr: ConnAddr::Inet(addr),
+                    #[cfg(feature = "kkdcp")]
+                    https: None,
+                });
+            }
+            #[cfg(feature = "kkdcp")]
+            Transport::Https => {
+                let Some(target) = https else { continue };
+                out.push(PendingConn {
+                    server_index: idx,
+                    transport: Transport::Https,
+                    udp: None,
+                    addr: ConnAddr::Inet(addr),
+                    https: Some(Arc::new(super::https::HttpsPeer {
+                        servername: e.hostname.clone(),
+                        port: e.port,
+                        path: e.uri_path.clone(),
+                        target: target.clone(),
+                    })),
                 });
             }
             _ => out.push(PendingConn {
@@ -172,6 +207,8 @@ async fn resolve_one(idx: usize, e: &ServerEntry, t: Transport) -> Vec<PendingCo
                 transport: Transport::Tcp,
                 udp: None,
                 addr: ConnAddr::Inet(addr),
+                #[cfg(feature = "kkdcp")]
+                https: None,
             }),
         }
     }
@@ -189,6 +226,8 @@ fn resolve_unix(idx: usize, e: &ServerEntry, t: Transport) -> Vec<PendingConn> {
         transport: Transport::Tcp,
         udp: None,
         addr: ConnAddr::Unix(e.hostname.clone().into()),
+        #[cfg(feature = "kkdcp")]
+        https: None,
     }]
 }
 
@@ -224,6 +263,18 @@ pub(super) fn start(
                     }
                 }
             })
+        }
+        #[cfg(feature = "kkdcp")]
+        Transport::Https => {
+            let msg = message.to_vec();
+            match (conn.addr.clone(), conn.https.clone()) {
+                (ConnAddr::Inet(a), Some(peer)) => {
+                    tokio::spawn(super::https::https_conn(id, idx, a, peer, msg, tx))
+                }
+                _ => tokio::spawn(async move {
+                    let _ = tx.send(ConnEvent::Dead(id));
+                }),
+            }
         }
         _ => {
             let msg = message.to_vec();

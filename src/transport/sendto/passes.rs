@@ -170,7 +170,7 @@ async fn wait_window(
         // applies.  CONNECTING conns do not count (sendto_kdc.c:1389-1403).
         let any_tcp = live
             .iter()
-            .any(|c| c.transport == Transport::Tcp && c.established);
+            .any(|c| c.transport != Transport::Udp && c.established);
         let win = if any_tcp { None } else { Some(dur) };
         let clipped = match (win, deadline) {
             (Some(w), Some(d)) => Some(w.min(d.saturating_duration_since(Instant::now()))),

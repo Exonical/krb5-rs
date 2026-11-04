@@ -25,7 +25,9 @@ mod udp;
 mod udp_tcp;
 
 pub use located::LocatedTransport;
-pub use sendto::{sendto, sendto_kdc, KdcReply, SendtoConfig, SendtoError, SendtoTiming, Strategy};
+pub use sendto::{
+    sendto, sendto_kdc, HttpsTarget, KdcReply, SendtoConfig, SendtoError, SendtoTiming, Strategy,
+};
 pub use tcp::TcpTransport;
 pub use udp::UdpTransport;
 pub use udp_tcp::UdpTcpTransport;

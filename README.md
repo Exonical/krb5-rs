@@ -9,6 +9,7 @@ builds aws-lc and simsimd.
 ## Features
 
 - **Kerberos V5 Client** — AS/TGS exchanges (TGT acquisition, service ticket requests), krb5.conf parsing, KDC discovery
+- **KKDCP** — KDC requests over HTTPS (MS-KKDCP) for `https://` `kdc` entries, verified like MIT's k5tls: `http_anchors` (`FILE:`, `DIR:`, `ENV:`) or the system trust store, then MIT's subjectAltName/CN name check (`kkdcp` feature, part of `client`)
 - **KDC** — AS/TGS request processing, FAST, UDP/TCP serving (`kdc` feature; the deployable daemon is `krb5-rs-kdc` in `crates/krb5-rs-kdc`)
 - **GSSAPI/SPNEGO** — HTTP Negotiate authentication
 - **PKINIT** — X.509 certificate-based authentication, client and KDC (`pkinit` feature; DH/ECDH replies, MIT 1.22 parity)
