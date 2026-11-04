@@ -630,20 +630,27 @@ fn run() {
             return;
         }
         "load" => {
-            // db2 has no lockout records to merge (`merge_nra` is ignored,
-            // `kdb_db2.c:234`).
-            load_command(args, iprop, |entries, policies, update, _, log_from| {
-                let master = master_key(&cfg, &realm, master_password_file.as_deref());
-                FileStore::load_dump(
-                    &cfg.database_name,
-                    &realm,
-                    &master,
-                    entries,
-                    policies,
-                    update,
-                    iprop.map(|c| (c, log_from)),
-                )
-            });
+            // `load -i` and `-x merge_nra` keep the lockout fields of
+            // principals already in the database (`dump.c:1498`,
+            // `kdb_db2.c:1515`).
+            let merge_nra = db_args.merge_nra;
+            load_command(
+                args,
+                iprop,
+                |entries, policies, update, iprop_load, log_from| {
+                    let master = master_key(&cfg, &realm, master_password_file.as_deref());
+                    FileStore::load_dump(
+                        &cfg.database_name,
+                        &realm,
+                        &master,
+                        entries,
+                        policies,
+                        update,
+                        iprop_load || merge_nra,
+                        iprop.map(|c| (c, log_from)),
+                    )
+                },
+            );
             return;
         }
         _ => {}

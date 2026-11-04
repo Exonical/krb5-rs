@@ -102,6 +102,15 @@ pub(super) struct KdbPrincipal {
     /// `KRB5_TL_MKEY_AUX`.
     #[rasn(tag(explicit(context, 15)))]
     pub tl_data: Option<Vec<KdbTlData>>,
+    /// MIT `last_success`, as db2 keeps it in the entry; absent = 0.
+    #[rasn(tag(explicit(context, 16)))]
+    pub last_success: Option<u32>,
+    /// MIT `last_failed`; absent = 0.
+    #[rasn(tag(explicit(context, 17)))]
+    pub last_failed: Option<u32>,
+    /// MIT `fail_auth_count`; absent = 0.
+    #[rasn(tag(explicit(context, 18)))]
+    pub fail_auth_count: Option<u32>,
 }
 
 /// One MIT `krb5_tl_data`.
