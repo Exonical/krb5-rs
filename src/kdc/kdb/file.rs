@@ -386,8 +386,13 @@ fn carry_lockout(record: &mut KdbPrincipal, previous: &KdbPrincipal) {
             (a.kvno, a.enctype, a.mkvno, a.enc_key.as_ref())
                 != (b.kvno, b.enctype, b.mkvno, b.enc_key.as_ref())
         });
-    let unlocked =
-        record.last_admin_unlock.as_ref().map(ts) != previous.last_admin_unlock.as_ref().map(ts);
+    let unlock = record.last_admin_unlock.as_ref().map(ts);
+    // A new unlock time, or one no earlier than the last failure (a repeat
+    // unlock in the same second): failures not after the unlock are reset,
+    // as `locked_check_p` and `krb5_db2_lockout_audit` treat them
+    // (`lockout.c:101-104, 197-202`).
+    let unlocked = unlock != previous.last_admin_unlock.as_ref().map(ts)
+        || unlock.is_some_and(|u| state.last_failed <= u);
     if rekeyed || unlocked {
         state.fail_count = 0;
     }
@@ -2237,6 +2242,31 @@ mod tests {
             .expect("cpw");
         let rekeyed = store.lockout_state(&a, "R").expect("state");
         assert_eq!((rekeyed.fail_count, rekeyed.last_failed), (0, 600));
+    }
+
+    #[test]
+    fn a_repeat_unlock_in_the_same_second_zeroes_the_failure_count() {
+        let path = temp("lockout_reunlock");
+        let master = master_key_from_password("R", "m", 18).expect("master");
+        let store = FileStore::create(&path, "R", &master).expect("create");
+        let a = PrincipalName::new_principal("a");
+        store.create_record(user("a"), None).expect("a");
+        let now = Utc::now().timestamp();
+        store
+            .update_record(&a, "R", |r| {
+                r.entry.last_admin_unlock = Some(kerberos_time(now));
+                Ok(())
+            })
+            .expect("unlock");
+        store.apply_lockout(&a, "R", &failure(now)).expect("fail");
+        assert_eq!(store.lockout_state(&a, "R").expect("state").fail_count, 1);
+        store
+            .update_record(&a, "R", |r| {
+                r.entry.last_admin_unlock = Some(kerberos_time(now));
+                Ok(())
+            })
+            .expect("unlock again");
+        assert_eq!(store.lockout_state(&a, "R").expect("state").fail_count, 0);
     }
 
     #[test]
