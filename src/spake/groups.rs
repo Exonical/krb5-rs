@@ -110,6 +110,9 @@ impl Group {
         wbytes: &[u8],
         use_m: bool,
     ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), InvalidElement> {
+        if wbytes.len() != self.mult_len() {
+            return Err(InvalidElement);
+        }
         match self {
             Group::Edwards25519 => ed_keygen(wbytes, use_m),
             Group::P256 => nist_keygen::<p256::NistP256>(self, wbytes, use_m),
@@ -128,7 +131,10 @@ impl Group {
         kdc: bool,
     ) -> Result<Vec<u8>, InvalidElement> {
         let use_m = !kdc;
-        if theirpub.len() != self.elem_len() || ourpriv.len() != self.mult_len() {
+        if theirpub.len() != self.elem_len()
+            || ourpriv.len() != self.mult_len()
+            || wbytes.len() != self.mult_len()
+        {
             return Err(InvalidElement);
         }
         match self {

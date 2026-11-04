@@ -156,6 +156,9 @@ mod tests {
             let (kpriv, kpub) = group.keygen(&w, true).expect("test");
             let (cpriv, cpub) = group.keygen(&w, false).expect("test");
             assert_eq!(kpub.len(), group.elem_len());
+            let short = &w[..group.mult_len() - 1];
+            assert!(group.keygen(short, true).is_err());
+            assert!(group.result(short, &kpriv, &cpub, true).is_err());
             let a = group.result(&w, &kpriv, &cpub, true).expect("test");
             let b = group.result(&w, &cpriv, &kpub, false).expect("test");
             assert_eq!(a, b);

@@ -52,8 +52,9 @@ fn parse_cookie(c: &[u8]) -> Option<(u16, i32, &[u8], &[u8])> {
             return None;
         }
         let n = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-        let d = rest.get(4..4 + n)?;
-        rest = &rest[4 + n..];
+        let end = n.checked_add(4)?;
+        let d = rest.get(4..end)?;
+        rest = &rest[end..];
         Some(d)
     };
     let spake = take()?;
@@ -189,6 +190,9 @@ mod tests {
             (0, 1, &[1u8, 2, 3][..], &[9u8; 32][..])
         );
         assert!(parse_cookie(&c[..c.len() - 1]).is_none());
+        let mut huge = c[..8].to_vec();
+        huge.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_cookie(&huge).is_none());
         let mut v2 = c.clone();
         v2[1] = 2;
         assert!(parse_cookie(&v2).is_none());

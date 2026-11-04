@@ -31,6 +31,11 @@ pub(crate) struct CookieState {
     output: Vec<PaData>,
 }
 
+/// TGT keys the cookie can be derived from: enctypes krb5-rs implements.
+fn supported(etype: i32) -> bool {
+    find_etype(etype).is_ok()
+}
+
 /// `derive_cookie_key`: PRF+(TGT key, "COOKIE" || client principal).
 fn derive_cookie_key(tgt_key: &EncryptionKey, client: &[u8]) -> Result<EncryptionKey, KdcError> {
     let mut input = b"COOKIE".to_vec();
@@ -60,7 +65,7 @@ impl CookieState {
             return Ok(state);
         }
         let kvno = u32::from_be_bytes([v[4], v[5], v[6], v[7]]);
-        let Some(tgt_key) = local_tgt.find_key(None, KvnoSel::Exact(kvno), &|_| true) else {
+        let Some(tgt_key) = local_tgt.find_key(None, KvnoSel::Exact(kvno), &supported) else {
             return Ok(state);
         };
         let key = derive_cookie_key(&tgt_key.key, client)?;
@@ -116,7 +121,7 @@ impl CookieState {
         client: &[u8],
         now: i64,
     ) -> Result<PaData, KdcError> {
-        let tgt_key = local_tgt.find_key(None, KvnoSel::Highest, &|_| true);
+        let tgt_key = local_tgt.find_key(None, KvnoSel::Highest, &supported);
         let (Some(tgt_key), false) = (tgt_key, self.output.is_empty()) else {
             return Ok(PaData {
                 padata_type: PaDataType::FxCookie as i32,
