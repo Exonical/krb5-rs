@@ -678,12 +678,14 @@ impl Ccache for KeyringCcache {
             )),
             ..Default::default()
         };
-        self.remove_cred(MatchFlags::empty(), &m)?;
-        if let Some(data) = data {
-            let (client, realm) = self.principal()?;
-            self.store(&config_cred(&client, &realm, principal, key, data))?;
+        // krb5_cc_set_config: storing replaces the key of the same name.
+        match data {
+            None => self.remove_cred(MatchFlags::empty(), &m),
+            Some(data) => {
+                let (client, realm) = self.principal()?;
+                self.store(&config_cred(&client, &realm, principal, key, data))
+            }
         }
-        Ok(())
     }
 
     fn get_config(

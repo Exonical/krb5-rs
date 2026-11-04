@@ -226,6 +226,10 @@ fn keyring_process_collection() {
     let mut primary = match default_cache(&c) {
         Ok(p) => p,
         Err(e) => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI runners have keyrings: {e}"
+            );
             eprintln!("skipping: no keyring access: {e}");
             return;
         }

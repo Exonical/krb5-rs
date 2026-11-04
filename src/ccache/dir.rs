@@ -104,25 +104,12 @@ fn read_primary(dir: &Path) -> Result<Option<String>, CcError> {
     Ok(Some(name.to_string()))
 }
 
-/// `krb5int_random_string`: `n` random alphanumeric characters.
+/// `krb5int_random_string`: `n` alphanumeric characters from the CSPRNG.
 pub(crate) fn random_string(n: usize) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64)
-        ^ (u64::from(std::process::id()) << 32)
-        ^ COUNTER
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut out = String::with_capacity(n);
-    for _ in 0..n {
-        seed = (seed ^ (seed >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        seed ^= seed >> 32;
-        out.push(CHARS[(seed % CHARS.len() as u64) as usize] as char);
-    }
-    out
+    const CHARS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    (0..n)
+        .map(|_| CHARS[usize::from(rand::random::<u8>()) % CHARS.len()] as char)
+        .collect()
 }
 
 /// Create a file named `prefix` plus six random characters, like `mkstemp`.

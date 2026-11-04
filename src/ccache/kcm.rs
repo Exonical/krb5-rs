@@ -212,10 +212,12 @@ impl KcmIo {
             return Err(CcError::code("KRB5_KCM_REPLY_TOO_BIG", "KCM daemon reply too big").into());
         }
         let status = i32::from_be_bytes(read4(&mut self.stream)?);
+        let mut reply = vec![0; len];
         if status != 0 {
+            // Consume the body so the next call on this stream starts in sync.
+            let _ = self.stream.read_exact(&mut reply);
             return Err(KcmErr::Status(status));
         }
-        let mut reply = vec![0; len];
         self.stream.read_exact(&mut reply).map_err(|_| cc_io())?;
         if reply.len() < 4 {
             return Err(malformed().into());
