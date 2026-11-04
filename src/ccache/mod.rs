@@ -322,16 +322,21 @@ pub(crate) fn config_principal(
 /// NUL are backslash-escaped.
 pub fn unparse_name(name: &PrincipalName, realm: &str) -> String {
     fn escape(s: &[u8], out: &mut String) {
-        for &b in s {
-            match b {
-                b'/' => out.push_str("\\/"),
-                b'@' => out.push_str("\\@"),
-                b'\\' => out.push_str("\\\\"),
-                b'\t' => out.push_str("\\t"),
-                b'\n' => out.push_str("\\n"),
-                0x08 => out.push_str("\\b"),
-                0 => out.push_str("\\0"),
-                _ => out.push(b as char),
+        // Valid UTF-8 keeps its characters; other bytes map one to one.
+        let chars: Vec<char> = match std::str::from_utf8(s) {
+            Ok(t) => t.chars().collect(),
+            Err(_) => s.iter().map(|&b| b as char).collect(),
+        };
+        for c in chars {
+            match c {
+                '/' => out.push_str("\\/"),
+                '@' => out.push_str("\\@"),
+                '\\' => out.push_str("\\\\"),
+                '\t' => out.push_str("\\t"),
+                '\n' => out.push_str("\\n"),
+                '\u{8}' => out.push_str("\\b"),
+                '\0' => out.push_str("\\0"),
+                _ => out.push(c),
             }
         }
     }

@@ -880,6 +880,10 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
     for m in &audit {
         m.kdc_stop(true);
     }
+    // krb5_free_context: finalize the hostrealm modules lookups opened.
+    tokio::task::spawn_blocking(krb5_rs::plugin::finalize_remote)
+        .await
+        .map_err(io_err)?;
     Ok(())
 }
 

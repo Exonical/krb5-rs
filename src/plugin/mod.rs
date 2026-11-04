@@ -133,20 +133,41 @@ type ConnKey = (&'static str, String, PathBuf);
 /// can't be reached or refuses `handshake` is skipped (`None`), as MIT
 /// skips one that fails to load or initialize, and tried again next time.
 pub fn remote(handshake: &'static str, name: &str, path: &Path) -> Option<Arc<rpc::Conn>> {
-    static CONNS: OnceLock<Mutex<HashMap<ConnKey, Arc<rpc::Conn>>>> = OnceLock::new();
     let key = (handshake, name.to_string(), path.to_path_buf());
-    let conns = CONNS.get_or_init(Default::default);
-    if let Some(c) = conns
+    let slot = conns()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get(&key)
-    {
+        .entry(key)
+        .or_default()
+        .clone();
+    // One opener per module, so concurrent first lookups initialize it once.
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(c) = &*slot {
         return Some(c.clone());
     }
     let conn = Arc::new(rpc::Conn::open(name, handshake, connector(path.to_path_buf())).ok()?);
-    conns
+    *slot = Some(conn.clone());
+    Some(conn)
+}
+
+type Slot = Arc<Mutex<Option<Arc<rpc::Conn>>>>;
+
+fn conns() -> &'static Mutex<HashMap<ConnKey, Slot>> {
+    static CONNS: OnceLock<Mutex<HashMap<ConnKey, Slot>>> = OnceLock::new();
+    CONNS.get_or_init(Default::default)
+}
+
+/// Release the modules [`remote`] opened, like `krb5_free_context` unloading
+/// a context's modules: each module gets FINALIZE once its last user drops
+/// it. Statics aren't dropped at exit, so call this before exiting.
+pub fn finalize_remote() {
+    let slots: Vec<Slot> = conns()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, conn.clone());
-    Some(conn)
+        .drain()
+        .map(|(_, v)| v)
+        .collect();
+    for s in slots {
+        s.lock().unwrap_or_else(PoisonError::into_inner).take();
+    }
 }

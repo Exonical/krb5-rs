@@ -172,3 +172,62 @@ fn unreachable_module_is_skipped() {
     let bad = Profile::parse("[plugins]\n hostrealm = {\n  module = nocolon\n }\n").unwrap();
     assert!(get_host_realm(&bad, "x").is_err());
 }
+
+#[derive(Default)]
+struct Counting {
+    init: std::sync::atomic::AtomicUsize,
+    fini: std::sync::atomic::AtomicUsize,
+}
+impl HostRealm for Counting {
+    fn name(&self) -> &str {
+        "counting"
+    }
+    fn init(&self) -> Result<(), i32> {
+        self.init.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        Ok(())
+    }
+    fn fini(&self) {
+        self.fini.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn default_realm(&self) -> Result<Vec<String>, i32> {
+        Ok(vec!["COUNTED".into()])
+    }
+}
+
+#[test]
+fn concurrent_lookups_initialize_once_and_finalize_remote_finalizes() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let dir = std::env::temp_dir().join(format!("krb5rs-hostrealm-c-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let m = Arc::new(Counting::default());
+    let path = listen(&dir, "counting", m.clone());
+    let p = Arc::new(
+        Profile::parse(&format!(
+            "[plugins]\n hostrealm = {{\n  module = counting:unix:path={}\n }}\n",
+            path.display()
+        ))
+        .unwrap(),
+    );
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let p = p.clone();
+            std::thread::spawn(move || get_default_realm(&p))
+        })
+        .collect();
+    for t in threads {
+        assert_eq!(t.join().unwrap().as_deref(), Ok("COUNTED"));
+    }
+    assert_eq!(m.init.load(SeqCst), 1);
+    assert_eq!(m.fini.load(SeqCst), 0);
+    krb5_rs::plugin::finalize_remote();
+    for _ in 0..100 {
+        if m.fini.load(SeqCst) == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(m.fini.load(SeqCst), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
