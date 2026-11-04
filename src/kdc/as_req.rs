@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use rasn::types::OctetString;
 
 use super::authdata::include_pac_p;
+use super::cookie::CookieState;
 use super::db::{KvnoSel, PrincipalAttributes, PrincipalEntry};
 use super::error::{general_string, ErrorContext, KdcError};
 use super::fast::{anonymous_client, FastInputs};
@@ -18,6 +19,7 @@ use super::preauth::{
     select_client_key, verify_enc_timestamp, verify_encrypted_challenge,
 };
 use super::reqbody::raw_req_body;
+use super::spake::{self as kdc_spake, SpakeOutcome, KDC_ERR_MORE_PREAUTH_DATA_REQUIRED};
 use super::{is_tgs_principal, random_key, GateSubject, Kdc, PrincipalRole, PrincipalStore};
 use crate::crypto::{find_etype, fx_cf2, key_usage};
 use crate::protocol::ap::encrypt_ticket_part;
@@ -205,6 +207,14 @@ impl<S: PrincipalStore> Kdc<S> {
         // krb5_db_check_policy_as, the last step of validate_as_request
         // (kdc_util.c:801).
         self.check_lockout(&client, kdc_time).await?;
+        // kdc_fast_read_cookie (do_as_req.c:747), keyed to the request client.
+        let cookie_client = super::kdb::mit::unparse_name(cname, realm);
+        let mut cookies = CookieState::read(
+            request.padata.as_deref(),
+            &local_tgt,
+            &cookie_client,
+            kdc_time,
+        )?;
 
         let permitted = self.permitted();
         let session_etype = select_session_keytype(&server, &body.etype, &permitted)
@@ -277,6 +287,8 @@ impl<S: PrincipalStore> Kdc<S> {
         let mut pa_ok = false;
         let mut saved: Option<KdcError> = None;
         let mut kdc_challenge_key = None;
+        let mut spake_key: Option<EncryptionKey> = None;
+        let mut spake_more: Option<PaData> = None;
         for pa in request.padata.iter().flatten() {
             let verified = if pa.padata_type == PaDataType::EncTimestamp as i32 {
                 verify_enc_timestamp(pa, &client, &permitted, kdc_time, self.config.clockskew)
@@ -292,6 +304,29 @@ impl<S: PrincipalStore> Kdc<S> {
                     self.config.clockskew,
                 )
                 .map(Some)
+            } else if pa.padata_type == crate::spake::PA_SPAKE
+                && !self.config.spake_groups.is_empty()
+            {
+                match kdc_spake::verify(
+                    pa.padata_value.as_ref(),
+                    &self.config.spake_groups,
+                    client_key.as_ref().map(|k| &k.entry.key),
+                    &pk_body_der,
+                    &mut cookies,
+                ) {
+                    Ok(SpakeOutcome::Verified(k0)) => {
+                        spake_key = Some(k0);
+                        Ok(None)
+                    }
+                    Ok(SpakeOutcome::Challenge(ch)) => {
+                        spake_more.get_or_insert(ch);
+                        Err(KdcError::new(
+                            KDC_ERR_MORE_PREAUTH_DATA_REQUIRED,
+                            "MORE_PREAUTH_DATA_REQUIRED",
+                        ))
+                    }
+                    Err(e) => Err(e),
+                }
             } else {
                 match self.pkinit_verify(pa, request, raw, &pk_body_der, &local_tgt, now) {
                     None => continue,
@@ -318,9 +353,34 @@ impl<S: PrincipalStore> Kdc<S> {
             .attributes
             .contains(PrincipalAttributes::REQUIRES_HW_AUTH);
         let is_armored = armored.is_some();
+        // spake_edata (spake_kdc.c), skipped for hardware-only clients.
+        let spake_hint = |cookies: &mut CookieState| {
+            if self.config.spake_groups.is_empty() || hw_only {
+                return None;
+            }
+            kdc_spake::edata(
+                self.config.spake_challenge,
+                client_key.as_ref().map(|k| &k.entry.key),
+                cookies,
+            )
+            .ok()
+            .flatten()
+        };
         if let (true, false, Some(mut err)) = (pa_found, pa_ok, saved) {
             // finish_preauth (do_as_req.c:434-466): PREAUTH_FAILED carries
             // the hint list.
+            // maybe_add_etype_info2 (kdc_preauth.c:1149-1172) and the cookie
+            // every error's e-data carries (do_as_req.c:785-795).
+            if err.code == KDC_ERR_MORE_PREAUTH_DATA_REQUIRED {
+                let mut list: Vec<PaData> = spake_more.into_iter().collect();
+                if find_padata(request.padata.as_deref(), PaDataType::FxCookie).is_none() {
+                    if let Some(ck) = &client_key {
+                        list.push(etype_info2_padata(&client, ck)?);
+                    }
+                }
+                list.push(cookies.make(&local_tgt, &cookie_client, kdc_time)?);
+                err = err.with_e_data(rasn::der::encode(&list)?);
+            }
             if err.code == KDC_ERR_PREAUTH_FAILED {
                 err = err.with_e_data(hint_list_with(
                     &client,
@@ -328,6 +388,8 @@ impl<S: PrincipalStore> Kdc<S> {
                     hw_only,
                     is_armored,
                     &pk_extras,
+                    spake_hint(&mut cookies),
+                    cookies.make(&local_tgt, &cookie_client, kdc_time)?,
                 )?);
             }
             return Err(err);
@@ -353,6 +415,8 @@ impl<S: PrincipalStore> Kdc<S> {
                     hw_only,
                     is_armored,
                     &pk_extras,
+                    spake_hint(&mut cookies),
+                    cookies.make(&local_tgt, &cookie_client, kdc_time)?,
                 )?,
             ));
         }
@@ -372,6 +436,9 @@ impl<S: PrincipalStore> Kdc<S> {
                 return Err(KdcError::new(KDC_ERR_ETYPE_NOSUPP, "CANT_FIND_CLIENT_KEY"))
             }
         };
+        // replace_reply_key(is_strengthen = TRUE) from SPAKE: K'[0] is the
+        // reply key; etype-info2 is still returned.
+        let base_key = spake_key.clone().unwrap_or(base_key);
 
         // return_padata (kdc_preauth.c:1438-1493): module padata (the KDC
         // challenge), then etype-info2 for the key.
@@ -403,7 +470,20 @@ impl<S: PrincipalStore> Kdc<S> {
         };
 
         // check_kdcpolicy_as (do_as_req.c:214-223).
-        self.check_kdcpolicy(false, Some(cname), None, &server.name, kdc_time, &mut times)?;
+        let indicators: &[String] = if spake_key.is_some() {
+            &self.config.spake_indicators
+        } else {
+            &[]
+        };
+        self.check_kdcpolicy(
+            indicators,
+            false,
+            Some(cname),
+            None,
+            &server.name,
+            kdc_time,
+            &mut times,
+        )?;
         let tkt_flags = KerberosFlags::new(flags);
         let mut part = EncTicketPart {
             flags: tkt_flags,

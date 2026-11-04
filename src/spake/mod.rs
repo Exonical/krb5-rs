@@ -22,6 +22,23 @@ pub const KEYUSAGE_SPAKE: i32 = 65;
 /// `SPAKE_SF_NONE`.
 pub const SF_NONE: i32 = 1;
 
+/// `parse_groups` (groups.c): words separated by spaces, tabs, newlines or
+/// commas; unknown names and repeats are skipped.
+pub fn parse_groups(s: &str) -> Vec<Group> {
+    let mut out = Vec::new();
+    for word in s
+        .split([' ', '\t', '\r', '\n', ','])
+        .filter(|w| !w.is_empty())
+    {
+        if let Some(g) = Group::from_name(word) {
+            if !out.contains(&g) {
+                out.push(g);
+            }
+        }
+    }
+    out
+}
+
 /// `update_thash` (util.c): `thash = H(thash || d1 || d2)`, starting from
 /// all zeros the length of the group's hash.
 pub fn update_thash(group: Group, thash: &mut Vec<u8>, d1: &[u8], d2: &[u8]) {

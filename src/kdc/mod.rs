@@ -19,6 +19,7 @@
 mod as_req;
 mod authdata;
 mod config;
+mod cookie;
 mod db;
 mod error;
 mod fast;
@@ -33,6 +34,7 @@ mod reqbody;
 mod s4u;
 #[cfg(feature = "tokio")]
 mod server;
+mod spake;
 pub mod store;
 mod summary;
 mod tgs_req;
@@ -141,6 +143,13 @@ pub struct KdcConfig {
     /// MIT `restrict_anonymous_to_tgt` (kdc.conf realm relation,
     /// kdc_util.c:701-712): anonymous clients may only get local TGTs.
     pub restrict_anonymous_to_tgt: bool,
+    /// SPAKE groups the KDC permits (`[libdefaults] spake_preauth_groups`);
+    /// empty, the MIT KDC default, disables SPAKE.
+    pub spake_groups: Vec<crate::spake::Group>,
+    /// Optimistic challenge group (`[kdcdefaults] spake_preauth_kdc_challenge`).
+    pub spake_challenge: Option<crate::spake::Group>,
+    /// Auth indicators for SPAKE (`[realms] spake_preauth_indicator`).
+    pub spake_indicators: Vec<String>,
     /// PKINIT settings; `None` leaves PKINIT off (MIT: no `pkinit_identity`).
     #[cfg(feature = "pkinit")]
     pub pkinit: Option<std::sync::Arc<crate::pkinit::server::ServerConfig>>,
@@ -168,6 +177,9 @@ impl KdcConfig {
             disable_last_success: false,
             tgs_recheck_client: true,
             restrict_anonymous_to_tgt: false,
+            spake_groups: Vec::new(),
+            spake_challenge: None,
+            spake_indicators: Vec::new(),
             #[cfg(feature = "pkinit")]
             pkinit: None,
         }
@@ -545,6 +557,7 @@ impl<S: PrincipalStore> Kdc<S> {
     /// `check_kdcpolicy_as` / `check_kdcpolicy_tgs` (`kdc/policy.c`).
     fn check_kdcpolicy(
         &self,
+        auth_indicators: &[String],
         tgs: bool,
         client: Option<&PrincipalName>,
         ticket_client: Option<(&PrincipalName, &str)>,
@@ -562,7 +575,7 @@ impl<S: PrincipalStore> Kdc<S> {
             server: String::from_utf8_lossy(&kdb::mit::unparse_name(server, realm)).into_owned(),
             ticket_client: ticket_client
                 .map(|(c, r)| String::from_utf8_lossy(&kdb::mit::unparse_name(c, r)).into_owned()),
-            auth_indicators: Vec::new(),
+            auth_indicators: auth_indicators.to_vec(),
         };
         plugins::check_policy(
             &self.kdcpolicy,

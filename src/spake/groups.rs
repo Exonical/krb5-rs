@@ -52,11 +52,8 @@ impl Group {
         }
     }
 
-    /// `find_gnum` (groups.c): case-insensitive name or decimal number.
+    /// `find_gnum` (groups.c): case-insensitive IANA name.
     pub fn from_name(s: &str) -> Option<Group> {
-        if let Ok(n) = s.parse::<i32>() {
-            return Group::from_id(n);
-        }
         Group::ALL
             .into_iter()
             .find(|g| g.name().eq_ignore_ascii_case(s))
