@@ -331,6 +331,10 @@ impl<S: PrincipalStore> Kdc<S> {
                 match self.pkinit_verify(pa, request, raw, &pk_body_der, &local_tgt, now) {
                     None => continue,
                     Some(Ok(v)) => {
+                        // pkinit_srv.c:602-603.
+                        if v.hw_authent {
+                            flags |= TicketFlags::HW_AUTHENT;
+                        }
                         pkinit_verified = Some(v);
                         Ok(None)
                     }
@@ -490,6 +494,7 @@ impl<S: PrincipalStore> Kdc<S> {
         if let (Some(v), Some(pk)) = (&pkinit_verified, &self.config.pkinit) {
             // Only a signed (non-anonymous) request (pkinit_srv.c:591).
             if v.client_cert.is_some() {
+                v.certauth_indicators.iter().for_each(|i| add(i));
                 pk.indicators.iter().for_each(|i| add(i));
             }
         }

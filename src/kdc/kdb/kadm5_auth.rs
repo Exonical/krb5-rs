@@ -300,42 +300,7 @@ impl Kadm5AuthModules {
     }
 }
 
-/// The module order of MIT's plugin framework (`plugin.c`
-/// `configure_interface`): dynamic `module` entries in profile order, then
-/// the built-in modules, dropping later duplicates; then `disable` removes
-/// modules, and `enable_only`, if set, keeps only the modules it names, in
-/// its order.
-#[must_use]
-pub fn module_order(
-    dynamic: &[String],
-    builtin: &[&str],
-    enable_only: &[String],
-    disable: &[String],
-) -> Vec<String> {
-    let mut list: Vec<String> = Vec::new();
-    for name in dynamic
-        .iter()
-        .map(String::as_str)
-        .chain(builtin.iter().copied())
-    {
-        if !list.iter().any(|n| n == name) {
-            list.push(name.to_string());
-        }
-    }
-    list.retain(|n| !disable.contains(n));
-    if enable_only.is_empty() {
-        return list;
-    }
-    enable_only
-        .iter()
-        .filter(|n| list.contains(n))
-        .fold(Vec::new(), |mut out, n| {
-            if !out.contains(n) {
-                out.push(n.clone());
-            }
-            out
-        })
-}
+pub use crate::plugin::module_order;
 
 #[cfg(test)]
 mod tests {

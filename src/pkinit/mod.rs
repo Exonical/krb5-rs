@@ -20,6 +20,7 @@
 //! but not asserted). Certificate names are compared by their DER encoding.
 
 pub mod asn1;
+pub mod certauth;
 pub mod client;
 pub mod cms;
 mod der;
