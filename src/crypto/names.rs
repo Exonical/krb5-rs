@@ -55,6 +55,16 @@ pub fn enctype_name(etype: i32) -> Option<&'static str> {
         .map(|(_, n, _)| *n)
 }
 
+/// MIT `krb5_enctype_to_name(.., shortest = TRUE, ..)`: the shortest of
+/// the primary name and aliases.
+pub fn enctype_short_name(etype: i32) -> Option<&'static str> {
+    NAMES.iter().find(|(n, _, _)| *n == etype).map(|(_, n, a)| {
+        a.iter()
+            .copied()
+            .fold(*n, |best, x| if x.len() < best.len() { x } else { best })
+    })
+}
+
 fn mod_list(list: &mut Vec<i32>, etype: i32, add: bool) {
     if add {
         if !list.contains(&etype) {

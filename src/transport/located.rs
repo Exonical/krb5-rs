@@ -163,6 +163,13 @@ impl LocatedTransport {
             let locator = Locator::new(self.inner.profile.as_ref(), self.dns_ref());
             locator.locate_kdc(realm, self.use_primary(), no_udp)?
         };
+        crate::k5trace!(
+            "Sending request ({} bytes) to {}{}{}",
+            message.len(),
+            crate::trace::data(realm.as_bytes()),
+            if self.use_primary() { " (primary)" } else { "" },
+            if no_udp { " (tcp only)" } else { "" }
+        );
         let mut last: Option<(usize, Transport)> = None;
         let result =
             sendto::sendto_kdc_track(&servers, message, no_udp, &self.inner.cfg, Some(&mut last))

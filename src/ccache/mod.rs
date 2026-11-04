@@ -14,6 +14,7 @@ pub mod marshal;
 mod memory;
 mod resolve;
 mod retrieve;
+mod select;
 
 use bitflags::bitflags;
 use rasn::types::GeneralString;
@@ -36,6 +37,7 @@ pub use resolve::{
     split_name, AnyCcache, CcContext, DEFAULT_CCNAME,
 };
 pub use retrieve::creds_match_request;
+pub use select::{cc_select, select_cache, Selection};
 
 /// The realm used for ccache config entries (ccfns.c:212-228).
 pub const CONFIG_REALM: &str = "X-CACHECONF:";
