@@ -412,7 +412,13 @@ impl<S: PrincipalStore> Kdc<S> {
         // S4U2Self padata names the requested client; S4U2Proxy takes the
         // evidence ticket (do_tgs_req.c:692-756).
         let s4u2self = self
-            .process_s4u2self_req(req, &server, auth.subkey.as_ref(), &header.key)
+            .process_s4u2self_req(
+                req,
+                &server,
+                auth.subkey.as_ref(),
+                &header.key,
+                &mut ctx.s4u2self_user,
+            )
             .await?;
         ctx.s4u2self_user = s4u2self.as_ref().map(|s| {
             String::from_utf8_lossy(&super::kdb::mit::unparse_name(&s.user, &s.user_realm))

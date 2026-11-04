@@ -542,6 +542,11 @@ async fn s4u2self_modules_see_the_ticket_client_and_the_user() {
     let f = fixture_with_modules(Cfg::default(), AllowGate, vec![m.clone()], vec![m]).await;
     let tgt = f.login(&front(), true).await;
     f.s4u2self(&tgt, &alice()).await.expect("S4U2Self");
+    let nobody = PrincipalName {
+        name_type: 1,
+        name_string: vec![gs("nobody")],
+    };
+    f.s4u2self(&tgt, &nobody).await.expect_err("unknown user");
     let unparse = |p: &PrincipalName| {
         String::from_utf8_lossy(&krb5_rs::kdc::kdb::mit::unparse_name(p, REALM)).into_owned()
     };
@@ -550,6 +555,7 @@ async fn s4u2self_modules_see_the_ticket_client_and_the_user() {
         [
             format!("check_tgs {}", unparse(&front())),
             format!("s4u2self true {}", unparse(&alice())),
+            format!("s4u2self false {}", unparse(&nobody)),
         ]
     );
 }
