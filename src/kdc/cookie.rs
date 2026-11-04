@@ -140,3 +140,63 @@ impl CookieState {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kdc::{MemoryStore, PrincipalAttributes};
+    use crate::types::PrincipalName;
+
+    fn tgt() -> PrincipalEntry {
+        let mut store = MemoryStore::new();
+        let name = PrincipalName::new_srv_inst("krbtgt", "R");
+        store
+            .add_random_key(name.clone(), "R", 3, &[18], PrincipalAttributes::empty())
+            .expect("krbtgt");
+        store.get(&name, "R").expect("entry")
+    }
+
+    fn pa(t: i32, v: &[u8]) -> PaData {
+        PaData {
+            padata_type: t,
+            padata_value: v.to_vec().into(),
+        }
+    }
+
+    #[test]
+    fn cookie_round_trip_expiry_and_foreign_cookies_like_mit() {
+        let tgt = tgt();
+        let mut out = CookieState::default();
+        assert_eq!(
+            out.make(&tgt, b"c@R", 1000)
+                .expect("make")
+                .padata_value
+                .as_ref(),
+            b"MIT"
+        );
+        out.set(151, b"state".to_vec());
+        out.set(151, b"ignored".to_vec());
+        let cookie = out.make(&tgt, b"c@R", 1000).expect("make");
+        let v = cookie.padata_value.as_ref();
+        assert_eq!(&v[..8], b"MIT1\0\0\0\x03");
+
+        let req = [cookie.clone(), pa(151, b"")];
+        let st = CookieState::read(Some(&req), &tgt, b"c@R", 1600).expect("read");
+        assert_eq!(st.get(151), Some(&b"state"[..]));
+        // Another client's key cannot decrypt it.
+        let st = CookieState::read(Some(&req), &tgt, b"d@R", 1600).expect("read");
+        assert_eq!(st.get(151), None);
+        // Expired: an error only when the request has a relevant type.
+        let err = CookieState::read(Some(&req), &tgt, b"c@R", 1601)
+            .err()
+            .expect("expired");
+        assert_eq!(err.code, KDC_ERR_PREAUTH_EXPIRED);
+        let st = CookieState::read(Some(&req[..1]), &tgt, b"c@R", 1601).expect("read");
+        assert_eq!(st.get(151), None);
+        // The trivial cookie and short cookies are ignored.
+        for v in [&b"MIT"[..], b"MIT1\0\0\0\x03"] {
+            let st = CookieState::read(Some(&[pa(133, v)]), &tgt, b"c@R", 1000).expect("read");
+            assert_eq!(st.get(151), None);
+        }
+    }
+}

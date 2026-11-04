@@ -72,7 +72,7 @@ mod tests {
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("test"))
             .collect()
     }
 
@@ -80,7 +80,7 @@ mod tests {
     fn mit_vector_messages_roundtrip() {
         for v in super::super::vectors::VECTORS {
             let der = hex(v.challenge);
-            let msg: PaSpake = rasn::der::decode(&der).unwrap();
+            let msg: PaSpake = rasn::der::decode(&der).expect("test");
             let PaSpake::Challenge(c) = &msg else {
                 panic!("{msg:?}")
             };
@@ -92,12 +92,12 @@ mod tests {
                     data: None
                 }]
             );
-            assert_eq!(rasn::der::encode(&msg).unwrap(), der);
+            assert_eq!(rasn::der::encode(&msg).expect("test"), der);
             if let Some(s) = v.support {
                 let der = hex(s);
-                let msg: PaSpake = rasn::der::decode(&der).unwrap();
+                let msg: PaSpake = rasn::der::decode(&der).expect("test");
                 assert!(matches!(msg, PaSpake::Support(_)));
-                assert_eq!(rasn::der::encode(&msg).unwrap(), der);
+                assert_eq!(rasn::der::encode(&msg).expect("test"), der);
             }
         }
     }

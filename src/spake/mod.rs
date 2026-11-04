@@ -109,7 +109,7 @@ mod tests {
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("test"))
             .collect()
     }
 
@@ -121,20 +121,27 @@ mod tests {
                 continue; // DES3 is not implemented.
             }
             ran += 1;
-            let group = Group::from_id(v.group).unwrap();
+            let group = Group::from_id(v.group).expect("test");
             let ikey = EncryptionKey::new(v.enctype, hex(v.ikey));
-            let w = derive_wbytes(group, &ikey).unwrap();
+            let w = derive_wbytes(group, &ikey).expect("test");
             assert_eq!(&w[..], &hex(v.w)[..], "w {}/{}", v.enctype, v.group);
             let k = hex(v.k);
-            assert_eq!(group.result(&w, &hex(v.x), &hex(v.s), true).unwrap(), k);
-            assert_eq!(group.result(&w, &hex(v.y), &hex(v.t), false).unwrap(), k);
+            assert_eq!(
+                group.result(&w, &hex(v.x), &hex(v.s), true).expect("test"),
+                k
+            );
+            assert_eq!(
+                group.result(&w, &hex(v.y), &hex(v.t), false).expect("test"),
+                k
+            );
             let mut thash = Vec::new();
             let support = v.support.map(hex).unwrap_or_default();
             update_thash(group, &mut thash, &support, &hex(v.challenge));
             update_thash(group, &mut thash, &hex(v.s), &[]);
             assert_eq!(thash, hex(v.thash));
             for (n, want) in [v.k0, v.k1, v.k2, v.k3].into_iter().enumerate() {
-                let kn = derive_key(group, &ikey, &w, &k, &thash, &hex(v.body), n as u32).unwrap();
+                let kn =
+                    derive_key(group, &ikey, &w, &k, &thash, &hex(v.body), n as u32).expect("test");
                 assert_eq!(kn.key_bytes(), &hex(want)[..], "K'[{n}]");
             }
         }
@@ -145,12 +152,12 @@ mod tests {
     fn keygen_result_agree() {
         let ikey = EncryptionKey::new(18, vec![7; 32]);
         for group in [Group::Edwards25519, Group::P256, Group::P384, Group::P521] {
-            let w = derive_wbytes(group, &ikey).unwrap();
-            let (kpriv, kpub) = group.keygen(&w, true).unwrap();
-            let (cpriv, cpub) = group.keygen(&w, false).unwrap();
+            let w = derive_wbytes(group, &ikey).expect("test");
+            let (kpriv, kpub) = group.keygen(&w, true).expect("test");
+            let (cpriv, cpub) = group.keygen(&w, false).expect("test");
             assert_eq!(kpub.len(), group.elem_len());
-            let a = group.result(&w, &kpriv, &cpub, true).unwrap();
-            let b = group.result(&w, &cpriv, &kpub, false).unwrap();
+            let a = group.result(&w, &kpriv, &cpub, true).expect("test");
+            let b = group.result(&w, &cpriv, &kpub, false).expect("test");
             assert_eq!(a, b);
             if group != Group::Edwards25519 {
                 // SEC1 tag 0x05 is not a point encoding.

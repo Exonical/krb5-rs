@@ -555,6 +555,7 @@ impl<S: PrincipalStore> Kdc<S> {
     }
 
     /// `check_kdcpolicy_as` / `check_kdcpolicy_tgs` (`kdc/policy.c`).
+    #[allow(clippy::too_many_arguments)]
     fn check_kdcpolicy(
         &self,
         auth_indicators: &[String],

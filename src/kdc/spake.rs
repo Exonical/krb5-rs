@@ -183,7 +183,7 @@ mod tests {
     fn cookie_round_trips_like_mit() {
         let c = make_cookie(0, 1, &[1, 2, 3], &[9; 32]);
         assert_eq!(&c[..8], &[0, 1, 0, 0, 0, 0, 0, 1]);
-        let (stage, group, spake, thash) = parse_cookie(&c).unwrap();
+        let (stage, group, spake, thash) = parse_cookie(&c).expect("test");
         assert_eq!(
             (stage, group, spake, thash),
             (0, 1, &[1u8, 2, 3][..], &[9u8; 32][..])
