@@ -526,6 +526,22 @@ grep -q 'restore failed' "$BASE/truncated.mit.err"
 grep -q 'restore failed' "$BASE/truncated.rs.err"
 rs_kdb "$RS_LOAD" dump "$BASE/after-bad.dump"
 cmp "$BASE/before-bad.dump" "$BASE/after-bad.dump"
+# Input that stops where MIT's fscanf sees EOF ends the load; that record is dropped.
+{ head -n 3 "$MIT_DUMP"; printf 'princ\t'; } > "$BASE/cut-princ.dump"
+{ head -n 3 "$MIT_DUMP"; printf 'policy\tq\t1\t2\t3\t4\t5\t0\t6\t7\t8'; } > "$BASE/cut-policy.dump"
+{ head -n 3 "$MIT_DUMP"; printf 'policy\tq\t1\t2\t3\t4\t5\t0\t6\t7\t8\t'; } > "$BASE/cut-tail.dump"
+for cut in cut-princ cut-policy cut-tail; do
+  mit_env "$MIT_LOAD" "$MIT_KDB" load -r "$REALM" "$BASE/$cut.dump"
+  rs_kdb "$RS_LOAD" load "$BASE/$cut.dump"
+  mit_env "$MIT_LOAD" "$MIT_KDB" dump -r "$REALM" "$BASE/$cut.mit.out"
+  rs_kdb "$RS_LOAD" dump "$BASE/$cut.rs.out"
+  test "$(grep -c '^princ' "$BASE/$cut.mit.out")" = 2
+  test "$(grep -c '^princ' "$BASE/$cut.rs.out")" = 2
+  if grep -q '^policy' "$BASE/$cut.mit.out" "$BASE/$cut.rs.out"; then
+    echo "$cut kept its cut-off policy" >&2
+    exit 1
+  fi
+done
 rs_kdb "$RS_DIR" dump "$BASE/two.dump" 'K/M@.*' 'bob@KLMDB\.LIVE'
 rs_kdb "$RS_LOAD" load "$BASE/two.dump"
 rs_kdb "$RS_LOAD" dump "$BASE/replaced.dump"

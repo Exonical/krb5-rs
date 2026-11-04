@@ -257,10 +257,6 @@ Deviations:
   main commit changes nothing; stale lockout rows of principals that were
   not reloaded stay, as in MIT. The file store uses `<db>~` plus rename like
   db2 (`plugins/kdb/db2/kdb_db2.c:298, 1419`).
-- Input that ends inside a record (after `princ`/`policy` or within its
-  fields) is rejected; MIT treats it as the end of the dump and drops the
-  record (`dump.c:616, 898, 907, 917`). A complete policy missing only its
-  final newline is kept.
 - `-hash` is accepted and ignored; `-rev` and `-recurse` are accepted and
   ignored on dump. `-mkey_convert` and `-new_mkey_file` rewrap every
   dumped key under a new master key, as `master_key_convert` does

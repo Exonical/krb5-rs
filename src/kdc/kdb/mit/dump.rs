@@ -301,11 +301,10 @@ impl<'a> Loader<'a> {
     }
 
     /// The next record, `None` at end of input (`process_tagged`,
-    /// `dump.c:958-980`).
-    /// Deviation: MIT ends the load without error when the input stops right
-    /// after a record tag or a policy's numeric fields (`dump.c:616, 898, 907,
-    /// 917`), silently dropping that record; that is an error here, except
-    /// that a complete policy missing only its final newline is kept.
+    /// `dump.c:958-980`). As in MIT, input that stops right after a record
+    /// tag, after a 1.11 policy's 1.8 fields, or after the tab that starts
+    /// its 1.11 fields also ends the load, and that record is dropped
+    /// (`dump.c:616, 813, 852, 898, 907, 917`).
     pub fn next_record(&mut self) -> Result<Option<Record>, LoadError> {
         if self.at_eof() {
             return Ok(None);
@@ -314,8 +313,9 @@ impl<'a> Loader<'a> {
             return Err(self.fail(""));
         };
         match tag {
+            b"princ" if self.at_eof() => Ok(None),
             b"princ" => self.principal().map(|e| Some(Record::Principal(e))),
-            b"policy" => self.policy().map(|p| Some(Record::Policy(p))),
+            b"policy" => Ok(self.policy()?.map(Record::Policy)),
             b"End" => Ok(None),
             other => Err(self.fail(format!(
                 "unknown record type \"{}\"",
@@ -460,10 +460,10 @@ impl<'a> Loader<'a> {
 
     /// `process_k5beta7_policy`, `process_r1_8_policy` and
     /// `process_r1_11_policy` (`dump.c:796-956`).
-    fn policy(&mut self) -> Result<MitPolicy, LoadError> {
+    fn policy(&mut self) -> Result<Option<MitPolicy>, LoadError> {
         self.line += 1;
         let Some(name) = self.token(1023) else {
-            return Err(self.fail("cannot parse policy (0 read)"));
+            return Ok(None);
         };
         let name = String::from_utf8_lossy(name).into_owned();
         let wanted = if self.version == DumpVersion::Beta7 || self.version == DumpVersion::R13 {
@@ -496,14 +496,17 @@ impl<'a> Loader<'a> {
             tl_data: Vec::new(),
         };
         if self.version != DumpVersion::R111 {
-            return Ok(policy);
+            return Ok(Some(policy));
         }
         let Some(&next) = self.data.get(self.pos) else {
-            return Ok(policy);
+            return Ok(None);
         };
         self.pos += 1;
         if next == b'\n' {
-            return Ok(policy);
+            return Ok(Some(policy));
+        }
+        if self.at_eof() {
+            return Ok(None);
         }
         let mut extra = [0u32; 3];
         for (read, field) in extra.iter_mut().enumerate() {
@@ -527,7 +530,7 @@ impl<'a> Loader<'a> {
             .and_then(|n| i16::try_from(n).ok())
             .ok_or_else(|| self.fail("cannot parse policy (4 read)"))?;
         policy.tl_data = self.tl_data(usize::try_from(count).unwrap_or(0))?;
-        Ok(policy)
+        Ok(Some(policy))
     }
 }
 
@@ -685,23 +688,6 @@ pub enum LoadFailure {
 mod tests {
     use super::*;
 
-    #[test]
-    fn input_ending_inside_a_record_is_rejected() {
-        for body in ["princ\t", "princ\t38\t", "policy\t", "policy\tp\t0\t0"] {
-            let data = format!("kdb5_util load_dump version 7\n{body}");
-            assert!(
-                matches!(
-                    read_dump(data.as_bytes(), "d", None),
-                    Err(LoadFailure::Record { .. })
-                ),
-                "{body:?}"
-            );
-        }
-        let data = b"kdb5_util load_dump version 7\npolicy\tp\t0\t0\t0\t1\t0\t0\t0\t0\t0";
-        let (_, records, _) = read_dump(data, "d", None).expect("complete policy");
-        assert_eq!(records.len(), 1);
-    }
-
     fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(format!(
             "{}/tests/fixtures/mit-dump/{name}.dump",
@@ -839,6 +825,53 @@ mod tests {
             "{:?}",
             error.messages
         );
+    }
+
+    #[test]
+    fn input_ending_where_mit_sees_eof_drops_the_record() {
+        let v7 = "kdb5_util load_dump version 7\n";
+        let full = "policy\tp\t1\t2\t3\t4\t5\t0\t6\t7\t8\n";
+        for tail in [
+            "princ",
+            "princ\t\n",
+            "policy\t",
+            "policy\tq\t1\t2\t3\t4\t5\t0\t6\t7\t8",
+            "policy\tq\t1\t2\t3\t4\t5\t0\t6\t7\t8\t",
+            "policy\tq\t1\t2\t3\t4\t5\t0\t6\t7\t8\t \n",
+        ] {
+            let data = format!("{v7}{full}{tail}");
+            let (_, records, _) = read_dump(data.as_bytes(), "d", None)
+                .unwrap_or_else(|e| panic!("{tail:?} rejected: {e:?}"));
+            assert_eq!(records.len(), 1, "{tail:?}");
+        }
+    }
+
+    #[test]
+    fn input_ending_inside_record_fields_is_an_error() {
+        let v7 = "kdb5_util load_dump version 7\n";
+        for (tail, message) in [
+            ("princ\t1\t2", "d(2): cannot match size tokens"),
+            ("princ\t38\t", "d(2): cannot match size tokens"),
+            ("policy\tq\t1\t2", "cannot parse policy (3 read)"),
+            (
+                "policy\tq\t1\t2\t3\t4\t5\t0\t6\t7\t8\t0\t1",
+                "cannot parse policy (2 read)",
+            ),
+        ] {
+            let data = format!("{v7}{tail}");
+            let Err(LoadFailure::Record { error, .. }) = read_dump(data.as_bytes(), "d", None)
+            else {
+                panic!("{tail:?} accepted")
+            };
+            assert_eq!(error.messages, vec![message.to_string()], "{tail:?}");
+        }
+    }
+
+    #[test]
+    fn short_format_policy_without_final_newline_is_kept() {
+        let data = b"kdb5_util load_dump version 6\npolicy\tp\t1\t2\t3\t4\t5\t0\t6\t7\t8";
+        let (_, records, _) = read_dump(data, "d", None).expect("load");
+        assert_eq!(records.len(), 1);
     }
 
     #[test]
