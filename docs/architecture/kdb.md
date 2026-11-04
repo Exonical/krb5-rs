@@ -1047,11 +1047,7 @@ in MIT, with a socket in place of the shared library:
   `KRB5KDC_ERR_POLICY`, "LOCAL_POLICY"). Each module's lifetime and renewable
   lifetime cap the end and renew-till times at the KDC time plus that many
   seconds (`update_ticket_times`). TGS checks also get the header ticket's
-  client. The only authentication indicators are SPAKE's
-  (`spake_preauth_indicator`), passed to `check_as` after SPAKE
-  pre-authentication. Not yet like MIT: other mechanisms' indicators and
-  the AD-AUTHENTICATION-INDICATOR ticket authdata that carries them to TGS
-  requests.
+  client. Both get the request's authentication indicators (below).
 - **audit:** `kdc_start` runs when the KDC starts serving and `kdc_stop` on
   shutdown, after open connections finish. Every decoded AS or TGS request
   reports `as_req` or `tgs_req` with its outcome, describing the inner request
@@ -1090,6 +1086,32 @@ Deviations:
 The tests port MIT's `plugins/kdcpolicy/test/main.c` and
 `plugins/audit/test/au_test.c` and run the `t_kdcpolicy.py` and `t_audit.py`
 cases against the daemon.
+
+### Authentication indicators
+
+As in MIT (`kdc/authind.c`, `kdc/cammac.c`, `kdc_authdata.c`):
+- **Sources:** a successful pre-authentication asserts its configured
+  indicators: SPAKE `spake_preauth_indicator`, encrypted challenge
+  `[realms] encrypted_challenge_indicator`, and PKINIT `pkinit_indicator`
+  for signed (not anonymous) requests. Encrypted timestamp asserts none.
+  Duplicates are dropped.
+- **In tickets:** the indicators are encoded as AD-AUTHENTICATION-INDICATOR
+  (97, a SEQUENCE OF UTF8String) inside an AD-CAMMAC (96) inside
+  AD-IF-RELEVANT. The CAMMAC carries a KDC verifier (key usage 64, the
+  current krbtgt key, over the ticket's DER EncTicketPart with the CAMMAC
+  elements as its authorization data) and a service verifier (the
+  ticket's key, over the elements). They are added before the PAC is
+  signed, also when no PAC is issued, and not for `NO_AUTH_DATA_REQUIRED`
+  services.
+- **TGS:** indicators come from CAMMACs in the header (or evidence) ticket
+  whose KDC verifier checks out against the local krbtgt key of the
+  verifier's kvno; others are ignored. They go into the new ticket.
+  S4U2Self tickets carry none, since the user did not authenticate.
+- **`require_auth`:** a service's `require_auth` string attribute
+  (`kadmin setstr`) lists indicators separated by spaces. AS and TGS
+  requests for it need one of them in the ticket, otherwise
+  `KDC_ERR_POLICY` "Required auth indicators not present in ticket".
+- **Modules:** kdcpolicy `check_as`/`check_tgs` get the same indicators.
 
 ## 7. Consistency policy
 

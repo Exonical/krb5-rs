@@ -7,6 +7,7 @@
 //! db2: a PAC issued here holds the client info and signatures, plus
 //! delegation info carried over from an incoming PAC.
 
+use super::cammac::add_auth_indicators;
 use super::db::KvnoSel;
 use super::error::KdcError;
 use super::{PrincipalAttributes, PrincipalEntry, PrincipalStore};
@@ -158,14 +159,18 @@ impl<S: PrincipalStore> super::Kdc<S> {
         server_key: &EncryptionKey,
         local_tgt: &PrincipalEntry,
         include_pac: bool,
+        indicators: &[String],
     ) -> Result<(), KdcError> {
+        // handle_authdata (kdc_authdata.c:477-493, 517): indicators go in
+        // before the ticket is signed.
         if server
             .attributes
             .contains(PrincipalAttributes::NO_AUTH_DATA_REQUIRED)
-            || self.config.disable_pac
-            || part.flags.contains(TicketFlags::ANONYMOUS)
-            || !include_pac
         {
+            return Ok(());
+        }
+        add_auth_indicators(part, indicators, server_key, local_tgt)?;
+        if self.config.disable_pac || part.flags.contains(TicketFlags::ANONYMOUS) || !include_pac {
             return Ok(());
         }
         let privsvr = self.privsvr_key(local_tgt)?;
@@ -198,6 +203,7 @@ impl<S: PrincipalStore> super::Kdc<S> {
         subject_tkt: &EncTicketPart,
         subject_pac: Option<&Pac>,
         s4u: S4uPac<'_>,
+        indicators: &[String],
     ) -> Result<(), KdcError> {
         let mut list: Vec<AuthorizationDataElement> = Vec::new();
         if let Some((enc, session, subkey)) = request_authdata {
@@ -215,15 +221,17 @@ impl<S: PrincipalStore> super::Kdc<S> {
         }
         part.authorization_data = (!list.is_empty()).then_some(list);
 
-        let Some(subject) = subject_pac else {
-            return Ok(());
-        };
         if server
             .attributes
             .contains(PrincipalAttributes::NO_AUTH_DATA_REQUIRED)
-            || self.config.disable_pac
-            || part.flags.contains(TicketFlags::ANONYMOUS)
         {
+            return Ok(());
+        }
+        add_auth_indicators(part, indicators, server_key, local_tgt)?;
+        let Some(subject) = subject_pac else {
+            return Ok(());
+        };
+        if self.config.disable_pac || part.flags.contains(TicketFlags::ANONYMOUS) {
             return Ok(());
         }
         let mut pac = Pac::new();

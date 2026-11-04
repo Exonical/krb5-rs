@@ -96,6 +96,9 @@ pub struct PrincipalEntry {
     /// Services allowed to delegate to this one with resource-based
     /// constrained delegation, as unparsed names.
     pub allowed_to_delegate_from: Vec<String>,
+    /// Indicators a ticket for this service must carry one of (the
+    /// `require_auth` string attribute, MIT `KRB5_KDB_SK_REQUIRE_AUTH`).
+    pub require_auth: Option<String>,
     /// The policy this principal is under (kadmin `-policy`), by name.
     pub policy: Option<String>,
     /// Bumped by every security-sensitive administrative change: disable,
@@ -263,6 +266,7 @@ impl MemoryStore {
         PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            require_auth: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
@@ -380,6 +384,7 @@ mod tests {
         PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            require_auth: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,

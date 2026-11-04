@@ -446,6 +446,7 @@ impl FileStore {
         let km = PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            require_auth: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
@@ -467,6 +468,7 @@ impl FileStore {
         let tgs = PrincipalEntry {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            require_auth: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
@@ -1777,6 +1779,7 @@ mod tests {
             keys: random_keys(1, &[18]).expect("keys"),
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
+            require_auth: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,

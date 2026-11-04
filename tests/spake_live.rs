@@ -126,6 +126,21 @@ fn live() {
                 PrincipalAttributes::REQUIRES_PRE_AUTH,
             )
             .expect("sam");
+        for (svc, require) in [("strong", "otp strong"), ("hardware", "hardware")] {
+            let name = PrincipalName::new_srv_inst("host", svc);
+            store
+                .add_random_key(
+                    name.clone(),
+                    REALM,
+                    1,
+                    &[18, 17],
+                    PrincipalAttributes::empty(),
+                )
+                .expect("service");
+            let mut entry = store.get(&name, REALM).expect("service entry");
+            entry.require_auth = Some(require.into());
+            store.insert(entry);
+        }
         let mut second = MemoryStore::new();
         for name in [
             PrincipalName::new_srv_inst("krbtgt", REALM),
@@ -135,6 +150,7 @@ fn live() {
         }
         let mut config = KdcConfig::new(REALM);
         config.spake_groups = Group::ALL.to_vec();
+        config.spake_indicators = vec!["strong".into()];
         let mut optimistic = config.clone();
         optimistic.spake_challenge = Some(Group::Edwards25519);
         let kdcs = [
@@ -250,4 +266,27 @@ fn mit_kinit_spake_wrong_password_fails() {
     assert_ne!(code, 0, "{out}");
     assert!(out.contains("Sending SPAKE response"), "{out}");
     assert!(out.contains("Preauthentication failed"), "{out}");
+}
+
+/// MIT `kvno` for `service` with the cache `mit_kinit` left for `port`.
+fn mit_kvno(port: u16, service: &str) -> (i32, String) {
+    run(
+        &format!(
+            "KRB5_CONFIG=/tmp/spake-krb5-{port}.conf KRB5CCNAME=/tmp/spake_cc_{port} kvno {service}"
+        ),
+        None,
+    )
+}
+
+#[test]
+#[ignore = "requires the MIT client container"]
+fn mit_kvno_needs_our_spake_indicator() {
+    let (code, out) = mit_kinit(PORT, "edwards25519", PASSWORD);
+    assert_eq!(code, 0, "{out}");
+    // The SPAKE indicator rides in the TGT's CAMMAC to the TGS request.
+    let (code, out) = mit_kvno(PORT, "host/strong");
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = mit_kvno(PORT, "host/hardware");
+    assert_ne!(code, 0, "{out}");
+    assert!(out.contains("KDC policy rejects request"), "{out}");
 }

@@ -312,6 +312,7 @@ mod tests {
             .string_to_key(b"pw", &salt, None)
             .expect("s2k");
         PrincipalEntry {
+            require_auth: None,
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
             policy: None,

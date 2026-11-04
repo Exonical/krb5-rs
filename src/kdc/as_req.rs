@@ -470,13 +470,31 @@ impl<S: PrincipalStore> Kdc<S> {
         };
 
         // check_kdcpolicy_as (do_as_req.c:214-223).
-        let indicators: &[String] = if spake_key.is_some() {
-            &self.config.spake_indicators
-        } else {
-            &[]
+        // Indicators asserted by the preauth mechanism that succeeded
+        // (add_auth_indicator, kdc_preauth.c:458; authind_add dedups).
+        let mut indicators: Vec<String> = Vec::new();
+        let mut add = |ind: &str| {
+            if !indicators.iter().any(|i| i == ind) {
+                indicators.push(ind.to_owned());
+            }
         };
+        if spake_key.is_some() {
+            self.config.spake_indicators.iter().for_each(|i| add(i));
+        }
+        if kdc_challenge_key.is_some() {
+            if let Some(ai) = &self.config.encrypted_challenge_indicator {
+                add(ai);
+            }
+        }
+        #[cfg(feature = "pkinit")]
+        if let (Some(v), Some(pk)) = (&pkinit_verified, &self.config.pkinit) {
+            // Only a signed (non-anonymous) request (pkinit_srv.c:591).
+            if v.client_cert.is_some() {
+                pk.indicators.iter().for_each(|i| add(i));
+            }
+        }
         self.check_kdcpolicy(
-            indicators,
+            &indicators,
             false,
             Some(cname),
             None,
@@ -507,7 +525,10 @@ impl<S: PrincipalStore> Kdc<S> {
             &server_key.key,
             &local_tgt,
             include_pac_p(request.padata.as_deref()),
+            &indicators,
         )?;
+        // check_indicators (do_as_req.c:284-288).
+        super::cammac::check_indicators(server.require_auth.as_deref(), &indicators)?;
         let kvno =
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;
         let ticket =
