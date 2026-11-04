@@ -87,7 +87,9 @@ pub async fn serve_udp_with<S: PrincipalStore + 'static>(
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
             Err(e) => return Err(e),
         };
-        let (reply, summary) = kdc.handle_summarized(&buf[..n], Transport::Udp).await;
+        let (reply, summary) = kdc
+            .handle_summarized_from(&buf[..n], Transport::Udp, Some(peer))
+            .await;
         if let Some(log) = &options.logger {
             log(&summary, peer);
         }
@@ -216,7 +218,9 @@ async fn serve_connection<S: PrincipalStore>(
     }
     let mut request = vec![0u8; usize::try_from(len).map_err(|_| io::ErrorKind::InvalidData)?];
     stream.read_exact(&mut request).await?;
-    let (reply, summary) = kdc.handle_summarized(&request, Transport::Tcp).await;
+    let (reply, summary) = kdc
+        .handle_summarized_from(&request, Transport::Tcp, Some(peer))
+        .await;
     if let Some(log) = logger {
         log(&summary, peer);
     }

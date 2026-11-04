@@ -399,6 +399,8 @@ impl<S: PrincipalStore> Kdc<S> {
             body.realm.clone()
         };
 
+        // check_kdcpolicy_as (do_as_req.c:214-223).
+        self.check_kdcpolicy(false, Some(cname), &server.name, kdc_time, &mut times)?;
         let tkt_flags = KerberosFlags::new(flags);
         let mut part = EncTicketPart {
             flags: tkt_flags,

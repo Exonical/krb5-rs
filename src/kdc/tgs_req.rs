@@ -686,6 +686,8 @@ impl<S: PrincipalStore> Kdc<S> {
         if times.starttime == times.authtime {
             times.starttime = 0;
         }
+        // check_kdcpolicy_tgs (do_tgs_req.c:919-925).
+        self.check_kdcpolicy(true, None, &server.name, kdc_time, &mut times)?;
         if s4u2self.is_some() && !is_referral {
             Self::s4u2self_forwardable(&server, &mut flags);
         }

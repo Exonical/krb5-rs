@@ -25,6 +25,7 @@ mod fast;
 pub mod kdb;
 pub mod lockout;
 mod pkinit;
+pub mod plugins;
 mod policy;
 mod preauth;
 pub mod replication;
@@ -81,7 +82,9 @@ use policy::{secs, RealmLimits};
 use crate::crypto::find_etype;
 use crate::crypto::util::generate_random;
 use crate::types::error_codes::*;
-use crate::types::{AsReq, EncryptionKey, KdcReq, PrincipalName, TgsReq};
+use crate::types::{
+    ApReq, AsRep, AsReq, EncryptionKey, KdcOptions, KdcReq, PrincipalName, TgsRep, TgsReq, Ticket,
+};
 
 #[cfg(feature = "tokio")]
 tokio::task_local! {
@@ -179,6 +182,8 @@ pub struct Kdc<S: PrincipalStore> {
     auth_state: Arc<dyn DynAuthState>,
     gate: Arc<dyn DynGate>,
     reporter: Arc<dyn LockoutReporter>,
+    kdcpolicy: Vec<Arc<dyn plugins::KdcPolicy>>,
+    audit: Vec<Arc<dyn plugins::Audit>>,
 }
 
 /// Builds a [`Kdc`] with injected services (docs/architecture/kdb.md §3).
@@ -196,6 +201,8 @@ pub struct KdcBuilder<S: PrincipalStore> {
     auth_state: Arc<dyn DynAuthState>,
     gate: Arc<dyn DynGate>,
     reporter: Arc<dyn LockoutReporter>,
+    kdcpolicy: Vec<Arc<dyn plugins::KdcPolicy>>,
+    audit: Vec<Arc<dyn plugins::Audit>>,
 }
 
 impl<S: PrincipalStore> KdcBuilder<S> {
@@ -225,6 +232,18 @@ impl<S: PrincipalStore> KdcBuilder<S> {
         self
     }
 
+    /// Run `modules` (in order) as MIT's kdcpolicy modules.
+    pub fn kdcpolicy(mut self, modules: Vec<Arc<dyn plugins::KdcPolicy>>) -> Self {
+        self.kdcpolicy = modules;
+        self
+    }
+
+    /// Report requests to `modules` as MIT's audit modules.
+    pub fn audit(mut self, modules: Vec<Arc<dyn plugins::Audit>>) -> Self {
+        self.audit = modules;
+        self
+    }
+
     /// Finish.
     pub fn build(self) -> Kdc<S> {
         Kdc {
@@ -234,6 +253,8 @@ impl<S: PrincipalStore> KdcBuilder<S> {
             auth_state: self.auth_state,
             gate: self.gate,
             reporter: self.reporter,
+            kdcpolicy: self.kdcpolicy,
+            audit: self.audit,
         }
     }
 }
@@ -245,6 +266,19 @@ impl<S: PrincipalStore> Kdc<S> {
         Self::builder(config, store).build()
     }
 
+    /// Replace the kdcpolicy and audit modules (see [`KdcBuilder::kdcpolicy`]
+    /// and [`KdcBuilder::audit`]).
+    #[must_use]
+    pub fn with_plugins(
+        mut self,
+        kdcpolicy: Vec<Arc<dyn plugins::KdcPolicy>>,
+        audit: Vec<Arc<dyn plugins::Audit>>,
+    ) -> Self {
+        self.kdcpolicy = kdcpolicy;
+        self.audit = audit;
+        self
+    }
+
     /// Start a [`KdcBuilder`].
     pub fn builder(config: KdcConfig, store: S) -> KdcBuilder<S> {
         KdcBuilder {
@@ -254,6 +288,8 @@ impl<S: PrincipalStore> Kdc<S> {
             auth_state: Arc::new(MemoryAuthState::new()),
             gate: Arc::new(AlwaysAllow),
             reporter: Arc::new(NoopLockoutReporter),
+            kdcpolicy: Vec::new(),
+            audit: Vec::new(),
         }
     }
 
@@ -265,7 +301,18 @@ impl<S: PrincipalStore> Kdc<S> {
 
     /// [`Kdc::handle`] with an injectable clock.
     pub async fn handle_at(&self, request: &[u8], now: DateTime<Utc>) -> Vec<u8> {
-        match self.dispatch(request, now).await {
+        self.handle_from_at(request, now, None).await
+    }
+
+    /// [`Kdc::handle_at`] for a request from `peer` (the audit modules'
+    /// client address).
+    pub async fn handle_from_at(
+        &self,
+        request: &[u8],
+        now: DateTime<Utc>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Vec<u8> {
+        match self.dispatch(request, now, peer).await {
             Ok(reply) => reply,
             Err(f) => build_krb_error(&f.err, &f.ctx, now),
         }
@@ -280,7 +327,17 @@ impl<S: PrincipalStore> Kdc<S> {
 
     /// [`Kdc::handle_udp`] with an injectable clock.
     pub async fn handle_udp_at(&self, request: &[u8], now: DateTime<Utc>) -> Vec<u8> {
-        let reply = self.handle_at(request, now).await;
+        self.handle_udp_from_at(request, now, None).await
+    }
+
+    /// [`Kdc::handle_udp_at`] for a datagram from `peer`.
+    pub async fn handle_udp_from_at(
+        &self,
+        request: &[u8],
+        now: DateTime<Utc>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Vec<u8> {
+        let reply = self.handle_from_at(request, now, peer).await;
         if reply.len() > self.config.max_dgram_reply_size {
             return self.bare_error(KRB_ERR_RESPONSE_TOO_BIG, now);
         }
@@ -294,21 +351,31 @@ impl<S: PrincipalStore> Kdc<S> {
         request: &[u8],
         transport: Transport,
     ) -> (Vec<u8>, RequestSummary) {
+        self.handle_summarized_from(request, transport, None).await
+    }
+
+    /// [`Kdc::handle_summarized`] for a request from `peer`.
+    pub async fn handle_summarized_from(
+        &self,
+        request: &[u8],
+        transport: Transport,
+        peer: Option<std::net::SocketAddr>,
+    ) -> (Vec<u8>, RequestSummary) {
         #[cfg(feature = "tokio")]
         let timer = std::sync::Arc::new(AtomicU64::new(0));
         #[cfg(feature = "tokio")]
         let reply = STORE_TIME_NANOS
             .scope(std::sync::Arc::clone(&timer), async {
                 match transport {
-                    Transport::Udp => self.handle_udp(request).await,
-                    Transport::Tcp => self.handle(request).await,
+                    Transport::Udp => self.handle_udp_from_at(request, Utc::now(), peer).await,
+                    Transport::Tcp => self.handle_from_at(request, Utc::now(), peer).await,
                 }
             })
             .await;
         #[cfg(not(feature = "tokio"))]
         let reply = match transport {
-            Transport::Udp => self.handle_udp(request).await,
-            Transport::Tcp => self.handle(request).await,
+            Transport::Udp => self.handle_udp_from_at(request, Utc::now(), peer).await,
+            Transport::Tcp => self.handle_from_at(request, Utc::now(), peer).await,
         };
         let summary = RequestSummary::new(request, &reply, transport);
         #[cfg(feature = "tokio")]
@@ -334,7 +401,12 @@ impl<S: PrincipalStore> Kdc<S> {
     }
 
     /// MIT `dispatch` (dispatch.c:89-175).
-    async fn dispatch(&self, request: &[u8], now: DateTime<Utc>) -> Result<Vec<u8>, Box<Failure>> {
+    async fn dispatch(
+        &self,
+        request: &[u8],
+        now: DateTime<Utc>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Result<Vec<u8>, Box<Failure>> {
         let local = self.local_context();
         let fail = |err: KdcError, ctx: &ErrorContext| {
             Box::new(Failure {
@@ -376,7 +448,122 @@ impl<S: PrincipalStore> Kdc<S> {
         } else {
             self.process_tgs_req(&decoded, request, now, &mut ctx).await
         };
+        if !self.audit.is_empty() {
+            self.kau_request(is_as, &decoded, peer, &result);
+        }
         result.map_err(|err| Box::new(Failure { err, ctx }))
+    }
+
+    /// `kau_as_req`, `kau_tgs_req`, `kau_s4u2self`, `kau_s4u2proxy` and
+    /// `kau_u2u` for a processed request.
+    fn kau_request(
+        &self,
+        is_as: bool,
+        req: &KdcReq,
+        peer: Option<std::net::SocketAddr>,
+        result: &Result<Vec<u8>, KdcError>,
+    ) {
+        let realm = &self.config.realm;
+        let unparse = |p: &PrincipalName| {
+            String::from_utf8_lossy(&kdb::mit::unparse_name(p, realm)).into_owned()
+        };
+        let tkt_id = |t: &Ticket| plugins::ticket_id(t.enc_part.cipher.as_ref());
+        let mut st = plugins::AuditState::new(peer);
+        st.client = req.req_body.cname.as_ref().map(unparse);
+        st.server = req.req_body.sname.as_ref().map(unparse);
+        st.cl_realm = Some(String::from_utf8_lossy(req.req_body.realm.as_bytes()).into_owned());
+        let success = result.is_ok();
+        match result {
+            Ok(reply) => {
+                st.stage = plugins::AuditStage::EncrRep;
+                st.status = Some("ISSUE".into());
+                let ticket = if is_as {
+                    rasn::der::decode::<AsRep>(reply).ok().map(|r| r.0.ticket)
+                } else {
+                    rasn::der::decode::<TgsRep>(reply).ok().map(|r| r.0.ticket)
+                };
+                st.tkt_out_id = ticket.as_ref().map(tkt_id);
+            }
+            Err(e) => {
+                st.error_code = e.code;
+                st.status = e.e_text.clone();
+                if e.code == plugins::KDC_ERR_POLICY {
+                    st.violation = plugins::LOCAL_POLICY;
+                }
+            }
+        }
+        let padata = req.padata.as_deref().unwrap_or_default();
+        if is_as {
+            for m in &self.audit {
+                m.as_req(success, &st);
+            }
+            return;
+        }
+        st.tkt_in_id = padata
+            .iter()
+            .find(|p| p.padata_type == 1)
+            .and_then(|p| rasn::der::decode::<ApReq>(p.padata_value.as_ref()).ok())
+            .map(|ap| tkt_id(&ap.ticket));
+        let opts = req.req_body.kdc_options;
+        st.evid_tkt_id = req
+            .req_body
+            .additional_tickets
+            .as_ref()
+            .and_then(|t| t.first())
+            .map(tkt_id);
+        // PA-FOR-USER and PA-S4U-X509-USER.
+        if padata
+            .iter()
+            .any(|p| p.padata_type == 129 || p.padata_type == 130)
+        {
+            for m in &self.audit {
+                m.s4u2self(success, &st);
+            }
+        }
+        if opts.contains(KdcOptions::CNAME_IN_ADDL_TKT) {
+            for m in &self.audit {
+                m.s4u2proxy(success, &st);
+            }
+        }
+        if opts.contains(KdcOptions::ENC_TKT_IN_SKEY) {
+            for m in &self.audit {
+                m.u2u(success, &st);
+            }
+        }
+        for m in &self.audit {
+            m.tgs_req(success, &st);
+        }
+    }
+
+    /// `check_kdcpolicy_as` / `check_kdcpolicy_tgs` (`kdc/policy.c`).
+    fn check_kdcpolicy(
+        &self,
+        tgs: bool,
+        client: Option<&PrincipalName>,
+        server: &PrincipalName,
+        now: i64,
+        times: &mut policy::Times,
+    ) -> Result<(), KdcError> {
+        if self.kdcpolicy.is_empty() {
+            return Ok(());
+        }
+        let realm = &self.config.realm;
+        let req = plugins::PolicyRequest {
+            client: client
+                .map(|c| String::from_utf8_lossy(&kdb::mit::unparse_name(c, realm)).into_owned()),
+            server: String::from_utf8_lossy(&kdb::mit::unparse_name(server, realm)).into_owned(),
+            ticket_client: None,
+            auth_indicators: Vec::new(),
+        };
+        plugins::check_policy(
+            &self.kdcpolicy,
+            tgs,
+            &req,
+            now,
+            &mut times.endtime,
+            &mut times.renew_till,
+        )
+        .map_err(|r| KdcError::new(r.code, &r.status))
     }
 
     fn local_context(&self) -> ErrorContext {

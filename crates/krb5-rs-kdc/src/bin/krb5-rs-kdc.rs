@@ -45,6 +45,8 @@ use tracing_subscriber::EnvFilter;
 
 #[path = "../daemon_metrics.rs"]
 mod metrics;
+#[path = "kdc/plugins.rs"]
+mod plugins;
 
 /// MIT's default kdc.conf location (`DEFAULT_KDC_PROFILE`).
 const DEFAULT_KDC_PROFILE: &str = "/usr/local/var/krb5kdc/kdc.conf";
@@ -711,6 +713,29 @@ async fn termination_signal() -> std::io::Result<&'static str> {
     Ok("ctrl-c")
 }
 
+/// The `[plugins] kdcpolicy` and `audit` modules from krb5.conf and kdc.conf.
+fn load_plugins(cli: &Cli, krb5_conf_explicit: bool) -> std::io::Result<plugins::Modules> {
+    let mut profiles = Vec::new();
+    let conf = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_KDC_PROFILE));
+    if cli.keytab.is_none() && conf.exists() {
+        profiles.push(
+            Profile::load(&conf).map_err(|e| io_err(format!("reading {}: {e}", conf.display())))?,
+        );
+    }
+    if let Some(p) = &cli.krb5_config {
+        if krb5_conf_explicit || p.exists() {
+            profiles.push(
+                Profile::load(p).map_err(|e| io_err(format!("reading {}: {e}", p.display())))?,
+            );
+        }
+    }
+    let refs: Vec<&Profile> = profiles.iter().collect();
+    plugins::load(&refs).map_err(io_err)
+}
+
 async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::io::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let metrics = Arc::new(metrics::Metrics::new());
@@ -734,7 +759,13 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
             }
         }
     };
-    let kdc = Arc::new(kdc);
+    let modules = load_plugins(&cli, krb5_conf_explicit)?;
+    let audit = modules.1.clone();
+    let kdc = Arc::new(kdc.with_plugins(modules.0, modules.1));
+    // kau_kdc_start (main.c:1028).
+    for m in &audit {
+        m.kdc_start(true);
+    }
 
     let request_metrics = Arc::clone(&metrics);
     let logger: RequestLogger = Arc::new(move |summary, peer| {
@@ -828,6 +859,10 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
     }
 
     let _ = shutdown_tx.send(true);
+    // kau_kdc_stop (main.c:1031).
+    for m in &audit {
+        m.kdc_stop(true);
+    }
     let timeout = Duration::from_secs(cli.shutdown_timeout);
     let drained = tokio::time::timeout(timeout, async {
         while let Some(result) = tasks.join_next().await {
