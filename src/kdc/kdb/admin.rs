@@ -361,6 +361,7 @@ pub struct AdminOps<S: AdminStore> {
     history_enctype: i32,
     modules: AdminModules,
     request_mask: Option<i32>,
+    requested_ks: Vec<KeySaltTuple>,
 }
 
 /// The password quality and kadm5_hook modules administration runs
@@ -373,15 +374,6 @@ pub struct AdminModules {
     pub pwqual: Arc<PwQualModules>,
     /// kadm5_hook modules; none by default.
     pub hooks: Arc<Kadm5Hooks>,
-}
-
-/// MIT's `KRB5_KDB_SALTTYPE_*` number for `salt`.
-fn salt_number(salt: SaltType) -> i32 {
-    match salt {
-        SaltType::Normal => 0,
-        SaltType::NoRealm => 2,
-        SaltType::OnlyRealm => 3,
-    }
 }
 
 fn unix_secs(t: Option<Option<KerberosTime>>) -> u32 {
@@ -404,6 +396,7 @@ impl<S: AdminStore> AdminOps<S> {
             history_enctype: DEFAULT_HISTORY_ENCTYPE,
             modules: AdminModules::default(),
             request_mask: None,
+            requested_ks: Vec::new(),
         }
     }
 
@@ -420,6 +413,15 @@ impl<S: AdminStore> AdminOps<S> {
     #[must_use]
     pub fn with_request_mask(mut self, mask: i32) -> Self {
         self.request_mask = Some(mask);
+        self
+    }
+
+    /// The key/salt tuples the kadm5 request named, which create and chpass
+    /// hooks see; none (the default) when it named none, even though keys
+    /// are then made for the realm's `supported_enctypes`.
+    #[must_use]
+    pub fn with_requested_keysalts(mut self, ks: Vec<KeySaltTuple>) -> Self {
+        self.requested_ks = ks;
         self
     }
 
@@ -446,10 +448,7 @@ impl<S: AdminStore> AdminOps<S> {
     }
 
     fn ks_tuples(&self) -> Vec<KeySaltTuple> {
-        self.keysalts
-            .iter()
-            .map(|&(e, s)| (e, salt_number(s)))
-            .collect()
+        self.requested_ks.clone()
     }
 
     /// The requested entry a create or modify hook sees.
@@ -459,6 +458,7 @@ impl<S: AdminStore> AdminOps<S> {
         realm: &str,
         opts: &PrincipalOptions,
         create: bool,
+        current: PrincipalAttributes,
     ) -> HookPrinc {
         let derived = {
             let mut m = if create { kmask::PRINCIPAL } else { 0 };
@@ -477,6 +477,9 @@ impl<S: AdminStore> AdminOps<S> {
             if opts.pw_expiration.is_some() {
                 m |= kmask::PW_EXPIRATION;
             }
+            if opts.unlock {
+                m |= kmask::FAIL_AUTH_COUNT;
+            }
             match opts.policy {
                 Some(Some(_)) => m |= kmask::POLICY,
                 Some(None) => m |= kmask::POLICY_CLR,
@@ -487,7 +490,7 @@ impl<S: AdminStore> AdminOps<S> {
         HookPrinc {
             principal: unparse(name, realm),
             mask: self.request_mask.unwrap_or(derived),
-            attributes: opts.attributes.set,
+            attributes: opts.attributes.apply(current).bits(),
             max_life: duration_secs(opts.max_life),
             max_renewable_life: duration_secs(opts.max_renewable_life),
             princ_expire_time: unix_secs(opts.expiration),
@@ -675,7 +678,7 @@ impl<S: AdminStore> AdminOps<S> {
         }
         entry.security_epoch = 1;
         let hooks = &self.modules.hooks;
-        let ent = self.hook_princ(name, realm, opts, true);
+        let ent = self.hook_princ(name, realm, opts, true, PrincipalAttributes::empty());
         let ks = self.ks_tuples();
         hooks.create(Stage::Precommit, &ent, &ks, password)?;
         self.store
@@ -894,7 +897,8 @@ impl<S: AdminStore> AdminOps<S> {
             _ => None,
         };
         let hooks = &self.modules.hooks;
-        let ent = self.hook_princ(name, realm, opts, false);
+        let current = self.require(name, realm).await?.entry.attributes;
+        let ent = self.hook_princ(name, realm, opts, false, current);
         hooks.modify(Stage::Precommit, &ent)?;
         let opts = opts.clone();
         self.store

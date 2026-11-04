@@ -1145,7 +1145,8 @@ impl Kadm5 {
             keysalts,
         )
         .with_history_enctype(self.history_enctype)
-        .with_modules(self.modules.clone()))
+        .with_modules(self.modules.clone())
+        .with_requested_keysalts(ks.to_vec()))
     }
 
     /// Administration as `caller`, who is recorded as the modifier.
@@ -1785,13 +1786,13 @@ impl Kadm5 {
             } else {
                 Vec::new()
             };
-            let (opts, _) = principal_options(rec, mask, &restr);
+            let (opts, mask) = principal_options(rec, mask, &restr);
             let admin = match self.admin_with(caller, &[], tl) {
                 Ok(a) => a,
                 Err(c) => return c,
             };
             match run(admin
-                .with_request_mask(mask)
+                .with_request_mask(mask as i32)
                 .modify_principal(&name, &realm, &opts))
             {
                 Ok(()) => code::OK,
