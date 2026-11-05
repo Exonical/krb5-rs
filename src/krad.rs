@@ -5,6 +5,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
 use std::io;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Packet codes (`KRAD_CODE_*`).
@@ -341,6 +342,7 @@ pub fn decode_response(secret: &str, request: &Packet, buf: &[u8]) -> Option<Pac
 }
 
 /// `krad_packet_bytes_needed` (packet.c:322-335) for stream framing.
+#[cfg(unix)]
 fn bytes_needed(buf: &[u8]) -> io::Result<usize> {
     if buf.len() < OFFSET_AUTH {
         return Ok(OFFSET_AUTH - buf.len());
