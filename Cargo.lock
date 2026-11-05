@@ -1764,6 +1764,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-webpki",
+ "serde_json",
  "sha1",
  "sha2",
  "subtle",

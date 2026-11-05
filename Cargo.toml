@@ -44,6 +44,9 @@ chrono = "0.4.38"
 
 # Error handling
 thiserror = "2.0"
+# OTP principal configuration (the `otp` string attribute is JSON, MIT
+# plugins/preauth/otp/otp_state.c).
+serde_json = { version = "1", optional = true }
 # PKINIT (feature `pkinit`). rsa is an exact-pinned release candidate: no stable
 # 0.10 exists yet, and rc.19 is newer than the 7-day dependency age rule.
 rsa = { version = "=0.10.0-rc.18", features = ["sha2"], optional = true }
@@ -67,7 +70,7 @@ const-oid = { version = "0.9", features = ["db"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs", "system"] }
 
 # localauth RULE regexps where there is no system regcomp.
 [target.'cfg(not(unix))'.dependencies]
@@ -104,7 +107,7 @@ pkinit = [
 # (`krb5_rs::pkinit::pki`); never enable in production builds.
 test-pki = ["pkinit"]
 fast = []                  # FAST pre-authentication tunneling
-kdc = []                   # Kerberos KDC (AS/TGS request processing)
+kdc = ["dep:serde_json", "tokio"] # Kerberos KDC (AS/TGS request processing)
 tokio = ["dep:tokio"]      # Tokio async transport adapter
 dns = ["dep:hickory-resolver", "dep:tokio"]  # Real DNS resolver for KDC location
 

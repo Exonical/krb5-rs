@@ -132,18 +132,20 @@ pub(crate) fn hint_list(
         padata_type: PaDataType::FxCookie as i32,
         padata_value: OctetString::from(b"MIT".to_vec()),
     };
-    hint_list_with(client, key, hw_only, armored, &[], None, cookie)
+    hint_list_with(client, key, hw_only, armored, &[], None, None, cookie)
 }
 
 /// [`hint_list`] with extra module hints (PKINIT's PA-PK-AS-REQ,
 /// PA-PKINIT-KX and freshness token) placed after the built-in mechanisms
 /// and before the cookie.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hint_list_with(
     client: &PrincipalEntry,
     key: Option<&ClientKey>,
     hw_only: bool,
     armored: bool,
     extras: &[PaData],
+    otp: Option<PaData>,
     spake: Option<PaData>,
     cookie: PaData,
 ) -> Result<Vec<u8>, KdcError> {
@@ -154,15 +156,17 @@ pub(crate) fn hint_list_with(
     let mut list = vec![empty(PaDataType::FxFast)];
     if let Some(k) = key {
         list.push(etype_info2_padata(client, k)?);
-        if !hw_only {
-            // MIT module order: SPAKE before encrypted challenge/timestamp.
-            list.extend(spake);
-            list.push(empty(if armored {
-                PaDataType::EncryptedChallenge
-            } else {
-                PaDataType::EncTimestamp
-            }));
-        }
+    }
+    // MIT module order (kdc_preauth.c:129-138): OTP, then SPAKE, then
+    // encrypted challenge/timestamp.
+    list.extend(otp);
+    if key.is_some() && !hw_only {
+        list.extend(spake);
+        list.push(empty(if armored {
+            PaDataType::EncryptedChallenge
+        } else {
+            PaDataType::EncTimestamp
+        }));
     }
     list.extend(extras.iter().cloned());
     list.push(cookie);
@@ -313,6 +317,7 @@ mod tests {
             .expect("s2k");
         PrincipalEntry {
             require_auth: None,
+            otp: None,
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
             policy: None,

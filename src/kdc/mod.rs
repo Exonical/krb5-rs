@@ -26,6 +26,7 @@ mod error;
 mod fast;
 pub mod kdb;
 pub mod lockout;
+mod otp;
 mod pkinit;
 pub mod plugins;
 mod policy;
@@ -52,6 +53,7 @@ use crate::profile::Profile;
 use chrono::{DateTime, Utc};
 
 #[cfg(feature = "tokio")]
+pub use otp::TokenType as OtpTokenType;
 pub use server::{
     serve_tcp, serve_tcp_with, serve_udp, serve_udp_with, RequestLogger, ServeOptions,
 };
@@ -154,6 +156,10 @@ pub struct KdcConfig {
     /// `[realms] encrypted_challenge_indicator`: asserted on a successful
     /// encrypted challenge (kdc_preauth_ec.c:91-141).
     pub encrypted_challenge_indicator: Option<String>,
+    /// OTP token types (`[otp]`, MIT otp_state.c `token_types_decode`);
+    /// `None` when they fail to load, which disables OTP as a failed
+    /// `otp_init` does.
+    pub otp_token_types: Option<Vec<otp::TokenType>>,
     /// PKINIT settings; `None` leaves PKINIT off (MIT: no `pkinit_identity`).
     #[cfg(feature = "pkinit")]
     pub pkinit: Option<std::sync::Arc<crate::pkinit::server::ServerConfig>>,
@@ -185,6 +191,7 @@ impl KdcConfig {
             spake_challenge: None,
             spake_indicators: Vec::new(),
             encrypted_challenge_indicator: None,
+            otp_token_types: Some(vec![otp::default_type()]),
             #[cfg(feature = "pkinit")]
             pkinit: None,
         }

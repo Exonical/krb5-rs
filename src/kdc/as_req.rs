@@ -289,6 +289,8 @@ impl<S: PrincipalStore> Kdc<S> {
         let mut kdc_challenge_key = None;
         let mut spake_key: Option<EncryptionKey> = None;
         let mut spake_more: Option<PaData> = None;
+        let mut otp_indicators: Option<Vec<String>> = None;
+        let client_unparsed = crate::ccache::unparse_name(&client.name, &client.realm);
         for pa in request.padata.iter().flatten() {
             let verified = if pa.padata_type == PaDataType::EncTimestamp as i32 {
                 verify_enc_timestamp(pa, &client, &permitted, kdc_time, self.config.clockskew)
@@ -327,14 +329,28 @@ impl<S: PrincipalStore> Kdc<S> {
                     }
                     Err(e) => Err(e),
                 }
+            } else if let (true, Some(types)) = (
+                pa.padata_type == crate::otp::PA_OTP_REQUEST,
+                self.config.otp_token_types.as_deref(),
+            ) {
+                super::otp::verify(
+                    types,
+                    pa.padata_value.as_ref(),
+                    armored.as_ref(),
+                    &client_unparsed,
+                    client.otp.as_deref(),
+                    kdc_time,
+                    self.config.clockskew,
+                )
+                .await
+                .map(|ind| {
+                    otp_indicators = Some(ind);
+                    None
+                })
             } else {
                 match self.pkinit_verify(pa, request, raw, &pk_body_der, &local_tgt, now) {
                     None => continue,
                     Some(Ok(v)) => {
-                        // pkinit_srv.c:602-603.
-                        if v.hw_authent {
-                            flags |= TicketFlags::HW_AUTHENT;
-                        }
                         pkinit_verified = Some(v);
                         Ok(None)
                     }
@@ -357,6 +373,13 @@ impl<S: PrincipalStore> Kdc<S> {
             .attributes
             .contains(PrincipalAttributes::REQUIRES_HW_AUTH);
         let is_armored = armored.is_some();
+        // otp_edata (otp/main.c:219-275): principals with an `otp` string
+        // attribute, armored requests only; not offered to hardware-only
+        // clients (no PA_HARDWARE, kdc_preauth.c:956).
+        let otp_hint = match (&self.config.otp_token_types, &client.otp, &armored) {
+            (Some(_), Some(_), Some(k)) if !hw_only => Some(super::otp::challenge(k, kdc_time)?),
+            _ => None,
+        };
         // spake_edata (spake_kdc.c), skipped for hardware-only clients.
         let spake_hint = |cookies: &mut CookieState| {
             if self.config.spake_groups.is_empty() || hw_only {
@@ -392,6 +415,7 @@ impl<S: PrincipalStore> Kdc<S> {
                     hw_only,
                     is_armored,
                     &pk_extras,
+                    otp_hint.clone(),
                     spake_hint(&mut cookies),
                     cookies.make(&local_tgt, &cookie_client, kdc_time)?,
                 )?);
@@ -419,6 +443,7 @@ impl<S: PrincipalStore> Kdc<S> {
                     hw_only,
                     is_armored,
                     &pk_extras,
+                    otp_hint.clone(),
                     spake_hint(&mut cookies),
                     cookies.make(&local_tgt, &cookie_client, kdc_time)?,
                 )?,
@@ -432,9 +457,18 @@ impl<S: PrincipalStore> Kdc<S> {
             Some(v) => Some(self.pkinit_return(v, request, raw, &pk_body_der)?),
             None => None,
         };
-        let client_key = client_key.filter(|_| replaced.is_none());
+        // replace_reply_key(armor key, is_strengthen = FALSE) from OTP
+        // (otp/main.c:162-165): no etype-info2 for the replaced key.
+        let otp_key = armored.clone().filter(|_| otp_indicators.is_some());
+        let client_key = client_key.filter(|_| replaced.is_none() && otp_key.is_none());
         let (reply_etype, base_key) = match (&replaced, &client_key) {
             (Some((_, key)), _) => (key.keytype, key.clone()),
+            (None, _) if otp_key.is_some() => {
+                let k = otp_key
+                    .clone()
+                    .ok_or_else(|| KdcError::generic("OTP_KEY"))?;
+                (k.keytype, k)
+            }
             (None, Some(ck)) => (ck.etype, ck.entry.key.clone()),
             (None, None) => {
                 return Err(KdcError::new(KDC_ERR_ETYPE_NOSUPP, "CANT_FIND_CLIENT_KEY"))
@@ -485,6 +519,7 @@ impl<S: PrincipalStore> Kdc<S> {
         if spake_key.is_some() {
             self.config.spake_indicators.iter().for_each(|i| add(i));
         }
+        otp_indicators.iter().flatten().for_each(|i| add(i));
         if kdc_challenge_key.is_some() {
             if let Some(ai) = &self.config.encrypted_challenge_indicator {
                 add(ai);

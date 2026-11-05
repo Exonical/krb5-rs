@@ -404,6 +404,8 @@ impl RealmConfig {
         kdc.spake_indicators = kdc_conf.get_values(&["realms", realm, "spake_preauth_indicator"]);
         kdc.encrypted_challenge_indicator =
             kdc_conf.get_string(&["realms", realm, "encrypted_challenge_indicator"]);
+        kdc.otp_token_types =
+            super::otp::token_types(kdc_conf, krb5_conf, std::path::Path::new(KDC_DIR)).ok();
         // The db2 module options live in `[dbmodules]` under the realm's
         // `database_module`, which defaults to the realm name (MIT
         // kdb5.c `get_conf_section`; kdb_db2.c:267-277).
