@@ -10,7 +10,7 @@ use krb5_rs::kdc::kdb::mit::{
 use krb5_rs::kdc::store::StoreError;
 use krb5_rs::types::PrincipalName;
 
-use crate::attr::{epoch_time, tl_from_value};
+use crate::attr::{epoch_time, string_time, tl_from_value, tl_to_value};
 use crate::keyseq;
 
 /// Attribute values of one search entry, names lowercased.
@@ -200,7 +200,7 @@ pub fn mit_entry(a: &Attrs, name: PrincipalName, realm: String) -> Result<MitEnt
     if mkvno != 0 {
         e.tl_data.push(TlData {
             kind: MKVNO,
-            data: (mkvno as u32).to_le_bytes().to_vec(),
+            data: (mkvno as u16).to_le_bytes().to_vec(),
         });
     }
     if let Some(t) = a.time("krbLastPwdChange")? {
@@ -300,4 +300,227 @@ pub fn policy_values(p: &krb5_rs::kdc::kdb::mit::MitPolicy) -> Vec<(&'static str
         out.push(("krbpwdallowedkeysalts", k.clone()));
     }
     out
+}
+
+/// Attribute values a principal write sets, as `krb5_ldap_put_principal`
+/// builds them (ldap_principal2.c:1095-1430). `None` deletes the attribute.
+pub type Values = Vec<(&'static str, Option<Vec<Vec<u8>>>)>;
+
+fn tl_u32(e: &MitEntry, kind: u16) -> Option<u32> {
+    e.tl_data
+        .iter()
+        .find(|t| t.kind == kind)
+        .and_then(|t| t.data.get(..4))
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn text(v: impl Into<String>) -> Option<Vec<Vec<u8>>> {
+    Some(vec![v.into().into_bytes()])
+}
+
+fn time_or_delete(t: u32) -> Option<Vec<Vec<u8>>> {
+    (t != 0).then(|| vec![string_time(t).into_bytes()])
+}
+
+/// Tl-data types kept in their own attributes, not `krbExtraData`.
+const DEDICATED_TL: [u16; 5] = [
+    LAST_PWD_CHANGE,
+    KADM_DATA,
+    KDB_TL_USER_INFO,
+    CONSTRAINED_DELEGATION_ACL,
+    LAST_ADMIN_UNLOCK,
+];
+
+/// `KDB_TL_USER_INFO` (kdb_ldap.h).
+pub const KDB_TL_USER_INFO: u16 = 0x00ff;
+
+/// The values a full write of `e` stores. `policy_dn` maps a password
+/// policy name to its DN.
+pub fn put_values(e: &MitEntry, policy_dn: impl Fn(&str) -> String) -> Result<Values, StoreError> {
+    let mut v: Values = vec![
+        ("krbmaxticketlife", text((e.max_life as i32).to_string())),
+        (
+            "krbmaxrenewableage",
+            text((e.max_renewable_life as i32).to_string()),
+        ),
+        ("krbticketflags", text((e.attributes as i32).to_string())),
+        ("krbprincipalexpiration", time_or_delete(e.expiration)),
+        ("krbpasswordexpiration", time_or_delete(e.pw_expiration)),
+        ("krbLastSuccessfulAuth", time_or_delete(e.last_success)),
+        ("krbLastFailedAuth", time_or_delete(e.last_failed)),
+        ("krbLoginFailedCount", text(e.fail_auth_count.to_string())),
+    ];
+    let osa = match e.tl_data.iter().find(|t| t.kind == KADM_DATA) {
+        Some(t) => OsaPrincipalData::decode(&t.data)?,
+        None => OsaPrincipalData::default(),
+    };
+    let policy = match (&osa.policy, osa.aux_attributes & KADM5_POLICY != 0) {
+        (Some(p), true) => {
+            let name = String::from_utf8(p.clone())
+                .map_err(|_| StoreError::corrupt("policy name is not UTF-8"))?;
+            text(policy_dn(&name))
+        }
+        _ => None,
+    };
+    v.push(("krbpwdpolicyreference", policy));
+    let hist = osa
+        .old_keys
+        .iter()
+        .filter(|k| !k.is_empty())
+        .map(|k| keyseq::encode(k, osa.admin_history_kvno as i32))
+        .collect::<Result<Vec<_>, _>>()?;
+    v.push(("krbpwdhistory", (!hist.is_empty()).then_some(hist)));
+    let mkvno = e
+        .tl_data
+        .iter()
+        .find(|t| t.kind == MKVNO)
+        .and_then(|t| t.data.get(..2))
+        .map_or(0, |b| i32::from(u16::from_le_bytes([b[0], b[1]])));
+    let mut keys = Vec::new();
+    let mut start = 0;
+    for i in 0..e.key_data.len() {
+        if i + 1 == e.key_data.len() || e.key_data[i + 1].kvno != e.key_data[start].kvno {
+            keys.push(keyseq::encode(&e.key_data[start..=i], mkvno)?);
+            start = i + 1;
+        }
+    }
+    v.push(("krbprincipalkey", (!keys.is_empty()).then_some(keys)));
+    v.push((
+        "krbLastPwdChange",
+        tl_u32(e, LAST_PWD_CHANGE).and_then(time_or_delete),
+    ));
+    let extra: Vec<Vec<u8>> = e
+        .tl_data
+        .iter()
+        .filter(|t| !DEDICATED_TL.contains(&t.kind))
+        .map(tl_to_value)
+        .collect();
+    v.push(("krbExtraData", (!extra.is_empty()).then_some(extra)));
+    let inds = krb5_rs::kdc::kdb::mit::string_attributes(e)?
+        .into_iter()
+        .find(|a| a.0 == b"require_auth")
+        .map(|a| {
+            String::from_utf8_lossy(&a.1)
+                .split(' ')
+                .filter(|s| !s.is_empty())
+                .take(10)
+                .map(|s| s.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+    v.push(("krbPrincipalAuthInd", inds));
+    v.push((
+        "krbLastAdminUnlock",
+        tl_u32(e, LAST_ADMIN_UNLOCK).and_then(time_or_delete),
+    ));
+    Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krb5_rs::kdc::kdb::mit::KeyData;
+
+    #[test]
+    fn put_then_read_round_trips() {
+        let mut e = MitEntry {
+            principal: PrincipalName::new_principal("alice"),
+            realm: "EXAMPLE.COM".into(),
+            attributes: 0x80,
+            max_life: 36000,
+            max_renewable_life: 0,
+            expiration: 1_700_000_000,
+            pw_expiration: 0,
+            last_success: 0,
+            last_failed: 1_700_000_100,
+            fail_auth_count: 2,
+            tl_data: vec![
+                TlData {
+                    kind: MKVNO,
+                    data: 1u16.to_le_bytes().to_vec(),
+                },
+                TlData {
+                    kind: LAST_PWD_CHANGE,
+                    data: 1_600_000_000u32.to_le_bytes().to_vec(),
+                },
+                TlData {
+                    kind: 0x0002,
+                    data: b"mod".to_vec(),
+                },
+            ],
+            key_data: vec![
+                KeyData {
+                    ver: 2,
+                    kvno: 2,
+                    fields: vec![(18, vec![1; 32]), (0, Vec::new())],
+                },
+                KeyData {
+                    ver: 2,
+                    kvno: 1,
+                    fields: vec![(18, vec![2; 32]), (0, Vec::new())],
+                },
+            ],
+        };
+        set_string_attr(&mut e, b"require_auth", Some(b"otp pkinit")).unwrap();
+        let osa = OsaPrincipalData {
+            policy: Some(b"p1".to_vec()),
+            aux_attributes: KADM5_POLICY,
+            ..Default::default()
+        };
+        e.tl_data.push(TlData {
+            kind: KADM_DATA,
+            data: osa.encode().unwrap(),
+        });
+        let vals = put_values(&e, |n| format!("cn={n},cn=EXAMPLE.COM,cn=krb")).unwrap();
+        let mut a = Attrs::default();
+        for (name, val) in vals.into_iter() {
+            if let Some(val) = val {
+                let n = name.to_ascii_lowercase();
+                match std::str::from_utf8(&val[0]) {
+                    Ok(_)
+                        if !matches!(
+                            n.as_str(),
+                            "krbprincipalkey" | "krbextradata" | "krbpwdhistory"
+                        ) =>
+                    {
+                        a.text.insert(
+                            n,
+                            val.into_iter()
+                                .map(|v| String::from_utf8(v).unwrap())
+                                .collect(),
+                        );
+                    }
+                    _ => {
+                        a.bin.insert(n, val);
+                    }
+                }
+            }
+        }
+        assert_eq!(a.text["krbprincipalauthind"], ["otp", "pkinit"]);
+        assert_eq!(
+            a.first("krbpwdpolicyreference"),
+            Some("cn=p1,cn=EXAMPLE.COM,cn=krb")
+        );
+        assert_eq!(a.bin["krbprincipalkey"].len(), 2);
+        let back = mit_entry(&a, e.principal.clone(), e.realm.clone()).unwrap();
+        assert_eq!(back.max_life, 36000);
+        assert_eq!(back.expiration, 1_700_000_000);
+        assert_eq!(back.fail_auth_count, 2);
+        assert_eq!(back.key_data, e.key_data);
+        assert_eq!(tl_u32(&back, LAST_PWD_CHANGE), Some(1_600_000_000));
+        let osa = OsaPrincipalData::decode(
+            &back
+                .tl_data
+                .iter()
+                .find(|t| t.kind == KADM_DATA)
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        assert_eq!(osa.policy.as_deref(), Some(&b"p1"[..]));
+        assert!(back
+            .tl_data
+            .iter()
+            .any(|t| t.kind == 0x0002 && t.data == b"mod"));
+    }
 }
