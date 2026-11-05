@@ -11,6 +11,7 @@ pub struct Krb5Acceptor {
     ctx: Option<Krb5Context>,
     delegated: Option<Vec<Credential>>,
     done: bool,
+    iakerb_conv: Option<Vec<u8>>,
 }
 
 impl Krb5Acceptor {
@@ -29,7 +30,15 @@ impl Krb5Acceptor {
             ctx: None,
             delegated: None,
             done: false,
+            iakerb_conv: None,
         }
+    }
+
+    /// Accept for the IAKERB mechanism (iakerb.c:888-904): a nonempty
+    /// `conv` must be covered by the initiator's IAKERB-FINISHED.
+    pub(crate) fn with_iakerb(mut self, conv: Vec<u8>) -> Self {
+        self.iakerb_conv = (!conv.is_empty()).then_some(conv);
+        self
     }
 
     /// Process an initial context token.
@@ -41,7 +50,16 @@ impl Krb5Acceptor {
         // (DCE-style, unsupported) are all defective here.
         let (mech, body) =
             parse_token_header(input).ok_or(Krb5Error::Gss(GssError::DefectiveToken))?;
-        if mech != MECH_KRB5 || body.len() < 2 {
+        // accept_sec_context.c:640-655 — the krb5 and IAKERB OIDs both
+        // reach kg_accept_krb5, and replies carry the OID received.
+        let mech_used: &'static [u8] = if mech == MECH_KRB5 {
+            MECH_KRB5
+        } else if mech == MECH_IAKERB {
+            MECH_IAKERB
+        } else {
+            return Err(gss(GssError::DefectiveToken));
+        };
+        if body.len() < 2 {
             return Err(gss(GssError::DefectiveToken));
         }
         if u16::from_be_bytes(body[..2].try_into().expect("2")) != TOK_AP_REQ {
@@ -106,7 +124,7 @@ impl Krb5Acceptor {
             ctx.acceptor_subkey = ac.send_subkey().cloned();
             ctx.flags |= GssFlags::PROT_READY;
 
-            let mut token = make_token_header(MECH_KRB5, ap_rep.len(), Some(TOK_AP_REP));
+            let mut token = make_token_header(mech_used, ap_rep.len(), Some(TOK_AP_REP));
             token.extend_from_slice(&ap_rep);
             self.ctx = Some(ctx);
             self.done = true;
@@ -128,6 +146,7 @@ impl Krb5Acceptor {
     ) -> Result<GssFlags, Krb5Error> {
         let mut cb_match = false;
         let mut flags = GssFlags::empty();
+        let mut finished = false;
 
         match &auth.cksum {
             None => {}
@@ -216,9 +235,21 @@ impl Krb5Acceptor {
                     if rest.len() < 8 {
                         return Err(gss(GssError::Failure));
                     }
+                    let id = u32::from_be_bytes(rest[0..4].try_into().expect("4"));
                     let len = u32::from_be_bytes(rest[4..8].try_into().expect("4")) as usize;
-                    if rest.len() < 8 + len {
+                    if rest.len() - 8 < len {
                         return Err(gss(GssError::Failure));
+                    }
+                    let ext = &rest[8..8 + len];
+                    // kg_process_extension (:374-400).
+                    if id == GSS_EXTS_FINISHED {
+                        let conv = self
+                            .iakerb_conv
+                            .as_deref()
+                            .ok_or(Krb5Error::Gss(GssError::Failure))?;
+                        let key = ac.recv_subkey().ok_or(Krb5Error::Gss(GssError::Failure))?;
+                        crate::gssapi::iakerb::verify_finished(key, conv, ext)?;
+                        finished = true;
                     }
                     rest = &rest[8 + len..];
                 }
@@ -255,6 +286,10 @@ impl Krb5Acceptor {
         }
         if client_cbt && self.cb.is_some() && !cb_match {
             return Err(gss(GssError::BadBindings));
+        }
+        // :850-853.
+        if self.iakerb_conv.is_some() && !finished {
+            return Err(gss(GssError::BadSig));
         }
         Ok(flags)
     }

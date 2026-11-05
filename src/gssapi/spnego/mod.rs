@@ -6,7 +6,13 @@
 //! and is treated as "field absent"; a matched tag with a bad length sets
 //! the input's error status).
 //!
-//! Inner mechanism: krb5 only.  All three Kerberos OIDs (canonical, the
+//! Inner mechanisms: krb5, and NegoEx (`MECH_NEGOEX`) over the
+//! [`NegoexMech`] mechanisms given to `with_negoex`, as MIT's
+//! spnego_mech.c:902-913 and :1480-1510 hand NegoEx tokens to
+//! negoex_init/negoex_accept. NegoEx mechanisms carry no SPNEGO
+//! mechListMIC because [`NegoexMech`] has no MIC operations.
+//!
+//! Krb5:  All three Kerberos OIDs (canonical, the
 //! pre-RFC `krb5_old`, and the Microsoft "wrong" OID) map to the same
 //! mechanism — `gss_mech_set_krb5_both` (krb5/gssapi_krb5.c:178-188).
 //!
@@ -22,6 +28,7 @@ use crate::error::Krb5Error;
 use crate::protocol::Credential;
 
 use super::krb5::{AcceptStep, InitStep, Krb5Acceptor, Krb5Context, Krb5Initiator, MECH_KRB5};
+use super::negoex::{Negoex, NegoexMech, MECH_NEGOEX};
 use super::token::{der_taglen, der_value_len, parse_token_header};
 use super::GssError;
 

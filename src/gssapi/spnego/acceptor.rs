@@ -6,6 +6,7 @@ use super::*;
 /// SPNEGO acceptor (spnego_gss_accept_sec_context:1546-1730).
 pub struct SpnegoAcceptor {
     inner: Option<Krb5Acceptor>,
+    negoex: Option<Negoex>,
     /// The acceptor's supported mechanism list (advertised in NegHints).
     mech_types: Vec<Vec<u8>>,
     der_mech_types: Vec<u8>,
@@ -32,6 +33,7 @@ impl SpnegoAcceptor {
     pub fn new(inner: Krb5Acceptor, mech_types: Vec<Vec<u8>>) -> Self {
         SpnegoAcceptor {
             inner: Some(inner),
+            negoex: None,
             mech_types,
             der_mech_types: Vec::new(),
             internal_mech: None,
@@ -41,6 +43,29 @@ impl SpnegoAcceptor {
             first: true,
             send_supported_mech: false,
         }
+    }
+
+    /// An acceptor supporting only NegoEx (`mech_types` must name
+    /// `MECH_NEGOEX`).
+    pub fn negoex(negoex: Negoex, mech_types: Vec<Vec<u8>>) -> Self {
+        SpnegoAcceptor {
+            inner: None,
+            negoex: Some(negoex),
+            mech_types,
+            der_mech_types: Vec::new(),
+            internal_mech: None,
+            mech_complete: false,
+            mic: MicCtx::default(),
+            opened: false,
+            first: true,
+            send_supported_mech: false,
+        }
+    }
+
+    /// Also accept NegoEx when `mech_types` names `MECH_NEGOEX`.
+    pub fn with_negoex(mut self, negoex: Negoex) -> Self {
+        self.negoex = Some(negoex);
+        self
     }
 
     /// Process one input token (acc_ctx_hints / acc_ctx_new /
@@ -123,19 +148,37 @@ impl SpnegoAcceptor {
         let mut mechtok_out: Option<Vec<u8>> = None;
         if neg_state != NegState::RequestMic {
             if let Some(tok) = mechtok_in {
-                // acc_ctx_vfy_oid (:1424-1468): the mechToken's framing
-                // OID must equal internal_mech or be a krb5 alias.
-                let (mechoid, _b) =
-                    parse_token_header(&tok).ok_or_else(|| gss(GssError::DefectiveToken))?;
-                let internal = self.internal_mech.clone().unwrap_or_default();
-                if mechoid != internal && !(is_kerb_mech(&internal) && is_kerb_mech(mechoid)) {
-                    return Err(gss(GssError::BadMech));
-                }
-                let inner = self
-                    .inner
-                    .as_mut()
-                    .ok_or_else(|| gss(GssError::NoContext))?;
-                match inner.step(&tok)? {
+                let step = if self.internal_mech.as_deref() == Some(MECH_NEGOEX) {
+                    // negoex_accept (spnego_mech.c:1498-1500); NegoEx tokens
+                    // carry no GSS framing to verify.
+                    let nx = self
+                        .negoex
+                        .as_mut()
+                        .ok_or_else(|| gss(GssError::NoContext))?;
+                    let s = nx.accept(&tok)?;
+                    if s.complete {
+                        AcceptStep::Complete {
+                            token: Some(s.token).filter(|t| !t.is_empty()),
+                        }
+                    } else {
+                        AcceptStep::ContinueNeeded(s.token)
+                    }
+                } else {
+                    // acc_ctx_vfy_oid (:1424-1468): the mechToken's framing
+                    // OID must equal internal_mech or be a krb5 alias.
+                    let (mechoid, _b) =
+                        parse_token_header(&tok).ok_or_else(|| gss(GssError::DefectiveToken))?;
+                    let internal = self.internal_mech.clone().unwrap_or_default();
+                    if mechoid != internal && !(is_kerb_mech(&internal) && is_kerb_mech(mechoid)) {
+                        return Err(gss(GssError::BadMech));
+                    }
+                    let inner = self
+                        .inner
+                        .as_mut()
+                        .ok_or_else(|| gss(GssError::NoContext))?;
+                    inner.step(&tok)?
+                };
+                match step {
                     AcceptStep::Complete { token } => {
                         self.mech_complete = true;
                         mechtok_out = token;
@@ -223,7 +266,18 @@ impl SpnegoAcceptor {
     /// Whether the context flags carry INTEG — our krb5 mechanism always
     /// sets it.
     fn integ(&self) -> bool {
-        true
+        self.internal_mech.as_deref() != Some(MECH_NEGOEX)
+    }
+
+    /// The NegoEx mechanism SPNEGO established; fails while the exchange
+    /// is incomplete or when NegoEx was not negotiated.
+    pub fn negoex_mech(self) -> Result<Box<dyn NegoexMech>, Krb5Error> {
+        if !self.opened || self.internal_mech.as_deref() != Some(MECH_NEGOEX) {
+            return Err(gss(GssError::NoContext));
+        }
+        self.negoex
+            .and_then(Negoex::into_mech)
+            .ok_or_else(|| gss(GssError::NoContext))
     }
 
     /// Extract the established context; fails while the SPNEGO exchange

@@ -12,6 +12,7 @@ use super::*;
 /// mechTypes is re-encoded without them.
 pub struct SpnegoInitiator {
     inner: Option<Krb5Initiator>,
+    negoex: Option<Negoex>,
     mech_types: Vec<Vec<u8>>,
     der_mech_types: Vec<u8>,
     internal_mech: Option<Vec<u8>>,
@@ -29,6 +30,7 @@ impl SpnegoInitiator {
     pub fn new(inner: Krb5Initiator, mech_types: Vec<Vec<u8>>) -> Self {
         SpnegoInitiator {
             inner: Some(inner),
+            negoex: None,
             mech_types,
             der_mech_types: Vec::new(),
             internal_mech: None,
@@ -38,6 +40,42 @@ impl SpnegoInitiator {
             opened: false,
             fresh: true,
         }
+    }
+
+    /// An initiator offering only NegoEx (`mech_types` must name
+    /// `MECH_NEGOEX`).
+    pub fn negoex(negoex: Negoex, mech_types: Vec<Vec<u8>>) -> Self {
+        let mut s = Self {
+            inner: None,
+            ..Self::new_empty(mech_types)
+        };
+        s.negoex = Some(negoex);
+        s
+    }
+
+    /// Also negotiate NegoEx when `mech_types` names `MECH_NEGOEX`.
+    pub fn with_negoex(mut self, negoex: Negoex) -> Self {
+        self.negoex = Some(negoex);
+        self
+    }
+
+    fn new_empty(mech_types: Vec<Vec<u8>>) -> Self {
+        SpnegoInitiator {
+            inner: None,
+            negoex: None,
+            mech_types,
+            der_mech_types: Vec::new(),
+            internal_mech: None,
+            mech_complete: false,
+            nego_done: false,
+            mic: MicCtx::default(),
+            opened: false,
+            fresh: true,
+        }
+    }
+
+    fn can_init(&self, oid: &[u8]) -> bool {
+        (is_kerb_mech(oid) && self.inner.is_some()) || (oid == MECH_NEGOEX && self.negoex.is_some())
     }
 
     /// Drive the exchange one step (init_ctx_new / init_ctx_cont /
@@ -59,7 +97,7 @@ impl SpnegoInitiator {
             let pos = self
                 .mech_types
                 .iter()
-                .position(|o| is_kerb_mech(o))
+                .position(|o| self.can_init(o))
                 .ok_or_else(|| gss(GssError::BadMech))?;
             self.mech_types.drain(..pos);
             self.internal_mech = Some(self.mech_types[0].clone());
@@ -103,7 +141,7 @@ impl SpnegoInitiator {
                     // Reselecting a non-krb5 mech cannot succeed: we have
                     // no initiator for it (MIT's gss_init_sec_context
                     // fails with GSS_S_BAD_MECH for an unknown mech).
-                    if !is_kerb_mech(&supported) {
+                    if !self.can_init(&supported) {
                         return Err(gss(GssError::BadMech));
                     }
                     send_cont = true;
@@ -136,11 +174,25 @@ impl SpnegoInitiator {
         // Step 2: invoke the inner krb5 mechanism (:1063-1074).
         if !self.mech_complete {
             let mechtok_in = resp.as_ref().and_then(|r| r.response_token.clone());
-            let inner = self
-                .inner
-                .as_mut()
-                .ok_or_else(|| gss(GssError::NoContext))?;
-            let out = inner.step(mechtok_in.as_deref())?;
+            let out = if self.internal_mech.as_deref() == Some(MECH_NEGOEX) {
+                // negoex_init (spnego_mech.c:902-907).
+                let nx = self
+                    .negoex
+                    .as_mut()
+                    .ok_or_else(|| gss(GssError::NoContext))?;
+                let s = nx.init(mechtok_in.as_deref())?;
+                if s.complete {
+                    InitStep::Complete(Some(s.token).filter(|t| !t.is_empty()))
+                } else {
+                    InitStep::Continue(s.token)
+                }
+            } else {
+                let inner = self
+                    .inner
+                    .as_mut()
+                    .ok_or_else(|| gss(GssError::NoContext))?;
+                inner.step(mechtok_in.as_deref())?
+            };
             match out {
                 InitStep::Continue(t) => mechtok_out = Some(t),
                 InitStep::Complete(t) => {
@@ -226,7 +278,18 @@ impl SpnegoInitiator {
     /// Whether the context flags carry INTEG — our krb5 mechanism always
     /// sets it (krb5.rs forces CONF|INTEG), like init_ctx_call_init:893.
     fn integ(&self) -> bool {
-        true
+        self.internal_mech.as_deref() != Some(MECH_NEGOEX)
+    }
+
+    /// The NegoEx mechanism SPNEGO established; fails while the exchange
+    /// is incomplete or when NegoEx was not negotiated.
+    pub fn negoex_mech(self) -> Result<Box<dyn NegoexMech>, Krb5Error> {
+        if !self.opened || self.internal_mech.as_deref() != Some(MECH_NEGOEX) {
+            return Err(gss(GssError::NoContext));
+        }
+        self.negoex
+            .and_then(Negoex::into_mech)
+            .ok_or_else(|| gss(GssError::NoContext))
     }
 
     /// Extract the established context; fails while the SPNEGO exchange
