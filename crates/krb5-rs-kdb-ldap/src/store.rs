@@ -270,7 +270,11 @@ impl LdapStore {
     }
 
     /// `krb5_read_tkt_policy` (ldap_principal2.c:1565-1613).
-    async fn apply_tkt_policy(&self, meta: &EntryMeta, e: &mut MitEntry) -> Result<(), StoreError> {
+    pub(crate) async fn apply_tkt_policy(
+        &self,
+        meta: &EntryMeta,
+        e: &mut MitEntry,
+    ) -> Result<(), StoreError> {
         if meta.has_max_life && meta.has_max_rlife && meta.has_flags {
             return Ok(());
         }

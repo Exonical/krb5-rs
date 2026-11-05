@@ -91,6 +91,10 @@ pub struct EntryMeta {
     pub names: Vec<String>,
     /// Whether the entry is a standalone `krbPrincipal`.
     pub standalone: bool,
+    /// The attribute names the entry has (lowercase).
+    pub present: Vec<String>,
+    /// The `objectClass` values.
+    pub classes: Vec<String>,
 }
 
 /// `krb5_ldap_policydn_to_name` (ldap_misc.c:1281-1327): the first RDN's
@@ -146,6 +150,8 @@ pub fn entry_meta(dn: &str, a: &Attrs) -> EntryMeta {
             .into_iter()
             .flatten()
             .any(|c| c.eq_ignore_ascii_case("krbprincipal")),
+        present: a.text.keys().chain(a.bin.keys()).cloned().collect(),
+        classes: a.text.get("objectclass").cloned().unwrap_or_default(),
     }
 }
 

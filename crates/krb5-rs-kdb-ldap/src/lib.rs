@@ -7,5 +7,6 @@ pub mod entry;
 pub mod keyseq;
 pub mod realm;
 pub mod store;
+pub mod write;
 
 pub use store::LdapStore;
