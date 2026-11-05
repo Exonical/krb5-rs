@@ -12,6 +12,11 @@ mod imp {
     use crate::kdc::error::KdcError;
     use crate::kdc::{Kdc, PrincipalStore};
     pub(in crate::kdc) use crate::pkinit::server::Verified;
+
+    /// Whether the verified certificate asserts hardware authentication.
+    pub(in crate::kdc) fn hw_authent(v: &Verified) -> bool {
+        v.hw_authent
+    }
     use crate::pkinit::server::{
         self, RequestInfo, PA_AS_FRESHNESS, PA_PKINIT_KX, PA_PK_AS_REP, PA_PK_AS_REQ,
     };
@@ -252,6 +257,11 @@ mod imp {
     /// Uninhabited without the `pkinit` feature.
     pub(in crate::kdc) enum Verified {}
 
+    /// Uninhabited without the `pkinit` feature.
+    pub(in crate::kdc) fn hw_authent(v: &Verified) -> bool {
+        match *v {}
+    }
+
     impl<S: PrincipalStore> Kdc<S> {
         pub(in crate::kdc) fn pkinit_hint_extras(
             &self,
@@ -285,3 +295,5 @@ mod imp {
         }
     }
 }
+
+pub(in crate::kdc) use imp::hw_authent;

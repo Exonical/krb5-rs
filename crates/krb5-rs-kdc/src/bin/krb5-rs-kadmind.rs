@@ -2537,6 +2537,27 @@ async fn kadmind(args: Args) {
         Some("krb5-rs-cockroach") => die(
             "db_library krb5-rs-cockroach needs a krb5-rs-kadmind built with the `cockroach` feature",
         ),
+        #[cfg(feature = "kldap")]
+        Some("kldap") => {
+            // MIT's kldap has no update log: the directory replicates itself.
+            if cfg.iprop.enabled {
+                die("iprop_enable is not supported with db_library kldap");
+            }
+            Db::Ldap(
+                krb5_rs_kdb_ldap::LdapStore::open(
+                    &cfg,
+                    &args.db_args,
+                    krb5_rs_kdb_ldap::config::ServerType::Admin,
+                    &master,
+                )
+                .await
+                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+            )
+        }
+        #[cfg(not(feature = "kldap"))]
+        Some("kldap") => {
+            die("db_library kldap needs a krb5-rs-kadmind built with the `kldap` feature")
+        }
         Some("krb5-rs-file") => Db::File(Arc::new(
             krb5_rs::kdc::kdb::FileStore::open(&cfg.database_name, &master)
                 .and_then(|store| store.with_iprop(&cfg.iprop))

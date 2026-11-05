@@ -332,7 +332,7 @@ impl<S: PrincipalStore> Kdc<S> {
                     None => continue,
                     Some(Ok(v)) => {
                         // pkinit_srv.c:602-603.
-                        if v.hw_authent {
+                        if super::pkinit::hw_authent(&v) {
                             flags |= TicketFlags::HW_AUTHENT;
                         }
                         pkinit_verified = Some(v);

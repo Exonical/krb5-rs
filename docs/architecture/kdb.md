@@ -30,12 +30,14 @@ kprop/kpropd push propagation stay. Nothing in this design removes them.
 | `crates/krb5-rs-kdb-lmdb` | MIT klmdb-compatible principal, policy and lockout store | default module in daemon/admin binaries |
 | `crates/krb5-rs-kdb-turso` | Turso replica: `PrincipalStore`, `PolicyStore`, `AuthStateStore`, `ReplicaSink`, migrations | optional module |
 | `crates/krb5-rs-kdb-cockroach` | CockroachDB: `AdminStore`, `ReplicationSource`, `AuthoritativeState`, lockout reporter, replica status registry, migrations, TLS | optional module |
-| `crates/krb5-rs-kdc` | Daemon and admin CLI. Cargo features `klmdb`, `turso` and `cockroach` compile modules; metrics/health HTTP | klmdb on by default |
+| `crates/krb5-rs-kdb-ldap` | MIT kldap-compatible store: principals, ticket and password policies and lockout state in an LDAP directory, MIT's schema in `schema/` | default module in daemon/admin binaries |
+| `crates/krb5-rs-kdc` | Daemon and admin CLI. Cargo features `klmdb`, `kldap`, `turso` and `cockroach` compile modules; metrics/health HTTP | klmdb and kldap on by default |
 
 The database modules are **pluggable**. The klmdb backend is compiled in by
 default for the daemon and admin binaries and is the default backend: an
 unset `db_library` selects klmdb, and `db_library = krb5-rs-file` selects the
-krb5-rs file store. Turso and CockroachDB are optional features. The core
+krb5-rs file store and `db_library = kldap` the LDAP store. Turso and
+CockroachDB are optional features. The core
 library remains pure Rust; the daemon/admin binaries include LMDB C code, and
 the CockroachDB build adds aws-lc-rs and `turso_core`'s `simsimd`.
 
@@ -132,6 +134,58 @@ write lock (`<database_name>.lock`) from export to backup, so it fails with
 "retry" rather than lose writes from a process still using the file backend. A
 crash leaves that lock file behind, exactly as a crashed file-store writer
 does; remove it once no file-store writer is running.
+
+### MIT kldap (LDAP directory)
+
+`db_library = kldap` selects `krb5-rs-kdb-ldap`, which follows MIT 1.22.2's
+`plugins/kdb/ldap`. The directory needs MIT's Kerberos schema, shipped in
+`crates/krb5-rs-kdb-ldap/schema/` (`kerberos.schema` for slapd.conf,
+`kerberos.openldap.ldif` for cn=config, `kerberos.ldif` for other servers).
+
+- **Configuration:** the `[dbmodules]` keys `ldap_kerberos_container_dn`,
+  `ldap_kdc_dn`, `ldap_kadmind_dn`, `ldap_kdc_sasl_mech`,
+  `ldap_kadmind_sasl_mech` (and the `_sasl_authcid`, `_sasl_authzid` and
+  `_sasl_realm` keys), `ldap_service_password_file`, `ldap_servers` and
+  `ldap_conns_per_server`, and the `-x` arguments `binddn`, `bindpwd`,
+  `nconns`, `sasl_mech`, `sasl_authcid`, `sasl_authzid`, `sasl_realm`,
+  `host` and `debug`, as in MIT. The KDC
+  binds with the KDC DN and kadmind and `krb5-rs-kdb` with the kadmind DN.
+  Unknown arguments fail; `temporary` fails with `KDB module requires
+  -update argument`.
+- **Service password stash:** `name#{HEX}hex` lines, `!` and `#` comments,
+  read as MIT's `kdb5_ldap_util stashsrvpw` writes them.
+- **Entries:** MIT's DNs, object classes, search filter
+  (`krbprincipalname`, escaped as `ldap_filter_correct`), search scope and
+  subtrees, `krbCanonicalName`, the duplicate-entry error, the
+  `krbPrincipalKey` ASN.1 key sequence, `krbExtraData`, password history,
+  `krbPrincipalAuthInd`, `krbAllowedToDelegateTo` and `nsAccountLock`.
+  Ticket lifetimes and flags missing from an entry come from its
+  `krbTicketPolicyReference` and then the realm, as in
+  `krb5_read_tkt_policy`; `addprinc` without `-maxlife`/`-maxrenewlife`
+  leaves them unset.
+- **Lockout:** `krbLoginFailedCount`, `krbLastFailedAuth` and
+  `krbLastSuccessfulAuth`, with `disable_lockout` and
+  `disable_last_success`, as in `krb5_ldap_lockout_audit`.
+- **`krb5-rs-kdb`:** `create` makes the realm container, `K/M`, `krbtgt` and
+  the kadmin principals as `kdb5_ldap_util create` does; `stash`, `dump`,
+  `load -update` and the principal and policy commands work. A load without
+  `-update` fails like MIT, and `destroy` fails with MIT's
+  `KRB5_PLUGIN_OP_NOTSUPP` message.
+- **Replication:** the directory replicates itself. As in MIT there is no
+  update log, so `iprop_enable` with kldap stops kadmind at startup.
+
+Differences from MIT:
+
+- `kdb5_ldap_util` itself is not provided. Realm creation is `krb5-rs-kdb
+  create`; ticket policies (`create_policy`), `modify`, `view`, `list` and
+  `stashsrvpw` must be done with LDAP tools.
+- SASL binds support `EXTERNAL` only (for `ldapi://` or TLS client
+  certificates); MIT supports any mechanism libsasl2 provides.
+- The master-key commands (`add_mkey`, `use_mkey`, `list_mkeys`,
+  `purge_mkeys`, `update_princ_encryption`), `ark` and `tabdump` are refused
+  on kldap.
+- The integration test (`cargo test -p krb5-rs-kdb-ldap --test openldap --
+  --ignored`) needs `slapd`; `tests/slapd.sh` starts a private instance.
 
 ### Password policy
 
@@ -399,8 +453,8 @@ MIT does (`ovsec_kadmd.c:507`), unless `-nofork` is given; `-P` then writes
 the daemon's pid. Startup errors before that point still reach the
 terminal, and the command exits with the daemon's status.
 
-kadmind administers klmdb, the file store (`db_library = krb5-rs-file`, as
-MIT's kadmind does db2) and CockroachDB. On the file store, principals keep
+kadmind administers klmdb, kldap, the file store (`db_library =
+krb5-rs-file`, as MIT's kadmind does db2) and CockroachDB. On the file store, principals keep
 their MIT tl-data, so the modifier in `MOD_PRINC`, string attributes and
 aliases read back as on klmdb.
 
