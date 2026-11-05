@@ -499,18 +499,14 @@ impl Negoex {
                 let count = h.u16() as usize;
                 let schemes = vector_base(off, count, GUID_LENGTH, msg)
                     .ok_or(err(NegoexError::InvalidMessageSize))?
-                    .chunks_exact(GUID_LENGTH)
-                    .map(|c| {
-                        let mut g = [0; GUID_LENGTH];
-                        g.copy_from_slice(c);
-                        g
-                    })
-                    .collect();
+                    .as_chunks::<GUID_LENGTH>()
+                    .0
+                    .to_vec();
                 let off = h.u32() as usize;
                 let count = h.u16() as usize;
                 let exts = vector_base(off, count, EXTENSION_LENGTH, msg)
                     .ok_or(err(NegoexError::InvalidMessageSize))?;
-                for e in exts.chunks_exact(EXTENSION_LENGTH) {
+                for e in exts.as_chunks::<EXTENSION_LENGTH>().0 {
                     let t = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
                     if t & EXTENSION_FLAG_CRITICAL != 0 {
                         return Err(err(NegoexError::UnsupportedCriticalExtension));

@@ -644,3 +644,50 @@ fn checksum_key_usages() {
     assert_eq!(a.keyusage(true), KEYUSAGE_INITIATOR_CHECKSUM);
     assert_eq!(a.keyusage(false), KEYUSAGE_ACCEPTOR_CHECKSUM);
 }
+
+fn spnego_run(env: Env) -> (Vec<u8>, Vec<u8>) {
+    use crate::gssapi::krb5::{AcceptStep, InitStep};
+    use crate::gssapi::spnego::{SpnegoAcceptor, SpnegoInitiator};
+    let env = Arc::new(env);
+    let list = vec![MECH_NEGOEX.to_vec()];
+    let mut i = SpnegoInitiator::negoex(Negoex::new(true, mechs(true, &env)), list.clone());
+    let mut a = SpnegoAcceptor::negoex(Negoex::new(false, mechs(false, &env)), list);
+    let mut tok = match i.step(None).unwrap() {
+        InitStep::Continue(t) => t,
+        InitStep::Complete(_) => panic!("complete before the acceptor answered"),
+    };
+    for _ in 0..20 {
+        let reply = match a.step(&tok).unwrap() {
+            AcceptStep::Complete { token: None } => break,
+            AcceptStep::Complete { token: Some(t) } | AcceptStep::ContinueNeeded(t) => t,
+        };
+        match i.step(Some(&reply)).unwrap() {
+            InitStep::Complete(None) => break,
+            InitStep::Complete(Some(t)) | InitStep::Continue(t) => tok = t,
+        }
+    }
+    let im = i.negoex_mech().unwrap().auth_scheme().to_vec();
+    let am = a.negoex_mech().unwrap().auth_scheme().to_vec();
+    (im, am)
+}
+
+#[test]
+fn spnego_negotiates_negoex() {
+    for e in [
+        hops(1),
+        hops(2),
+        hops(3),
+        Env {
+            init_query_fail: Some(102),
+            ..env()
+        },
+    ] {
+        let first = e.init_query_fail.is_none();
+        let (im, am) = spnego_run(e);
+        assert_eq!(im, am);
+        assert_eq!(
+            *im.iter().rfind(|&&b| b != 0).unwrap(),
+            if first { 102 } else { 44 }
+        );
+    }
+}
