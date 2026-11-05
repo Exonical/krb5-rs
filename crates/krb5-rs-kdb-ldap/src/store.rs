@@ -176,7 +176,8 @@ impl LdapStore {
         &self.inner.cfg
     }
 
-    pub(crate) fn master_keys(&self) -> MasterKeys {
+    /// The realm's master keys as last read from `K/M`.
+    pub fn master_keys(&self) -> MasterKeys {
         self.inner
             .master
             .read()

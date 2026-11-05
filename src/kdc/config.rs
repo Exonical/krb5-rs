@@ -286,6 +286,10 @@ impl RealmConfig {
     /// arguments (`plugins/kdb/db2/kdb_db2.c:222-247`): `hash=`, `unlockiter`
     /// and `lockiter` choose db2 access methods and change nothing there.
     pub fn apply_db_args(&mut self, args: &[String]) -> Result<DbArgs, String> {
+        // kldap parses its own arguments (`krb5_ldap_parse_db_params`).
+        if self.db_module.library.as_deref() == Some("kldap") {
+            return Ok(DbArgs::default());
+        }
         let db2 = self.db_module.library.as_deref() == Some("krb5-rs-file");
         let mut flags = DbArgs::default();
         for arg in args {

@@ -22,12 +22,14 @@ pub enum Db {
     File(Arc<FileStore>),
     #[cfg(feature = "cockroach")]
     Cockroach(CockroachStore),
+    #[cfg(feature = "kldap")]
+    Ldap(krb5_rs_kdb_ldap::LdapStore),
 }
 
 /// Run a CockroachDB call to completion from synchronous code, on the
 /// current runtime but off this thread (which may itself be a runtime
 /// worker, where `block_on` would panic).
-#[cfg(feature = "cockroach")]
+#[cfg(any(feature = "cockroach", feature = "kldap"))]
 fn wait<F>(f: F) -> F::Output
 where
     F: Future + Send,
@@ -47,6 +49,8 @@ impl Db {
     pub fn has_ulog(&self) -> bool {
         match self {
             Db::Lmdb(_) | Db::File(_) => true,
+            #[cfg(feature = "kldap")]
+            Db::Ldap(_) => false,
             #[cfg(feature = "cockroach")]
             Db::Cockroach(_) => false,
         }
@@ -61,6 +65,8 @@ impl Db {
         match self {
             Db::Lmdb(s) => s.principal_sync(name, realm),
             Db::File(s) => FileStore::get_record(s, name, realm).map(|r| r.map(|r| r.entry)),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => wait(AdminStore::get_record(s, name, realm)).map(|r| r.map(|r| r.entry)),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => {
                 wait(AdminStore::get_record(s, name, realm)).map(|r| r.map(|r| r.entry))
@@ -78,6 +84,8 @@ impl Db {
             Db::File(s) => s.mit_entry(name, realm),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.raw_entry(name, realm)),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => wait(s.raw_entry(name, realm)),
         }
     }
 
@@ -87,6 +95,8 @@ impl Db {
             Db::File(s) => s.mit_policy(name),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.raw_policy(name)),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => wait(s.raw_policy(name)),
         }
     }
 
@@ -96,6 +106,8 @@ impl Db {
             Db::File(s) => s.create_mit(raw),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.create_raw(raw)),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => wait(s.create_raw(raw)),
         }
     }
 
@@ -110,6 +122,8 @@ impl Db {
             Db::File(s) => s.rename_mit(name, realm, f),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.rename_raw(name, realm, f)),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => wait(s.rename_raw(name, realm, f)),
         }
     }
 
@@ -123,6 +137,8 @@ impl Db {
             Db::File(s) => s.update_mit(name, realm, f),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.update_raw(name, realm, f)),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => wait(s.update_raw(name, realm, f)),
         }
     }
 
@@ -132,6 +148,8 @@ impl Db {
             Db::File(s) => s.mit_entries(),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => wait(s.raw_entries()),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => wait(s.raw_entries()),
         }
     }
 
@@ -139,6 +157,11 @@ impl Db {
         match self {
             Db::Lmdb(s) => s.policy_names_sync(),
             Db::File(s) => Ok(FileStore::list_policies(s)?
+                .into_iter()
+                .map(|p| p.name)
+                .collect()),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => Ok(wait(AdminStore::list_policies(s))?
                 .into_iter()
                 .map(|p| p.name)
                 .collect()),
@@ -154,6 +177,8 @@ impl Db {
         match self {
             Db::Lmdb(s) => s.master_key_list(),
             Db::File(s) => s.master_key_list(),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => Ok(s.master_keys().clone()),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => Ok(s.master_keys()),
         }
@@ -164,6 +189,8 @@ impl Db {
         match self {
             Db::Lmdb(s) => CallerDb::Lmdb(s.as_caller(modifier)),
             Db::File(s) => CallerDb::File(s.as_caller(modifier)),
+            #[cfg(feature = "kldap")]
+            Db::Ldap(s) => CallerDb::Ldap(s.as_caller(modifier.clone(), Vec::new()), modifier),
             #[cfg(feature = "cockroach")]
             Db::Cockroach(s) => {
                 CallerDb::Cockroach(s.as_caller(modifier.clone(), Vec::new()), modifier)
@@ -179,6 +206,9 @@ pub enum CallerDb {
     /// The caller's store and the modifier it was made for.
     #[cfg(feature = "cockroach")]
     Cockroach(CockroachStore, Vec<u8>),
+    /// The caller's store and the modifier it was made for.
+    #[cfg(feature = "kldap")]
+    Ldap(krb5_rs_kdb_ldap::LdapStore, Vec<u8>),
 }
 
 impl CallerDb {
@@ -187,6 +217,10 @@ impl CallerDb {
         match self {
             CallerDb::Lmdb(s) => CallerDb::Lmdb(s.with_tl_data(tl)),
             CallerDb::File(s) => CallerDb::File(s.with_tl_data(tl)),
+            #[cfg(feature = "kldap")]
+            CallerDb::Ldap(s, modifier) => {
+                CallerDb::Ldap(s.as_caller(modifier.clone(), tl), modifier)
+            }
             #[cfg(feature = "cockroach")]
             CallerDb::Cockroach(s, modifier) => {
                 CallerDb::Cockroach(s.as_caller(modifier.clone(), tl), modifier)
@@ -196,7 +230,7 @@ impl CallerDb {
 }
 
 macro_rules! delegate_admin_store {
-    ($ty:ident, $lmdb:pat => $l:expr, $file:pat => $f:expr, $crdb:pat => $c:expr) => {
+    ($ty:ident, $lmdb:pat => $l:expr, $file:pat => $f:expr, $crdb:pat => $c:expr, $ldap:pat => $d:expr) => {
         impl AdminStore for $ty {
             fn get_record(
                 &self,
@@ -209,6 +243,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.get_record(name, realm).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.get_record(name, realm).await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.get_record(name, realm).await,
                     }
                 }
             }
@@ -224,6 +260,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.create_principal(entry, last_pwd_change).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.create_principal(entry, last_pwd_change).await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.create_principal(entry, last_pwd_change).await,
                     }
                 }
             }
@@ -243,6 +281,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.update_principal(name, realm, f).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.update_principal(name, realm, f).await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.update_principal(name, realm, f).await,
                     }
                 }
             }
@@ -258,6 +298,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.delete_principal(name, realm).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.delete_principal(name, realm).await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.delete_principal(name, realm).await,
                     }
                 }
             }
@@ -271,6 +313,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.list_principals().await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.list_principals().await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.list_principals().await,
                     }
                 }
             }
@@ -285,6 +329,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.get_policy(name).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.get_policy(name).await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.get_policy(name).await,
                     }
                 }
             }
@@ -299,6 +345,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.create_policy(policy).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.create_policy(policy).await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.create_policy(policy).await,
                     }
                 }
             }
@@ -317,6 +365,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.update_policy(name, f).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.update_policy(name, f).await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.update_policy(name, f).await,
                     }
                 }
             }
@@ -331,6 +381,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.delete_policy(name).await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.delete_policy(name).await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.delete_policy(name).await,
                     }
                 }
             }
@@ -344,6 +396,8 @@ macro_rules! delegate_admin_store {
                         $file => $f.list_policies().await,
                         #[cfg(feature = "cockroach")]
                         $crdb => $c.list_policies().await,
+                        #[cfg(feature = "kldap")]
+                        $ldap => $d.list_policies().await,
                     }
                 }
             }
@@ -351,10 +405,17 @@ macro_rules! delegate_admin_store {
     };
 }
 
-delegate_admin_store!(Db, Db::Lmdb(s) => (**s), Db::File(s) => s.admin(), Db::Cockroach(s) => s);
+delegate_admin_store!(
+    Db,
+    Db::Lmdb(s) => (**s),
+    Db::File(s) => s.admin(),
+    Db::Cockroach(s) => s,
+    Db::Ldap(s) => s
+);
 delegate_admin_store!(
     CallerDb,
     CallerDb::Lmdb(s) => s,
     CallerDb::File(s) => s,
-    CallerDb::Cockroach(s, _) => s
+    CallerDb::Cockroach(s, _) => s,
+    CallerDb::Ldap(s, _) => s
 );
