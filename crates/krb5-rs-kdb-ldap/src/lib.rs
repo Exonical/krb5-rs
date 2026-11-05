@@ -6,3 +6,6 @@ pub mod conn;
 pub mod entry;
 pub mod keyseq;
 pub mod realm;
+pub mod store;
+
+pub use store::LdapStore;
