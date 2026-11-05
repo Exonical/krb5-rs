@@ -77,6 +77,13 @@ impl LdapStore {
 
     /// Add a new standalone entry for `raw`.
     pub async fn add_entry(&self, raw: &MitEntry) -> Result<(), StoreError> {
+        self.add_entry_without(raw, &[]).await
+    }
+
+    /// [`Self::add_entry`] leaving out the attributes in `unset`, the ticket
+    /// values kadm5 left out of the mask, so they are inherited from the
+    /// ticket policy or realm on read (ldap_principal2.c:1181-1190).
+    async fn add_entry_without(&self, raw: &MitEntry, unset: &[&str]) -> Result<(), StoreError> {
         let user = ldap_unparse_name(&raw.principal, &raw.realm);
         let dn = self.standalone_dn(&user, None);
         let mut attrs: HashMap<Vec<u8>, HashSet<Vec<u8>>> = HashMap::new();
@@ -90,6 +97,9 @@ impl LdapStore {
         attrs.insert(b("krbprincipalname"), HashSet::from([b(&user)]));
         attrs.insert(b("krbcanonicalname"), HashSet::from([b(&user)]));
         for (n, v) in put_values(raw, |p| self.policy_dn(p))? {
+            if unset.contains(&n) {
+                continue;
+            }
             if let Some(v) = v.filter(|v| !v.is_empty()) {
                 attrs.insert(b(n), v.into_iter().collect());
             }
@@ -142,6 +152,13 @@ impl LdapStore {
                 entry.name, entry.realm
             )));
         }
+        let mut unset = Vec::new();
+        if entry.max_life.is_none() {
+            unset.push("krbmaxticketlife");
+        }
+        if entry.max_renewable_life.is_none() {
+            unset.push("krbmaxrenewableage");
+        }
         let record = PrincipalRecord {
             unlock: false,
             mod_time: Some(now_time()),
@@ -152,7 +169,7 @@ impl LdapStore {
         };
         let mut raw = new_entry(&record, &self.master_keys(), &modifier)?;
         update_tl_data(&mut raw, self.caller_tl());
-        self.add_entry(&raw).await
+        self.add_entry_without(&raw, &unset).await
     }
 
     /// Read, change and write back a principal as `modifier`.

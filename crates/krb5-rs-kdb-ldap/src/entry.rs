@@ -202,7 +202,7 @@ pub fn mit_entry(a: &Attrs, name: PrincipalName, realm: String) -> Result<MitEnt
         e.key_data.extend(set.key_data);
     }
     // krb5_decode_krbsecretkey: newest kvno first.
-    e.key_data.sort_by(|x, y| y.kvno.cmp(&x.kvno));
+    e.key_data.sort_by_key(|x| std::cmp::Reverse(x.kvno));
     if mkvno != 0 {
         e.tl_data.push(TlData {
             kind: MKVNO,
