@@ -11,7 +11,6 @@ use ldap3::{Mod, Scope};
 
 use crate::attr::string_time;
 use crate::store::{ldap_err, LdapStore};
-use crate::write::admin_name;
 
 fn time_value(t: i64) -> HashSet<Vec<u8>> {
     if t <= 0 {
@@ -127,7 +126,7 @@ impl AdminStore for LdapStore {
         entry: PrincipalEntry,
         last_pwd_change: Option<KerberosTime>,
     ) -> Result<(), StoreError> {
-        let modifier = admin_name(&self.inner.realm);
+        let modifier = self.modifier();
         self.create_principal_as(entry, last_pwd_change, modifier)
             .await
     }
@@ -141,7 +140,7 @@ impl AdminStore for LdapStore {
     where
         F: FnMut(&mut PrincipalRecord) -> Result<(), StoreError> + Send + 'static,
     {
-        let modifier = admin_name(&self.inner.realm);
+        let modifier = self.modifier();
         self.update_principal_as(name, realm, modifier, f).await
     }
 

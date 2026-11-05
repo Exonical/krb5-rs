@@ -12,6 +12,7 @@ use crate::attr::{filter_correct, ldap_parse_name, ldap_unparse_name};
 use crate::entry::{entry_meta, mit_entry, put_values, Values};
 use crate::realm::SCOPE_ONE;
 use crate::store::{attrs_of, ldap_err, Found, LdapStore, FILTER, PRINCIPAL_ATTRS};
+use krb5_rs::kdc::kdb::mit::update_tl_data;
 
 /// `attributes_set` (ldap_principal.c): what deleting a directory user's
 /// last principal removes.
@@ -149,7 +150,8 @@ impl LdapStore {
             password_history: None,
             entry,
         };
-        let raw = new_entry(&record, &self.master_keys(), &modifier)?;
+        let mut raw = new_entry(&record, &self.master_keys(), &modifier)?;
+        update_tl_data(&mut raw, self.caller_tl());
         self.add_entry(&raw).await
     }
 
@@ -175,6 +177,7 @@ impl LdapStore {
         record.mod_time = Some(now_time());
         record.mod_by = Some(modifier.clone());
         merge_record(&mut raw, &record, &keys, Some(&modifier))?;
+        update_tl_data(&mut raw, self.caller_tl());
         self.modify_entry(&found, &raw).await?;
         record_from_entry(&raw, &keys)
     }

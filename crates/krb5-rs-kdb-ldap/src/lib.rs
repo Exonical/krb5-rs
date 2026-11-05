@@ -7,6 +7,7 @@ pub mod create;
 pub mod entry;
 pub mod keyseq;
 pub mod policy;
+pub mod raw;
 pub mod realm;
 pub mod store;
 pub mod traits;

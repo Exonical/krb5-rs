@@ -76,7 +76,8 @@ pub fn policy_values(p: &MitPolicy) -> Vec<(&'static str, HashSet<Vec<u8>>)> {
 }
 
 impl LdapStore {
-    async fn read_policy(&self, name: &str) -> Result<Option<MitPolicy>, StoreError> {
+    /// The stored policy (`krb5_ldap_get_password_policy_from_dn`).
+    pub async fn read_policy(&self, name: &str) -> Result<Option<MitPolicy>, StoreError> {
         let dn = self.policy_dn(name);
         let mut h = self.inner.pool.get().await?;
         match h

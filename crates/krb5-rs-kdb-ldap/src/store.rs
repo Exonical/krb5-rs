@@ -89,6 +89,7 @@ pub(crate) struct Inner {
 #[derive(Clone)]
 pub struct LdapStore {
     pub(crate) inner: Arc<Inner>,
+    pub(crate) caller: Option<Arc<crate::raw::Caller>>,
 }
 
 impl LdapStore {
@@ -153,6 +154,7 @@ impl LdapStore {
             RealmParams::from_attrs(realm_dn, &a)
         };
         Ok(LdapStore {
+            caller: None,
             inner: Arc::new(Inner {
                 pool,
                 cfg,
