@@ -3,6 +3,7 @@
 pub mod attr;
 pub mod config;
 pub mod conn;
+pub mod create;
 pub mod entry;
 pub mod keyseq;
 pub mod policy;
