@@ -182,7 +182,16 @@ async fn kldap_against_openldap() {
         .expect("get alice")
         .expect("alice exists");
     assert_eq!(got.entry.policy.as_deref(), Some("p1"));
-    assert_eq!(got.entry.require_auth.as_deref(), Some("otp pkinit"));
+    // krbPrincipalAuthInd is multi-valued, and LDAP keeps no value order.
+    let mut inds: Vec<_> = got
+        .entry
+        .require_auth
+        .as_deref()
+        .unwrap_or("")
+        .split(' ')
+        .collect();
+    inds.sort_unstable();
+    assert_eq!(inds, ["otp", "pkinit"]);
     assert_eq!(got.entry.keys.len(), 2);
     assert_eq!(
         got.entry.keys[0].key.key_bytes(),
