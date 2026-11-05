@@ -454,6 +454,7 @@ mod tests {
     fn entry() -> PrincipalEntry {
         PrincipalEntry {
             require_auth: None,
+            otp: None,
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
             policy: None,

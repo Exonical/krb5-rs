@@ -15,6 +15,7 @@ builds aws-lc and simsimd.
 - **PKINIT** — X.509 certificate-based authentication, client and KDC (`pkinit` feature; DH/ECDH replies, MIT 1.22 parity)
 - **FAST** — Flexible Authentication via Secure Tunneling
 - **SPAKE** — MIT's SPAKE pre-authentication (PA-SPAKE), client and KDC: edwards25519, P-256, P-384 and P-521, MIT's encrypted PA-FX-COOKIE state, `spake_preauth_groups` / `spake_preauth_kdc_challenge` / `spake_preauth_indicator`. The client permits `edwards25519` by default (`AsExchangeConfig::spake_groups`); the KDC leaves SPAKE off until `KdcConfig::spake_groups` is set, as in MIT. Second factors are not implemented, as in MIT 1.22.
+- **OTP** — MIT's OTP pre-authentication (RFC 6560 PA-OTP-CHALLENGE/PA-OTP-REQUEST) over RADIUS (`krb5_rs::krad`, MIT libkrad), client and KDC: the principal's `otp` string attribute, `[otp]` token types (`server`, `secret`, `timeout`, `retries`, `strip_realm`, `indicator`), UDP and Unix-socket RADIUS, token fallback and per-token indicators. FAST is required, as in MIT. The client takes its answer from `AsExchangeConfig::otp`.
 - **Authentication indicators** — MIT's AD-AUTHENTICATION-INDICATOR in AD-CAMMAC tickets: SPAKE, encrypted challenge (`encrypted_challenge_indicator`) and PKINIT (`pkinit_indicator`) indicators, carried to TGS requests and checked against a service's `require_auth` string attribute, as in MIT.
 - **Credential Cache** — Read/write ccache and keytab formats; MIT FILE, MEMORY, DIR, KEYRING (Linux) and KCM caches with `KRB5CCNAME`/`default_ccache_name` resolution and cache collections; MIT ccselect (`~/.k5identity`, `realm` and `hostname` modules, `[plugins] ccselect`) and `KerberosClient::get_default_credentials`, which picks the cache like a GSS initiator with the default credential
 - **Tracing** — `KRB5_TRACE` and `krb5_rs::trace::set_trace_callback`/`set_trace_filename`, with MIT's line format and message text for KDC sends and replies, initial and service credentials, and ccselect
@@ -42,6 +43,7 @@ The core library is pure Rust and cross-compiles to musl.
 | [RFC 3962](https://www.rfc-editor.org/rfc/rfc3962) | AES encryption | Implemented |
 | [RFC 8009](https://www.rfc-editor.org/rfc/rfc8009) | AES-SHA2 encryption | Implemented |
 | [RFC 6113](https://www.rfc-editor.org/rfc/rfc6113) | FAST | Client + KDC |
+| [RFC 6560](https://www.rfc-editor.org/rfc/rfc6560) | OTP pre-authentication (over RADIUS, RFC 2865) | Client + KDC |
 | [RFC 6806](https://www.rfc-editor.org/rfc/rfc6806) | Enc-pa-rep / FAST negotiation | Client + KDC |
 | [RFC 4556](https://www.rfc-editor.org/rfc/rfc4556) | PKINIT (Diffie-Hellman and ECDH) | Client + KDC |
 | [RFC 8636](https://www.rfc-editor.org/rfc/rfc8636) | PKINIT algorithm agility (KDFs, ECDH groups) | Client + KDC |
