@@ -45,7 +45,7 @@ impl Attrs {
         out
     }
 
-    fn int(&self, name: &str) -> Option<u32> {
+    pub(crate) fn int(&self, name: &str) -> Option<u32> {
         // atoi: leading digits, 0 otherwise.
         self.first(name).map(|v| {
             let v = v.trim_start();
