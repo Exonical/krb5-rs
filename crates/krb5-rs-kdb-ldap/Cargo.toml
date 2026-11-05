@@ -1,0 +1,13 @@
+[package]
+name = "krb5-rs-kdb-ldap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+krb5-rs = { path = "../..", features = ["kdc", "tokio"] }
+rasn = "0.28"
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
+tokio = { version = "1.53.2", features = ["rt", "sync"] }
