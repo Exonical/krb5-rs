@@ -15,6 +15,8 @@ pub struct Krb5Initiator {
     /// Set after the AP-REQ is emitted; `step` then expects the AP-REP.
     awaiting_rep: bool,
     done: bool,
+    mech: &'static [u8],
+    iakerb_conv: Option<Vec<u8>>,
 }
 
 impl Krb5Initiator {
@@ -62,7 +64,18 @@ impl Krb5Initiator {
             ctx: None,
             awaiting_rep: false,
             done: false,
+            mech: MECH_KRB5,
+            iakerb_conv: None,
         })
+    }
+
+    /// Run as the IAKERB mechanism (iakerb.c:1014-1041): tokens carry the
+    /// IAKERB OID, and a nonempty `conv` (every IAKERB token exchanged)
+    /// adds the GSS_EXTS_FINISHED checksum extension.
+    pub(crate) fn with_iakerb(mut self, conv: Vec<u8>) -> Self {
+        self.mech = MECH_IAKERB;
+        self.iakerb_conv = (!conv.is_empty()).then_some(conv);
+        self
     }
 
     /// Drive the exchange one step.
@@ -142,6 +155,17 @@ impl Krb5Initiator {
             cksum_body.extend_from_slice(m);
         }
 
+        // init_sec_context.c:313-345 — IAKERB-FINISHED under the send
+        // subkey, appended as a big-endian extension.
+        if let Some(conv) = &self.iakerb_conv {
+            ac.generate_and_save_subkey(session.keytype)?;
+            let key = ac.send_subkey().ok_or(Krb5Error::Gss(GssError::Failure))?;
+            let finished = crate::gssapi::iakerb::make_finished(key, conv)?;
+            cksum_body.extend_from_slice(&GSS_EXTS_FINISHED.to_be_bytes());
+            cksum_body.extend_from_slice(&(finished.len() as u32).to_be_bytes());
+            cksum_body.extend_from_slice(&finished);
+        }
+
         let opts = ApReqOptions {
             mutual_required: flags.contains(GssFlags::MUTUAL),
             use_session_key: false,
@@ -152,7 +176,7 @@ impl Krb5Initiator {
         let ap_req = ac.mk_req(&opts, Some(&cksum_body), &self.cred)?;
         self.gss_flags = flags;
 
-        let mut token = make_token_header(MECH_KRB5, ap_req.len(), Some(TOK_AP_REQ));
+        let mut token = make_token_header(self.mech, ap_req.len(), Some(TOK_AP_REQ));
         token.extend_from_slice(&ap_req);
 
         // kg_setup_keys: proto 1, mandatory cksumtype implied by etype.
@@ -201,7 +225,7 @@ impl Krb5Initiator {
     fn mutual_auth(&mut self, token: &[u8]) -> Result<InitStep, Krb5Error> {
         let (mech, body) =
             parse_token_header(token).ok_or(Krb5Error::Gss(GssError::DefectiveToken))?;
-        if mech != MECH_KRB5 || body.len() < 2 {
+        if mech != self.mech || body.len() < 2 {
             return Err(gss(GssError::DefectiveToken));
         }
         let toktype = u16::from_be_bytes(body[..2].try_into().expect("2"));

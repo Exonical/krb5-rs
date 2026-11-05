@@ -1,5 +1,6 @@
 //! GSS-API (RFC 2743) support, with the RFC 4121 Kerberos 5 mechanism.
 
+pub mod iakerb;
 pub mod krb5;
 pub mod seqstate;
 pub mod spnego;

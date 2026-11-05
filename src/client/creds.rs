@@ -311,6 +311,59 @@ impl<T: KdcTransport> KerberosClient<T> {
         Ok((cache, cred))
     }
 
+    /// `gss_acquire_cred_with_password` for the krb5 mechanism
+    /// (acquire_cred.c:446-505, 609-660): the collection's cache for
+    /// `client` keeps a still-valid TGT; otherwise the TGT comes from the
+    /// password and goes to that cache, else an empty default cache, else a
+    /// new cache in the default collection. Returns the cache and the TGT.
+    pub async fn acquire_cred_with_password(
+        &self,
+        ctx: &CcContext,
+        client: PrincipalName,
+        password: &str,
+    ) -> Result<(AnyCcache, Credential), Krb5Error> {
+        let realm = self.realm.clone();
+        let mut cache = match crate::ccache::cache_match(ctx, &client, &realm) {
+            Ok(cache) => {
+                let req =
+                    CredsRequest::new(client.clone(), realm.clone(), tgt_name(&realm), &realm);
+                if let Ok(tgt) = self.get_cached_local_tgt(&cache, &req) {
+                    return Ok((cache, tgt));
+                }
+                cache
+            }
+            Err(_) => {
+                let defcc = crate::ccache::default_cache(ctx)?;
+                let name = defcc.name();
+                let (cctype, _) = crate::ccache::split_name(&name);
+                // krb5_cc_support_switch: DIR, KEYRING and KCM collections.
+                let have_collection = matches!(cctype, "DIR" | "KEYRING" | "KCM");
+                // KRB5_FCC_NOFILE; FILE reports a missing file as I/O.
+                let empty = match defcc.principal() {
+                    Err(CcError::NoFile(_)) => true,
+                    Err(CcError::Io(e)) => e.kind() == std::io::ErrorKind::NotFound,
+                    _ => false,
+                };
+                if empty {
+                    defcc
+                } else if have_collection {
+                    crate::ccache::new_unique(ctx, cctype)?
+                } else {
+                    return Err(CcError::code(
+                        "KG_CCACHE_NOMATCH",
+                        "Principal in credential cache does not match desired name".to_string(),
+                    )
+                    .into());
+                }
+            }
+        };
+        let config = crate::protocol::AsExchangeConfig::new(client, &realm);
+        let tgt = self.acquire_tgt_with_config(config, password).await?;
+        cache.initialize(&tgt.client, &tgt.crealm)?;
+        Self::store_cred(&mut cache, &tgt, None, false)?;
+        Ok((cache, tgt))
+    }
+
     /// `begin` through the referral states for one server candidate.
     async fn tkt_creds<C: Ccache>(
         &self,
