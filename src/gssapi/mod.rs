@@ -2,6 +2,7 @@
 
 pub mod iakerb;
 pub mod krb5;
+pub mod negoex;
 pub mod seqstate;
 pub mod spnego;
 pub mod token;
@@ -47,6 +48,9 @@ pub enum GssError {
     /// Context already fully established.
     #[error("context already established")]
     ContextEstablished,
+    /// GSS_S_UNAVAILABLE.
+    #[error("unavailable")]
+    Unavailable,
 }
 
 bitflags::bitflags! {

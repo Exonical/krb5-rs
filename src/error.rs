@@ -78,6 +78,10 @@ pub enum Krb5Error {
     #[error("GSS error: {0}")]
     Gss(#[from] crate::gssapi::GssError),
 
+    /// NegoEx failure (MIT's `ERR_NEGOEX_*` minor codes).
+    #[error("{0}")]
+    Negoex(#[from] crate::gssapi::negoex::NegoexError),
+
     /// Cryptographic operation failed.
     #[error("crypto error: {0}")]
     Crypto(String),
