@@ -182,7 +182,13 @@ impl Pool {
             .map_err(|e| access(e.to_string()))?;
         let idle = self.idle.lock().await.pop();
         let ldap = match idle {
-            Some(mut l) if !l.is_closed() => l,
+            Some(mut l) => {
+                if l.is_closed() {
+                    self.dial().await?
+                } else {
+                    l
+                }
+            }
             _ => self.dial().await?,
         };
         Ok(Handle {
