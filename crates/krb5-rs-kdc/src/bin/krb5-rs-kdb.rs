@@ -1966,10 +1966,28 @@ fn kldap_command(
                 .unwrap_or_else(|e| fail(format!("{e} while getting master key list")));
             ok(write_stash(&keyfile, realm, &key));
         }
-        "dump"
-        | "load"
-        | "destroy"
-        | "ark"
+        "dump" => {
+            dump_command(args, None, realm, cfg.master_key_type, |convert| {
+                let key = fetch_master(cfg, realm, master_password_file)
+                    .unwrap_or_else(|| std::process::exit(exit_status()));
+                let store = rt.block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &key))?;
+                let entries = rt.block_on(store.dump_entries())?;
+                Ok((entries, convert.then(|| store.master_keys())))
+            });
+        }
+        "load" => load_command(args, None, |entries, policies, update, _, _| {
+            // kldap refuses the "temporary" database a full load needs
+            // (ldap_misc.c:215).
+            if !update {
+                return Err(StoreError::backend("KDB module requires -update argument"));
+            }
+            let master = master_key(cfg, realm, master_password_file);
+            let store = rt.block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &master))?;
+            rt.block_on(store.load_update(entries, policies))
+        }),
+        // `krb5_ldap_delete_realm_1` returns KRB5_PLUGIN_OP_NOTSUPP.
+        "destroy" => fail("LDAP Plugin does not support the operation while destroying database"),
+        "ark"
         | "add_mkey"
         | "use_mkey"
         | "list_mkeys"

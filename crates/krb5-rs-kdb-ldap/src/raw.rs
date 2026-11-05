@@ -170,4 +170,37 @@ impl LdapStore {
     pub async fn raw_entries(&self) -> Result<Vec<MitEntry>, StoreError> {
         self.list_raw().await
     }
+
+    /// Every entry and policy, for `kdb5_util dump` (`krb5_db_iterate`).
+    pub async fn dump_entries(&self) -> Result<(Vec<MitEntry>, Vec<MitPolicy>), StoreError> {
+        Ok((self.raw_entries().await?, self.raw_policies().await?))
+    }
+
+    /// `kdb5_util load -update`: each policy and entry replaces the stored
+    /// one of the same name or is added (`krb5_db_put_principal`).
+    pub async fn load_update(
+        &self,
+        entries: &[MitEntry],
+        policies: &[MitPolicy],
+    ) -> Result<(), StoreError> {
+        for p in policies {
+            let policy = krb5_rs::kdc::kdb::mit::policy_from_entry(p);
+            if self.read_policy(&p.name).await?.is_some() {
+                self.update_policy(&p.name, |x| {
+                    *x = policy.clone();
+                    Ok(())
+                })
+                .await?;
+            } else {
+                self.create_policy(policy).await?;
+            }
+        }
+        for e in entries {
+            match self.search_raw(&e.principal, &e.realm).await? {
+                Some(found) => self.modify_entry(&found, e).await?,
+                None => self.add_entry(e).await?,
+            }
+        }
+        Ok(())
+    }
 }

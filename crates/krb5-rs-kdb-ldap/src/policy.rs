@@ -201,6 +201,16 @@ impl LdapStore {
 
     /// `krb5_ldap_iterate_password_policy`.
     pub async fn list_policies(&self) -> Result<Vec<Policy>, StoreError> {
+        Ok(self
+            .raw_policies()
+            .await?
+            .iter()
+            .map(policy_from_entry)
+            .collect())
+    }
+
+    /// Every policy below the realm (`krb5_ldap_iterate_password_policy`).
+    pub async fn raw_policies(&self) -> Result<Vec<MitPolicy>, StoreError> {
         let mut h = self.inner.pool.get().await?;
         let (rs, _) = h
             .search(
@@ -217,7 +227,7 @@ impl LdapStore {
             .filter_map(|e| {
                 let a = attrs_of(SearchEntry::construct(e));
                 let name = a.first("cn")?.to_string();
-                Some(policy_from_entry(&mit_policy(&name, &a)))
+                Some(mit_policy(&name, &a))
             })
             .collect())
     }
