@@ -114,6 +114,22 @@ const DBMODULE_OPTION_KEYS: &[&str] = &[
     "cockroach_statement_timeout",
     "cockroach_transaction_timeout",
     "cockroach_insecure",
+    "ldap_kerberos_container_dn",
+    "ldap_kdc_dn",
+    "ldap_kadmind_dn",
+    "ldap_service_password_file",
+    "ldap_servers",
+    "ldap_conns_per_server",
+    "ldap_kdc_sasl_mech",
+    "ldap_kdc_sasl_authcid",
+    "ldap_kdc_sasl_authzid",
+    "ldap_kdc_sasl_realm",
+    "ldap_kadmind_sasl_mech",
+    "ldap_kadmind_sasl_authcid",
+    "ldap_kadmind_sasl_authzid",
+    "ldap_kadmind_sasl_realm",
+    "disable_last_success",
+    "disable_lockout",
     "replication_read",
     "replication_poll_interval",
     "replication_batch_limit",
@@ -270,6 +286,10 @@ impl RealmConfig {
     /// arguments (`plugins/kdb/db2/kdb_db2.c:222-247`): `hash=`, `unlockiter`
     /// and `lockiter` choose db2 access methods and change nothing there.
     pub fn apply_db_args(&mut self, args: &[String]) -> Result<DbArgs, String> {
+        // kldap parses its own arguments (`krb5_ldap_parse_db_params`).
+        if self.db_module.library.as_deref() == Some("kldap") {
+            return Ok(DbArgs::default());
+        }
         let db2 = self.db_module.library.as_deref() == Some("krb5-rs-file");
         let mut flags = DbArgs::default();
         for arg in args {

@@ -12,6 +12,9 @@ builds aws-lc and simsimd.
 - **KKDCP** — KDC requests over HTTPS (MS-KKDCP) for `https://` `kdc` entries, verified like MIT's k5tls: `http_anchors` (`FILE:`, `DIR:`, `ENV:`) or the system trust store, then MIT's subjectAltName/CN name check (`kkdcp` feature, part of `client`)
 - **KDC** — AS/TGS request processing, FAST, UDP/TCP serving (`kdc` feature; the deployable daemon is `krb5-rs-kdc` in `crates/krb5-rs-kdc`)
 - **GSSAPI/SPNEGO** — HTTP Negotiate authentication
+- **IAKERB** — MIT's IAKERB mechanism (`krb5_rs::gssapi::iakerb`): the initiator gets its TGT (from a password) and service ticket through the acceptor's KDC proxy, with realm discovery, MIT's hop limit, the IAKERB-FINISHED checksum over the transcript, and MIT's `KRB_AP_ERR_IAKERB_KDC_NOT_FOUND`/`_NO_RESPONSE` errors. Both sides are sans-I/O: the acceptor returns each proxied request for the caller to send to the KDC.
+- **NegoEx** — MIT's NegoEx under SPNEGO (`krb5_rs::gssapi::negoex`): MS-NEGOEX messages, metadata exchange, optimistic tokens, VERIFY checksums (key usages 23 and 25) and VERIFY_NO_KEY alerts, over mechanisms implementing `NegoexMech`. NegoEx mechanisms get no SPNEGO mechListMIC, because `NegoexMech` has no MIC operations.
+- **Password credentials** — `KerberosClient::acquire_cred_with_password` stores the TGT where MIT's `gss_acquire_cred_with_password` does: the collection's cache for the client, else an empty default cache, else a new cache in the default collection (`KG_CCACHE_NOMATCH` otherwise)
 - **PKINIT** — X.509 certificate-based authentication, client and KDC (`pkinit` feature; DH/ECDH replies, MIT 1.22 parity)
 - **FAST** — Flexible Authentication via Secure Tunneling
 - **SPAKE** — MIT's SPAKE pre-authentication (PA-SPAKE), client and KDC: edwards25519, P-256, P-384 and P-521, MIT's encrypted PA-FX-COOKIE state, `spake_preauth_groups` / `spake_preauth_kdc_challenge` / `spake_preauth_indicator`. The client permits `edwards25519` by default (`AsExchangeConfig::spake_groups`); the KDC leaves SPAKE off until `KdcConfig::spake_groups` is set, as in MIT. Second factors are not implemented, as in MIT 1.22.
@@ -39,6 +42,8 @@ The core library is pure Rust and cross-compiles to musl.
 | [RFC 4120](https://www.rfc-editor.org/rfc/rfc4120) | Kerberos V5 core | Client + KDC |
 | [RFC 4121](https://www.rfc-editor.org/rfc/rfc4121) | GSSAPI mechanism | Implemented |
 | [RFC 4178](https://www.rfc-editor.org/rfc/rfc4178) | SPNEGO | Implemented |
+| [draft-ietf-kitten-iakerb](https://datatracker.ietf.org/doc/draft-ietf-kitten-iakerb/) | IAKERB (MIT 1.22 behavior) | Implemented |
+| [MS-NEGOEX](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-negoex/) | NegoEx under SPNEGO | Implemented |
 | [RFC 3961](https://www.rfc-editor.org/rfc/rfc3961) | Encryption specs | Implemented |
 | [RFC 3962](https://www.rfc-editor.org/rfc/rfc3962) | AES encryption | Implemented |
 | [RFC 8009](https://www.rfc-editor.org/rfc/rfc8009) | AES-SHA2 encryption | Implemented |

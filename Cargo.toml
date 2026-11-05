@@ -122,4 +122,5 @@ members = [
     "crates/krb5-rs-kdb-turso",
     "crates/krb5-rs-kdb-cockroach",
     "crates/krb5-rs-kdb-lmdb",
+    "crates/krb5-rs-kdb-ldap",
 ]

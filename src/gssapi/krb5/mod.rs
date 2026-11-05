@@ -23,6 +23,13 @@ pub use super::GssFlags;
 /// DER encoding of the krb5 mechanism OID 1.2.840.113554.1.2.2.
 pub const MECH_KRB5: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
 
+/// DER encoding of the IAKERB mechanism OID 1.3.6.1.5.2.5
+/// (gssapiP_krb5.h:89-91).
+pub const MECH_IAKERB: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x02, 0x05];
+
+/// GSS checksum extension carrying IAKERB-FINISHED (gssapiP_krb5.h:1296).
+const GSS_EXTS_FINISHED: u32 = 2;
+
 const TOK_AP_REQ: u16 = 0x0100;
 const TOK_AP_REP: u16 = 0x0200;
 const TOK_CTX_ERROR: u16 = 0x0300;

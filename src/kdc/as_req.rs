@@ -351,6 +351,10 @@ impl<S: PrincipalStore> Kdc<S> {
                 match self.pkinit_verify(pa, request, raw, &pk_body_der, &local_tgt, now) {
                     None => continue,
                     Some(Ok(v)) => {
+                        // pkinit_srv.c:602-603.
+                        if super::pkinit::hw_authent(&v) {
+                            flags |= TicketFlags::HW_AUTHENT;
+                        }
                         pkinit_verified = Some(v);
                         Ok(None)
                     }

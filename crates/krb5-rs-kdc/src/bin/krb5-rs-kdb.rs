@@ -559,6 +559,7 @@ fn run() {
         }
         cfg.database_name = database;
     }
+    let raw_db_args = db_args.clone();
     let db_args = cfg
         .apply_db_args(&db_args)
         .unwrap_or_else(|e| fail(format!("{e} while initializing database")));
@@ -574,6 +575,18 @@ fn run() {
         )
         .unwrap_or_else(|e| fail(e));
         *admin_modules() = Some(m);
+    }
+
+    if cfg.db_module.library.as_deref() == Some("kldap") {
+        kldap_command(
+            &cmd,
+            args,
+            &cfg,
+            &realm,
+            master_password_file.as_deref(),
+            &raw_db_args,
+        );
+        return;
     }
 
     if cfg.db_module.library.as_deref() == Some("klmdb") {
@@ -1901,6 +1914,112 @@ fn cockroach_command(
             run_admin(&admin, cmd, args, realm);
         }
     }
+}
+
+/// Commands against an LDAP directory (`db_library = kldap`): `create`,
+/// `stash` and the kadmin commands.
+#[cfg(feature = "kldap")]
+fn kldap_command(
+    cmd: &str,
+    mut args: Vec<String>,
+    cfg: &RealmConfig,
+    realm: &str,
+    master_password_file: Option<&str>,
+    db_args: &[String],
+) {
+    use krb5_rs_kdb_ldap::config::ServerType;
+    use krb5_rs_kdb_ldap::create::RealmOptions;
+    use krb5_rs_kdb_ldap::LdapStore;
+    let rt = runtime();
+    match cmd {
+        "create" => {
+            let stash = args.iter().any(|a| a == "-s");
+            let key = create_master_key(cfg, realm, master_password_file);
+            let store = rt
+                .block_on(LdapStore::create_realm(
+                    cfg,
+                    db_args,
+                    &key,
+                    &RealmOptions::default(),
+                ))
+                .unwrap_or_else(|e| fail(format!("{e} while creating realm '{realm}'")));
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
+            add_admin_princs(&admin, realm);
+            if stash {
+                ok(write_stash(&cfg.key_stash_file, realm, &key));
+            }
+        }
+        "stash" => {
+            let keyfile = match args.iter().position(|a| a == "-f") {
+                Some(at) if at + 1 < args.len() => PathBuf::from(args.remove(at + 1)),
+                Some(_) => usage(),
+                None => cfg.key_stash_file.clone(),
+            };
+            let key = master_key(cfg, realm, master_password_file);
+            // The key must decrypt K/M (`krb5_db_fetch_mkey_list`).
+            rt.block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &key))
+                .unwrap_or_else(|e| fail(format!("{e} while getting master key list")));
+            ok(write_stash(&keyfile, realm, &key));
+        }
+        "dump" => {
+            dump_command(args, None, realm, cfg.master_key_type, |convert| {
+                let key = fetch_master(cfg, realm, master_password_file)
+                    .unwrap_or_else(|| std::process::exit(exit_status()));
+                let store = rt.block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &key))?;
+                let entries = rt.block_on(store.dump_entries())?;
+                Ok((entries, convert.then(|| store.master_keys())))
+            });
+        }
+        // kldap refuses the "temporary" database a full load creates
+        // (ldap_misc.c:215, dump.c:1505).
+        "load" if !args.iter().any(|a| a == "-update") => {
+            fail("KDB module requires -update argument while creating database")
+        }
+        "load" => load_command(args, None, |entries, policies, _, _, _| {
+            let master = master_key(cfg, realm, master_password_file);
+            let store = rt.block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &master))?;
+            rt.block_on(store.load_update(entries, policies))
+        }),
+        // `krb5_ldap_delete_realm_1` returns KRB5_PLUGIN_OP_NOTSUPP.
+        "destroy" => fail("LDAP Plugin does not support the operation while destroying database"),
+        "ark"
+        | "add_mkey"
+        | "use_mkey"
+        | "list_mkeys"
+        | "update_princ_encryption"
+        | "purge_mkeys"
+        | "tabdump" => fail(format!("`{cmd}` is not supported with db_library = kldap")),
+        _ => {
+            let master = master_key(cfg, realm, master_password_file);
+            let store = rt
+                .block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &master))
+                .unwrap_or_else(|e| fail(format!("{e} while initializing database")));
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
+            run_admin(&admin, cmd, args, realm);
+        }
+    }
+}
+
+#[cfg(not(feature = "kldap"))]
+fn kldap_command(
+    _cmd: &str,
+    _args: Vec<String>,
+    _cfg: &RealmConfig,
+    _realm: &str,
+    _master_password_file: Option<&str>,
+    _db_args: &[String],
+) {
+    fail("db_library kldap needs a krb5-rs-kdb built with the `kldap` feature");
 }
 
 #[cfg(not(feature = "cockroach"))]

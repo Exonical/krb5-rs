@@ -444,7 +444,7 @@ impl AuthContext {
 
     /// `k5_generate_and_save_subkey` (gen_save_subkey.c): random key of the
     /// given etype, stored as BOTH send and recv subkey.
-    fn generate_and_save_subkey(&mut self, etype: i32) -> Result<(), Krb5Error> {
+    pub(crate) fn generate_and_save_subkey(&mut self, etype: i32) -> Result<(), Krb5Error> {
         let profile = find_etype(etype).map_err(|e| Krb5Error::Crypto(e.to_string()))?;
         let rnd = generate_random(profile.key_bytes());
         let kb = profile
