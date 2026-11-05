@@ -1975,12 +1975,12 @@ fn kldap_command(
                 Ok((entries, convert.then(|| store.master_keys())))
             });
         }
-        "load" => load_command(args, None, |entries, policies, update, _, _| {
-            // kldap refuses the "temporary" database a full load needs
-            // (ldap_misc.c:215).
-            if !update {
-                return Err(StoreError::backend("KDB module requires -update argument"));
-            }
+        // kldap refuses the "temporary" database a full load creates
+        // (ldap_misc.c:215, dump.c:1505).
+        "load" if !args.iter().any(|a| a == "-update") => {
+            fail("KDB module requires -update argument while creating database")
+        }
+        "load" => load_command(args, None, |entries, policies, _, _, _| {
             let master = master_key(cfg, realm, master_password_file);
             let store = rt.block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &master))?;
             rt.block_on(store.load_update(entries, policies))
