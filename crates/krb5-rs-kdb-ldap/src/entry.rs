@@ -127,3 +127,66 @@ pub fn mit_entry(a: &Attrs, name: PrincipalName, realm: String) -> Result<MitEnt
     }
     Ok(e)
 }
+
+/// Integer policy attributes in `add_policy_mods` order
+/// (ldap_pwd_policy.c:52-133).
+pub const POLICY_INT_ATTRS: [&str; 11] = [
+    "krbmaxpwdlife",
+    "krbminpwdlife",
+    "krbpwdmindiffchars",
+    "krbpwdminlength",
+    "krbpwdhistorylength",
+    "krbpwdmaxfailure",
+    "krbpwdfailurecountinterval",
+    "krbpwdlockoutduration",
+    "krbpwdattributes",
+    "krbpwdmaxlife",
+    "krbpwdmaxrenewablelife",
+];
+
+/// `populate_policy` (ldap_pwd_policy.c:244-284).
+pub fn mit_policy(a: &Attrs, name: &str) -> krb5_rs::kdc::kdb::mit::MitPolicy {
+    let v = |n: &str| a.int(n).unwrap_or(0);
+    krb5_rs::kdc::kdb::mit::MitPolicy {
+        name: name.to_string(),
+        pw_max_life: v("krbmaxpwdlife"),
+        pw_min_life: v("krbminpwdlife"),
+        pw_min_classes: v("krbpwdmindiffchars"),
+        pw_min_length: v("krbpwdminlength"),
+        pw_history_num: v("krbpwdhistorylength"),
+        pw_max_fail: v("krbpwdmaxfailure"),
+        pw_failcnt_interval: v("krbpwdfailurecountinterval"),
+        pw_lockout_duration: v("krbpwdlockoutduration"),
+        attributes: v("krbpwdattributes"),
+        max_life: v("krbpwdmaxlife"),
+        max_renewable_life: v("krbpwdmaxrenewablelife"),
+        allowed_keysalts: a.first("krbpwdallowedkeysalts").map(str::to_string),
+        tl_data: Vec::new(),
+    }
+}
+
+/// `add_policy_mods` values, as `(attribute, value)` pairs.
+pub fn policy_values(p: &krb5_rs::kdc::kdb::mit::MitPolicy) -> Vec<(&'static str, String)> {
+    let ints = [
+        p.pw_max_life,
+        p.pw_min_life,
+        p.pw_min_classes,
+        p.pw_min_length,
+        p.pw_history_num,
+        p.pw_max_fail,
+        p.pw_failcnt_interval,
+        p.pw_lockout_duration,
+        p.attributes,
+        p.max_life,
+        p.max_renewable_life,
+    ];
+    let mut out: Vec<(&'static str, String)> = POLICY_INT_ATTRS
+        .iter()
+        .zip(ints)
+        .map(|(n, v)| (*n, (v as i32).to_string()))
+        .collect();
+    if let Some(k) = &p.allowed_keysalts {
+        out.push(("krbpwdallowedkeysalts", k.clone()));
+    }
+    out
+}
