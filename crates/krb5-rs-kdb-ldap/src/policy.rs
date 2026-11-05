@@ -146,10 +146,16 @@ impl LdapStore {
         let mut policy = policy_from_entry(&raw);
         f(&mut policy)?;
         merge_policy(&mut raw, &policy)?;
-        let mods = policy_values(&raw)
+        let mut mods: Vec<_> = policy_values(&raw)
             .into_iter()
             .map(|(n, v)| Mod::Replace(n.as_bytes().to_vec(), v))
             .collect();
+        if raw.allowed_keysalts.is_none() {
+            mods.push(Mod::Replace(
+                b"krbpwdallowedkeysalts".to_vec(),
+                HashSet::new(),
+            ));
+        }
         let mut h = self.inner.pool.get().await?;
         h.modify(&self.policy_dn(name), mods)
             .await

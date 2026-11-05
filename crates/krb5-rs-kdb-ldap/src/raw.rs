@@ -136,8 +136,14 @@ impl LdapStore {
             let parent = found
                 .meta
                 .dn
-                .split_once(',')
-                .map_or(String::new(), |(_, p)| format!(",{p}"));
+                .char_indices()
+                .scan(false, |esc, (i, c)| {
+                    let sep = !*esc && c == ',';
+                    *esc = !*esc && c == '\\';
+                    Some((i, sep))
+                })
+                .find(|&(_, sep)| sep)
+                .map_or(String::new(), |(i, _)| found.meta.dn[i..].to_string());
             found.meta.dn = format!("{rdn}{parent}");
             h.modify(
                 &found.meta.dn,

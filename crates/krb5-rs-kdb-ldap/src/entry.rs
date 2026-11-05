@@ -415,6 +415,15 @@ pub fn put_values(e: &MitEntry, policy_dn: impl Fn(&str) -> String) -> Result<Va
         })
         .filter(|v| !v.is_empty());
     v.push(("krbPrincipalAuthInd", inds));
+    // ldap_principal2.c:1374-1395: the delegation ACL TL values become
+    // krbAllowedToDelegateTo, replaced as a whole.
+    let acl: Vec<Vec<u8>> = e
+        .tl_data
+        .iter()
+        .filter(|t| t.kind == CONSTRAINED_DELEGATION_ACL)
+        .map(|t| t.data.strip_suffix(b"\0").unwrap_or(&t.data).to_vec())
+        .collect();
+    v.push(("krballowedtodelegateto", (!acl.is_empty()).then_some(acl)));
     v.push((
         "krbLastAdminUnlock",
         tl_u32(e, LAST_ADMIN_UNLOCK).and_then(time_or_delete),

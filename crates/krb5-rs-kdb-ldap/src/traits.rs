@@ -67,48 +67,74 @@ impl AuthStateStore for LdapStore {
         realm: &str,
         update: &AuthStateUpdate,
     ) -> Result<AuthState, StoreError> {
-        let Some((dn, old)) = self.read_auth_state(name, realm).await? else {
-            return Err(StoreError::not_found(format!(
-                "Principal {name}@{realm} does not exist"
-            )));
-        };
-        let mut st = old;
-        st.apply(update);
-        let cfg = self.config();
-        if cfg.disable_lockout && !matches!(update, AuthStateUpdate::Set(_)) {
-            st.fail_count = old.fail_count;
-            st.last_failed = old.last_failed;
-        }
-        if cfg.disable_last_success && !matches!(update, AuthStateUpdate::Set(_)) {
-            st.last_success = old.last_success;
-        }
-        let mut mods = Vec::new();
-        if st.fail_count != old.fail_count {
-            mods.push(Mod::Replace(
-                b"krbLoginFailedCount".to_vec(),
-                HashSet::from([st.fail_count.to_string().into_bytes()]),
-            ));
-        }
-        if st.last_failed != old.last_failed {
-            mods.push(Mod::Replace(
-                b"krbLastFailedAuth".to_vec(),
-                time_value(st.last_failed),
-            ));
-        }
-        if st.last_success != old.last_success {
-            mods.push(Mod::Replace(
-                b"krbLastSuccessfulAuth".to_vec(),
-                time_value(st.last_success),
-            ));
-        }
-        if !mods.is_empty() {
+        // ldap_principal2.c:1130-1170: an increment asserts the old count by
+        // deleting it before adding the new one, so racing KDCs can't lose a
+        // failure; retry on a lost race.
+        let mut absent = false;
+        for _ in 0..8 {
+            let Some((dn, old)) = self.read_auth_state(name, realm).await? else {
+                return Err(StoreError::not_found(format!(
+                    "Principal {name}@{realm} does not exist"
+                )));
+            };
+            let mut st = old;
+            st.apply(update);
+            let cfg = self.config();
+            if cfg.disable_lockout && !matches!(update, AuthStateUpdate::Set(_)) {
+                st.fail_count = old.fail_count;
+                st.last_failed = old.last_failed;
+            }
+            if cfg.disable_last_success && !matches!(update, AuthStateUpdate::Set(_)) {
+                st.last_success = old.last_success;
+            }
+            let attr = b"krbLoginFailedCount".to_vec();
+            let count = |n: u32| HashSet::from([n.to_string().into_bytes()]);
+            let increment = matches!(update, AuthStateUpdate::Failure { .. })
+                && st.fail_count == old.fail_count.wrapping_add(1);
+            let mut mods = Vec::new();
+            if increment {
+                if !absent {
+                    mods.push(Mod::Delete(attr.clone(), count(old.fail_count)));
+                }
+                mods.push(Mod::Add(attr, count(st.fail_count)));
+            } else if st.fail_count != old.fail_count {
+                mods.push(Mod::Replace(attr, count(st.fail_count)));
+            }
+            if st.last_failed != old.last_failed {
+                mods.push(Mod::Replace(
+                    b"krbLastFailedAuth".to_vec(),
+                    time_value(st.last_failed),
+                ));
+            }
+            if st.last_success != old.last_success {
+                mods.push(Mod::Replace(
+                    b"krbLastSuccessfulAuth".to_vec(),
+                    time_value(st.last_success),
+                ));
+            }
+            if mods.is_empty() {
+                return Ok(st);
+            }
             let mut h = self.inner.pool.get().await?;
-            h.modify(&dn, mods)
-                .await
-                .and_then(|r| r.success())
-                .map_err(|e| ldap_err("lockout update", e))?;
+            match h.modify(&dn, mods).await.and_then(|r| r.success()) {
+                Ok(_) => return Ok(st),
+                // noSuchAttribute: the asserted count changed, or (1.8.1 and
+                // older entries) the attribute was never set.
+                Err(ldap3::LdapError::LdapResult { result }) if increment && result.rc == 16 => {
+                    absent = old.fail_count == 0 && !absent;
+                }
+                // attributeOrValueExists / constraintViolation from a racing add.
+                Err(ldap3::LdapError::LdapResult { result })
+                    if increment && matches!(result.rc, 19 | 20) =>
+                {
+                    absent = false;
+                }
+                Err(e) => return Err(ldap_err("lockout update", e)),
+            }
         }
-        Ok(st)
+        Err(StoreError::unavailable(
+            "lockout update: krbLoginFailedCount kept changing".to_string(),
+        ))
     }
 }
 
