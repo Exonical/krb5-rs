@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use krb5_rs::kdc::kdb::mit::{
-    MitEntry, TlData, CONSTRAINED_DELEGATION_ACL, LAST_ADMIN_UNLOCK, LAST_PWD_CHANGE, MKVNO,
+    set_string_attr, MitEntry, OsaPrincipalData, TlData, CONSTRAINED_DELEGATION_ACL, KADM_DATA,
+    LAST_ADMIN_UNLOCK, LAST_PWD_CHANGE, MKVNO,
 };
 use krb5_rs::kdc::store::StoreError;
 use krb5_rs::types::PrincipalName;
@@ -64,8 +65,92 @@ impl Attrs {
     }
 }
 
-/// `populate_krb5_db_entry` minus the kldap user-info tl-data, which the
-/// store keeps itself.
+/// `KADM5_POLICY` (kadm5/admin.h:99).
+pub const KADM5_POLICY: i32 = 0x0800;
+/// `KADM5_KEY_HIST` (kadm5/admin.h:113).
+pub const KADM5_KEY_HIST: i32 = 0x0040_0000;
+
+/// What MIT keeps in its `KDB_TL_USER_INFO` tl-data: facts about the
+/// directory entry rather than the principal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryMeta {
+    /// The entry's DN.
+    pub dn: String,
+    /// `krbTicketPolicyReference`.
+    pub tkt_policy_dn: Option<String>,
+    /// `krbObjectReferences`.
+    pub link_dns: Vec<String>,
+    /// Whether `krbMaxTicketLife`, `krbMaxRenewableAge` and
+    /// `krbTicketFlags` are present.
+    pub has_max_life: bool,
+    /// See [`EntryMeta::has_max_life`].
+    pub has_max_rlife: bool,
+    /// See [`EntryMeta::has_max_life`].
+    pub has_flags: bool,
+    /// The `krbPrincipalName` values.
+    pub names: Vec<String>,
+    /// Whether the entry is a standalone `krbPrincipal`.
+    pub standalone: bool,
+}
+
+/// `krb5_ldap_policydn_to_name` (ldap_misc.c:1281-1327): the first RDN's
+/// value, unescaped.
+pub fn policydn_to_name(dn: &str) -> Result<String, StoreError> {
+    let bad = || StoreError::corrupt(format!("invalid policy DN {dn:?}"));
+    let (_, rest) = dn.split_once('=').ok_or_else(bad)?;
+    let mut out = Vec::new();
+    let b = rest.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b',' | b'+' => break,
+            b'\\' => {
+                let hex = b
+                    .get(i + 1..i + 3)
+                    .and_then(|h| std::str::from_utf8(h).ok());
+                if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(*b.get(i + 1).ok_or_else(bad)?);
+                    i += 2;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| bad())
+}
+
+/// The directory facts of an entry.
+pub fn entry_meta(dn: &str, a: &Attrs) -> EntryMeta {
+    let has = |n: &str| a.first(n).is_some();
+    EntryMeta {
+        dn: dn.to_string(),
+        tkt_policy_dn: a.first("krbticketpolicyreference").map(str::to_string),
+        link_dns: a
+            .text
+            .get("krbobjectreferences")
+            .cloned()
+            .unwrap_or_default(),
+        has_max_life: has("krbmaxticketlife"),
+        has_max_rlife: has("krbmaxrenewableage"),
+        has_flags: has("krbticketflags"),
+        names: a.text.get("krbprincipalname").cloned().unwrap_or_default(),
+        standalone: a
+            .text
+            .get("objectclass")
+            .into_iter()
+            .flatten()
+            .any(|c| c.eq_ignore_ascii_case("krbprincipal")),
+    }
+}
+
+/// `populate_krb5_db_entry` minus the kldap user-info tl-data (see
+/// [`EntryMeta`]) and the ticket policy, which the store applies.
 pub fn mit_entry(a: &Attrs, name: PrincipalName, realm: String) -> Result<MitEntry, StoreError> {
     let mut e = MitEntry {
         principal: name,
@@ -81,6 +166,29 @@ pub fn mit_entry(a: &Attrs, name: PrincipalName, realm: String) -> Result<MitEnt
         tl_data: Vec::new(),
         key_data: Vec::new(),
     };
+    let mut osa = OsaPrincipalData::default();
+    if let Some(dn) = a.first("krbpwdpolicyreference") {
+        osa.policy = Some(policydn_to_name(dn)?.into_bytes());
+        osa.aux_attributes |= KADM5_POLICY;
+    }
+    let hist = a.bytes("krbpwdhistory");
+    if !hist.is_empty() {
+        let mut sets = hist
+            .iter()
+            .map(|v| keyseq::decode(v))
+            .collect::<Result<Vec<_>, _>>()?;
+        osa.admin_history_kvno = sets[0].mkvno as u32;
+        sets.sort_by_key(|s| s.key_data.first().map_or(0, |k| k.kvno));
+        osa.old_keys = sets.into_iter().map(|s| s.key_data).collect();
+        osa.old_key_next = osa.old_keys.len() as u32;
+        osa.aux_attributes |= KADM5_KEY_HIST;
+    }
+    if osa.aux_attributes != 0 {
+        e.tl_data.push(TlData {
+            kind: KADM_DATA,
+            data: osa.encode()?,
+        });
+    }
     let mut mkvno = 0;
     for v in a.bytes("krbprincipalkey") {
         let set = keyseq::decode(&v)?;
@@ -119,6 +227,9 @@ pub fn mit_entry(a: &Attrs, name: PrincipalName, realm: String) -> Result<MitEnt
         let tl = tl_from_value(&v)?;
         e.tl_data.retain(|t| t.kind != tl.kind);
         e.tl_data.push(tl);
+    }
+    if let Some(inds) = a.text.get("krbprincipalauthind").filter(|v| !v.is_empty()) {
+        set_string_attr(&mut e, b"require_auth", Some(inds.join(" ").as_bytes()))?;
     }
     if a.first("nsAccountLock")
         .is_some_and(|v| v.eq_ignore_ascii_case("TRUE"))
