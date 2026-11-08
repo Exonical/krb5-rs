@@ -92,22 +92,27 @@ async fn authenticate(ldap: &mut Ldap, server: &str, bind: &Bind) -> Result<(), 
                 ))
             })
         }
-        Bind::Sasl { mech, .. } => {
-            let r = if mech.eq_ignore_ascii_case("EXTERNAL") {
-                ldap.sasl_external_bind()
-                    .await
-                    .and_then(|r| r.success())
-                    .map(|_| ())
-            } else {
-                Err(ldap3::LdapError::InvalidScopeString(format!(
-                    "SASL mechanism {mech} is not supported"
-                )))
+        Bind::Sasl {
+            mech,
+            authcid,
+            authzid,
+            realm,
+            password,
+        } => {
+            let interact = crate::sasl::Interact {
+                authcid: authcid.clone(),
+                authzid: authzid.clone(),
+                realm: realm.clone(),
+                password: password.clone(),
             };
-            r.map_err(|e| {
-                access(format!(
-                    "Cannot bind to LDAP server '{server}' with SASL mechanism '{mech}': {e}"
-                ))
-            })
+            let host = crate::sasl::sasl_host(server);
+            crate::sasl::bind(ldap, mech, &host, &interact)
+                .await
+                .map_err(|e| {
+                    access(format!(
+                        "Cannot bind to LDAP server '{server}' with SASL mechanism '{mech}': {e}"
+                    ))
+                })
         }
     }
 }

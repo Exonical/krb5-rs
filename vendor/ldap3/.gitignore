@@ -1,0 +1,22 @@
+# Ignore vim swapfiles
+*.swp
+*.vim
+
+# Exuberant Ctags
+tags
+
+# Ignore build directory
+/build/
+/target/
+
+Cargo.lock
+
+/rfcs/
+/data/db/
+/data/config/
+
+# IDEA config
+/.idea/
+
+# VSCode config
+/.vscode/

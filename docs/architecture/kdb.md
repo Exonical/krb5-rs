@@ -186,14 +186,26 @@ Differences from MIT:
 - `krb5-rs-kdb5-ldap-util create` accepts `-kv` and `-M`, but the master key
   is always `K/M` with kvno 1, as `krb5-rs-kdb create` makes it; another `-M`
   name is refused.
-- SASL binds support `EXTERNAL` only (for `ldapi://` or TLS client
-  certificates); MIT supports any mechanism libsasl2 provides.
+- MIT binds with any mechanism libsasl2 provides. krb5-rs supports
+  `EXTERNAL`, `PLAIN`, `LOGIN`, `ANONYMOUS`, `SCRAM-SHA-1`, `SCRAM-SHA-256`
+  (rsasl), `CRAM-MD5`, `DIGEST-MD5` (with Cyrus's `auth-int`/`auth-conf`
+  layers: rc4, rc4-56, rc4-40, des, 3des) and `GSSAPI` (krb5-rs's own GSS-API,
+  with integrity/confidentiality layers). Other mechanisms (GSS-SPNEGO,
+  GS2-*, NTLM, OAUTHBEARER) are refused.
+- The SASL host is the LDAP URL's host (the local host name for `ldapi://`),
+  as with Cyrus's `SASL_NOCANON`; libldap's reverse lookup of the peer
+  address is not done.
+- Security-layer properties are Cyrus's defaults (`minssf` 0, `maxssf`
+  unlimited, `maxbufsize` 65536): the strongest layer the server offers is
+  used. `ldap.conf`'s `SASL_SECPROPS` is not read.
 - The master-key commands (`add_mkey`, `use_mkey`, `list_mkeys`,
   `purge_mkeys`, `update_princ_encryption`), `ark` and `tabdump` are refused
   on kldap.
 - The integration tests (`cargo test -p krb5-rs-kdb-ldap --test openldap --
   --ignored` and `cargo test -p krb5-rs-kdc --test kdb5_ldap_util --
-  --ignored`) need `slapd`; `tests/slapd.sh` starts a private instance.
+  --ignored`, `cargo test -p krb5-rs-kdb-ldap --test sasl -- --ignored`)
+  need `slapd`; `tests/slapd.sh` starts a private instance. The GSSAPI bind
+  test also needs MIT's `krb5kdc`.
 
 ### Password policy
 

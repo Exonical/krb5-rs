@@ -9,6 +9,7 @@ pub mod keyseq;
 pub mod policy;
 pub mod raw;
 pub mod realm;
+pub mod sasl;
 pub mod store;
 pub mod traits;
 pub mod util;

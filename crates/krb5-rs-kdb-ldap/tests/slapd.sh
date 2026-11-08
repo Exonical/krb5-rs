@@ -14,6 +14,9 @@ dn: cn=config
 objectClass: olcGlobal
 cn: config
 olcPidFile: $dir/slapd.pid
+olcSaslSecProps: none
+olcAuthzRegexp: {0}uid=([^,]*),cn=[^,]*,cn=auth cn=\$1,dc=example,dc=com
+olcAuthzRegexp: {1}uid=([^,]*),cn=[^,]*,cn=[^,]*,cn=auth cn=\$1,dc=example,dc=com
 
 dn: cn=module{0},cn=config
 objectClass: olcModuleList
@@ -63,6 +66,12 @@ dc: example
 dn: ou=people,dc=example,dc=com
 objectClass: organizationalUnit
 ou: people
+
+dn: cn=kdcsasl,dc=example,dc=com
+objectClass: person
+cn: kdcsasl
+sn: kdcsasl
+userPassword: saslsecret
 LDIF
 slapadd -n1 -F "$dir/slapd.d" -l "$dir/base.ldif" 
 # Ubuntu's AppArmor profile for /usr/sbin/slapd denies paths outside
