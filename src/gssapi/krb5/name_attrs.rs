@@ -215,6 +215,8 @@ impl Krb5Context {
                 Some(Some(t)) => {
                     pac.add_buffer(t, value)
                         .map_err(|_| gss(GssError::Failure))?;
+                    // k5_pac_add_buffer clears the verified flag (pac.c:102).
+                    attrs.pac_verified = false;
                     found = true;
                 }
                 None => {}
