@@ -11,7 +11,7 @@ use krb5_rs::ccache::{
 };
 use krb5_rs::client::{default_client_keytab_name, vfy::resolve_keytab, KerberosClient};
 use krb5_rs::profile::{string_to_deltat, Profile};
-use krb5_rs::protocol::{AsExchange, AsExchangeConfig, Credential, FastMode};
+use krb5_rs::protocol::{AsExchange, AsExchangeConfig, Credential, FastMode, InCcache};
 use krb5_rs::types::{KdcOptions, KerberosFlags, PrincipalName};
 use krb5_rs::Krb5Error;
 use krb5_rs_clients::{
@@ -781,15 +781,13 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
                     return false;
                 }
             };
-            // read_allowed_preauth_type (get_in_tkt.c:731-753).
-            if let Some(in_cc) = &k5.in_cc {
-                let krbtgt = PrincipalName::new_srv_inst("krbtgt", &k5.realm);
-                let server = config.server.clone().unwrap_or(krbtgt);
-                config.allowed_preauth_type = in_cc
-                    .get_config(Some((&server, &k5.realm)), CONF_PA_TYPE)
-                    .ok()
-                    .flatten()
-                    .and_then(|v| String::from_utf8(v).ok()?.parse().ok());
+            // krb5_get_init_creds_opt_set_in_ccache (kinit.c:686-690).
+            if let Some(in_cc) = k5.in_cc.take() {
+                let in_cc = std::sync::Mutex::new(in_cc);
+                config.in_ccache = Some(InCcache(Arc::new(move |server, realm, key| {
+                    let cc = in_cc.lock().ok()?;
+                    cc.get_config(Some((server, realm)), key).ok().flatten()
+                })));
             }
             let mut run_init = |x: AsExchange| {
                 let x = rt.block_on(client.get_init_creds(x))?;

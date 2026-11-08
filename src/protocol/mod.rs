@@ -21,7 +21,7 @@ mod tgs_exchange;
 pub(crate) mod transit;
 mod validate;
 
-pub use as_exchange::{AsExchange, AsExchangeConfig, StepResult};
+pub use as_exchange::{AsExchange, AsExchangeConfig, InCcache, StepResult};
 pub use credential::{Credential, TicketTimes};
 pub use error_codes::ErrorCode;
 pub use fast::FastMode;

@@ -226,6 +226,7 @@ impl AsExchange {
         self.preauth_sent = false;
         self.spake = super::spake::SpakeClientState::default();
         let do_fast = self.config.fast.required() || fast_upgrade;
+        self.read_allowed_preauth_type();
         self.reset_fast_state(do_fast)?;
         let (as_req_der, req_body) = self.build_as_req(None)?;
         self.last_req_body = Some(req_body);

@@ -83,18 +83,46 @@ fn test_exchange_preauth_required_produces_enc_timestamp() {
     }
 }
 
+/// A client referral re-reads `pa_type` for the new realm's krbtgt
+/// (restart_init_creds_loop calls read_allowed_preauth_type).
+#[test]
+fn test_exchange_allowed_preauth_type_after_referral() {
+    let mut config = AsExchangeConfig::new(PrincipalName::new_principal("testuser"), "EXAMPLE.COM");
+    config.in_ccache = Some(pa_type_cache(PaDataType::Spake as i32));
+    let mut exchange = AsExchange::new(config, "password");
+    exchange.step(&[]).expect("initial step");
+    let r = exchange
+        .step(&build_referral_error(KDC_ERR_WRONG_REALM, "OTHER.COM"))
+        .expect("referral");
+    assert!(matches!(r, StepResult::SendToKdc { ref realm, .. } if realm == "OTHER.COM"));
+    let r = exchange
+        .step(&build_preauth_required_error())
+        .expect("any mechanism allowed");
+    assert!(matches!(r, StepResult::SendToKdc { .. }));
+}
+
+/// An input cache holding `pa_type` for krbtgt/EXAMPLE.COM only.
+fn pa_type_cache(t: i32) -> super::InCcache {
+    super::InCcache(std::sync::Arc::new(move |server, realm, key| {
+        (key == "pa_type"
+            && realm == "EXAMPLE.COM"
+            && *server == PrincipalName::new_srv_inst("krbtgt", "EXAMPLE.COM"))
+        .then(|| t.to_string().into_bytes())
+    }))
+}
+
 /// pa_type_allowed (preauth2.c:625-631): an input cache's `pa_type`
 /// restricts the real mechanism; any other offered one is not used.
 #[test]
 fn test_exchange_allowed_preauth_type() {
     let mut config = AsExchangeConfig::new(PrincipalName::new_principal("testuser"), "EXAMPLE.COM");
-    config.allowed_preauth_type = Some(PaDataType::Spake as i32);
+    config.in_ccache = Some(pa_type_cache(PaDataType::Spake as i32));
     let mut exchange = AsExchange::new(config, "password");
     exchange.step(&[]).expect("initial step");
     assert!(exchange.step(&build_preauth_required_error()).is_err());
 
     let mut config = AsExchangeConfig::new(PrincipalName::new_principal("testuser"), "EXAMPLE.COM");
-    config.allowed_preauth_type = Some(PaDataType::EncTimestamp as i32);
+    config.in_ccache = Some(pa_type_cache(PaDataType::EncTimestamp as i32));
     let mut exchange = AsExchange::new(config, "password");
     exchange.step(&[]).expect("initial step");
     let r = exchange

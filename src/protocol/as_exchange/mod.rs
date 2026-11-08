@@ -4,6 +4,7 @@
 //! The caller drives the loop and controls transport — this module only
 //! produces outbound messages and consumes inbound responses.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Timelike, Utc};
@@ -100,10 +101,23 @@ pub struct AsExchangeConfig {
     /// Addresses for the request body (`krb5_get_init_creds_opt_set_address_list`).
     /// Default: none.
     pub addresses: Option<Vec<crate::types::HostAddress>>,
-    /// The only real preauth mechanism to use, from an input cache's
-    /// `pa_type` config entry (MIT `ctx->allowed_preauth_type`,
-    /// get_in_tkt.c:731-753). Default: none (any mechanism).
-    pub allowed_preauth_type: Option<i32>,
+    /// The input ccache (`krb5_get_init_creds_opt_set_in_ccache`), read for
+    /// its config entries. Default: none.
+    pub in_ccache: Option<InCcache>,
+}
+
+/// Config-entry lookup on an input ccache: `(server, server realm, key)`
+/// to the entry's data, as `krb5_cc_get_config`.
+#[derive(Clone)]
+pub struct InCcache(pub Arc<CcConfigLookup>);
+
+/// The lookup behind [`InCcache`].
+pub type CcConfigLookup = dyn Fn(&PrincipalName, &str, &str) -> Option<Vec<u8>> + Send + Sync;
+
+impl std::fmt::Debug for InCcache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InCcache(..)")
+    }
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -133,7 +147,7 @@ impl Default for AsExchangeConfig {
             otp: None,
             start_time: 0,
             addresses: None,
-            allowed_preauth_type: None,
+            in_ccache: None,
         }
     }
 }
@@ -269,6 +283,10 @@ pub struct AsExchange {
     /// The padata type of the last preauth mechanism we answered with
     /// (MIT `ctx->selected_preauth_type`).
     selected_preauth_type: Option<i32>,
+
+    /// The only real preauth mechanism to use, from the input cache's
+    /// `pa_type` entry (MIT `ctx->allowed_preauth_type`).
+    allowed_preauth_type: Option<i32>,
     /// FAST armor key set as the AS key by OTP (preauth_otp.c:1118-1120).
     otp_key: Option<EncryptionKey>,
     /// Real preauth types that already failed this exchange
@@ -337,6 +355,7 @@ impl AsExchange {
             restarted: false,
             preauth_sent: false,
             selected_preauth_type: None,
+            allowed_preauth_type: None,
             otp_key: None,
             preauth_failed: Vec::new(),
             method_padata: None,
@@ -391,6 +410,7 @@ impl AsExchange {
                 // First call — build initial AS-REQ (no preauth). Armor it
                 // when FAST is required (MIT KRB5_FAST_REQUIRED).
                 let required = self.config.fast.required();
+                self.read_allowed_preauth_type();
                 self.reset_fast_state(required)?;
                 let (as_req_der, req_body) = self.build_as_req(None)?;
                 self.last_req_body = Some(req_body);
@@ -441,6 +461,20 @@ impl AsExchange {
     /// path; failure there is non-fatal, so this is a flag not an error).
     pub fn kdc_verified(&self) -> bool {
         self.kdc_verified
+    }
+
+    /// `read_allowed_preauth_type` (get_in_tkt.c:731-753), run on each
+    /// (re)start so a client referral reads the new realm's entry.
+    fn read_allowed_preauth_type(&mut self) {
+        let server = self
+            .config
+            .server
+            .clone()
+            .unwrap_or_else(|| PrincipalName::new_srv_inst("krbtgt", &self.config.realm));
+        self.allowed_preauth_type = self.config.in_ccache.as_ref().and_then(|cc| {
+            let v = (cc.0)(&server, &self.config.realm, "pa_type")?;
+            String::from_utf8(v).ok()?.trim().parse().ok()
+        });
     }
 
     /// Rebuild the FAST request state for a (re)start
@@ -703,7 +737,7 @@ impl AsExchange {
         };
         let hint = || hint.clone();
         // pa_type_allowed (preauth2.c:625-631, :667).
-        let only = self.config.allowed_preauth_type;
+        let only = self.allowed_preauth_type;
         let allowed = move |t: i32| only.is_none_or(|a| a == t);
         #[cfg(feature = "pkinit")]
         if allowed(crate::pkinit::server::PA_PK_AS_REQ) && self.pkinit_offered(method) {
