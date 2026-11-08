@@ -315,6 +315,10 @@ fn fq_local_hostname() -> Result<String, i32> {
     if host.is_empty() {
         return Err(EAI_FAIL);
     }
+    // Targets without getaddrinfo have no canonical name to look up.
+    if cfg!(not(any(unix, windows))) {
+        return Ok(host);
+    }
     super::dns_canonical(&host, false).ok_or(EAI_FAIL)
 }
 
