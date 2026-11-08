@@ -242,7 +242,12 @@ impl<S: PrincipalStore> Kdc<S> {
         let req_rtime = body.rtime.as_ref().map(ts).unwrap_or(0);
         let mut times = Times {
             authtime: kdc_time,
-            starttime: kdc_time,
+            // do_as_req.c:692-695.
+            starttime: if opts.contains(KdcOptions::POSTDATED) {
+                body.from.as_ref().map(ts).unwrap_or(0)
+            } else {
+                kdc_time
+            },
             endtime: 0,
             renew_till: 0,
         };

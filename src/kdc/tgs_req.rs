@@ -13,7 +13,6 @@ use super::fast::{anonymous_client, FastInputs};
 use super::policy::{
     check_tgs_opts, check_tgs_svc_policy, check_tgs_times, get_ticket_endtime, get_ticket_flags,
     get_ticket_renewtime, kerberos_time, select_session_keytype, ts, HeaderRenewal, Times,
-    UNSUPPORTED_OPTIONS,
 };
 use super::preauth::{enc_pa_rep_padata, find_padata};
 use super::reqbody::raw_req_body;
@@ -491,9 +490,6 @@ impl<S: PrincipalStore> Kdc<S> {
         };
 
         // check_tgs_constraints (tgs_policy.c:668-730).
-        if opts.intersects(UNSUPPORTED_OPTIONS) {
-            return Err(KdcError::new(KDC_ERR_BADOPTION, "UNSUPPORTED OPTION"));
-        }
         // check_anon (tgs_policy.c:762-765).
         if self.config.restrict_anonymous_to_tgt
             && crate::types::is_anonymous_name(&header.cname)
@@ -504,13 +500,22 @@ impl<S: PrincipalStore> Kdc<S> {
         let header_flags: TicketFlags = *header.flags;
         let header_renew_till = header.renew_till.as_ref().map(ts).unwrap_or(0);
         check_tgs_opts(opts, header_flags)?;
-        check_tgs_times(opts, header_renew_till, kdc_time)?;
+        let header_start = header
+            .starttime
+            .as_ref()
+            .map(ts)
+            .unwrap_or(ts(&header.authtime));
+        check_tgs_times(opts, header_start, header_renew_till, kdc_time)?;
         if opts.intersects(NON_TGT_OPTION) {
             if !names_equal(&ap.ticket.sname, sname) || ap.ticket.realm != body.realm {
                 return Err(KdcError::new(
                     KDC_ERR_SERVER_NOMATCH,
                     "SERVER DIDN'T MATCH TICKET FOR RENEW/FORWARD/ETC",
                 ));
+            }
+            // check_tgs_nontgt (tgs_policy.c:639-644).
+            if opts.contains(KdcOptions::PROXY) && is_tgs_principal(sname) {
+                return Err(KdcError::new(KDC_ERR_BADOPTION, "CAN'T PROXY TGT"));
             }
         } else {
             if !is_tgs_principal(&ap.ticket.sname) {
@@ -659,45 +664,55 @@ impl<S: PrincipalStore> Kdc<S> {
         let req_till = ts(&body.till);
         let req_rtime = body.rtime.as_ref().map(ts).unwrap_or(0);
         let header_end = ts(&header.endtime);
-        let header_start = header
-            .starttime
-            .as_ref()
-            .map(ts)
-            .unwrap_or(ts(&header.authtime));
         let mut times = Times {
             authtime: ts(&subject_tkt.authtime),
-            starttime: kdc_time,
+            starttime: if opts.contains(KdcOptions::POSTDATED) {
+                body.from.as_ref().map(ts).unwrap_or(0)
+            } else {
+                kdc_time
+            },
             endtime: 0,
             renew_till: 0,
         };
-        times.endtime = if opts.contains(KdcOptions::RENEW) {
-            header_renew_till.min(kdc_time + (header_end - header_start))
+        // Validation requests preserve the header ticket times
+        // (do_tgs_req.c:820-824).
+        if opts.contains(KdcOptions::VALIDATE) {
+            times = Times {
+                authtime: ts(&header.authtime),
+                starttime: header.starttime.as_ref().map(ts).unwrap_or(0),
+                endtime: header_end,
+                renew_till: header_renew_till,
+            };
         } else {
-            get_ticket_endtime(
+            times.endtime = if opts.contains(KdcOptions::RENEW) {
+                header_renew_till.min(kdc_time + (header_end - header_start))
+            } else {
+                get_ticket_endtime(
+                    &limits,
+                    times.starttime,
+                    header_end,
+                    req_till,
+                    client.as_ref(),
+                    &server,
+                )
+            };
+            get_ticket_renewtime(
                 &limits,
-                times.starttime,
-                header_end,
+                opts,
+                req_rtime,
                 req_till,
+                Some(HeaderRenewal {
+                    flags: header_flags,
+                    renew_till: header_renew_till,
+                }),
                 client.as_ref(),
                 &server,
-            )
-        };
-        get_ticket_renewtime(
-            &limits,
-            opts,
-            req_rtime,
-            req_till,
-            Some(HeaderRenewal {
-                flags: header_flags,
-                renew_till: header_renew_till,
-            }),
-            client.as_ref(),
-            &server,
-            &mut flags,
-            &mut times,
-        );
-        if times.starttime == times.authtime {
-            times.starttime = 0;
+                &mut flags,
+                &mut times,
+            );
+            if times.starttime == times.authtime {
+                times.starttime = 0;
+            }
         }
         // Indicators from the subject ticket, not for S4U2Self, where the
         // client didn't authenticate (do_tgs_req.c:761-769, 894-902).
@@ -791,7 +806,8 @@ impl<S: PrincipalStore> Kdc<S> {
 
         let want_enc_pa_rep = find_padata(req.padata.as_deref(), PaDataType::ReqEncPaRep).is_some();
 
-        let (ticket_caddr, reply_caddr) = if !opts.contains(KdcOptions::RENEW)
+        let (ticket_caddr, reply_caddr) = if !opts
+            .intersects(KdcOptions::RENEW | KdcOptions::VALIDATE)
             && opts.intersects(KdcOptions::FORWARDED | KdcOptions::PROXY)
         {
             (body.addresses.clone(), body.addresses.clone())
@@ -843,7 +859,7 @@ impl<S: PrincipalStore> Kdc<S> {
         )?;
         let kvno =
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;
-        let ticket_sname = if opts.contains(KdcOptions::RENEW) {
+        let ticket_sname = if opts.intersects(KdcOptions::RENEW | KdcOptions::VALIDATE) {
             ap.ticket.sname.clone()
         } else if is_referral {
             server.name.clone()
