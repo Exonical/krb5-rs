@@ -344,19 +344,33 @@ fn main() {
         die(&whoami, MALFORMED, "while parsing principal name")
     };
     let auth = if ccache_name.is_some() {
-        println!("Authenticating as principal {princstr} with existing credentials.");
+        if !script_mode {
+            println!("Authenticating as principal {princstr} with existing credentials.")
+        };
         Auth::Ccache(cc)
     } else if use_anon {
-        println!("Authenticating as principal {princstr} with password; anonymous requested.");
+        if !script_mode {
+            println!("Authenticating as principal {princstr} with password; anonymous requested.")
+        };
         Auth::Anonymous
     } else if use_keytab {
         match &keytab_name {
-            Some(k) => println!("Authenticating as principal {princstr} with keytab {k}."),
-            None => println!("Authenticating as principal {princstr} with default keytab."),
+            Some(k) => {
+                if !script_mode {
+                    println!("Authenticating as principal {princstr} with keytab {k}.")
+                }
+            }
+            None => {
+                if !script_mode {
+                    println!("Authenticating as principal {princstr} with default keytab.")
+                }
+            }
         }
         Auth::Keytab(keytab_name.clone())
     } else {
-        println!("Authenticating as principal {princstr} with password.");
+        if !script_mode {
+            println!("Authenticating as principal {princstr} with password.")
+        };
         let pw = match password {
             Some(p) => p,
             None => rpassword::prompt_password(format!("Password for {princstr}: "))
@@ -1750,9 +1764,7 @@ fn ktremove(st: &mut Kadmin, argv: &[String]) {
         }
     }
     if !did && mode == RemMode::Old {
-        st.error(format!(
-            "{w}: There is only one entry for principal {princ_str} in keytab {ktname}\n"
-        ));
+        eprintln!("{w}: There is only one entry for principal {princ_str} in keytab {ktname}");
     }
 }
 
