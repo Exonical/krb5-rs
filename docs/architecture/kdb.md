@@ -1182,13 +1182,48 @@ The tests port MIT's `plugins/kdcpolicy/test/main.c` and
 `plugins/audit/test/au_test.c` and run the `t_kdcpolicy.py` and `t_audit.py`
 cases against the daemon.
 
+### OTP pre-authentication
+
+As in MIT (`plugins/preauth/otp/main.c`, `otp_state.c`, `lib/krad`,
+`lib/krb5/krb/preauth_otp.c`):
+- **When offered:** the KDC sends PA-OTP-CHALLENGE (141) only for a
+  principal with an `otp` string attribute, in a FAST-armored request
+  that is not hardware-only. The nonce is a 4-byte timestamp and random
+  bytes as long as the armor key; the challenge has one empty token info.
+- **Verification:** PA-OTP-REQUEST (142) `encData` is decrypted with the
+  armor key (usage 45); the nonce, or failing that a PA-ENC-TS-ENC
+  timestamp, must be within the clock skew. The `otp` attribute is a JSON
+  array of tokens (`type`, `username`, `indicators`); `[]` means one
+  `DEFAULT` token. Each token is tried in turn with an Access-Request
+  (User-Name, User-Password, Service-Type Authenticate-Only, NAS-Identifier
+  = the host name); the first Access-Accept succeeds.
+- **Token types:** `[otp]` relations `server`, `secret` (a file relative to
+  the KDC directory, first line, trimmed), `timeout` (5), `retries` (3),
+  `strip_realm` (true) and `indicator`. `DEFAULT` is built in: the Unix
+  socket `KDC_RUN_DIR/DEFAULT.socket`, an empty secret and no realm
+  stripping. Unix sockets get no retries; UDP is tried `retries + 1` times.
+- **Reply key:** the armor key replaces the reply key, and the token's
+  indicators (or else its type's) are asserted.
+- **Client:** token infos MIT can't handle are dropped; the PIN is
+  prepended to the OTP value unless `SEPARATE_PIN`; the nonce is encrypted
+  back with the armor key, which becomes the AS reply key. A failed OTP is
+  not retried.
+
+Differences: the client has no prompter or responder; the token choice,
+OTP value and PIN come from `AsExchangeConfig::otp` (`OtpAnswer`). The
+host name sent as NAS-Identifier is `uname`'s node name.
+
+The tests (`tests/kdc_otp.rs`) port MIT's `tests/t_otp.py` cases against
+fake UDP and Unix-socket RADIUS servers.
+
 ### Authentication indicators
 
 As in MIT (`kdc/authind.c`, `kdc/cammac.c`, `kdc_authdata.c`):
 - **Sources:** a successful pre-authentication asserts its configured
   indicators: SPAKE `spake_preauth_indicator`, encrypted challenge
   `[realms] encrypted_challenge_indicator`, and PKINIT `pkinit_indicator`
-  for signed (not anonymous) requests. Encrypted timestamp asserts none.
+  for signed (not anonymous) requests, and OTP token or `[otp]` type
+  `indicator`s. Encrypted timestamp asserts none.
   Duplicates are dropped.
 - **In tickets:** the indicators are encoded as AD-AUTHENTICATION-INDICATOR
   (97, a SEQUENCE OF UTF8String) inside an AD-CAMMAC (96) inside

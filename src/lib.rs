@@ -29,8 +29,11 @@ pub mod error;
 pub(crate) mod fsutil;
 pub mod gssapi;
 pub mod keytab;
+#[cfg(feature = "tokio")]
+pub mod krad;
 pub mod localauth;
 pub mod locate;
+pub mod otp;
 pub mod pac;
 #[cfg(feature = "pkinit")]
 pub mod pkinit;

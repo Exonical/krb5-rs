@@ -48,6 +48,8 @@ pub const KADM5_POLICY: i32 = 0x0000_0800;
 const ALLOWED_TO_DELEGATE_FROM: &[u8] = b"krb5rs_allowed_to_delegate_from";
 /// `KRB5_KDB_SK_REQUIRE_AUTH`.
 const REQUIRE_AUTH: &[u8] = b"require_auth";
+/// The OTP module's string attribute (otp/main.c `get_string(..., "otp")`).
+const OTP: &[u8] = b"otp";
 
 /// A raw MIT string-attribute key/value pair.
 pub type StringAttribute = (Vec<u8>, Vec<u8>);
@@ -205,6 +207,40 @@ pub fn set_string_attr(
         Some(_) => {}
     }
     put_attr_pairs(entry, &pairs);
+    Ok(())
+}
+
+/// [`set_string_attr`] on a bare tl-data list.
+pub fn set_string_attr_in(
+    tl_data: &mut Vec<TlData>,
+    key: &[u8],
+    value: Option<&[u8]>,
+) -> Result<(), StoreError> {
+    let mut pairs = attr_pairs_in(tl_data)?;
+    let had = tl_data.iter().any(|tl| tl.kind == STRING_ATTRS);
+    pairs.retain(|(k, _)| value.is_some() || k != key);
+    match (value, pairs.iter_mut().find(|(k, _)| k == key)) {
+        (Some(v), Some(pair)) => pair.1 = v.to_vec(),
+        (Some(v), None) => pairs.push((key.to_vec(), v.to_vec())),
+        (None, _) => {}
+    }
+    if pairs.is_empty() && !had {
+        return Ok(());
+    }
+    let mut data = Vec::new();
+    for (k, v) in &pairs {
+        data.extend_from_slice(k);
+        data.push(0);
+        data.extend_from_slice(v);
+        data.push(0);
+    }
+    match tl_data.iter_mut().find(|tl| tl.kind == STRING_ATTRS) {
+        Some(tl) => tl.data = data,
+        None => tl_data.push(TlData {
+            kind: STRING_ATTRS,
+            data,
+        }),
+    }
     Ok(())
 }
 
@@ -605,6 +641,17 @@ pub fn require_auth_attr(tl_data: &[TlData]) -> Result<Option<String>, StoreErro
         .transpose()
 }
 
+/// The `otp` string attribute in `tl_data`, if set.
+pub fn otp_attr(tl_data: &[TlData]) -> Result<Option<String>, StoreError> {
+    attr_pairs_in(tl_data)?
+        .into_iter()
+        .find(|(key, _)| key == OTP)
+        .map(|(_, value)| {
+            String::from_utf8(value).map_err(|_| corrupt("otp attribute is not UTF-8"))
+        })
+        .transpose()
+}
+
 /// [`record_from_entry`] without decrypting the keys (`entry.keys` empty),
 /// for stores that keep keys encrypted.
 pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreError> {
@@ -620,6 +667,7 @@ pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreErr
         }
     }
     let require_auth = require_auth_attr(&entry.tl_data)?;
+    let otp = otp_attr(&entry.tl_data)?;
     let last_pwd_change =
         get_u32_tl(entry, LAST_PWD_CHANGE)?.map(|time| kerberos_time(i64::from(time)));
     let (mod_time, mod_by) = match mod_principal_data(entry)? {
@@ -647,6 +695,7 @@ pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreErr
             allowed_to_delegate_to: constrained_delegation_values(entry)?,
             allowed_to_delegate_from,
             require_auth,
+            otp,
             policy,
             security_epoch: 0,
             last_admin_unlock,
@@ -917,6 +966,7 @@ mod tests {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
             require_auth: None,
+            otp: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
@@ -1254,6 +1304,7 @@ mod tests {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
             require_auth: None,
+            otp: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,

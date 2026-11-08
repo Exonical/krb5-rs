@@ -981,6 +981,7 @@ impl CockroachStore {
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
             require_auth: None,
+            otp: None,
             policy: None,
             security_epoch: 1,
             last_admin_unlock: None,

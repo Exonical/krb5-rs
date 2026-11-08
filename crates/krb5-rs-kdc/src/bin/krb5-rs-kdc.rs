@@ -694,6 +694,9 @@ async fn config_mode(
         .or_else(|| default_realm(&kdc_conf, krb5.as_ref()))
         .ok_or_else(|| io_err("no realm given and no default realm found"))?;
     let cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm).map_err(io_err)?;
+    if let Some(e) = krb5_rs::kdc::otp_config_error(&kdc_conf, krb5.as_ref()) {
+        error!("preauth otp failed to initialize: {e}");
+    }
     let master = match &cli.master_password_file {
         Some(path) => {
             let text = std::fs::read_to_string(path)

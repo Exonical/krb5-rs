@@ -257,7 +257,25 @@ impl StoredPrincipal {
                 s2kparams: k.s2kparams.clone(),
             });
         }
-        Ok(Self::with_keys(entry, last_pwd_change, mod_time, stored))
+        let mut sp = Self::with_keys(entry, last_pwd_change, mod_time, stored);
+        sp.set_model_attrs(entry)?;
+        Ok(sp)
+    }
+
+    /// The `require_auth` and `otp` string attributes, which the model
+    /// carries as fields, as `krb5_dbe_set_string`.
+    fn set_model_attrs(&mut self, entry: &PrincipalEntry) -> Result<(), StoreError> {
+        use super::kdb::mit::set_string_attr_in;
+        set_string_attr_in(
+            &mut self.tl_data,
+            b"require_auth",
+            entry.require_auth.as_deref().map(str::as_bytes),
+        )?;
+        set_string_attr_in(
+            &mut self.tl_data,
+            b"otp",
+            entry.otp.as_deref().map(str::as_bytes),
+        )
     }
 
     /// [`StoredPrincipal::from_entry`] for a rewrite of `previous`: when the
@@ -278,6 +296,7 @@ impl StoredPrincipal {
             _ => Self::from_entry(entry, last_pwd_change, mod_time, keys)?,
         };
         sp.tl_data = previous.tl_data.clone();
+        sp.set_model_attrs(entry)?;
         Ok(sp)
     }
 
@@ -351,6 +370,7 @@ impl StoredPrincipal {
             allowed_to_delegate_to: self.allowed_to_delegate_to,
             allowed_to_delegate_from: self.allowed_to_delegate_from,
             require_auth: super::kdb::mit::require_auth_attr(&self.tl_data)?,
+            otp: super::kdb::mit::otp_attr(&self.tl_data)?,
             policy: self.policy,
             security_epoch: self.security_epoch,
             last_admin_unlock: self.last_admin_unlock.map(kerberos_time),
@@ -914,6 +934,8 @@ mod tests {
             .expect("entry");
         entry.policy = Some("p".into());
         entry.security_epoch = 7;
+        entry.otp = Some("[{}]".into());
+        entry.require_auth = Some("otp".into());
         let masters = MasterKeys::single(master.clone());
         let stored =
             StoredPrincipal::from_entry(&entry, Some(10), Some(20), &masters).expect("stored");
@@ -926,6 +948,21 @@ mod tests {
         assert_eq!(
             (back.policy.as_deref(), back.security_epoch),
             (Some("p"), 7)
+        );
+        assert_eq!(
+            (back.otp.as_deref(), back.require_auth.as_deref()),
+            (Some("[{}]"), Some("otp"))
+        );
+        let mut cleared = back.clone();
+        cleared.otp = None;
+        let rewritten =
+            StoredPrincipal::from_update(&cleared, Some(10), Some(20), &masters, &stored)
+                .expect("update")
+                .into_entry(&masters)
+                .expect("decrypt");
+        assert_eq!(
+            (rewritten.otp, rewritten.require_auth.as_deref()),
+            (None, Some("otp"))
         );
         assert!(stored
             .clone()

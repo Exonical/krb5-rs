@@ -54,7 +54,11 @@ impl AsExchange {
             .as_key()
             .filter(|_| self.selected_preauth_type == Some(crate::spake::PA_SPAKE))
             .cloned();
-        let as_key = match pkinit_key.or(spake_key) {
+        let otp_key = self
+            .otp_key
+            .clone()
+            .filter(|_| self.selected_preauth_type == Some(crate::otp::PA_OTP_CHALLENGE));
+        let as_key = match pkinit_key.or(spake_key).or(otp_key) {
             Some(key) => key,
             None => {
                 let (salt, s2kparams) = self.compute_reply_key_params(rep);

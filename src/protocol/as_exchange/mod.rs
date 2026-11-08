@@ -90,6 +90,9 @@ pub struct AsExchangeConfig {
     /// (`[libdefaults] spake_preauth_groups`; MIT default `edwards25519`).
     /// Empty disables SPAKE.
     pub spake_groups: Vec<crate::spake::Group>,
+    /// Answer to a KDC's PA-OTP-CHALLENGE (MIT responder question
+    /// `otp`); `None` skips OTP. Requires FAST armor.
+    pub otp: Option<crate::otp::OtpAnswer>,
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -116,6 +119,7 @@ impl Default for AsExchangeConfig {
             identify_realm: false,
             subject_cert: None,
             spake_groups: vec![crate::spake::Group::Edwards25519],
+            otp: None,
         }
     }
 }
@@ -248,6 +252,8 @@ pub struct AsExchange {
     /// The padata type of the last preauth mechanism we answered with
     /// (MIT `ctx->selected_preauth_type`).
     selected_preauth_type: Option<i32>,
+    /// FAST armor key set as the AS key by OTP (preauth_otp.c:1118-1120).
+    otp_key: Option<EncryptionKey>,
     /// Real preauth types that already failed this exchange
     /// (MIT `k5_preauth_note_failed`).
     preauth_failed: Vec<i32>,
@@ -313,6 +319,7 @@ impl AsExchange {
             restarted: false,
             preauth_sent: false,
             selected_preauth_type: None,
+            otp_key: None,
             preauth_failed: Vec::new(),
             method_padata: None,
             pa_offset: None,
@@ -589,7 +596,13 @@ impl AsExchange {
                 self.last_preauth_etype = Some(hint.etype);
             }
             Err(e) => {
-                if self.last_preauth_etype.is_none() && !pkinit_offered {
+                // OTP's reply key is the armor key, so it needs no hint.
+                let otp_offered = self.config.otp.is_some()
+                    && !self.preauth_failed.contains(&crate::otp::PA_OTP_CHALLENGE)
+                    && method
+                        .iter()
+                        .any(|p| p.padata_type == crate::otp::PA_OTP_CHALLENGE);
+                if self.last_preauth_etype.is_none() && !pkinit_offered && !otp_offered {
                     return Err(e);
                 }
             }
@@ -648,6 +661,18 @@ impl AsExchange {
                     self.selected_preauth_type = Some(t);
                     return Ok(out);
                 }
+                t if t == crate::otp::PA_OTP_CHALLENGE => {
+                    if self.preauth_failed.contains(&t) {
+                        continue;
+                    }
+                    match self.otp_process(pa.padata_value.as_ref())? {
+                        Some(out) => {
+                            self.selected_preauth_type = Some(t);
+                            return Ok(out);
+                        }
+                        None => self.preauth_failed.push(t),
+                    }
+                }
                 t if t == PaDataType::Spake as i32 => {
                     if self.preauth_failed.contains(&t) {
                         continue;
@@ -694,6 +719,7 @@ fn duration_secs_i64(dur: Duration) -> i64 {
 
 pub(crate) use crate::protocol::validate::now_kerberos;
 
+mod otp;
 #[cfg(feature = "pkinit")]
 mod pkinit;
 mod reply;
