@@ -130,10 +130,15 @@ impl<T: KdcTransport> KerberosClient<T> {
                             && same_principal(&c.server, &c.srealm, imp, imp_realm)
                     })
                     .ok_or(gss(GssError::NoCred))?;
+                // init_sec_context.c:186-190: IAKERB only looks in the cache.
+                let mut proxy_flags = GcOptions::CANONICALIZE;
+                if cred.iakerb_mech {
+                    proxy_flags |= GcOptions::CACHED;
+                }
                 let evidence = Credential::try_from(evidence)
                     .map_err(|_| gss(GssError::DefectiveCredential))?;
                 let out = self
-                    .get_credentials_for_proxy(cache, GcOptions::CANONICALIZE, &req, &evidence)
+                    .get_credentials_for_proxy(cache, proxy_flags, &req, &evidence)
                     .await?;
                 if !same_principal(&out.client, &out.crealm, &name, &realm) {
                     return Err(gss(GssError::Failure));
