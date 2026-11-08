@@ -149,7 +149,7 @@ fn now() -> i64 {
 }
 
 impl GssCred {
-    fn empty(usage: CredUsage) -> Self {
+    pub(crate) fn empty(usage: CredUsage) -> Self {
         GssCred {
             usage,
             name: None,

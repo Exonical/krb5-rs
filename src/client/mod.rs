@@ -42,6 +42,7 @@ use crate::Krb5Error;
 
 pub use canonprinc::{CanonHost, HostCanonicalization};
 pub use creds::{CredsRequest, GcOptions};
+pub use gss_cred::CredStore;
 pub use primary::{get_tgt, is_unreach, with_primary_fallback};
 
 /// Maximum number of state machine steps before aborting.
