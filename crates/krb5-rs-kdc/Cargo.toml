@@ -53,6 +53,7 @@ turso = ["dep:krb5-rs-kdb-turso"]
 cockroach = ["dep:krb5-rs-kdb-cockroach", "turso"]
 
 [dependencies]
+rpassword = "7"
 krb5-rs-kdb-lmdb = { path = "../krb5-rs-kdb-lmdb", optional = true }
 krb5-rs-kdb-ldap = { path = "../krb5-rs-kdb-ldap", optional = true }
 libc = "0.2"

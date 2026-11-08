@@ -161,8 +161,16 @@ fn read_line(prompt: &str) -> String {
 /// `krb5_prompter_posix`: the prompt and ": " on stdout, a newline after the
 /// answer. `context` completes "Cannot read password while ...".
 fn read_password(prompt: &str, context: &str) -> String {
+    use std::io::IsTerminal as _;
     print!("{prompt}: ");
     let _ = std::io::stdout().flush();
+    if std::io::stdin().is_terminal() {
+        // The prompter turns echo off, as MIT's krb5_prompter_posix does.
+        let p = rpassword::read_password()
+            .unwrap_or_else(|_| fail(format!("Cannot read password while {context}")));
+        println!();
+        return p;
+    }
     let mut line = String::new();
     let read = std::io::stdin().lock().read_line(&mut line).unwrap_or(0);
     println!();
