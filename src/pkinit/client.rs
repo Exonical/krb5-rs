@@ -24,6 +24,7 @@ use crate::types::{
 /// `pkinit_pool`, `pkinit_revoke`, `pkinit_eku_checking`,
 /// `pkinit_dh_min_bits`, `pkinit_kdc_hostname`,
 /// `pkinit_require_crl_checking`).
+#[derive(Clone)]
 pub struct ClientConfig {
     /// The user's certificate chain and key.
     pub identity: Option<Identity>,

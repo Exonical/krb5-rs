@@ -312,7 +312,7 @@ impl AnyCcache {
     }
 
     /// `krb5_cc_switch`: make this its collection's primary cache. FILE and
-    /// MEMORY have no collection, so this is `KRB5_CC_NOSUPP` for them.
+    /// MEMORY have no `switch_to`, which MIT treats as success (ccfns.c:297).
     pub fn switch_to(&self) -> Result<(), CcError> {
         match self {
             Self::Dir(d) => d.switch_to(),
@@ -320,10 +320,7 @@ impl AnyCcache {
             Self::Keyring(k) => k.switch_to(),
             #[cfg(unix)]
             Self::Kcm(k) => k.switch_to(),
-            _ => Err(CcError::code(
-                "KRB5_CC_NOSUPP",
-                "Ccache function not supported: not implemented",
-            )),
+            _ => Ok(()),
         }
     }
 }

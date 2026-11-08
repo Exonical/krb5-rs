@@ -35,6 +35,33 @@ impl AsExchange {
 
     /// Replace the placeholder PA-PK-AS-REQ with the real value, computed
     /// over the request body (`pa_pkinit_gen_req`, :56-150).
+    /// `pkinit_client_profile` (pkinit_clnt.c:704-711): an input cache's
+    /// `X509_user_identity` replaces the configured identity, without
+    /// certificate matching (`crypto_cert_select_default` wants exactly one).
+    pub(super) fn apply_configured_identity(&mut self) {
+        let base = self
+            .configured_pkinit
+            .get_or_insert_with(|| self.config.pkinit.clone())
+            .clone();
+        let spec = self
+            .cc_config_in
+            .get("X509_user_identity")
+            .and_then(|v| std::str::from_utf8(v).ok());
+        self.config.pkinit = match (base, spec) {
+            (Some(cfg), Some(spec)) if cfg.identity.is_some() => {
+                match crate::pkinit::cms::Identity::load_all(spec) {
+                    Ok(mut ids) if ids.len() == 1 => {
+                        let mut cfg = (*cfg).clone();
+                        cfg.identity = ids.pop();
+                        Some(Arc::new(cfg))
+                    }
+                    _ => None,
+                }
+            }
+            (base, _) => base,
+        };
+    }
+
     pub(super) fn fill_pkinit(
         &mut self,
         padata: Option<Vec<PaData>>,
@@ -61,6 +88,11 @@ impl AsExchange {
             self.freshness_token.as_deref(),
         )
         .map_err(pkinit_error)?;
+        // pkinit_identity_prompt saves the signer identity.
+        if let Some(id) = cfg.identity.as_ref().filter(|i| !i.name.is_empty()) {
+            self.cc_config_out
+                .insert("X509_user_identity".into(), id.name.clone().into_bytes());
+        }
         slot.padata_value = value.into();
         self.pkinit_keypair = Some(keypair);
         Ok(Some(list))

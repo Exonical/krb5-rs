@@ -16,8 +16,19 @@ use super::dns::{DnsResolver, SrvRecord, UriRecord};
 pub struct HickoryResolver {
     /// One current-thread runtime shared by all queries.  The hickory
     /// resolver and its lookups must live on the same executor.
-    rt: tokio::runtime::Runtime,
+    /// Always `Some` until `drop`.
+    rt: Option<tokio::runtime::Runtime>,
     inner: Mutex<Option<Resolver<hickory_resolver::name_server::TokioConnectionProvider>>>,
+}
+
+/// Dropping a runtime inside another runtime's async context panics, so
+/// shut it down without waiting for its blocking pool.
+impl Drop for HickoryResolver {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
 }
 
 impl HickoryResolver {
@@ -27,7 +38,7 @@ impl HickoryResolver {
             .enable_all()
             .build()?;
         Ok(HickoryResolver {
-            rt,
+            rt: Some(rt),
             inner: Mutex::new(None),
         })
     }
@@ -41,13 +52,18 @@ impl HickoryResolver {
     {
         if tokio::runtime::Handle::try_current().is_ok() {
             std::thread::scope(|s| {
-                s.spawn(|| self.rt.block_on(fut))
+                s.spawn(|| self.rt().block_on(fut))
                     .join()
                     .unwrap_or_else(|p| std::panic::resume_unwind(p))
             })
         } else {
-            self.rt.block_on(fut)
+            self.rt().block_on(fut)
         }
+    }
+
+    #[allow(clippy::expect_used)]
+    fn rt(&self) -> &tokio::runtime::Runtime {
+        self.rt.as_ref().expect("runtime present until drop")
     }
 
     fn with_resolver<R>(

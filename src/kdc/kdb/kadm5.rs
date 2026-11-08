@@ -1483,6 +1483,498 @@ pub fn getpkeys_ret(api_version: u32, code: u32, keys: &[KeyData]) -> Vec<u8> {
     w.0
 }
 
+// Client side (`lib/kadm5/clnt`): argument encoders and result decoders.
+
+fn write_ns(w: &mut XdrWriter, s: Option<&String>) {
+    write_nullstring(w, s.map(String::as_bytes));
+}
+
+fn write_ks(w: &mut XdrWriter, ks: &[KeySalt]) {
+    w.u32(u32::try_from(ks.len()).unwrap_or(u32::MAX));
+    for (e, s) in ks {
+        w.i32(*e);
+        w.i32(*s);
+    }
+}
+
+impl PolicyEnt {
+    /// `xdr_kadm5_policy_ent_rec` for `api_version`.
+    pub fn encode(&self, w: &mut XdrWriter, api_version: u32) {
+        write_ns(w, self.policy.as_ref());
+        w.i32(self.pw_min_life);
+        w.i32(self.pw_max_life);
+        w.i32(self.pw_min_length);
+        w.i32(self.pw_min_classes);
+        w.i32(self.pw_history_num);
+        w.i32(self.policy_refcnt);
+        if api_version >= API_VERSION_3 {
+            w.u32(self.pw_max_fail);
+            w.i32(self.pw_failcnt_interval);
+            w.i32(self.pw_lockout_duration);
+        }
+        if api_version >= API_VERSION_4 {
+            w.u32(self.attributes);
+            w.i32(self.max_life);
+            w.i32(self.max_renewable_life);
+            write_ns(w, self.allowed_keysalts.as_ref());
+            w.i32(len_i32(self.tl_data.len()));
+            write_tl_list(w, &self.tl_data);
+        }
+    }
+}
+
+impl ReadArgs {
+    /// XDR arguments for this call.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = XdrWriter::default();
+        match self {
+            Self::Api(v) => w.u32(*v),
+            Self::GetPrincipal {
+                api_version,
+                princ,
+                mask,
+            } => {
+                w.u32(*api_version);
+                write_ns(&mut w, princ.as_ref());
+                w.i32(*mask);
+            }
+            Self::Name { api_version, name } => {
+                w.u32(*api_version);
+                write_ns(&mut w, name.as_ref());
+            }
+        }
+        w.0
+    }
+}
+
+impl WriteArgs {
+    /// The procedure number and XDR arguments for this call.
+    pub fn encode(&self) -> (u32, Vec<u8>) {
+        let mut w = XdrWriter::default();
+        w.u32(self.api_version());
+        let w = &mut w;
+        let p = match self {
+            Self::CreatePrincipal {
+                rec,
+                mask,
+                ks_tuple,
+                passwd,
+                ..
+            } => {
+                rec.encode(w);
+                w.i32(*mask);
+                if let Some(ks) = ks_tuple {
+                    write_ks(w, ks);
+                }
+                write_ns(w, passwd.as_ref());
+                if ks_tuple.is_some() {
+                    proc_::CREATE_PRINCIPAL3
+                } else {
+                    proc_::CREATE_PRINCIPAL
+                }
+            }
+            Self::DeletePrincipal { princ, .. } => {
+                write_ns(w, princ.as_ref());
+                proc_::DELETE_PRINCIPAL
+            }
+            Self::ModifyPrincipal { rec, mask, .. } => {
+                rec.encode(w);
+                w.i32(*mask);
+                proc_::MODIFY_PRINCIPAL
+            }
+            Self::RenamePrincipal { src, dest, .. } => {
+                write_ns(w, src.as_ref());
+                write_ns(w, dest.as_ref());
+                proc_::RENAME_PRINCIPAL
+            }
+            Self::ChpassPrincipal {
+                princ,
+                v3,
+                keepold,
+                ks_tuple,
+                pass,
+                ..
+            } => {
+                write_ns(w, princ.as_ref());
+                if *v3 {
+                    w.bool(*keepold);
+                    write_ks(w, ks_tuple);
+                }
+                write_ns(w, pass.as_ref());
+                if *v3 {
+                    proc_::CHPASS_PRINCIPAL3
+                } else {
+                    proc_::CHPASS_PRINCIPAL
+                }
+            }
+            Self::ChrandPrincipal {
+                princ,
+                v3,
+                keepold,
+                ks_tuple,
+                ..
+            } => {
+                write_ns(w, princ.as_ref());
+                if *v3 {
+                    w.bool(*keepold);
+                    write_ks(w, ks_tuple);
+                    proc_::CHRAND_PRINCIPAL3
+                } else {
+                    proc_::CHRAND_PRINCIPAL
+                }
+            }
+            Self::SetkeyPrincipal {
+                princ,
+                keepold,
+                keys,
+                ..
+            } => {
+                write_ns(w, princ.as_ref());
+                match keys {
+                    SetKeys::V1(kb) => {
+                        w.u32(u32::try_from(kb.len()).unwrap_or(u32::MAX));
+                        kb.iter().for_each(|k| k.encode(w));
+                        proc_::SETKEY_PRINCIPAL
+                    }
+                    SetKeys::V3(ks, kb) => {
+                        w.bool(*keepold);
+                        write_ks(w, ks);
+                        w.u32(u32::try_from(kb.len()).unwrap_or(u32::MAX));
+                        kb.iter().for_each(|k| k.encode(w));
+                        proc_::SETKEY_PRINCIPAL3
+                    }
+                    SetKeys::V4(kd) => {
+                        w.bool(*keepold);
+                        w.u32(u32::try_from(kd.len()).unwrap_or(u32::MAX));
+                        kd.iter().for_each(|k| k.encode(w));
+                        proc_::SETKEY_PRINCIPAL4
+                    }
+                }
+            }
+            Self::CreatePolicy {
+                api_version,
+                rec,
+                mask,
+            }
+            | Self::ModifyPolicy {
+                api_version,
+                rec,
+                mask,
+            } => {
+                rec.encode(w, *api_version);
+                w.i32(*mask);
+                if matches!(self, Self::CreatePolicy { .. }) {
+                    proc_::CREATE_POLICY
+                } else {
+                    proc_::MODIFY_POLICY
+                }
+            }
+            Self::DeletePolicy { name, .. } => {
+                write_ns(w, name.as_ref());
+                proc_::DELETE_POLICY
+            }
+            Self::Purgekeys {
+                princ, keepkvno, ..
+            } => {
+                write_ns(w, princ.as_ref());
+                w.i32(*keepkvno);
+                proc_::PURGEKEYS
+            }
+            Self::SetString {
+                princ, key, value, ..
+            } => {
+                write_ns(w, princ.as_ref());
+                write_ns(w, key.as_ref());
+                write_ns(w, value.as_ref());
+                proc_::SET_STRING
+            }
+            Self::ExtractKeys { princ, kvno, .. } => {
+                write_ns(w, princ.as_ref());
+                w.u32(*kvno);
+                proc_::EXTRACT_KEYS
+            }
+            Self::CreateAlias { alias, target, .. } => {
+                write_ns(w, alias.as_ref());
+                write_ns(w, target.as_ref());
+                proc_::CREATE_ALIAS
+            }
+        };
+        (p, std::mem::take(&mut w.0))
+    }
+}
+
+/// A decoded kadm5 result: `(api_version, code, payload)`. The payload is
+/// present only when `code` is [`code::OK`].
+pub type Ret<T> = (u32, u32, Option<T>);
+
+fn decode_ret<T>(
+    b: &[u8],
+    f: impl FnOnce(&mut XdrReader<'_>, u32) -> Result<T, XdrError>,
+) -> Result<Ret<T>, XdrError> {
+    let mut r = XdrReader::new(b);
+    let v = r.u32()?;
+    let c = r.u32()?;
+    let out = if c == code::OK {
+        Some(f(&mut r, v)?)
+    } else {
+        None
+    };
+    r.finish()?;
+    Ok((v, c, out))
+}
+
+/// Decode a `generic_ret`.
+pub fn decode_generic_ret(b: &[u8]) -> Result<Ret<()>, XdrError> {
+    decode_ret(b, |_, _| Ok(()))
+}
+
+/// Decode a `gprincs_ret` / `gpols_ret`.
+pub fn decode_names_ret(b: &[u8]) -> Result<Ret<Vec<String>>, XdrError> {
+    decode_ret(b, |r, _| {
+        let _count = r.i32()?;
+        read_array(r, |r| read_nullstring(r).map(Option::unwrap_or_default))
+    })
+}
+
+/// Decode a `getprivs_ret` (the privileges are sent whatever the code).
+pub fn decode_getprivs_ret(b: &[u8]) -> Result<(u32, u32, i32), XdrError> {
+    let mut r = XdrReader::new(b);
+    let out = (r.u32()?, r.u32()?, r.i32()?);
+    r.finish()?;
+    Ok(out)
+}
+
+/// Decode a `getstrings_ret`.
+pub fn decode_gstrings_ret(b: &[u8]) -> Result<Ret<Vec<(String, String)>>, XdrError> {
+    decode_ret(b, |r, _| {
+        let _count = r.i32()?;
+        read_array(r, |r| {
+            Ok((
+                read_nullstring(r)?.unwrap_or_default(),
+                read_nullstring(r)?.unwrap_or_default(),
+            ))
+        })
+    })
+}
+
+/// Decode a `gpol_ret`.
+pub fn decode_gpol_ret(b: &[u8]) -> Result<Ret<PolicyEnt>, XdrError> {
+    decode_ret(b, PolicyEnt::decode)
+}
+
+/// Decode a `gprinc_ret`.
+pub fn decode_gprinc_ret(b: &[u8]) -> Result<Ret<PrincipalEnt>, XdrError> {
+    decode_ret(b, |r, _| PrincipalEnt::decode(r))
+}
+
+/// Decode a `chrand_ret`.
+pub fn decode_chrand_ret(b: &[u8]) -> Result<Ret<Vec<KeyBlock>>, XdrError> {
+    decode_ret(b, |r, _| read_array(r, KeyBlock::decode))
+}
+
+/// Decode a `getpkeys_ret`.
+pub fn decode_getpkeys_ret(b: &[u8]) -> Result<Ret<Vec<KeyData>>, XdrError> {
+    decode_ret(b, |r, _| read_array(r, KeyData::decode))
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    #[test]
+    fn write_args_round_trip() {
+        let n = |s: &str| Some(s.to_string());
+        let rec = PrincipalEnt {
+            principal: Some(b"a@R".to_vec()),
+            policy: Some(b"p".to_vec()),
+            max_life: 3600,
+            ..PrincipalEnt::default()
+        };
+        let pol = PolicyEnt {
+            policy: n("p"),
+            pw_min_length: 8,
+            pw_max_fail: 3,
+            allowed_keysalts: n("aes256-cts:normal"),
+            ..PolicyEnt::default()
+        };
+        let v = API_VERSION_4;
+        let cases = vec![
+            WriteArgs::CreatePrincipal {
+                api_version: v,
+                rec: Box::new(rec.clone()),
+                mask: 0x11,
+                ks_tuple: Some(vec![(18, 0)]),
+                passwd: n("pw"),
+            },
+            WriteArgs::CreatePrincipal {
+                api_version: v,
+                rec: Box::new(rec.clone()),
+                mask: 0x11,
+                ks_tuple: None,
+                passwd: None,
+            },
+            WriteArgs::DeletePrincipal {
+                api_version: v,
+                princ: n("a"),
+            },
+            WriteArgs::ModifyPrincipal {
+                api_version: v,
+                rec: Box::new(rec),
+                mask: 4,
+            },
+            WriteArgs::RenamePrincipal {
+                api_version: v,
+                src: n("a"),
+                dest: n("b"),
+            },
+            WriteArgs::ChpassPrincipal {
+                api_version: v,
+                princ: n("a"),
+                v3: true,
+                keepold: true,
+                ks_tuple: vec![(17, 3)],
+                pass: n("x"),
+            },
+            WriteArgs::ChrandPrincipal {
+                api_version: v,
+                princ: n("a"),
+                v3: false,
+                keepold: false,
+                ks_tuple: Vec::new(),
+            },
+            WriteArgs::SetkeyPrincipal {
+                api_version: v,
+                princ: n("a"),
+                keepold: true,
+                keys: SetKeys::V4(vec![KeyData {
+                    kvno: 2,
+                    key: KeyBlock {
+                        enctype: 18,
+                        contents: vec![1; 32],
+                    },
+                    salt_type: 0,
+                    salt: Vec::new(),
+                }]),
+            },
+            WriteArgs::CreatePolicy {
+                api_version: v,
+                rec: Box::new(pol.clone()),
+                mask: 9,
+            },
+            WriteArgs::ModifyPolicy {
+                api_version: API_VERSION_2,
+                rec: Box::new(PolicyEnt {
+                    pw_max_fail: 0,
+                    allowed_keysalts: None,
+                    ..pol
+                }),
+                mask: 9,
+            },
+            WriteArgs::DeletePolicy {
+                api_version: v,
+                name: n("p"),
+            },
+            WriteArgs::Purgekeys {
+                api_version: v,
+                princ: n("a"),
+                keepkvno: -1,
+            },
+            WriteArgs::SetString {
+                api_version: v,
+                princ: n("a"),
+                key: n("k"),
+                value: None,
+            },
+            WriteArgs::ExtractKeys {
+                api_version: v,
+                princ: n("a"),
+                kvno: 0,
+            },
+            WriteArgs::CreateAlias {
+                api_version: v,
+                alias: n("x"),
+                target: n("a"),
+            },
+        ];
+        for c in cases {
+            let (p, b) = c.encode();
+            assert_eq!(
+                WriteArgs::decode(p, &b).expect("handled").expect("decode"),
+                c
+            );
+        }
+        for (p, c) in [
+            (proc_::INIT, ReadArgs::Api(v)),
+            (
+                proc_::GET_PRINCIPAL,
+                ReadArgs::GetPrincipal {
+                    api_version: v,
+                    princ: n("a"),
+                    mask: 7,
+                },
+            ),
+            (
+                proc_::GET_PRINCS,
+                ReadArgs::Name {
+                    api_version: v,
+                    name: None,
+                },
+            ),
+        ] {
+            assert_eq!(
+                ReadArgs::decode(p, &c.encode())
+                    .expect("handled")
+                    .expect("decode"),
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn rets_round_trip() {
+        let v = API_VERSION_4;
+        assert_eq!(
+            decode_generic_ret(&generic_ret(v, 5)).expect("g"),
+            (v, 5, None)
+        );
+        let names = vec![b"a@R".to_vec(), b"b@R".to_vec()];
+        assert_eq!(
+            decode_names_ret(&names_ret(v, 0, &names)).expect("n").2,
+            Some(vec!["a@R".to_string(), "b@R".to_string()])
+        );
+        assert_eq!(
+            decode_getprivs_ret(&getprivs_ret(v, 0, 0x3f)).expect("p"),
+            (v, 0, 0x3f)
+        );
+        let strs = vec![(b"k".to_vec(), b"v".to_vec())];
+        assert_eq!(
+            decode_gstrings_ret(&gstrings_ret(v, 0, &strs))
+                .expect("s")
+                .2,
+            Some(vec![("k".into(), "v".into())])
+        );
+        let ent = PrincipalEnt {
+            principal: Some(b"a@R".to_vec()),
+            kvno: 3,
+            ..PrincipalEnt::default()
+        };
+        assert_eq!(
+            decode_gprinc_ret(&gprinc_ret(v, 0, Some(&ent)))
+                .expect("e")
+                .2,
+            Some(ent)
+        );
+        let kb = vec![KeyBlock {
+            enctype: 17,
+            contents: vec![2; 16],
+        }];
+        assert_eq!(
+            decode_chrand_ret(&chrand_ret(v, 0, &kb)).expect("c").2,
+            Some(kb)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

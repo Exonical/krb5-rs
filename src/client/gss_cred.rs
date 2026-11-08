@@ -389,7 +389,7 @@ fn time_to_refresh(cache: &mut AnyCcache, cred: &GssCred) -> bool {
 
 /// krb5_kt_client_default (kt_file.c, init_ctx.c): `KRB5_CLIENT_KTNAME`,
 /// then `default_client_keytab_name`, then MIT's built-in DEFCKTNAME.
-fn default_client_keytab_name(profile: Option<&Profile>) -> Result<String, Krb5Error> {
+pub fn default_client_keytab_name(profile: Option<&Profile>) -> Result<String, Krb5Error> {
     let name = std::env::var("KRB5_CLIENT_KTNAME")
         .ok()
         .or_else(|| {

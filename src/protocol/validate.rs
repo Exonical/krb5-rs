@@ -81,10 +81,24 @@ pub(crate) fn validate_as_reply(
         ));
     }
 
-    // 6. Start time within acceptable clock skew
+    // 6. A postdated reply starts when requested (get_in_tkt.c:243-245).
+    if let Some(from) = &request_body.from {
+        if request_body
+            .kdc_options
+            .contains(crate::types::KdcOptions::POSTDATED)
+            && enc_part.starttime.as_ref() != Some(from)
+        {
+            return Err(Krb5Error::ReplyValidation(
+                "KDC reply did not match expectations",
+            ));
+        }
+    }
+
+    // 7. Start time within acceptable clock skew, unless postdated
+    //    (get_in_tkt.c:266-269).
     let starttime = enc_part.starttime.as_ref().unwrap_or(&enc_part.authtime);
     let skew = time_diff(starttime, &now);
-    if skew > max_clock_skew {
+    if request_body.from.is_none() && skew > max_clock_skew {
         return Err(Krb5Error::ClockSkew {
             max_skew: max_clock_skew,
         });

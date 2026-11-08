@@ -55,11 +55,15 @@ impl From<VerifyError> for PkinitError {
 }
 
 /// A certificate chain and private key (`FILE:` identities).
+#[derive(Clone)]
 pub struct Identity {
     /// The identity certificate first, then any intermediates.
     pub chain: Vec<Cert>,
     /// The signing key.
     pub key: PrivateKey,
+    /// The spec naming only this identity (MIT `cred->name`, saved as the
+    /// cache's `X509_user_identity`); empty when built from PEM text.
+    pub name: String,
 }
 
 impl Identity {
@@ -73,6 +77,7 @@ impl Identity {
         Ok(Identity {
             chain,
             key: PrivateKey::from_pem(key_pem)?,
+            name: String::new(),
         })
     }
 
@@ -92,9 +97,16 @@ impl Identity {
         }
         let mut names = rest.split(',').filter(|n| !n.is_empty());
         let cert_path = names.next().unwrap_or(rest);
-        let key_path = names.next().unwrap_or(cert_path);
+        let key = names.next();
+        let key_path = key.unwrap_or(cert_path);
         let read = |p: &str| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"));
-        Identity::from_pem(&read(cert_path)?, &read(key_path)?)
+        let mut id = Identity::from_pem(&read(cert_path)?, &read(key_path)?)?;
+        // reassemble_files_name
+        id.name = match key {
+            Some(k) => format!("FILE:{cert_path},{k}"),
+            None => format!("FILE:{cert_path}"),
+        };
+        Ok(id)
     }
 
     /// Every candidate identity `spec` names (`crypto_load_certs`):
@@ -132,6 +144,7 @@ impl Identity {
             out.push(Identity {
                 chain: id.chain.into_iter().take(1).collect(),
                 key: id.key,
+                name: format!("FILE:{0}/{name},{0}/{stem}.key", dir.display()),
             });
             if out.len() >= super::matching::MAX_CREDS_ALLOWED {
                 break;

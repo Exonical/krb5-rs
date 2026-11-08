@@ -127,6 +127,9 @@ impl TgsExchange {
 
     /// KDC options for an ordinary request.
     fn kdc_options(&self, canonicalize: bool) -> KdcOptions {
+        if let Some(o) = self.options.valrenew {
+            return o | super::s4u::flags2opts(&self.cur_tgt);
+        }
         let mut kdc_opts = KdcOptions::empty();
         if self.options.renewable {
             kdc_opts |= KdcOptions::RENEWABLE;

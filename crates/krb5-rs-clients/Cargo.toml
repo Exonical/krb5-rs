@@ -1,0 +1,54 @@
+[package]
+name = "krb5-rs-clients"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+authors = ["Dmitry Prudnikov <mail@polaz.com>"]
+description = "MIT-compatible Kerberos user and administration tools (kinit, klist, kdestroy, kvno, kswitch, kpasswd, kadmin, ktutil) built on krb5-rs"
+repository = "https://github.com/structured-world/krb5-rs"
+publish = false
+
+[[bin]]
+name = "krb5-rs-kadmin"
+path = "src/bin/kadmin.rs"
+
+[[bin]]
+name = "krb5-rs-kinit"
+path = "src/bin/kinit.rs"
+
+[[bin]]
+name = "krb5-rs-kvno"
+path = "src/bin/kvno.rs"
+
+[[bin]]
+name = "krb5-rs-kpasswd"
+path = "src/bin/kpasswd.rs"
+
+[[bin]]
+name = "krb5-rs-ktutil"
+path = "src/bin/ktutil.rs"
+
+[[bin]]
+name = "krb5-rs-klist"
+path = "src/bin/klist.rs"
+
+[[bin]]
+name = "krb5-rs-kdestroy"
+path = "src/bin/kdestroy.rs"
+
+[[bin]]
+name = "krb5-rs-kswitch"
+path = "src/bin/kswitch.rs"
+
+[dependencies]
+krb5-rs = { path = "../..", features = ["client", "gssapi", "pkinit", "dns", "kdc"] }
+base64 = "0.22"
+chrono = { version = "0.4.38", default-features = false, features = ["clock", "unstable-locales"] }
+rasn = "0.28"
+dns-lookup = "4"
+rpassword = "7"
+tokio = { version = "1.53.2", features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27"

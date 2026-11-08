@@ -40,9 +40,9 @@ use crate::transport::KdcTransport;
 use crate::types::PrincipalName;
 use crate::Krb5Error;
 
-pub use canonprinc::{CanonHost, HostCanonicalization};
+pub use canonprinc::{canonicalize_hostname, CanonHost, HostCanonicalization};
 pub use creds::{CredsRequest, GcOptions};
-pub use gss_cred::CredStore;
+pub use gss_cred::{default_client_keytab_name, CredStore};
 pub use primary::{get_tgt, is_unreach, with_primary_fallback};
 
 /// Maximum number of state machine steps before aborting.
@@ -145,11 +145,93 @@ impl<T: KdcTransport> KerberosClient<T> {
             .await
     }
 
+    /// Obtain initial credentials with keys from a keytab
+    /// (`krb5_get_init_creds_keytab`): `keys` are the newest kvno's keys for
+    /// the client.
+    pub async fn acquire_tgt_with_keys(
+        &self,
+        config: AsExchangeConfig,
+        keys: Vec<crate::types::EncryptionKey>,
+    ) -> Result<Credential, Krb5Error> {
+        crate::k5trace!(
+            "Getting initial credentials for {}",
+            crate::trace::princ(&config.client, &config.realm)
+        );
+        self.run_as_exchange(AsExchange::with_keys(config, keys))
+            .await
+    }
+
+    /// `krb5_get_etype_info`: send one AS-REQ without pre-authentication
+    /// and return the etype, salt and s2kparams the KDC would use for the
+    /// client's long-term key, or `None` when it names none.
+    pub async fn get_etype_info(
+        &self,
+        config: AsExchangeConfig,
+    ) -> Result<Option<(i32, Vec<u8>, Option<Vec<u8>>)>, Krb5Error> {
+        let mut exchange = AsExchange::new(config, "");
+        exchange.etype_probe = true;
+        let mut kdc_reply = Vec::new();
+        for _ in 0..MAX_EXCHANGE_STEPS {
+            match exchange.step(&kdc_reply)? {
+                StepResult::SendToKdc { data, realm } | StepResult::RetryTcp { data, realm } => {
+                    kdc_reply = self.transport.send_recv(&realm, &data).await?;
+                }
+                StepResult::Complete => return Ok(exchange.etype_info()),
+            }
+        }
+        Err(Krb5Error::ReplyValidation(
+            "AS exchange did not complete within step limit",
+        ))
+    }
+
+    /// Renew or validate `old` (val_renew.c `get_new_creds`): a TGS request
+    /// for `old`'s server using `old` itself, with `kdcopt`
+    /// (`KDC_OPT_RENEW` or `KDC_OPT_VALIDATE`) plus `old`'s `FLAGS2OPTS` bits.
+    pub async fn get_valrenewed_creds(
+        &self,
+        old: &Credential,
+        kdcopt: crate::types::KdcOptions,
+    ) -> Result<Credential, Krb5Error> {
+        let options = TgsOptions {
+            canonicalize: false,
+            valrenew: Some(kdcopt),
+            ..self.tgs_options.clone()
+        };
+        let mut exchange = TgsExchange::new(old.clone(), old.server.clone(), options);
+        let mut kdc_reply = Vec::new();
+        for _ in 0..MAX_EXCHANGE_STEPS {
+            match exchange.step(&kdc_reply)? {
+                TgsStepResult::SendToKdc { data, realm }
+                | TgsStepResult::RetryTcp { data, realm } => {
+                    kdc_reply = self.transport.send_recv(&realm, &data).await?;
+                }
+                TgsStepResult::Complete => return exchange.credential().cloned(),
+            }
+        }
+        Err(Krb5Error::ReplyValidation(
+            "TGS exchange did not complete within step limit",
+        ))
+    }
+
+    /// Drive an AS exchange to completion and return it, so the caller can
+    /// read [`AsExchange::credential`], [`AsExchange::fast_avail`] and
+    /// [`AsExchange::selected_preauth_type`] (`krb5_get_init_creds` with
+    /// an output cache, get_in_tkt.c:1615-1660).
+    pub async fn get_init_creds(&self, mut exchange: AsExchange) -> Result<AsExchange, Krb5Error> {
+        self.drive_as_exchange(&mut exchange).await?;
+        Ok(exchange)
+    }
+
     /// Drive an AS exchange to completion over the transport.
     pub(crate) async fn run_as_exchange(
         &self,
         mut exchange: AsExchange,
     ) -> Result<Credential, Krb5Error> {
+        self.drive_as_exchange(&mut exchange).await?;
+        exchange.credential().cloned()
+    }
+
+    async fn drive_as_exchange(&self, exchange: &mut AsExchange) -> Result<(), Krb5Error> {
         let mut kdc_reply = Vec::new();
 
         for _ in 0..MAX_EXCHANGE_STEPS {
@@ -170,9 +252,7 @@ impl<T: KdcTransport> KerberosClient<T> {
                          transport such as TcpTransport or UdpTcpTransport",
                     ));
                 }
-                StepResult::Complete => {
-                    return exchange.credential().cloned();
-                }
+                StepResult::Complete => return Ok(()),
             }
         }
 

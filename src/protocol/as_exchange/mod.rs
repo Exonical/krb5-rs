@@ -4,6 +4,7 @@
 //! The caller drives the loop and controls transport — this module only
 //! produces outbound messages and consumes inbound responses.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Timelike, Utc};
@@ -93,6 +94,42 @@ pub struct AsExchangeConfig {
     /// Answer to a KDC's PA-OTP-CHALLENGE (MIT responder question
     /// `otp`); `None` skips OTP. Requires FAST armor.
     pub otp: Option<crate::otp::OtpAnswer>,
+    /// Seconds from now until the ticket becomes valid (MIT `start_time`);
+    /// non-zero requests a postdated ticket (get_in_tkt.c:928-929).
+    /// Default: 0.
+    pub start_time: u32,
+    /// Addresses for the request body (`krb5_get_init_creds_opt_set_address_list`).
+    /// Default: none.
+    pub addresses: Option<Vec<crate::types::HostAddress>>,
+    /// The input ccache (`krb5_get_init_creds_opt_set_in_ccache`), read for
+    /// its config entries. Default: none.
+    pub in_ccache: Option<InCcache>,
+}
+
+/// MIT's JSON strings are byte strings (`k5_json`, json.c:819-830 reads
+/// `\u00XX` as a byte and passes other bytes through): carry each byte as
+/// U+0000..U+00FF so binary values such as an OTP `tokenID` round-trip.
+fn latin1_string(b: &[u8]) -> String {
+    b.iter().map(|&c| char::from(c)).collect()
+}
+
+/// The inverse of [`latin1_string`]; `None` for a code point above U+00FF.
+fn latin1_bytes(s: &str) -> Option<Vec<u8>> {
+    s.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect()
+}
+
+/// Config-entry lookup on an input ccache: `(server, server realm, key)`
+/// to the entry's data, as `krb5_cc_get_config`.
+#[derive(Clone)]
+pub struct InCcache(pub Arc<CcConfigLookup>);
+
+/// The lookup behind [`InCcache`].
+pub type CcConfigLookup = dyn Fn(&PrincipalName, &str, &str) -> Option<Vec<u8>> + Send + Sync;
+
+impl std::fmt::Debug for InCcache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InCcache(..)")
+    }
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -120,6 +157,9 @@ impl Default for AsExchangeConfig {
             subject_cert: None,
             spake_groups: vec![crate::spake::Group::Edwards25519],
             otp: None,
+            start_time: 0,
+            addresses: None,
+            in_ccache: None,
         }
     }
 }
@@ -236,6 +276,9 @@ pub struct AsExchange {
     last_s2kparams: Option<Vec<u8>>,
     /// Persisted etype from preauth hint (for hint-less MORE_PREAUTH_DATA).
     last_preauth_etype: Option<i32>,
+    /// `krb5_get_etype_info`: stop at the first PREAUTH_REQUIRED or AS-REP
+    /// and record its etype-info.
+    pub(crate) etype_probe: bool,
     /// PA-FX-COOKIE from the most recent KDC error, echoed verbatim in the
     /// next AS-REQ (MIT preauth2.c:856-884 `copy_cookie`). Not cached:
     /// an error without a cookie clears it.
@@ -252,6 +295,18 @@ pub struct AsExchange {
     /// The padata type of the last preauth mechanism we answered with
     /// (MIT `ctx->selected_preauth_type`).
     selected_preauth_type: Option<i32>,
+
+    /// The only real preauth mechanism to use, from the input cache's
+    /// `pa_type` entry (MIT `ctx->allowed_preauth_type`).
+    allowed_preauth_type: Option<i32>,
+
+    /// String members of the input cache's `pa_config_data` JSON object
+    /// (MIT `ctx->cc_config_in`, read before each request).
+    cc_config_in: std::collections::BTreeMap<String, Vec<u8>>,
+
+    /// Module settings to save as `pa_config_data` (MIT
+    /// `ctx->cc_config_out`, cleared before each request).
+    cc_config_out: std::collections::BTreeMap<String, Vec<u8>>,
     /// FAST armor key set as the AS key by OTP (preauth_otp.c:1118-1120).
     otp_key: Option<EncryptionKey>,
     /// Real preauth types that already failed this exchange
@@ -280,6 +335,10 @@ pub struct AsExchange {
     /// Key pair of the outstanding PA-PK-AS-REQ.
     #[cfg(feature = "pkinit")]
     pkinit_keypair: Option<crate::pkinit::kex::KeyPair>,
+    /// `config.pkinit` as given, before an input cache's
+    /// `X509_user_identity` replaced its identity.
+    #[cfg(feature = "pkinit")]
+    configured_pkinit: Option<Option<Arc<crate::pkinit::client::ClientConfig>>>,
     /// Freshness token from the KDC (RFC 8070).
     #[cfg(feature = "pkinit")]
     freshness_token: Option<Vec<u8>>,
@@ -314,11 +373,15 @@ impl AsExchange {
             last_preauth_salt: None,
             last_s2kparams: None,
             last_preauth_etype: None,
+            etype_probe: false,
             cookie: None,
             info_pa_permitted: true,
             restarted: false,
             preauth_sent: false,
             selected_preauth_type: None,
+            allowed_preauth_type: None,
+            cc_config_in: Default::default(),
+            cc_config_out: Default::default(),
             otp_key: None,
             preauth_failed: Vec::new(),
             method_padata: None,
@@ -332,6 +395,8 @@ impl AsExchange {
             pkinit_group,
             #[cfg(feature = "pkinit")]
             pkinit_keypair: None,
+            #[cfg(feature = "pkinit")]
+            configured_pkinit: None,
             #[cfg(feature = "pkinit")]
             freshness_token: None,
             spake: spake::SpakeClientState::default(),
@@ -373,6 +438,7 @@ impl AsExchange {
                 // First call — build initial AS-REQ (no preauth). Armor it
                 // when FAST is required (MIT KRB5_FAST_REQUIRED).
                 let required = self.config.fast.required();
+                self.read_allowed_preauth_type();
                 self.reset_fast_state(required)?;
                 let (as_req_der, req_body) = self.build_as_req(None)?;
                 self.last_req_body = Some(req_body);
@@ -404,6 +470,13 @@ impl AsExchange {
             .ok_or(Krb5Error::ReplyValidation("exchange not complete"))
     }
 
+    /// The real preauth mechanism that produced the reply, if any (MIT
+    /// `ctx->selected_preauth_type`, saved as the `pa_type` cache config
+    /// entry, get_in_tkt.c:1149-1166).
+    pub fn selected_preauth_type(&self) -> Option<i32> {
+        self.selected_preauth_type
+    }
+
     /// Whether the reply negotiated FAST availability (RFC 6806 §11:
     /// ENC_PA_REP flag set and PA-FX-FAST in the encrypted padata;
     /// MIT `krb5int_fast_verify_nego`).
@@ -416,6 +489,61 @@ impl AsExchange {
     /// path; failure there is non-fatal, so this is a flag not an error).
     pub fn kdc_verified(&self) -> bool {
         self.kdc_verified
+    }
+
+    /// `read_allowed_preauth_type` (get_in_tkt.c:731-753), run on each
+    /// (re)start so a client referral reads the new realm's entry.
+    fn read_allowed_preauth_type(&mut self) {
+        self.allowed_preauth_type = self
+            .in_cc_config("pa_type")
+            .and_then(|v| String::from_utf8(v).ok()?.trim().parse().ok());
+    }
+
+    /// `krb5_cc_get_config` on the input cache for the request's server
+    /// (`ctx->request->server`).
+    fn in_cc_config(&self, key: &str) -> Option<Vec<u8>> {
+        let cc = self.config.in_ccache.as_ref()?;
+        let server = self
+            .config
+            .server
+            .clone()
+            .unwrap_or_else(|| PrincipalName::new_srv_inst("krbtgt", &self.config.realm));
+        (cc.0)(&server, &self.config.realm, key)
+    }
+
+    /// `read_cc_config_in_data` and `clear_cc_config_out_data`
+    /// (get_in_tkt.c:1168-1211, run before each request's preauth).
+    pub(super) fn reset_cc_config(&mut self) {
+        self.cc_config_out.clear();
+        self.cc_config_in = self
+            .in_cc_config("pa_config_data")
+            .and_then(|v| match serde_json::from_str(&latin1_string(&v)).ok()? {
+                serde_json::Value::Object(o) => Some(o),
+                _ => None,
+            })
+            .map(|o| {
+                o.into_iter()
+                    .filter_map(|(k, v)| Some((k, latin1_bytes(v.as_str()?)?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "pkinit")]
+        self.apply_configured_identity();
+    }
+
+    /// The `pa_config_data` entry to store with the new credential: the
+    /// JSON object preauth modules set, or `None` when empty
+    /// (`save_cc_config_out_data`, get_in_tkt.c:1213-1232).
+    pub fn cc_config_out_data(&self) -> Option<Vec<u8>> {
+        if self.cc_config_out.is_empty() {
+            return None;
+        }
+        let map: serde_json::Map<String, serde_json::Value> = self
+            .cc_config_out
+            .iter()
+            .map(|(k, v)| (k.clone(), latin1_string(v).into()))
+            .collect();
+        latin1_bytes(&serde_json::to_string(&map).ok()?)
     }
 
     /// Rebuild the FAST request state for a (re)start
@@ -432,6 +560,26 @@ impl AsExchange {
         Ok(())
     }
 
+    /// `k5_get_etype_info`: the preferred etype-info entry, if any.
+    fn note_etype_info(&mut self, padata: &[PaData]) {
+        if let Ok(hint) = extract_preauth_hint_padata(padata, &self.config.etypes) {
+            self.last_preauth_etype = Some(hint.etype);
+            self.last_preauth_salt = hint.salt;
+            self.last_s2kparams = hint.s2kparams;
+        }
+    }
+
+    /// The etype, salt and s2kparams recorded by an etype-info probe
+    /// (`krb5_get_etype_info`); the salt defaults to the principal's.
+    pub(crate) fn etype_info(&self) -> Option<(i32, Vec<u8>, Option<Vec<u8>>)> {
+        let etype = self.last_preauth_etype?;
+        let salt = self
+            .last_preauth_salt
+            .clone()
+            .unwrap_or_else(|| self.default_salt());
+        Some((etype, salt, self.last_s2kparams.clone()))
+    }
+
     /// Process a KDC response.
     fn process_kdc_reply(&mut self, kdc_reply: &[u8]) -> Result<StepResult, Krb5Error> {
         if kdc_reply.is_empty() {
@@ -445,6 +593,11 @@ impl AsExchange {
             }
             // get_in_tkt.c:1786-1789: any reply means the client exists here.
             if self.config.identify_realm {
+                self.state = AsState::Complete;
+                return Ok(StepResult::Complete);
+            }
+            if self.etype_probe {
+                self.note_etype_info(as_rep.0.padata.as_deref().unwrap_or(&[]));
                 self.state = AsState::Complete;
                 return Ok(StepResult::Complete);
             }
@@ -477,6 +630,13 @@ impl AsExchange {
         #[cfg(feature = "pkinit")]
         if let Some(result) = self.pkinit_error(&krb_error, err_padata.as_deref()) {
             return result;
+        }
+
+        // get_etype_info.c get_from_error: only PREAUTH_REQUIRED carries it.
+        if self.etype_probe && krb_error.error_code == KDC_ERR_PREAUTH_REQUIRED {
+            self.note_etype_info(err_padata.as_deref().unwrap_or(&[]));
+            self.state = AsState::Complete;
+            return Ok(StepResult::Complete);
         }
 
         match krb_error.error_code {
@@ -645,8 +805,11 @@ impl AsExchange {
             s2kparams: self.last_s2kparams.clone(),
         };
         let hint = || hint.clone();
+        // pa_type_allowed (preauth2.c:625-631, :667).
+        let only = self.allowed_preauth_type;
+        let allowed = move |t: i32| only.is_none_or(|a| a == t);
         #[cfg(feature = "pkinit")]
-        if self.pkinit_offered(method) {
+        if allowed(crate::pkinit::server::PA_PK_AS_REQ) && self.pkinit_offered(method) {
             self.selected_preauth_type = Some(crate::pkinit::server::PA_PK_AS_REQ);
             return Ok(PaData {
                 padata_type: crate::pkinit::server::PA_PK_AS_REQ,
@@ -654,6 +817,9 @@ impl AsExchange {
             });
         }
         for pa in method {
+            if !allowed(pa.padata_type) {
+                continue;
+            }
             match pa.padata_type {
                 t if t == PaDataType::EncryptedChallenge as i32 => {
                     // ec_process:26-33 — no armor key means we cannot

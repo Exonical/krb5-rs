@@ -208,13 +208,7 @@ fn file_collection_yields_only_an_existing_default() {
         .initialize(&princ(&["alice"]), REALM)
         .unwrap();
     assert_eq!(collection(&c).unwrap().len(), 1);
-    assert!(matches!(
-        default_cache(&c).unwrap().switch_to(),
-        Err(CcError::Code {
-            name: "KRB5_CC_NOSUPP",
-            ..
-        })
-    ));
+    assert!(default_cache(&c).unwrap().switch_to().is_ok());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

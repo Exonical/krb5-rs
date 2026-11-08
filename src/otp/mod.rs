@@ -166,7 +166,8 @@ pub struct PaOtpEncRequest {
 /// challenge's supported list, the OTP value and an optional PIN.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OtpAnswer {
-    /// Index into the supported token infos.
+    /// Index into the supported token infos; ignored when only one is
+    /// left (after an input cache's saved choice), as MIT does not prompt.
     pub tokeninfo: usize,
     /// The one-time password.
     pub value: Option<String>,
