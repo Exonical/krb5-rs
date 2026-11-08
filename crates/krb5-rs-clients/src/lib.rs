@@ -24,6 +24,7 @@ pub fn progname() -> &'static str {
     })
 }
 
+pub mod kadm5;
 pub mod ss;
 
 /// `com_err(progname, code, fmt)`: `prog: message context`.
