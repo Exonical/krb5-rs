@@ -28,17 +28,39 @@ pub enum Bind {
         /// The password.
         password: String,
     },
-    /// SASL bind with a mechanism.
+    /// SASL bind with a mechanism and the interaction values MIT's
+    /// `interact` callback supplies.
     Sasl {
         /// The mechanism name.
         mech: String,
+        /// `sasl_authcid` (`SASL_CB_AUTHNAME`).
+        authcid: Option<String>,
+        /// `sasl_authzid` (`SASL_CB_USER`).
+        authzid: Option<String>,
+        /// `sasl_realm` (`SASL_CB_GETREALM`).
+        realm: Option<String>,
+        /// The secret (`SASL_CB_PASS`), if one could be found.
+        password: Option<String>,
     },
 }
 
 /// `validate_context` (kdb_ldap_conn.c:43-88).
 pub fn validate(cfg: &LdapConfig) -> Result<Bind, StoreError> {
     if let Some(mech) = &cfg.sasl_mech {
-        return Ok(Bind::Sasl { mech: mech.clone() });
+        // Read the password as the SASL secret if we can, but don't require
+        // one: not every mechanism needs it.
+        let password = match (&cfg.bind_pwd, &cfg.sasl_authcid, &cfg.service_password_file) {
+            (Some(p), _, _) => Some(p.clone()),
+            (None, Some(authcid), Some(file)) => read_password(file, authcid).ok(),
+            _ => None,
+        };
+        return Ok(Bind::Sasl {
+            mech: mech.clone(),
+            authcid: cfg.sasl_authcid.clone(),
+            authzid: cfg.sasl_authzid.clone(),
+            realm: cfg.sasl_realm.clone(),
+            password,
+        });
     }
     let dn = cfg
         .bind_dn
@@ -70,7 +92,7 @@ async fn authenticate(ldap: &mut Ldap, server: &str, bind: &Bind) -> Result<(), 
                 ))
             })
         }
-        Bind::Sasl { mech } => {
+        Bind::Sasl { mech, .. } => {
             let r = if mech.eq_ignore_ascii_case("EXTERNAL") {
                 ldap.sasl_external_bind()
                     .await
@@ -249,7 +271,26 @@ mod tests {
         assert_eq!(
             validate(&c).unwrap(),
             Bind::Sasl {
-                mech: "EXTERNAL".into()
+                mech: "EXTERNAL".into(),
+                authcid: None,
+                authzid: None,
+                realm: None,
+                password: Some("pw".into()),
+            }
+        );
+        c.bind_pwd = None;
+        c.sasl_mech = Some("SCRAM-SHA-256".into());
+        c.sasl_authcid = Some("kdc-service".into());
+        c.sasl_authzid = Some("dn:cn=kdc".into());
+        c.sasl_realm = Some("EXAMPLE".into());
+        assert_eq!(
+            validate(&c).unwrap(),
+            Bind::Sasl {
+                mech: "SCRAM-SHA-256".into(),
+                authcid: Some("kdc-service".into()),
+                authzid: Some("dn:cn=kdc".into()),
+                realm: Some("EXAMPLE".into()),
+                password: None,
             }
         );
     }
