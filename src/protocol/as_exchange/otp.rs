@@ -66,7 +66,14 @@ impl AsExchange {
         let Some(answer) = self.config.otp.clone() else {
             return Ok(None);
         };
-        let Some(ti) = chl.tokeninfo.get(answer.tokeninfo) else {
+        // prompt_for_token (preauth_otp.c:750-753): a single token, as left
+        // by the cached choice, is used without asking which.
+        let index = if chl.tokeninfo.len() == 1 {
+            0
+        } else {
+            answer.tokeninfo
+        };
+        let Some(ti) = chl.tokeninfo.get(index) else {
             return Ok(None);
         };
         let mut req = make_request(ti, &answer)?;
