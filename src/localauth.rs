@@ -756,12 +756,12 @@ fn replace(
 
 /// The system's POSIX extended regular expressions, as MIT uses on Unix.
 #[cfg(unix)]
-struct Regex(Box<libc::regex_t>);
+pub(crate) struct Regex(Box<libc::regex_t>);
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
 impl Regex {
-    fn new(pattern: &[u8]) -> Option<Self> {
+    pub(crate) fn new(pattern: &[u8]) -> Option<Self> {
         let pat = std::ffi::CString::new(pattern).ok()?;
         // SAFETY: regex_t is plain data that regcomp initializes.
         let mut re: Box<libc::regex_t> = Box::new(unsafe { std::mem::zeroed() });
@@ -773,7 +773,7 @@ impl Regex {
     }
 
     /// The first match in `s` (C string semantics) as byte offsets.
-    fn find(&self, s: &[u8]) -> Option<(usize, usize)> {
+    pub(crate) fn find(&self, s: &[u8]) -> Option<(usize, usize)> {
         let s = std::ffi::CString::new(cstr_bytes(s)).ok()?;
         let mut m = libc::regmatch_t { rm_so: 0, rm_eo: 0 };
         // SAFETY: self.0 was compiled by regcomp; m has room for 1 match.
@@ -794,17 +794,17 @@ impl Drop for Regex {
 /// Without a system regex library, the `regex` crate (leftmost-first,
 /// not POSIX leftmost-longest).
 #[cfg(not(unix))]
-struct Regex(regex::bytes::Regex);
+pub(crate) struct Regex(regex::bytes::Regex);
 
 #[cfg(not(unix))]
 impl Regex {
-    fn new(pattern: &[u8]) -> Option<Self> {
+    pub(crate) fn new(pattern: &[u8]) -> Option<Self> {
         regex::bytes::Regex::new(std::str::from_utf8(pattern).ok()?)
             .ok()
             .map(Regex)
     }
 
-    fn find(&self, s: &[u8]) -> Option<(usize, usize)> {
+    pub(crate) fn find(&self, s: &[u8]) -> Option<(usize, usize)> {
         self.0.find(cstr_bytes(s)).map(|m| (m.start(), m.end()))
     }
 }

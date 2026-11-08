@@ -348,7 +348,15 @@ impl<S: PrincipalStore> Kdc<S> {
                     None
                 })
             } else {
-                match self.pkinit_verify(pa, request, raw, &pk_body_der, &local_tgt, now) {
+                match self.pkinit_verify(
+                    pa,
+                    request,
+                    raw,
+                    &pk_body_der,
+                    &local_tgt,
+                    client.pkinit_cert_match.as_deref(),
+                    now,
+                ) {
                     None => continue,
                     Some(Ok(v)) => {
                         // pkinit_srv.c:602-603.

@@ -76,6 +76,22 @@ impl ClientConfig {
         }
     }
 
+    /// MIT defaults with the identity selected from an `X509_user_identity`
+    /// spec (`FILE:` or `DIR:`) by the `pkinit_cert_match` rules for `realm`
+    /// in `profile` (`pkinit_identity_prompt` and `pkinit_cert_matching`).
+    pub fn from_identity_spec(
+        spec: &str,
+        store: TrustStore,
+        profile: &crate::profile::Profile,
+        realm: &str,
+    ) -> Result<Self, String> {
+        let rules = super::matching::cert_match_rules(profile, realm);
+        Ok(Self::new(
+            super::matching::select_identity(spec, &rules)?,
+            store,
+        ))
+    }
+
     /// Wrap in an `Arc` for use in `AsExchangeConfig`.
     pub fn shared(self) -> Arc<Self> {
         Arc::new(self)

@@ -107,6 +107,14 @@ fn our_kdc(require_freshness: bool) -> Kdc<MemoryStore> {
             )
             .expect("user");
     }
+    // dbmatch: every pkiuser certificate, formatted as OpenSSL does.
+    let mut e = store.get(&name("pkiuser"), PKI_REALM).expect("pkiuser");
+    e.pkinit_cert_match = Some(
+        "&&<SUBJECT>^CN=pkiuser$<ISSUER>^CN=krb5-rs PKINIT Test CA$\
+         <SAN>^pkiuser@PKI\\.REALM$<KU>digitalSignature<EKU>pkinit"
+            .into(),
+    );
+    store.insert(e);
     let identity =
         Identity::from_spec(&pki_spec("kdc-pki-realm", "kdc-key")).expect("KDC identity");
     let mut server = ServerConfig::new(identity, anchors("ca"));

@@ -113,6 +113,8 @@ pub struct RequestInfo<'a> {
     pub nonce: u32,
     /// Requested enctypes in order.
     pub etypes: &'a [i32],
+    /// The client's `pkinit_cert_match` string attribute, for `dbmatch`.
+    pub cert_match: Option<&'a str>,
 }
 
 /// A failed verification with the data MIT puts in the error.
@@ -287,6 +289,7 @@ fn authorize_cert(
     cert: &Cert,
     client: &PrincipalName,
     realm: &str,
+    cert_match: Option<&str>,
 ) -> Result<(bool, Vec<String>), PkinitError> {
     use super::certauth::{CertauthModule, CERTAUTH_HWAUTH, CERTAUTH_HWAUTH_PASS};
     use crate::plugin::rpc::{ERROR_TABLE_BASE_KRB5, PLUGIN_NO_HANDLE};
@@ -311,7 +314,16 @@ fn authorize_cert(
                 },
                 Vec::new(),
             ),
-            CertauthModule::Dbmatch => (PLUGIN_NO_HANDLE, Vec::new()),
+            // dbmatch_authorize (pkinit_srv.c:1230-1259).
+            CertauthModule::Dbmatch => (
+                match cert_match.map(|r| super::matching::client_cert_match(r, cert)) {
+                    None => PLUGIN_NO_HANDLE,
+                    Some(Ok(true)) => 0,
+                    Some(Ok(false)) => ERROR_TABLE_BASE_KRB5 + KDC_ERR_CERTIFICATE_MISMATCH,
+                    Some(Err(e)) => e.errno(),
+                },
+                Vec::new(),
+            ),
             CertauthModule::Module(m) => m.authorize(cert.der(), &unparsed),
         };
         match code {
@@ -329,6 +341,7 @@ fn authorize_cert(
                         proto,
                         "client certificate has no acceptable extended key usage",
                     ),
+                    KDC_ERR_CERTIFICATE_MISMATCH => (proto, "Certificate mismatch"),
                     0..=127 => (proto, "certificate refused by a certauth module"),
                     _ => (KDC_ERR_PREAUTH_FAILED, "certauth module failed"),
                 };
@@ -380,11 +393,13 @@ pub fn verify(
     let mut certauth_indicators = Vec::new();
     match &signer {
         Some(cert) => {
-            (hw_authent, certauth_indicators) = authorize_cert(cfg, cert, req.client, req.realm)
-                .map_err(|e| Failure {
-                    e_data: edata_for(cfg, e.code, Some(cert)),
-                    code: e.code,
-                    message: e.message,
+            (hw_authent, certauth_indicators) =
+                authorize_cert(cfg, cert, req.client, req.realm, req.cert_match).map_err(|e| {
+                    Failure {
+                        e_data: edata_for(cfg, e.code, Some(cert)),
+                        code: e.code,
+                        message: e.message,
+                    }
                 })?;
         }
         None if !(is_anonymous_name(req.client) && req.client_realm == ANONYMOUS_REALM) => {

@@ -440,7 +440,7 @@ impl Cert {
     }
 
     /// The keyUsage bit string's first byte (bit 0 = digitalSignature).
-    fn key_usage_byte(&self) -> Option<u8> {
+    pub(crate) fn key_usage_byte(&self) -> Option<u8> {
         let e = self.ext(asn1::EXT_KEY_USAGE_BITS)?;
         let (bits, _) = der::read(&e.value)?;
         bits.content.get(1).copied().or(Some(0))

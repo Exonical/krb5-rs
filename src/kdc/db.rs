@@ -102,6 +102,9 @@ pub struct PrincipalEntry {
     /// OTP token configuration (the `otp` string attribute, JSON; MIT
     /// plugins/preauth/otp).
     pub otp: Option<String>,
+    /// The `pkinit_cert_match` string attribute: a rule the client's
+    /// certificate must match (MIT's `dbmatch` certauth module).
+    pub pkinit_cert_match: Option<String>,
     /// The policy this principal is under (kadmin `-policy`), by name.
     pub policy: Option<String>,
     /// Bumped by every security-sensitive administrative change: disable,
@@ -271,6 +274,7 @@ impl MemoryStore {
             allowed_to_delegate_from: Vec::new(),
             require_auth: None,
             otp: None,
+            pkinit_cert_match: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
@@ -390,6 +394,7 @@ mod tests {
             allowed_to_delegate_from: Vec::new(),
             require_auth: None,
             otp: None,
+            pkinit_cert_match: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
