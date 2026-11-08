@@ -186,6 +186,7 @@ pub fn verify_signature(
 }
 
 /// A private signing key (PKCS#8, PKCS#1 RSA or SEC1 EC).
+#[derive(Clone)]
 pub enum PrivateKey {
     /// RSA.
     Rsa(Box<RsaPrivateKey>),

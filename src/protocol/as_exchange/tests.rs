@@ -101,6 +101,47 @@ fn test_exchange_allowed_preauth_type_after_referral() {
     assert!(matches!(r, StepResult::SendToKdc { .. }));
 }
 
+/// `pa_config_data` round trip: read the input cache's JSON, pick the
+/// saved OTP token, save the chosen token's settings.
+#[test]
+fn test_exchange_pa_config_data() {
+    use crate::otp::OtpTokenInfo;
+    let ti = |vendor: &str, id: &[u8]| OtpTokenInfo {
+        flags: Default::default(),
+        vendor: Some(vendor.into()),
+        challenge: None,
+        length: None,
+        format: None,
+        token_id: Some(id.to_vec().into()),
+        alg_id: None,
+        supported_hash_alg: None,
+        iteration_count: None,
+    };
+    let mut config = AsExchangeConfig::new(PrincipalName::new_principal("testuser"), "EXAMPLE.COM");
+    config.in_ccache = Some(super::InCcache(std::sync::Arc::new(|_, _, key| {
+        (key == "pa_config_data").then(|| br#"{"vendor":"B","n":1}"#.to_vec())
+    })));
+    let mut exchange = AsExchange::new(config, "password");
+    exchange.reset_cc_config();
+    assert_eq!(exchange.cc_config_in.len(), 1);
+
+    let mut tis = vec![ti("A", b"1"), ti("B", b"2")];
+    exchange.filter_config_tokeninfos(&mut tis);
+    assert_eq!(tis, vec![ti("B", b"2")]);
+    let mut tis = vec![ti("B", b"1"), ti("B", b"2")];
+    exchange.filter_config_tokeninfos(&mut tis);
+    assert_eq!(tis.len(), 2, "two matches: no filtering");
+
+    assert_eq!(exchange.cc_config_out_data(), None);
+    exchange.save_config_tokeninfo(&ti("B", b"2"));
+    assert_eq!(
+        exchange.cc_config_out_data().as_deref(),
+        Some(&br#"{"tokenID":"2","vendor":"B"}"#[..])
+    );
+    exchange.reset_cc_config();
+    assert_eq!(exchange.cc_config_out_data(), None);
+}
+
 /// An input cache holding `pa_type` for krbtgt/EXAMPLE.COM only.
 fn pa_type_cache(t: i32) -> super::InCcache {
     super::InCcache(std::sync::Arc::new(move |server, realm, key| {
@@ -323,4 +364,50 @@ fn build_preauth_required_error() -> Vec<u8> {
         e_data: Some(e_data.into()),
     };
     rasn::der::encode(&krb_error).expect("encode KRB-ERROR")
+}
+
+/// An input cache's `X509_user_identity` replaces the configured PKINIT
+/// identity (pkinit_client_profile, pkinit_clnt.c:704-711).
+#[cfg(feature = "pkinit")]
+#[test]
+fn test_exchange_pkinit_configured_identity() {
+    use crate::pkinit::cms::Identity;
+    use crate::pkinit::pki::{self, CertSpec, RsaSlot, TestKey};
+    use std::sync::Arc;
+    let p = crate::pkinit::x509::tests::pki(false);
+    let princ = PrincipalName::new_principal("testuser");
+    let dir = std::env::temp_dir().join(format!("krb5rs-pkid-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let key = TestKey::rsa(RsaSlot::Client);
+    for (n, serial) in [("a", 10), ("b", 11)] {
+        let spec = CertSpec::client(n, serial, &princ, "EXAMPLE.COM");
+        let cert = pki::issue(&spec, &key, Some(&p.ca), &p.ca_key);
+        std::fs::write(dir.join(format!("{n}.crt")), pki::certs_pem(&[&cert])).expect("write");
+        std::fs::write(dir.join(format!("{n}.key")), key.pem()).expect("write");
+    }
+    let ids = Identity::load_all(&format!("DIR:{}", dir.display())).expect("load DIR");
+    assert_eq!(ids.len(), 2);
+    let b = ids[1].name.clone();
+    assert_eq!(Identity::load_all(&b).expect("load FILE").len(), 1);
+
+    let mut config = AsExchangeConfig::new(princ, "EXAMPLE.COM");
+    config.pkinit = Some(Arc::new(crate::pkinit::client::ClientConfig::new(
+        ids[0].clone(),
+        p.store.clone(),
+    )));
+    let spec = b.clone();
+    config.in_ccache = Some(super::InCcache(Arc::new(move |_, _, key| {
+        (key == "pa_config_data")
+            .then(|| serde_json::to_vec(&serde_json::json!({ "X509_user_identity": spec })))?
+            .ok()
+    })));
+    let mut exchange = AsExchange::new(config, "");
+    exchange.reset_cc_config();
+    let id = exchange
+        .config
+        .pkinit
+        .as_ref()
+        .and_then(|c| c.identity.as_ref());
+    assert_eq!(id.map(|i| i.name.as_str()), Some(b.as_str()));
+    std::fs::remove_dir_all(&dir).ok();
 }

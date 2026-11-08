@@ -4,8 +4,8 @@ use super::AsExchange;
 use crate::crypto::find_etype;
 use crate::otp::{
     flags::{COLLECT_PIN, NEXTOTP, SEPARATE_PIN},
-    flags_to_bits, tokeninfo_supported, OtpAnswer, PaOtpChallenge, PaOtpEncRequest, PaOtpRequest,
-    KEYUSAGE_PA_OTP_REQUEST, PA_OTP_REQUEST,
+    flags_to_bits, tokeninfo_supported, OtpAnswer, OtpTokenInfo, PaOtpChallenge, PaOtpEncRequest,
+    PaOtpRequest, KEYUSAGE_PA_OTP_REQUEST, PA_OTP_REQUEST,
 };
 use crate::types::{EncryptedData, EncryptionKey, PaData};
 use crate::Krb5Error;
@@ -62,6 +62,7 @@ impl AsExchange {
             return Ok(None);
         };
         chl.tokeninfo.retain(tokeninfo_supported);
+        self.filter_config_tokeninfos(&mut chl.tokeninfo);
         let Some(answer) = self.config.otp.clone() else {
             return Ok(None);
         };
@@ -69,6 +70,7 @@ impl AsExchange {
             return Ok(None);
         };
         let mut req = make_request(ti, &answer)?;
+        self.save_config_tokeninfo(ti);
         req.enc_data = encrypt_nonce(&armor, &chl)?;
         self.otp_key = Some(armor);
         let der = rasn::der::encode(&req).map_err(Krb5Error::Asn1Encode)?;
@@ -76,6 +78,45 @@ impl AsExchange {
             padata_type: PA_OTP_REQUEST,
             padata_value: der.into(),
         }))
+    }
+}
+
+impl AsExchange {
+    /// `filter_config_tokeninfos` (preauth_otp.c:924-970): keep only the
+    /// token matching the input cache's saved vendor/algID/tokenID, when
+    /// exactly one matches.
+    pub(super) fn filter_config_tokeninfos(&self, tis: &mut Vec<OtpTokenInfo>) {
+        let cfg = |k: &str| self.cc_config_in.get(k).map(String::as_bytes);
+        let (vendor, alg_id, token_id) = (cfg("vendor"), cfg("algID"), cfg("tokenID"));
+        let differs = |want: Option<&[u8]>, have: Option<&[u8]>| match (want, have) {
+            (Some(w), Some(h)) => !h.is_empty() && w != h,
+            _ => false,
+        };
+        let matches: Vec<usize> = (0..tis.len())
+            .filter(|&i| {
+                let ti = &tis[i];
+                !differs(vendor, ti.vendor.as_ref().map(|v| v.as_bytes()))
+                    && !differs(alg_id, ti.alg_id.as_ref().map(|v| v.as_bytes()))
+                    && !differs(token_id, ti.token_id.as_deref())
+            })
+            .collect();
+        if let [i] = matches[..] {
+            let ti = tis.swap_remove(i);
+            *tis = vec![ti];
+        }
+    }
+
+    /// `save_config_tokeninfo` (preauth_otp.c:1028-1058).
+    pub(super) fn save_config_tokeninfo(&mut self, ti: &OtpTokenInfo) {
+        let mut set = |k: &str, v: Option<&[u8]>| {
+            if let Some(v) = v.filter(|v| !v.is_empty()) {
+                self.cc_config_out
+                    .insert(k.to_string(), String::from_utf8_lossy(v).into_owned());
+            }
+        };
+        set("vendor", ti.vendor.as_ref().map(|v| v.as_bytes()));
+        set("algID", ti.alg_id.as_ref().map(|v| v.as_bytes()));
+        set("tokenID", ti.token_id.as_deref());
     }
 }
 

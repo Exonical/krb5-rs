@@ -46,7 +46,7 @@ chrono = "0.4.38"
 thiserror = "2.0"
 # OTP principal configuration (the `otp` string attribute is JSON, MIT
 # plugins/preauth/otp/otp_state.c).
-serde_json = { version = "1", optional = true }
+serde_json = "1"
 # PKINIT (feature `pkinit`). rsa is an exact-pinned release candidate: no stable
 # 0.10 exists yet, and rc.19 is newer than the 7-day dependency age rule.
 rsa = { version = "=0.10.0-rc.18", features = ["sha2"], optional = true }
@@ -107,7 +107,7 @@ pkinit = [
 # (`krb5_rs::pkinit::pki`); never enable in production builds.
 test-pki = ["pkinit"]
 fast = []                  # FAST pre-authentication tunneling
-kdc = ["dep:serde_json", "tokio"] # Kerberos KDC (AS/TGS request processing)
+kdc = ["tokio"] # Kerberos KDC (AS/TGS request processing)
 tokio = ["dep:tokio"]      # Tokio async transport adapter
 dns = ["dep:hickory-resolver", "dep:tokio"]  # Real DNS resolver for KDC location
 

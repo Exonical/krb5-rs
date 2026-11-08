@@ -408,5 +408,6 @@ pub fn identity(chain: Vec<Cert>, key: &TestKey) -> Identity {
     Identity {
         chain,
         key: PrivateKey::from_pem(key.pem()).expect("test key parses"),
+        name: String::new(),
     }
 }

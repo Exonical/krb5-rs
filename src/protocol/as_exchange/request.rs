@@ -23,6 +23,7 @@ impl AsExchange {
     /// get_in_tkt.c:1273-1287 encodes it before running preauth, which
     /// SPAKE hashes).
     pub(super) fn new_req_body(&mut self) -> Result<KdcReqBody, Krb5Error> {
+        self.reset_cc_config();
         // Generate random nonce. Mask to 31 bits — MIT KDC decodes nonce
         // as signed krb5_int32, rejecting DER-encoded values >= 2^31.
         self.nonce = rand::random::<u32>() & 0x7FFF_FFFF;

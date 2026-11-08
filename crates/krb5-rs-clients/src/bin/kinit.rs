@@ -304,6 +304,7 @@ fn parse_options() -> Opts {
 /// Cache config keys (k5-int.h KRB5_CC_CONF_*).
 const CONF_FAST_AVAIL: &str = "fast_avail";
 const CONF_PA_TYPE: &str = "pa_type";
+const CONF_PA_CONFIG_DATA: &str = "pa_config_data";
 
 struct K5 {
     ctx: CcContext,
@@ -771,7 +772,7 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
         }
     };
     let mut pwprompt = false;
-    let mut init_info: Option<(bool, Option<i32>)> = None;
+    let mut init_info: Option<(bool, Option<i32>, Option<Vec<u8>>)> = None;
     let result: Result<Credential, Krb5Error> = match o.action {
         Action::InitPw | Action::InitKt => {
             let mut config = match as_config(k5, o) {
@@ -791,7 +792,11 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
             }
             let mut run_init = |x: AsExchange| {
                 let x = rt.block_on(client.get_init_creds(x))?;
-                init_info = Some((x.fast_avail(), x.selected_preauth_type()));
+                init_info = Some((
+                    x.fast_avail(),
+                    x.selected_preauth_type(),
+                    x.cc_config_out_data(),
+                ));
                 x.credential().cloned()
             };
             if o.action == Action::InitKt {
@@ -932,7 +937,7 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
     if matches!(o.action, Action::InitPw | Action::InitKt) {
         // The gic out_ccache (get_in_tkt.c:1615-1660): stage in MEMORY,
         // then replace the output cache's contents.
-        let (fast_avail, pa_type) = init_info.unwrap_or_default();
+        let (fast_avail, pa_type, pa_config) = init_info.unwrap_or_default();
         let srv = (&cred.server, cred.srealm.as_str());
         let stored = store_primary(&mut k5.out_cc, &cred, &cprinc.0, &cprinc.1)
             .and_then(|()| match fast_avail {
@@ -946,6 +951,12 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
                     k5.out_cc
                         .set_config(Some(srv), CONF_PA_TYPE, Some(t.to_string().as_bytes()))
                 }
+                None => Ok(()),
+            })
+            .and_then(|()| match &pa_config {
+                Some(d) => k5
+                    .out_cc
+                    .set_config(Some(srv), CONF_PA_CONFIG_DATA, Some(d)),
                 None => Ok(()),
             });
         if let Err(e) = stored {

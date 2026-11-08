@@ -287,6 +287,14 @@ pub struct AsExchange {
     /// The only real preauth mechanism to use, from the input cache's
     /// `pa_type` entry (MIT `ctx->allowed_preauth_type`).
     allowed_preauth_type: Option<i32>,
+
+    /// String members of the input cache's `pa_config_data` JSON object
+    /// (MIT `ctx->cc_config_in`, read before each request).
+    cc_config_in: std::collections::BTreeMap<String, String>,
+
+    /// Module settings to save as `pa_config_data` (MIT
+    /// `ctx->cc_config_out`, cleared before each request).
+    cc_config_out: std::collections::BTreeMap<String, String>,
     /// FAST armor key set as the AS key by OTP (preauth_otp.c:1118-1120).
     otp_key: Option<EncryptionKey>,
     /// Real preauth types that already failed this exchange
@@ -315,6 +323,10 @@ pub struct AsExchange {
     /// Key pair of the outstanding PA-PK-AS-REQ.
     #[cfg(feature = "pkinit")]
     pkinit_keypair: Option<crate::pkinit::kex::KeyPair>,
+    /// `config.pkinit` as given, before an input cache's
+    /// `X509_user_identity` replaced its identity.
+    #[cfg(feature = "pkinit")]
+    configured_pkinit: Option<Option<Arc<crate::pkinit::client::ClientConfig>>>,
     /// Freshness token from the KDC (RFC 8070).
     #[cfg(feature = "pkinit")]
     freshness_token: Option<Vec<u8>>,
@@ -356,6 +368,8 @@ impl AsExchange {
             preauth_sent: false,
             selected_preauth_type: None,
             allowed_preauth_type: None,
+            cc_config_in: Default::default(),
+            cc_config_out: Default::default(),
             otp_key: None,
             preauth_failed: Vec::new(),
             method_padata: None,
@@ -369,6 +383,8 @@ impl AsExchange {
             pkinit_group,
             #[cfg(feature = "pkinit")]
             pkinit_keypair: None,
+            #[cfg(feature = "pkinit")]
+            configured_pkinit: None,
             #[cfg(feature = "pkinit")]
             freshness_token: None,
             spake: spake::SpakeClientState::default(),
@@ -466,15 +482,51 @@ impl AsExchange {
     /// `read_allowed_preauth_type` (get_in_tkt.c:731-753), run on each
     /// (re)start so a client referral reads the new realm's entry.
     fn read_allowed_preauth_type(&mut self) {
+        self.allowed_preauth_type = self
+            .in_cc_config("pa_type")
+            .and_then(|v| String::from_utf8(v).ok()?.trim().parse().ok());
+    }
+
+    /// `krb5_cc_get_config` on the input cache for the request's server
+    /// (`ctx->request->server`).
+    fn in_cc_config(&self, key: &str) -> Option<Vec<u8>> {
+        let cc = self.config.in_ccache.as_ref()?;
         let server = self
             .config
             .server
             .clone()
             .unwrap_or_else(|| PrincipalName::new_srv_inst("krbtgt", &self.config.realm));
-        self.allowed_preauth_type = self.config.in_ccache.as_ref().and_then(|cc| {
-            let v = (cc.0)(&server, &self.config.realm, "pa_type")?;
-            String::from_utf8(v).ok()?.trim().parse().ok()
-        });
+        (cc.0)(&server, &self.config.realm, key)
+    }
+
+    /// `read_cc_config_in_data` and `clear_cc_config_out_data`
+    /// (get_in_tkt.c:1168-1211, run before each request's preauth).
+    pub(super) fn reset_cc_config(&mut self) {
+        self.cc_config_out.clear();
+        self.cc_config_in = self
+            .in_cc_config("pa_config_data")
+            .and_then(|v| match serde_json::from_slice(&v).ok()? {
+                serde_json::Value::Object(o) => Some(o),
+                _ => None,
+            })
+            .map(|o| {
+                o.into_iter()
+                    .filter_map(|(k, v)| Some((k, v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "pkinit")]
+        self.apply_configured_identity();
+    }
+
+    /// The `pa_config_data` entry to store with the new credential: the
+    /// JSON object preauth modules set, or `None` when empty
+    /// (`save_cc_config_out_data`, get_in_tkt.c:1213-1232).
+    pub fn cc_config_out_data(&self) -> Option<Vec<u8>> {
+        if self.cc_config_out.is_empty() {
+            return None;
+        }
+        serde_json::to_vec(&self.cc_config_out).ok()
     }
 
     /// Rebuild the FAST request state for a (re)start
