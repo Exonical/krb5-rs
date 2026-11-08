@@ -138,7 +138,62 @@ impl NameAttrs {
     }
 }
 
+impl NameAttrs {
+    /// k5_ad_externalize over the mspac and authentication-indicators
+    /// modules (authdata.c, pac.c mspac_externalize, ai_authdata.c
+    /// authind_externalize).
+    fn externalize(&self) -> Vec<u8> {
+        let mut out = 2u32.to_be_bytes().to_vec();
+        let mut module = |name: &str, body: Vec<u8>| {
+            out.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&body);
+        };
+        let mut pac = Vec::new();
+        match &self.pac {
+            Some(p) => {
+                let data = p.encode();
+                pac.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                pac.extend_from_slice(&data);
+                pac.extend_from_slice(&u32::from(self.pac_verified).to_be_bytes());
+            }
+            None => pac.extend_from_slice(&[0; 8]),
+        }
+        module("mspac", pac);
+        let mut ind = (self.indicators.len() as u32).to_be_bytes().to_vec();
+        for i in &self.indicators {
+            ind.extend_from_slice(&(i.len() as u32).to_be_bytes());
+            ind.extend_from_slice(i.as_bytes());
+        }
+        module("authentication-indicators", ind);
+        out
+    }
+}
+
 impl Krb5Context {
+    /// gss_export_name_composite (naming_exts.c:583-666) for the
+    /// initiator name: `04 02`, the krb5 mech OID, the principal and the
+    /// externalized name attributes (none for a locally initiated context,
+    /// whose name has no authdata context).
+    pub fn export_name_composite(&self) -> Vec<u8> {
+        let princ = crate::ccache::unparse_name(&self.initiator, &self.crealm);
+        let attrs = if self.initiate {
+            Vec::new()
+        } else {
+            self.name_attrs.externalize()
+        };
+        let mech = super::MECH_KRB5;
+        let mut out = vec![0x04, 0x02];
+        out.extend_from_slice(&((mech.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&[0x06, mech.len() as u8]);
+        out.extend_from_slice(mech);
+        out.extend_from_slice(&(princ.len() as u32).to_be_bytes());
+        out.extend_from_slice(princ.as_bytes());
+        out.extend_from_slice(&(attrs.len() as u32).to_be_bytes());
+        out.extend_from_slice(&attrs);
+        out
+    }
+
     /// gss_inquire_name: the attribute names of the initiator name
     /// (krb5_authdata_get_attribute_types).
     pub fn inquire_name(&self) -> Vec<String> {
