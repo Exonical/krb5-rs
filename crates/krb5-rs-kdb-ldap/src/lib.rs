@@ -6,6 +6,7 @@ pub mod conn;
 pub mod create;
 pub mod entry;
 pub mod keyseq;
+pub mod ldapconf;
 pub mod policy;
 pub mod raw;
 pub mod realm;
