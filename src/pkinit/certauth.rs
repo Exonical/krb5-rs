@@ -50,7 +50,7 @@ pub enum CertauthModule {
     PkinitSan,
     /// `pkinit_eku`.
     PkinitEku,
-    /// `dbmatch`: passes, as `pkinit_cert_match` is not implemented.
+    /// `dbmatch`: the client's `pkinit_cert_match` string attribute.
     Dbmatch,
     /// Another module.
     Module(Arc<dyn Certauth>),

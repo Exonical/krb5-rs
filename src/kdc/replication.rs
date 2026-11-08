@@ -262,7 +262,7 @@ impl StoredPrincipal {
         Ok(sp)
     }
 
-    /// The `require_auth` and `otp` string attributes, which the model
+    /// The `require_auth`, `otp` and `pkinit_cert_match` string attributes, which the model
     /// carries as fields, as `krb5_dbe_set_string`.
     fn set_model_attrs(&mut self, entry: &PrincipalEntry) -> Result<(), StoreError> {
         use super::kdb::mit::set_string_attr_in;
@@ -275,6 +275,11 @@ impl StoredPrincipal {
             &mut self.tl_data,
             b"otp",
             entry.otp.as_deref().map(str::as_bytes),
+        )?;
+        set_string_attr_in(
+            &mut self.tl_data,
+            b"pkinit_cert_match",
+            entry.pkinit_cert_match.as_deref().map(str::as_bytes),
         )
     }
 
@@ -371,6 +376,7 @@ impl StoredPrincipal {
             allowed_to_delegate_from: self.allowed_to_delegate_from,
             require_auth: super::kdb::mit::require_auth_attr(&self.tl_data)?,
             otp: super::kdb::mit::otp_attr(&self.tl_data)?,
+            pkinit_cert_match: super::kdb::mit::cert_match_attr(&self.tl_data)?,
             policy: self.policy,
             security_epoch: self.security_epoch,
             last_admin_unlock: self.last_admin_unlock.map(kerberos_time),

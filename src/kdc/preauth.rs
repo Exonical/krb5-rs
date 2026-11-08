@@ -318,6 +318,7 @@ mod tests {
         PrincipalEntry {
             require_auth: None,
             otp: None,
+            pkinit_cert_match: None,
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
             policy: None,

@@ -149,6 +149,7 @@ mod imp {
             raw: &[u8],
             body_der: &[u8],
             local_tgt: &PrincipalEntry,
+            cert_match: Option<&str>,
             now: DateTime<Utc>,
         ) -> Option<Result<Verified, KdcError>> {
             if pa.padata_type != PA_PK_AS_REQ {
@@ -173,6 +174,7 @@ mod imp {
                 server: server_name,
                 nonce: body.nonce,
                 etypes: &body.etype,
+                cert_match,
             };
             let skew = i64::try_from(self.config.clockskew.as_secs()).unwrap_or(i64::MAX);
             let result =
@@ -231,6 +233,7 @@ mod imp {
                 server: server_name,
                 nonce: body.nonce,
                 etypes: &body.etype,
+                cert_match: None,
             };
             let (value, key) = server::reply(cfg, verified, &info)
                 .map_err(|e| KdcError::new(filter_preauth_error(e.code), "PREAUTH_FAILED"))?;
@@ -279,6 +282,7 @@ mod imp {
             _raw: &[u8],
             _body_der: &[u8],
             _local_tgt: &PrincipalEntry,
+            _cert_match: Option<&str>,
             _now: DateTime<Utc>,
         ) -> Option<Result<Verified, KdcError>> {
             None

@@ -1101,7 +1101,9 @@ Differences from MIT:
   builds with the `dns` feature, which is MIT's KRB5_DNS_LOOKUP; without
   it the module declines. The Windows `registry` module isn't
   implemented.
-- `dbmatch` passes, because `pkinit_cert_match` isn't implemented.
+- `dbmatch` checks the client certificate against the principal's
+  `pkinit_cert_match` string attribute as MIT does; with no attribute it
+  declines.
 
 ### kdcpolicy and audit modules
 

@@ -895,3 +895,122 @@ async fn named_pkinit_is_unaffected_by_the_anonymous_principal() {
     assert!(!cred.flags.contains(TicketFlags::ANONYMOUS));
     assert_eq!(cred.crealm, REALM);
 }
+
+// ------------------------------------------------------- pkinit_cert_match
+
+fn kdc_with_cert_match(w: &World, rule: &str) -> Kdc<MemoryStore> {
+    let mut s = store();
+    let mut e = s.get(&name("alice"), REALM).expect("alice");
+    e.pkinit_cert_match = Some(rule.into());
+    s.insert(e);
+    let server = ServerConfig::new(w.ca.kdc(100, REALM, &w.kdc_key), w.ca.store());
+    let mut config = KdcConfig::new(REALM);
+    config.pkinit = Some(Arc::new(server));
+    Kdc::new(config, s)
+}
+
+#[tokio::test]
+async fn dbmatch_authorizes_a_certificate_matching_the_string_attribute() {
+    let w = world();
+    for rule in [
+        format!("<SAN>^alice@{REALM}$"),
+        "&&<SUBJECT>CN=alice$<ISSUER>CN=Test CA".into(),
+        "<KU>digitalSignature<EKU>pkinit".into(),
+        "||<SUBJECT>CN=other<SAN>^alice@".into(),
+    ] {
+        let kdc = kdc_with_cert_match(&w, &rule);
+        let id = client_identity(&w, "alice", 10);
+        let r = run(&kdc, as_config("alice", pkinit_cfg(id, &w))).await;
+        assert!(r.result.is_ok(), "{rule}: {:?}", r.result.err());
+    }
+}
+
+#[tokio::test]
+async fn dbmatch_refuses_a_mismatch_with_certificate_mismatch() {
+    let w = world();
+    for rule in [
+        "&&<SUBJECT>CN=other<SAN>^alice@",
+        "<KU>keyEncipherment",
+        "<EKU>clientAuth",
+        "<SAN>^bob@",
+    ] {
+        let kdc = kdc_with_cert_match(&w, rule);
+        let id = client_identity(&w, "alice", 10);
+        let r = run(&kdc, as_config("alice", pkinit_cfg(id, &w))).await;
+        assert_eq!(r.code(), 66, "{rule}");
+    }
+}
+
+#[tokio::test]
+async fn dbmatch_with_an_unparsable_rule_is_preauth_failed() {
+    let w = world();
+    let kdc = kdc_with_cert_match(&w, "<KU>bogus");
+    let id = client_identity(&w, "alice", 10);
+    let r = run(&kdc, as_config("alice", pkinit_cfg(id, &w))).await;
+    assert_eq!(r.code(), 24);
+}
+
+#[tokio::test]
+async fn client_selects_a_dir_identity_certificate_with_pkinit_cert_match() {
+    use krb5_rs::pkinit::matching::{rfc2253_name, select_identity};
+    use krb5_rs::profile::Profile;
+    let w = world();
+    let dir = std::env::temp_dir().join(format!("krb5rs_certmatch_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("tempdir");
+    let alice = w.ca.issue(
+        &CertSpec::client("alice", 10, &name("alice"), REALM),
+        &w.client_key,
+    );
+    let mut other = CertSpec::client("other", 11, &name("bob"), REALM);
+    other.key_usage = Some(0x80 | 0x20);
+    let other = w.ca.issue(&other, &w.client_key);
+    for (n, c) in [("a", &alice), ("b", &other)] {
+        std::fs::write(dir.join(format!("{n}.crt")), pki::certs_pem(&[c])).expect("crt");
+        std::fs::write(dir.join(format!("{n}.key")), w.client_key.pem()).expect("key");
+    }
+    let spec = format!("DIR:{}", dir.display());
+    let subject = |rules: &[&str]| {
+        let rules: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
+        select_identity(&spec, &rules)
+            .map(|id| String::from_utf8(rfc2253_name(id.cert().subject_der())).expect("utf8"))
+    };
+    // No rules: the default (first) certificate.
+    assert_eq!(subject(&[]).as_deref(), Ok("CN=alice"));
+    assert_eq!(subject(&["<KU>keyEncipherment"]).as_deref(), Ok("CN=other"));
+    // An invalid rule is skipped; an ambiguous one selects nothing.
+    assert_eq!(
+        subject(&["<KU>bogus", "<SAN>^bob@"]).as_deref(),
+        Ok("CN=other")
+    );
+    assert!(subject(&["<EKU>pkinit"]).is_err());
+    assert!(subject(&["<EKU>pkinit", "<SAN>nobody"]).is_err());
+
+    // The rules come from the realm's profile, as in MIT.
+    let profile = Profile::parse(&format!(
+        "[libdefaults]\n pkinit_cert_match = <SAN>^nobody@\n\
+         [realms]\n {REALM} = {{\n  pkinit_cert_match = <SUBJECT>CN=alice$\n }}\n"
+    ))
+    .expect("conf");
+    let cfg =
+        ClientConfig::from_identity_spec(&spec, w.ca.store(), &profile, REALM).expect("select");
+    let kdc = kdc_with(&w, |_| {});
+    let r = run(&kdc, as_config("alice", cfg)).await;
+    assert!(r.result.is_ok(), "{:?}", r.result.err());
+
+    // FILE residuals parse like MIT's parse_fs_options (strtok on ',').
+    let a = |f: &str| format!("FILE:{}", dir.join(f).display());
+    std::fs::write(
+        dir.join("both.pem"),
+        format!("{}{}", pki::certs_pem(&[&alice]), w.client_key.pem()),
+    )
+    .expect("pem");
+    assert!(Identity::from_spec("FILE:").is_err());
+    assert!(Identity::from_spec(&format!("FILE:,{}", dir.join("a.crt").display())).is_err());
+    assert!(Identity::from_spec(&format!("{},", a("both.pem"))).is_ok());
+    assert!(
+        Identity::from_spec(&format!("{},,{}", a("a.crt"), dir.join("a.key").display())).is_ok()
+    );
+    assert!(Identity::from_spec(&a("a.crt")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

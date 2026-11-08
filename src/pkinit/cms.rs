@@ -77,8 +77,8 @@ impl Identity {
     }
 
     /// Parse a MIT identity specification: `FILE:cert[,key]` (`pkinit_identity`,
-    /// `X509_user_identity`). PKCS11, PKCS12 and DIR identities are not
-    /// supported.
+    /// `X509_user_identity`). PKCS11 and PKCS12 identities are not
+    /// supported; for `DIR:` see [`Identity::load_all`].
     pub fn from_spec(spec: &str) -> Result<Identity, String> {
         let (kind, rest) = spec
             .split_once(':')
@@ -86,9 +86,61 @@ impl Identity {
         if kind != "FILE" {
             return Err(format!("{kind} identities are not supported"));
         }
-        let (cert_path, key_path) = rest.split_once(',').unwrap_or((rest, rest));
+        // parse_fs_options: strtok on ',' skips empty names.
+        if rest.is_empty() || rest.starts_with(',') {
+            return Err(format!("invalid identity {spec:?}"));
+        }
+        let mut names = rest.split(',').filter(|n| !n.is_empty());
+        let cert_path = names.next().unwrap_or(rest);
+        let key_path = names.next().unwrap_or(cert_path);
         let read = |p: &str| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"));
         Identity::from_pem(&read(cert_path)?, &read(key_path)?)
+    }
+
+    /// Every candidate identity `spec` names (`crypto_load_certs`):
+    /// `FILE:cert[,key]` gives one, `DIR:path` one for each `NAME.crt` with
+    /// a loadable `NAME.key` (in name order, at most
+    /// [`super::matching::MAX_CREDS_ALLOWED`]; `pkinit_get_certs_dir`).
+    pub fn load_all(spec: &str) -> Result<Vec<Identity>, String> {
+        let Some(dir) = spec.strip_prefix("DIR:") else {
+            return Ok(vec![Identity::from_spec(spec)?]);
+        };
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map_err(|e| format!("{dir}: {e}"))?
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            if name.starts_with('.') || name.len() < 5 {
+                continue;
+            }
+            let Some(stem) = name.strip_suffix(".crt") else {
+                continue;
+            };
+            let dir = std::path::Path::new(dir);
+            let cert = std::fs::read_to_string(dir.join(&name));
+            let key = std::fs::read_to_string(dir.join(format!("{stem}.key")));
+            let Ok(id) = cert
+                .and_then(|c| Ok((c, key?)))
+                .map_err(|e| e.to_string())
+                .and_then(|(c, k)| Identity::from_pem(&c, &k))
+            else {
+                continue;
+            };
+            // pkinit_load_fs_cert_and_key keeps only the first certificate.
+            out.push(Identity {
+                chain: id.chain.into_iter().take(1).collect(),
+                key: id.key,
+            });
+            if out.len() >= super::matching::MAX_CREDS_ALLOWED {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Err(format!("No certificate and key found in {dir}"));
+        }
+        Ok(out)
     }
 
     /// The identity certificate.

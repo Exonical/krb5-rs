@@ -9,11 +9,11 @@
 //! Modules: [`kex`] (groups, key agreement, octetstring2key and the RFC 8636
 //! KDFs), [`x509`] (certificates, keys, OpenSSL-style path validation with
 //! CRLs), [`cms`] (SignedData), [`server`] and [`client`] (the protocol
-//! halves). A test-only certificate issuer (`pki`, feature `test-pki`) is
+//! halves), [`matching`] (`pkinit_cert_match` rules for client certificate
+//! selection and the KDC's `dbmatch` certauth module). A test-only certificate issuer (`pki`, feature `test-pki`) is
 //! not part of normal builds.
 //!
-//! Not implemented, as in or beyond MIT: `pkinit_cert_match` and the
-//! `dbmatch` certauth module, anonymous PKINIT (RFC 6112), OCSP (MIT has none
+//! Not implemented, as in or beyond MIT: anonymous PKINIT (RFC 6112), OCSP (MIT has none
 //! either), PKCS#11 and PKCS#12 identities, encrypted private keys, CRLs
 //! carried inside the CMS message, X.509 name constraints, attribute
 //! certificates, and authentication indicators (`pkinit_indicator` is stored
@@ -26,6 +26,7 @@ pub mod cms;
 mod der;
 mod groups_data;
 pub mod kex;
+pub mod matching;
 mod pem;
 #[cfg(any(test, feature = "test-pki"))]
 #[doc(hidden)]
