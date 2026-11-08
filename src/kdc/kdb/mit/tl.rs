@@ -841,6 +841,13 @@ pub fn merge_record(
         });
     }
     update_string_attrs(entry, &record.entry.allowed_to_delegate_from)?;
+    for (key, value) in [
+        (REQUIRE_AUTH, &record.entry.require_auth),
+        (OTP, &record.entry.otp),
+        (PKINIT_CERT_MATCH, &record.entry.pkinit_cert_match),
+    ] {
+        set_string_attr(entry, key, value.as_deref().map(str::as_bytes))?;
+    }
     update_kadm_data(
         entry,
         record.entry.policy.as_deref(),
@@ -1346,6 +1353,44 @@ mod tests {
                 .expect("MOD_PRINC exists")
                 .1,
             creator
+        );
+    }
+
+    #[test]
+    fn string_attrs_in_the_record_are_written_and_cleared() {
+        let master = master_key_from_password("R", "master", 18).expect("master key");
+        let keys = MasterKeys::single(master.clone());
+        let mut record = PrincipalRecord {
+            unlock: false,
+            entry: PrincipalEntry {
+                require_auth: Some("otp".into()),
+                otp: Some("[{}]".into()),
+                pkinit_cert_match: Some("<SAN>^u@R$".into()),
+                ..record_from_entry(&test_entry(&master), &keys)
+                    .expect("record")
+                    .entry
+            },
+            ..record_from_entry(&test_entry(&master), &keys).expect("record")
+        };
+        let mut entry = new_entry(&record, &keys, b"c").expect("new entry");
+        assert_eq!(
+            require_auth_attr(&entry.tl_data).expect("attr").as_deref(),
+            Some("otp")
+        );
+        assert_eq!(
+            otp_attr(&entry.tl_data).expect("attr").as_deref(),
+            Some("[{}]")
+        );
+        assert_eq!(
+            cert_match_attr(&entry.tl_data).expect("attr").as_deref(),
+            Some("<SAN>^u@R$")
+        );
+        record.entry.pkinit_cert_match = None;
+        merge_record(&mut entry, &record, &keys, None).expect("merge");
+        assert_eq!(cert_match_attr(&entry.tl_data).expect("attr"), None);
+        assert_eq!(
+            otp_attr(&entry.tl_data).expect("attr").as_deref(),
+            Some("[{}]")
         );
     }
 
