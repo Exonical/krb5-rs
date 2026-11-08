@@ -242,6 +242,30 @@ pub trait EtypeProfile: Send + Sync {
         Err(CryptoError::UnsupportedEtype)
     }
 
+    /// `krb5_c_encrypt_iov` with a HEADER, the `iov` regions in order and a
+    /// TRAILER: DATA regions are encrypted in place, SIGN_ONLY regions are
+    /// only covered by the checksum.  Returns `(header, trailer)`.
+    fn encrypt_iov(
+        &self,
+        _key: &[u8],
+        _key_usage: i32,
+        _iov: &mut [CryptoIov<'_>],
+    ) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+        Err(CryptoError::UnsupportedEtype)
+    }
+
+    /// `krb5_c_decrypt_iov`, the inverse of [`Self::encrypt_iov`].
+    fn decrypt_iov(
+        &self,
+        _key: &[u8],
+        _key_usage: i32,
+        _header: &[u8],
+        _iov: &mut [CryptoIov<'_>],
+        _trailer: &[u8],
+    ) -> Result<(), CryptoError> {
+        Err(CryptoError::UnsupportedEtype)
+    }
+
     /// [`Self::decrypt`] chaining the cipher state `state`.
     fn decrypt_with_state(
         &self,
@@ -268,6 +292,33 @@ pub static ETYPE_REGISTRY: LazyLock<HashMap<i32, &'static dyn EtypeProfile>> =
             (aes256_sha2.etype(), aes256_sha2),
         ])
     });
+
+/// One region of an IOV message (`krb5_crypto_iov` of type DATA or
+/// SIGN_ONLY).
+pub struct CryptoIov<'a> {
+    /// KRB5_CRYPTO_TYPE_SIGN_ONLY: integrity-protected, not encrypted.
+    pub sign_only: bool,
+    /// Region contents.
+    pub data: &'a mut [u8],
+}
+
+/// Concatenate the regions (only DATA ones when `data_only`).
+pub(crate) fn iov_gather(iov: &[CryptoIov<'_>], data_only: bool) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::new());
+    for r in iov.iter().filter(|r| !(data_only && r.sign_only)) {
+        out.extend_from_slice(r.data);
+    }
+    out
+}
+
+/// Write `buf` back over the DATA regions in order.
+pub(crate) fn iov_scatter(iov: &mut [CryptoIov<'_>], mut buf: &[u8]) {
+    for r in iov.iter_mut().filter(|r| !r.sign_only) {
+        let (head, rest) = buf.split_at(r.data.len());
+        r.data.copy_from_slice(head);
+        buf = rest;
+    }
+}
 
 /// Look up an etype implementation by number.
 pub fn find_etype(etype: i32) -> Result<&'static dyn EtypeProfile, CryptoError> {
@@ -358,4 +409,54 @@ pub fn derive_prfplus(
     )?;
     let key = out_profile.random_to_key(&rnd)?;
     Ok(EncryptionKey::new(etype, key.to_vec()))
+}
+
+#[cfg(test)]
+mod iov_tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_iov_matches_contiguous_and_signs_assoc_data() {
+        for etype in [17, 18, 19, 20] {
+            let p = find_etype(etype).expect("etype");
+            let key = util::generate_random(p.key_length());
+            let (mut a, mut b, mut c) = (b"hello".to_vec(), b"assoc".to_vec(), b"world!".to_vec());
+            let mut iov = [
+                CryptoIov {
+                    sign_only: false,
+                    data: &mut a,
+                },
+                CryptoIov {
+                    sign_only: true,
+                    data: &mut b,
+                },
+                CryptoIov {
+                    sign_only: false,
+                    data: &mut c,
+                },
+            ];
+            let (h, t) = p.encrypt_iov(&key, 24, &mut iov).expect("enc");
+            assert_ne!(iov[0].data, b"hello");
+            assert_eq!(iov[1].data, b"assoc");
+            p.decrypt_iov(&key, 24, &h, &mut iov, &t).expect("dec");
+            assert_eq!(
+                (&*iov[0].data, &*iov[2].data),
+                (&b"hello"[..], &b"world!"[..])
+            );
+            p.encrypt_iov(&key, 24, &mut iov).expect("enc");
+            iov[1].data[0] ^= 1;
+            assert!(p.decrypt_iov(&key, 24, &h, &mut iov, &t).is_err());
+
+            let mut d = b"plain data".to_vec();
+            let mut iov = [CryptoIov {
+                sign_only: false,
+                data: &mut d,
+            }];
+            let (h, t) = p.encrypt_iov(&key, 22, &mut iov).expect("enc");
+            let mut flat = h.clone();
+            flat.extend_from_slice(iov[0].data);
+            flat.extend_from_slice(&t);
+            assert_eq!(p.decrypt(&key, 22, &flat).expect("flat"), b"plain data");
+        }
+    }
 }

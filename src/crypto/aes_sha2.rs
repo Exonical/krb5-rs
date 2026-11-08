@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 
 use super::aes_cts::{aes_cts_decrypt_iv, aes_cts_encrypt_iv};
 use super::util::generate_random;
-use super::{CryptoError, EtypeProfile, KeyPurpose};
+use super::{iov_gather, iov_scatter, CryptoError, CryptoIov, EtypeProfile, KeyPurpose};
 
 const AES_BLOCK: usize = 16;
 /// Default PBKDF2 iteration count (RFC 8009 §4, MIT s2k_pbkdf2.c:215).
@@ -136,6 +136,58 @@ fn sha2_encrypt<H: Sha2Hash>(
     let mut out = ct;
     out.extend_from_slice(&tag[..hash_len / 2]);
     Ok(out)
+}
+
+/// enc_etm.c krb5int_etm_encrypt: E(Ke, conf | DATA), then
+/// HMAC(Ki, IV | E(conf) | regions) truncated to `hash_len / 2`.
+fn sha2_encrypt_iov<H: Sha2Hash>(
+    key: &[u8],
+    usage: i32,
+    iov: &mut [CryptoIov<'_>],
+    key_len: usize,
+    hash_len: usize,
+) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    let ke = sha2_derive::<H>(key, usage, KeyPurpose::Encryption, key_len, hash_len)?;
+    let ki = sha2_derive::<H>(key, usage, KeyPurpose::Integrity, key_len, hash_len)?;
+    let mut plain = Zeroizing::new(generate_random(AES_BLOCK));
+    plain.extend_from_slice(&iov_gather(iov, true));
+    let ct = aes_cts_encrypt_iv(&ke, &mut [0u8; AES_BLOCK], &plain)?;
+    iov_scatter(iov, &ct[AES_BLOCK..]);
+    let header = ct[..AES_BLOCK].to_vec();
+    let mut mac_input = vec![0u8; AES_BLOCK];
+    mac_input.extend_from_slice(&header);
+    mac_input.extend_from_slice(&iov_gather(iov, false));
+    let tag = H::hmac(&ki, &mac_input);
+    Ok((header, tag[..hash_len / 2].to_vec()))
+}
+
+/// enc_etm.c krb5int_etm_decrypt.
+fn sha2_decrypt_iov<H: Sha2Hash>(
+    key: &[u8],
+    usage: i32,
+    header: &[u8],
+    iov: &mut [CryptoIov<'_>],
+    trailer: &[u8],
+    key_len: usize,
+    hash_len: usize,
+) -> Result<(), CryptoError> {
+    if header.len() != AES_BLOCK || trailer.len() != hash_len / 2 {
+        return Err(CryptoError::InputTooShort);
+    }
+    let ki = sha2_derive::<H>(key, usage, KeyPurpose::Integrity, key_len, hash_len)?;
+    let mut mac_input = vec![0u8; AES_BLOCK];
+    mac_input.extend_from_slice(header);
+    mac_input.extend_from_slice(&iov_gather(iov, false));
+    let computed = H::hmac(&ki, &mac_input);
+    if !bool::from(computed[..hash_len / 2].ct_eq(trailer)) {
+        return Err(CryptoError::IntegrityFailure);
+    }
+    let ke = sha2_derive::<H>(key, usage, KeyPurpose::Encryption, key_len, hash_len)?;
+    let mut ct = header.to_vec();
+    ct.extend_from_slice(&iov_gather(iov, true));
+    let plain = Zeroizing::new(aes_cts_decrypt_iv(&ke, &mut [0u8; AES_BLOCK], &ct)?);
+    iov_scatter(iov, &plain[AES_BLOCK..]);
+    Ok(())
 }
 
 fn sha2_decrypt<H: Sha2Hash>(
@@ -286,6 +338,26 @@ impl EtypeProfile for Aes128CtsHmacSha256128 {
         )
     }
 
+    fn encrypt_iov(
+        &self,
+        key: &[u8],
+        key_usage: i32,
+        iov: &mut [CryptoIov<'_>],
+    ) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+        sha2_encrypt_iov::<Sha256Hash>(key, key_usage, iov, self.key_length(), 32)
+    }
+
+    fn decrypt_iov(
+        &self,
+        key: &[u8],
+        key_usage: i32,
+        header: &[u8],
+        iov: &mut [CryptoIov<'_>],
+        trailer: &[u8],
+    ) -> Result<(), CryptoError> {
+        sha2_decrypt_iov::<Sha256Hash>(key, key_usage, header, iov, trailer, self.key_length(), 32)
+    }
+
     fn decrypt(
         &self,
         key: &[u8],
@@ -399,6 +471,26 @@ impl EtypeProfile for Aes256CtsHmacSha384192 {
             48,
             &mut [0u8; AES_BLOCK],
         )
+    }
+
+    fn encrypt_iov(
+        &self,
+        key: &[u8],
+        key_usage: i32,
+        iov: &mut [CryptoIov<'_>],
+    ) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+        sha2_encrypt_iov::<Sha384Hash>(key, key_usage, iov, self.key_length(), 48)
+    }
+
+    fn decrypt_iov(
+        &self,
+        key: &[u8],
+        key_usage: i32,
+        header: &[u8],
+        iov: &mut [CryptoIov<'_>],
+        trailer: &[u8],
+    ) -> Result<(), CryptoError> {
+        sha2_decrypt_iov::<Sha384Hash>(key, key_usage, header, iov, trailer, self.key_length(), 48)
     }
 
     fn decrypt(
