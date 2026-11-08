@@ -93,61 +93,118 @@ impl<T: KdcTransport> KerberosClient<T> {
                 crate::ccache::parse_principal(v, Some(&self.realm)).ok_or_else(fail)?,
             )),
         };
-        let mut cred = GssCred::empty(usage);
+        let nocred = || gss(GssError::NoCred);
+        let principal = name.map(|n| (n.clone(), self.realm.clone()));
+        // acquire_accept_cred and check_keytab (acquire_cred.c:125-249).
+        let mut acceptor = None;
         if usage != CredUsage::Initiate {
-            cred.keytab = Some(
-                store
-                    .keytab
-                    .clone()
-                    .unwrap_or_else(|| default_keytab_name(profile)),
-            );
-            cred.rcache = store.rcache.clone();
-        }
-        if usage == CredUsage::Accept {
-            cred.name = name.map(|n| GssName::principal(n.clone(), self.realm.clone()));
-            return Ok(cred);
-        }
-        let mut init = if let Some(password) = &store.password {
-            let client = name.ok_or(gss(GssError::BadName))?.clone();
-            let (cache, tgt) = self
-                .acquire_cred_with_password(ctx, client, password)
-                .await?;
-            if let Some(vp) = &verify {
-                let kt = match &store.keytab {
-                    Some(k) => Some(resolve_keytab(k)?),
-                    None => None,
-                };
-                let opts = VerifyInitCredsOptions {
-                    profile,
-                    ..Default::default()
-                };
-                let server = vp.as_ref().map(|(n, r)| (n, r.as_str()));
-                self.verify_init_creds(&tgt, server, kt.as_deref(), None, &opts)
-                    .await?;
+            let ktname = store
+                .keytab
+                .clone()
+                .unwrap_or_else(|| default_keytab_name(profile));
+            let kt = resolve_keytab(&ktname).map_err(|_| nocred())?;
+            let ok = match &principal {
+                Some((n, r)) => kt.get_entry(n, r, None, None).is_ok(),
+                None => kt.entries().is_ok_and(|e| !e.is_empty()),
+            };
+            if !ok {
+                return Err(nocred());
             }
-            let mut c = GssCred::from_ccache(ctx, &cache.name())?;
+            acceptor = Some(ktname);
+        }
+        let mut init = if usage == CredUsage::Accept {
+            let mut c = GssCred::empty(usage);
+            c.name = principal.map(|(n, r)| GssName::principal(n, r));
+            c
+        } else if let Some(password) = &store.password {
+            // acquire_init_cred and get_initial_cred (acquire_cred.c:610-778):
+            // a password always gets a new TGT into a private MEMORY cache,
+            // except for IAKERB, which gets it during negotiation.
+            let (client, realm) = principal.clone().ok_or(gss(GssError::BadName))?;
+            let mut creds = Vec::new();
+            let mut princ = (client.clone(), realm.clone());
+            if !iakerb {
+                let config = crate::protocol::AsExchangeConfig::new(client, &realm);
+                let tgt = self.acquire_tgt_with_config(config, password).await?;
+                if let Some(vp) = &verify {
+                    let kt = match &store.keytab {
+                        Some(k) => Some(resolve_keytab(k)?),
+                        None => None,
+                    };
+                    // verify_initial_cred sets ap_req_nofail.
+                    let opts = VerifyInitCredsOptions {
+                        ap_req_nofail: Some(true),
+                        profile,
+                    };
+                    let server = vp.as_ref().map(|(n, r)| (n, r.as_str()));
+                    self.verify_init_creds(&tgt, server, kt.as_deref(), None, &opts)
+                        .await?;
+                }
+                princ = (tgt.client.clone(), tgt.crealm.clone());
+                creds.push(CcCredential::from(&tgt));
+            }
+            let mut c = GssCred::empty(usage);
             c.password = Some(password.clone());
+            c.ccache = Some(CredCache::Memory {
+                principal: princ.clone(),
+                creds: creds.clone(),
+            });
+            c.name = Some(GssName::principal(princ.0, princ.1));
+            if let Some(t) = creds.first() {
+                c.have_tgt = true;
+                c.expire = i64::from(t.endtime);
+            }
             c
         } else {
-            let ccname = match &store.ccache {
-                Some(c) => c.clone(),
-                None => crate::ccache::default_cache(ctx)
-                    .map_err(|_| gss(GssError::NoCred))?
-                    .name(),
+            let mut cache = match (&store.ccache, &principal) {
+                (Some(c), _) => resolve(ctx, c).map_err(|_| nocred())?,
+                (None, Some((n, r))) => match crate::ccache::cache_match(ctx, n, r) {
+                    Ok(c) => c,
+                    Err(_) => super::creds::new_cache_for_name(ctx)?,
+                },
+                (None, None) => crate::ccache::default_cache(ctx).map_err(|_| nocred())?,
             };
-            let c = GssCred::from_ccache(ctx, &ccname)?;
-            if let (Some(want), Some((have, _))) = (name, c.principal()) {
-                if want.name_string != have.name_string {
-                    return Err(gss(GssError::NoCred));
+            let scanned = GssCred::from_ccache(ctx, &cache.name());
+            let mut c = match (scanned, &principal) {
+                (Ok(c), _) => c,
+                (Err(_), Some(_)) => GssCred::empty(usage),
+                (Err(e), None) => return Err(e),
+            };
+            // scan_ccache: the cache must hold the desired principal.
+            if let (Some((n, r)), Some((have, hrealm))) = (&principal, c.principal()) {
+                if !same_principal(n, r, have, hrealm) {
+                    return Err(nocred());
+                }
+            }
+            // maybe_get_initial_cred with the client keytab
+            // (acquire_cred.c:658-678); never for IAKERB.
+            if let Some((n, r)) = &principal {
+                if !c.have_tgt && !iakerb {
+                    let ktname = store
+                        .client_keytab
+                        .clone()
+                        .map_or_else(|| default_client_keytab_name(profile), Ok)?;
+                    let kt = resolve_keytab(&ktname).map_err(|_| nocred())?;
+                    let entry = kt.get_entry(n, r, None, None).map_err(|_| nocred())?;
+                    let config = crate::protocol::AsExchangeConfig::new(n.clone(), r);
+                    let tgt = self
+                        .run_as_exchange(crate::protocol::AsExchange::with_key(config, entry.key))
+                        .await?;
+                    cache.initialize(&tgt.client, &tgt.crealm)?;
+                    Self::store_cred(&mut cache, &tgt, None, false)?;
+                    c = GssCred::from_ccache(ctx, &cache.name())?;
                 }
             }
             c
         };
         init.usage = usage;
-        init.keytab = cred.keytab;
-        init.rcache = cred.rcache;
+        init.keytab = acceptor;
+        if usage != CredUsage::Initiate {
+            init.rcache = store.rcache.clone();
+        }
         init.client_keytab = store.client_keytab.clone();
         init.iakerb_mech = iakerb;
+        init.default_identity = name.is_none();
         Ok(init)
     }
 
@@ -269,6 +326,18 @@ impl<T: KdcTransport> KerberosClient<T> {
     }
 }
 
+/// krb5_kt_client_default (kt_file.c, init_ctx.c): `KRB5_CLIENT_KTNAME`,
+/// then `default_client_keytab_name`, then MIT's built-in DEFCKTNAME.
+fn default_client_keytab_name(profile: Option<&Profile>) -> Result<String, Krb5Error> {
+    let name = std::env::var("KRB5_CLIENT_KTNAME")
+        .ok()
+        .or_else(|| {
+            profile.and_then(|p| p.get_string(&["libdefaults", "default_client_keytab_name"]))
+        })
+        .unwrap_or_else(|| "FILE:/usr/local/var/krb5/user/%{euid}/client.keytab".to_string());
+    Ok(crate::ccache::expand_path_tokens(&name)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +402,27 @@ mod tests {
             .await
             .expect_err("must fail");
         assert_eq!(major(err), Some(GssError::Failure));
+        let empty = CredStore {
+            keytab: Some("MEMORY:acf-empty".into()),
+            ..Default::default()
+        };
+        let err = client
+            .acquire_cred_from(&ctx, None, Some(&user), CredUsage::Accept, &empty, false)
+            .await
+            .expect_err("must fail");
+        assert_eq!(major(err), Some(GssError::NoCred));
+        let mut kt = crate::keytab::MemoryKeytab::resolve("acf");
+        crate::keytab::Keytab::add_entry(
+            &mut kt,
+            &crate::keytab::KeytabEntry {
+                principal: user.clone(),
+                realm: "EXAMPLE.COM".into(),
+                timestamp: 0,
+                kvno: 1,
+                key: crate::types::EncryptionKey::new(18, vec![0; 32]),
+            },
+        )
+        .expect("add entry");
         let accept = CredStore {
             keytab: Some("MEMORY:acf".into()),
             rcache: Some("none:".into()),

@@ -141,7 +141,15 @@ impl<T: KdcTransport> KerberosClient<T> {
             "Getting initial credentials for {}",
             crate::trace::princ(&config.client, &config.realm)
         );
-        let mut exchange = AsExchange::new(config, password);
+        self.run_as_exchange(AsExchange::new(config, password))
+            .await
+    }
+
+    /// Drive an AS exchange to completion over the transport.
+    pub(crate) async fn run_as_exchange(
+        &self,
+        mut exchange: AsExchange,
+    ) -> Result<Credential, Krb5Error> {
         let mut kdc_reply = Vec::new();
 
         for _ in 0..MAX_EXCHANGE_STEPS {
