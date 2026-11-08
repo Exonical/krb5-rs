@@ -1,3 +1,22 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.12.1+krb5-rs](https://github.com/Exonical/krb5-rs/compare/ldap3-v0.12.1...ldap3-v0.12.1+krb5-rs) - 2026-11-08
+
+### Added
+
+- *(kldap)* GSS-SPNEGO, GS2, NTLM, OAUTHBEARER, SASL_SECPROPS and libldap host canonicalization like MIT
+- *(kldap)* SASL binds beyond EXTERNAL like MIT (PLAIN, SCRAM, CRAM-MD5, DIGEST-MD5, GSSAPI on krb5-rs GSS)
+
+### Fixed
+
+- *(ldap3)* wait for the rest of a SASL frame header instead of failing
 ## v0.12.1, 2025-09-11
 
 * [breaking change] Compiling with Rustls now requires explicit
