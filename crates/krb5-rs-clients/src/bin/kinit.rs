@@ -305,7 +305,6 @@ struct K5 {
     ctx: CcContext,
     profile: Arc<Profile>,
     out_cc: AnyCcache,
-    in_cc: Option<AnyCcache>,
     me: PrincipalName,
     realm: String,
     name: String,
@@ -510,10 +509,9 @@ fn k5_begin(o: &mut Opts) -> Option<K5> {
             c
         }
     };
-    let mut in_cc = None;
     if let Some(n) = &o.in_cache {
         match resolve(&ctx, n) {
-            Ok(c) => in_cc = Some(c),
+            Ok(_) => {}
             Err(e) => {
                 com_err(e, &format!("resolving ccache {n}"));
                 return None;
@@ -532,7 +530,6 @@ fn k5_begin(o: &mut Opts) -> Option<K5> {
         ctx,
         profile,
         out_cc,
-        in_cc,
         me,
         realm,
         name,
@@ -855,18 +852,14 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
                     k5.realm.clone(),
                 )),
             };
+            // krb5_get_renewed_creds / krb5_get_validated_creds read
+            // out_cc (kinit.c:760-767); -I only feeds get_init_creds.
             let old = server.and_then(|(sp, sr)| {
-                k5.in_cc
-                    .as_ref()
-                    .unwrap_or(&k5.out_cc)
-                    .creds()
-                    .ok()?
-                    .into_iter()
-                    .find(|c| {
-                        c.server.name_string == sp.name_string
-                            && c.srealm == sr
-                            && c.client.name_string == k5.me.name_string
-                    })
+                k5.out_cc.creds().ok()?.into_iter().find(|c| {
+                    c.server.name_string == sp.name_string
+                        && c.srealm == sr
+                        && c.client.name_string == k5.me.name_string
+                })
             });
             match old.map(|c| Credential::try_from(&c)) {
                 Some(Ok(old)) => {
