@@ -117,8 +117,10 @@ mod acceptor;
 mod context;
 mod ext;
 mod initiator;
+mod iov;
 
 pub use acceptor::Krb5Acceptor;
 pub use context::{Krb5Context, Unwrapped};
 pub use ext::*;
 pub use initiator::Krb5Initiator;
+pub use iov::{GssIov, IovType};

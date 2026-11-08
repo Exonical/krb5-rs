@@ -124,7 +124,7 @@ impl Krb5Context {
 
     /// The per-message key: acceptor subkey when present, else `key`
     /// (k5sealv3.c:86-93).
-    fn msg_key(&self) -> &EncryptionKey {
+    pub(super) fn msg_key(&self) -> &EncryptionKey {
         self.acceptor_subkey.as_ref().unwrap_or(&self.key)
     }
 
@@ -313,7 +313,7 @@ impl Krb5Context {
     /// Header checks shared by unwrap/verify_mic: length, direction
     /// (k5sealv3iov.c:314-318), tok id, filler byte.  Returns the 16-byte
     /// header as received.
-    fn check_common(&self, token: &[u8], tok_id: u16) -> Result<Vec<u8>, Krb5Error> {
+    pub(super) fn check_common(&self, token: &[u8], tok_id: u16) -> Result<Vec<u8>, Krb5Error> {
         if token.len() < 16 {
             return Err(gss(GssError::DefectiveToken));
         }
@@ -337,7 +337,11 @@ impl Krb5Context {
     /// The peer's per-message key and usage (seal vs sign).  The acceptor
     /// subkey is used only when we have it AND the token flags it
     /// (k5sealv3iov.c:322-329).
-    fn recv_key_usage(&self, token: &[u8], seal: bool) -> Result<(&EncryptionKey, i32), Krb5Error> {
+    pub(super) fn recv_key_usage(
+        &self,
+        token: &[u8],
+        seal: bool,
+    ) -> Result<(&EncryptionKey, i32), Krb5Error> {
         let usage = if seal {
             if self.initiate {
                 USAGE_ACCEPTOR_SEAL
