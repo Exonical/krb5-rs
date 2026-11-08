@@ -309,8 +309,13 @@ impl LdapUtil {
                 Ok((rs, _)) => rs,
                 Err(e) => return Err(ldap_err("Error reading ticket policy", e)),
             };
-            for e in rs {
-                let dn = SearchEntry::construct(e).dn;
+            // Children before parents, so nested policies don't block deletion.
+            let mut dns: Vec<String> = rs
+                .into_iter()
+                .map(|e| SearchEntry::construct(e).dn)
+                .collect();
+            dns.sort_by_key(|dn| std::cmp::Reverse(dn.split(',').count()));
+            for dn in dns {
                 let _ = h.delete(&dn).await;
             }
         }
