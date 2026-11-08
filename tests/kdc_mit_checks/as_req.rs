@@ -264,10 +264,16 @@ async fn as_exchange_realm_max_life_caps_endtime() {
 async fn as_exchange_default_request_keeps_ten_hour_life_and_seven_day_renew() {
     let f = fixture().await;
     let cred = get_tgt(&f).await;
+    // The client computes `till` and `rtime` from its own clock, so the KDC
+    // can see a time up to a second later and cap the lifetimes by it.
     let auth = cred.times.authtime.timestamp();
-    assert_eq!(cred.times.endtime.timestamp() - auth, 10 * 3600);
-    let renew = cred.times.renew_till.expect("renew_till");
-    assert_eq!(renew.timestamp() - auth, 7 * 24 * 3600);
+    let life = cred.times.endtime.timestamp() - auth;
+    assert!((10 * 3600 - 1..=10 * 3600).contains(&life), "{life}");
+    let renew = cred.times.renew_till.expect("renew_till").timestamp() - auth;
+    assert!(
+        (7 * 24 * 3600 - 1..=7 * 24 * 3600).contains(&renew),
+        "{renew}"
+    );
 }
 
 #[tokio::test]
