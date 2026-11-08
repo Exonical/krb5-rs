@@ -1,5 +1,6 @@
 //! GSS-API (RFC 2743) support, with the RFC 4121 Kerberos 5 mechanism.
 
+pub mod cred;
 pub mod iakerb;
 pub mod krb5;
 pub mod negoex;
@@ -51,6 +52,9 @@ pub enum GssError {
     /// GSS_S_UNAVAILABLE.
     #[error("unavailable")]
     Unavailable,
+    /// GSS_S_DUPLICATE_ELEMENT.
+    #[error("duplicate element")]
+    DuplicateElement,
 }
 
 bitflags::bitflags! {
