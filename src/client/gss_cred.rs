@@ -6,7 +6,7 @@ use super::creds::{same_principal, CredsRequest, GcOptions};
 use super::vfy::{default_keytab_name, resolve_keytab, VerifyInitCredsOptions};
 use super::KerberosClient;
 use crate::ccache::{new_unique, resolve, AnyCcache, CcContext, CcCredential, Ccache};
-use crate::gssapi::cred::{CredCache, CredUsage, GssCred, GssName};
+use crate::gssapi::cred::{CredCache, CredUsage, GssCred, GssName, CONF_REFRESH_TIME};
 use crate::gssapi::GssError;
 use crate::profile::Profile;
 use crate::protocol::Credential;
@@ -179,20 +179,57 @@ impl<T: KdcTransport> KerberosClient<T> {
             // maybe_get_initial_cred with the client keytab
             // (acquire_cred.c:658-678); never for IAKERB.
             if let Some((n, r)) = &principal {
-                if !c.have_tgt && !iakerb {
-                    let ktname = store
-                        .client_keytab
-                        .clone()
-                        .map_or_else(|| default_client_keytab_name(profile), Ok)?;
-                    let kt = resolve_keytab(&ktname).map_err(|_| nocred())?;
-                    let entry = kt.get_entry(n, r, None, None).map_err(|_| nocred())?;
-                    let config = crate::protocol::AsExchangeConfig::new(n.clone(), r);
-                    let tgt = self
-                        .run_as_exchange(crate::protocol::AsExchange::with_key(config, entry.key))
-                        .await?;
-                    cache.initialize(&tgt.client, &tgt.crealm)?;
-                    Self::store_cred(&mut cache, &tgt, None, false)?;
-                    c = GssCred::from_ccache(ctx, &cache.name())?;
+                if !iakerb && (c.expire == 0 || time_to_refresh(&mut cache, &c)) {
+                    let got: Result<(), Krb5Error> = async {
+                        let ktname = store
+                            .client_keytab
+                            .clone()
+                            .map_or_else(|| default_client_keytab_name(profile), Ok)?;
+                        let kt = resolve_keytab(&ktname).map_err(|_| nocred())?;
+                        // lookup_etypes_for_keytab: the newest kvno's keys.
+                        let entries: Vec<_> = kt
+                            .entries()
+                            .map_err(|_| nocred())?
+                            .into_iter()
+                            .filter(|e| {
+                                same_principal(&e.principal, &e.realm, n, r)
+                                    && crate::crypto::find_etype(e.key.keytype).is_ok()
+                            })
+                            .collect();
+                        let max = entries.iter().map(|e| e.kvno).max().ok_or_else(nocred)?;
+                        let keys = entries
+                            .into_iter()
+                            .filter(|e| e.kvno == max)
+                            .map(|e| e.key)
+                            .collect();
+                        let config = crate::protocol::AsExchangeConfig::new(n.clone(), r);
+                        let tgt = self
+                            .run_as_exchange(crate::protocol::AsExchange::with_keys(config, keys))
+                            .await?;
+                        cache.initialize(&tgt.client, &tgt.crealm)?;
+                        Self::store_cred(&mut cache, &tgt, None, false)?;
+                        // kg_cred_set_initial_refresh: refresh at half-life.
+                        let t = CcCredential::from(&tgt);
+                        let start = i64::from(if t.starttime != 0 {
+                            t.starttime
+                        } else {
+                            t.authtime
+                        });
+                        let refresh = start + (i64::from(t.endtime) - start) / 2;
+                        cache.set_config(
+                            None,
+                            CONF_REFRESH_TIME,
+                            Some(refresh.to_string().as_bytes()),
+                        )?;
+                        Ok(())
+                    }
+                    .await;
+                    // A failed refresh keeps the existing credentials.
+                    match got {
+                        Ok(()) => c = GssCred::from_ccache(ctx, &cache.name())?,
+                        Err(e) if c.expire == 0 => return Err(e),
+                        Err(_) => {}
+                    }
                 }
             }
             c
@@ -324,6 +361,22 @@ impl<T: KdcTransport> KerberosClient<T> {
         }
         self.get_credentials(cache, flags, &req).await
     }
+}
+
+/// kg_cred_time_to_refresh (acquire_cred.c:550-572).
+fn time_to_refresh(cache: &mut AnyCcache, cred: &GssCred) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let soon = now.saturating_add(30);
+    if cred.refresh_time != 0 && cred.refresh_time <= now {
+        // Don't retry for 30 seconds.
+        cache
+            .set_config(None, CONF_REFRESH_TIME, Some(soon.to_string().as_bytes()))
+            .ok();
+        return true;
+    }
+    soon > cred.expire
 }
 
 /// krb5_kt_client_default (kt_file.c, init_ctx.c): `KRB5_CLIENT_KTNAME`,
