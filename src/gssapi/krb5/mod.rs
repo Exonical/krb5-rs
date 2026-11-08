@@ -115,8 +115,10 @@ pub enum AcceptStep {
 
 mod acceptor;
 mod context;
+mod ext;
 mod initiator;
 
 pub use acceptor::Krb5Acceptor;
 pub use context::{Krb5Context, Unwrapped};
+pub use ext::*;
 pub use initiator::Krb5Initiator;

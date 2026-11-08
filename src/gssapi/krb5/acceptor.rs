@@ -105,6 +105,18 @@ impl Krb5Acceptor {
             // (accept_sec_context.c:1107-1109).
             seq_recv,
         );
+        ctx.mech = mech_used;
+        ctx.authtime = result.ticket.authtime;
+        ctx.ticket_flags = result.ticket.flags;
+        ctx.authdata = result
+            .ticket
+            .authorization_data
+            .iter()
+            .chain(auth.authorization_data.iter())
+            .flatten()
+            .cloned()
+            .collect();
+        ctx.ticket_key = session.clone();
         ctx.initial_ticket = result
             .ticket
             .flags

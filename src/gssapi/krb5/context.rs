@@ -32,6 +32,16 @@ pub struct Krb5Context {
     /// Acceptor side: the service ticket carried `TKT_FLG_INITIAL`
     /// (`gss_krb5_get_tkt_flags`).
     pub(super) initial_ticket: bool,
+    /// MIT `ctx->mech_used`.
+    pub(super) mech: &'static [u8],
+    /// MIT `ctx->krb_times.authtime`.
+    pub(super) authtime: KerberosTime,
+    /// MIT `ctx->krb_flags`.
+    pub(super) ticket_flags: KerberosFlags<TicketFlags>,
+    /// Acceptor: ticket plus authenticator authdata (`ctx->authdata`).
+    pub(super) authdata: Vec<AuthorizationDataElement>,
+    /// The ticket session key (`krb5_auth_con_getkey_k`).
+    pub(super) ticket_key: EncryptionKey,
 }
 
 impl Krb5Context {
@@ -53,11 +63,16 @@ impl Krb5Context {
             crealm,
             acceptor,
             endtime,
+            ticket_key: key.clone(),
             key,
             acceptor_subkey: None,
             seq_send,
             seqstate: SeqState::new(0, false, false, true),
             initial_ticket: false,
+            mech: MECH_KRB5,
+            authtime: endtime,
+            ticket_flags: KerberosFlags::default(),
+            authdata: Vec::new(),
         }
     }
 
