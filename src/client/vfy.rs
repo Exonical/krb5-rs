@@ -4,7 +4,7 @@ use super::creds::same_principal;
 use super::{CredsRequest, GcOptions, KerberosClient};
 use crate::ccache::{CcCredential, Ccache, MemoryCcache};
 use crate::error::Krb5Error;
-use crate::keytab::{FileKeytab, Keytab, KtError};
+use crate::keytab::{FileKeytab, Keytab, KtError, MemoryKeytab};
 use crate::profile::{conf_boolean, Profile};
 use crate::protocol::ap::{ApReqOptions, AuthContext, AuthContextFlags, KeySource};
 use crate::protocol::Credential;
@@ -64,17 +64,23 @@ pub fn default_keytab_name(profile: Option<&Profile>) -> String {
         .unwrap_or_else(|| DEFAULT_KEYTAB_NAME.to_string())
 }
 
-/// `krb5_kt_default` for the FILE and WRFILE keytab types.
-pub fn default_keytab(profile: Option<&Profile>) -> Result<FileKeytab, Krb5Error> {
-    let name = default_keytab_name(profile);
-    let path = match name.split_once(':') {
-        Some(("FILE" | "WRFILE", rest)) => rest,
+/// `krb5_kt_default`: the FILE, WRFILE or MEMORY keytab named by
+/// [`default_keytab_name`].
+pub fn default_keytab(profile: Option<&Profile>) -> Result<Box<dyn VerifyKeytab>, Krb5Error> {
+    resolve_keytab(&default_keytab_name(profile))
+}
+
+/// `krb5_kt_resolve` for the FILE, WRFILE and MEMORY types; a name with
+/// no type prefix (or a one-letter one, a DOS drive) is a FILE path.
+pub fn resolve_keytab(name: &str) -> Result<Box<dyn VerifyKeytab>, Krb5Error> {
+    Ok(match name.split_once(':') {
+        Some(("FILE" | "WRFILE", rest)) => Box::new(FileKeytab::new(rest)),
+        Some(("MEMORY", rest)) => Box::new(MemoryKeytab::resolve(rest)),
         Some((t, _)) if t.len() > 1 && !t.contains('/') => {
             return Err(Krb5Error::Protocol(format!("unsupported keytab type {t}")));
         }
-        _ => name.as_str(),
-    };
-    Ok(FileKeytab::new(path))
+        _ => Box::new(FileKeytab::new(name)),
+    })
 }
 
 /// `copy_creds_except` (vfy_increds.c:47-80).
@@ -157,7 +163,7 @@ impl<T: KdcTransport> KerberosClient<T> {
             Some(k) => k,
             None => {
                 default = default_keytab(opts.profile)?;
-                &default
+                default.as_ref()
             }
         };
         let mut have_keys = false;

@@ -22,7 +22,7 @@ use krb5_rs::kdc::kdb::kpasswd::{process_request, Service};
 use krb5_rs::kdc::kdb::kprop::ReplayCache;
 use krb5_rs::kdc::kdb::{master_key_from_password, FileStore};
 use krb5_rs::kdc::{Kdc, KdcConfig};
-use krb5_rs::keytab::FileKeytab;
+use krb5_rs::keytab::{FileKeytab, Keytab, MemoryKeytab};
 use krb5_rs::locate::Locator;
 use krb5_rs::profile::Profile;
 use krb5_rs::protocol::kpasswd::{KPASSWD_ACCESSDENIED, KPASSWD_SUCCESS};
@@ -344,6 +344,23 @@ async fn verify_init_creds_uses_host_keys_like_mit() {
         .verify_init_creds(&tgt, Some((&host, REALM)), Some(&kt), None, &opts)
         .await
         .expect("verify server");
+
+    // The default keytab may be a named MEMORY keytab (kt_memory.c).
+    let mut mem = MemoryKeytab::resolve("client-chpw-vfy");
+    for e in kt.entries().expect("entries") {
+        mem.add_entry(&e).expect("add");
+    }
+    drop(mem);
+    let p = Profile::parse("[libdefaults]\n default_keytab_name = MEMORY:client-chpw-vfy\n")
+        .expect("profile");
+    let mem_opts = VerifyInitCredsOptions {
+        ap_req_nofail: Some(true),
+        profile: Some(&p),
+    };
+    client
+        .verify_init_creds(&tgt, None, None, None, &mem_opts)
+        .await
+        .expect("verify with MEMORY default keytab");
 
     // A keytab whose key no longer matches the KDC's fails.
     let stale = r.dir.path("stale.kt");
