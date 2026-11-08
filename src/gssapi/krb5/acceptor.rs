@@ -12,6 +12,8 @@ pub struct Krb5Acceptor {
     delegated: Option<Vec<Credential>>,
     done: bool,
     iakerb_conv: Option<Vec<u8>>,
+    /// The accepted service ticket as a credential (for S4U2Proxy).
+    accepted: Option<crate::ccache::CcCredential>,
 }
 
 impl Krb5Acceptor {
@@ -31,7 +33,27 @@ impl Krb5Acceptor {
             delegated: None,
             done: false,
             iakerb_conv: None,
+            accepted: None,
         }
+    }
+
+    /// The constrained-delegation credential gss_accept_sec_context makes
+    /// when no TGT was forwarded and `verifier` is a GSS_C_BOTH credential
+    /// (accept_sec_context.c:944-957): the accepted ticket in a proxy
+    /// credential for S4U2Proxy.  `None` when that does not apply.
+    pub fn constrained_deleg_cred(
+        &self,
+        ctx: &crate::ccache::CcContext,
+        verifier: &crate::gssapi::cred::GssCred,
+    ) -> Result<Option<crate::gssapi::cred::GssCred>, Krb5Error> {
+        if self.delegated.is_some() || verifier.usage != crate::gssapi::cred::CredUsage::Both {
+            return Ok(None);
+        }
+        let subject = self
+            .accepted
+            .as_ref()
+            .ok_or(Krb5Error::Gss(GssError::NoContext))?;
+        verifier.compose_deleg_cred(ctx, subject).map(Some)
     }
 
     /// Accept for the IAKERB mechanism (iakerb.c:888-904): a nonempty
@@ -130,6 +152,25 @@ impl Krb5Acceptor {
             )
             .map_err(|_| Krb5Error::Gss(GssError::Failure))?;
         ctx.name_attrs = super::name_attrs::NameAttrs::import(&result.ticket, &skey)?;
+        let t = &result.ticket;
+        let secs = |t: &KerberosTime| t.timestamp() as u32;
+        self.accepted = Some(crate::ccache::CcCredential {
+            client: t.cname.clone(),
+            crealm: String::from_utf8_lossy(t.crealm.as_bytes()).into_owned(),
+            server: tkt.sname.clone(),
+            srealm: String::from_utf8_lossy(tkt.realm.as_bytes()).into_owned(),
+            keyblock: t.key.clone(),
+            authtime: secs(&t.authtime),
+            starttime: t.starttime.as_ref().map_or(0, secs),
+            endtime: secs(&t.endtime),
+            renew_till: t.renew_till.as_ref().map_or(0, secs),
+            is_skey: false,
+            ticket_flags: t.flags.bits(),
+            addresses: Vec::new(),
+            authdata: Vec::new(),
+            ticket: rasn::der::encode(&tkt).map_err(|_| Krb5Error::Gss(GssError::Failure))?,
+            second_ticket: Vec::new(),
+        });
         ctx.initial_ticket = result
             .ticket
             .flags

@@ -28,6 +28,7 @@ pub mod canonprinc;
 /// Password changes over kpasswd.
 pub mod chpw;
 mod creds;
+mod gss_cred;
 mod s4u;
 /// Initial credential verification.
 pub mod vfy;
