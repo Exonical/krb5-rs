@@ -846,6 +846,9 @@ pub fn merge_record(
         (OTP, &record.entry.otp),
         (PKINIT_CERT_MATCH, &record.entry.pkinit_cert_match),
     ] {
+        if value.as_deref().is_some_and(|v| v.contains('\0')) {
+            return Err(StoreError::backend("NUL in string attribute"));
+        }
         set_string_attr(entry, key, value.as_deref().map(str::as_bytes))?;
     }
     update_kadm_data(
@@ -1392,6 +1395,8 @@ mod tests {
             otp_attr(&entry.tl_data).expect("attr").as_deref(),
             Some("[{}]")
         );
+        record.entry.otp = Some("x\0y".into());
+        assert!(merge_record(&mut entry, &record, &keys, None).is_err());
     }
 
     #[test]
