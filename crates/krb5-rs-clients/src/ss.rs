@@ -117,8 +117,16 @@ impl<T> Subsystem<T> {
             crate::com_err_as(self.name, "Unbalanced quotes in command line");
             return Exec::Done;
         };
-        let Some(cmd) = argv.first() else {
+        if argv.is_empty() {
             return Exec::Done;
+        }
+        self.execute_command(state, &argv)
+    }
+
+    /// `ss_execute_command`: run an already-split request.
+    pub fn execute_command(&self, state: &mut T, argv: &[String]) -> Exec {
+        let Some(cmd) = argv.first() else {
+            return Exec::NotFound;
         };
         if LIST_NAMES.contains(&cmd.as_str()) {
             print!("{}", self.listing());
@@ -129,7 +137,7 @@ impl<T> Subsystem<T> {
         }
         match self.table.iter().find(|r| r.names.contains(&cmd.as_str())) {
             Some(r) => {
-                (r.func)(state, &argv);
+                (r.func)(state, argv);
                 Exec::Done
             }
             None => Exec::NotFound,
