@@ -1,4 +1,4 @@
-//! Real DNS resolver for KDC discovery, backed by hickory-resolver on a
+//! Real DNS resolver for KDC discovery and TXT realm lookups, backed by hickory-resolver on a
 //! tokio runtime (feature `dns`).
 //!
 //! The URI RR type (256) is not modeled by hickory-resolver's typed API, so
@@ -32,6 +32,24 @@ impl HickoryResolver {
         })
     }
 
+    /// Run `fut` to completion on this resolver's runtime.  Inside another
+    /// tokio runtime `block_on` would panic, so the query then runs on a
+    /// scoped thread, blocking the caller as MIT's res_nsearch does.
+    fn block_on<F: std::future::Future + Send>(&self, fut: F) -> F::Output
+    where
+        F::Output: Send,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|s| {
+                s.spawn(|| self.rt.block_on(fut))
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p))
+            })
+        } else {
+            self.rt.block_on(fut)
+        }
+    }
+
     fn with_resolver<R>(
         &self,
         f: impl FnOnce(&Resolver<hickory_resolver::name_server::TokioConnectionProvider>) -> R,
@@ -57,7 +75,7 @@ impl Default for HickoryResolver {
 impl DnsResolver for HickoryResolver {
     fn srv(&self, name: &str) -> Result<Vec<SrvRecord>, ()> {
         self.with_resolver(|r| {
-            self.rt.block_on(async {
+            self.block_on(async {
                 match r.srv_lookup(name).await {
                     Ok(lookup) => Ok(lookup
                         .iter()
@@ -78,5 +96,20 @@ impl DnsResolver for HickoryResolver {
         // URI (type 256) isn't representable in hickory-resolver's typed
         // lookup API; behave like MIT on Windows (dnssrv.c:111-120).
         Ok(Vec::new())
+    }
+
+    fn txt(&self, name: &str) -> Result<Vec<String>, ()> {
+        self.with_resolver(|r| {
+            self.block_on(async {
+                match r.txt_lookup(name).await {
+                    Ok(lookup) => Ok(lookup
+                        .iter()
+                        .filter_map(|t| t.txt_data().first())
+                        .map(|d| String::from_utf8_lossy(d).into_owned())
+                        .collect()),
+                    Err(_) => Err(()),
+                }
+            })
+        })?
     }
 }

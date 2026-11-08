@@ -36,6 +36,12 @@ pub trait DnsResolver {
     fn srv(&self, name: &str) -> Result<Vec<SrvRecord>, ()>;
     /// URI query for `name` (e.g. "_kerberos.EXAMPLE.COM.").
     fn uri(&self, name: &str) -> Result<Vec<UriRecord>, ()>;
+    /// TXT query for `name` (e.g. "_kerberos.host.example.com."): the
+    /// first character-string of each answer, in answer order.  The
+    /// default fails the query, as for a resolver that can't issue it.
+    fn txt(&self, _name: &str) -> Result<Vec<String>, ()> {
+        Err(())
+    }
 }
 
 /// make_lookup_name (dnssrv.c:50-78): `service.[protocol.][site._sites.]realm.`

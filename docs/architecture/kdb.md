@@ -1097,8 +1097,10 @@ ones, as in MIT's plugin order:
 Differences from MIT:
 - Modules run as separate processes, so certauth modules don't get the
   client's database entry.
-- The `dns` hostrealm module declines, because krb5-rs does no TXT
-  lookups. The Windows `registry` module isn't implemented.
+- The `dns` hostrealm module looks up `_kerberos` TXT records only in
+  builds with the `dns` feature, which is MIT's KRB5_DNS_LOOKUP; without
+  it the module declines. The Windows `registry` module isn't
+  implemented.
 - `dbmatch` passes, because `pkinit_cert_match` isn't implemented.
 
 ### kdcpolicy and audit modules
