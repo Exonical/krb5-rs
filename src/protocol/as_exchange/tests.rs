@@ -83,6 +83,30 @@ fn test_exchange_preauth_required_produces_enc_timestamp() {
     }
 }
 
+/// pa_type_allowed (preauth2.c:625-631): an input cache's `pa_type`
+/// restricts the real mechanism; any other offered one is not used.
+#[test]
+fn test_exchange_allowed_preauth_type() {
+    let mut config = AsExchangeConfig::new(PrincipalName::new_principal("testuser"), "EXAMPLE.COM");
+    config.allowed_preauth_type = Some(PaDataType::Spake as i32);
+    let mut exchange = AsExchange::new(config, "password");
+    exchange.step(&[]).expect("initial step");
+    assert!(exchange.step(&build_preauth_required_error()).is_err());
+
+    let mut config = AsExchangeConfig::new(PrincipalName::new_principal("testuser"), "EXAMPLE.COM");
+    config.allowed_preauth_type = Some(PaDataType::EncTimestamp as i32);
+    let mut exchange = AsExchange::new(config, "password");
+    exchange.step(&[]).expect("initial step");
+    let r = exchange
+        .step(&build_preauth_required_error())
+        .expect("enc-timestamp allowed");
+    assert!(matches!(r, StepResult::SendToKdc { .. }));
+    assert_eq!(
+        exchange.selected_preauth_type(),
+        Some(PaDataType::EncTimestamp as i32)
+    );
+}
+
 #[test]
 fn test_exchange_loop_count_exceeded() {
     let config = AsExchangeConfig::new(PrincipalName::new_principal("testuser"), "EXAMPLE.COM");

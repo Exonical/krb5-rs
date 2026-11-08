@@ -100,6 +100,10 @@ pub struct AsExchangeConfig {
     /// Addresses for the request body (`krb5_get_init_creds_opt_set_address_list`).
     /// Default: none.
     pub addresses: Option<Vec<crate::types::HostAddress>>,
+    /// The only real preauth mechanism to use, from an input cache's
+    /// `pa_type` config entry (MIT `ctx->allowed_preauth_type`,
+    /// get_in_tkt.c:731-753). Default: none (any mechanism).
+    pub allowed_preauth_type: Option<i32>,
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -129,6 +133,7 @@ impl Default for AsExchangeConfig {
             otp: None,
             start_time: 0,
             addresses: None,
+            allowed_preauth_type: None,
         }
     }
 }
@@ -417,6 +422,13 @@ impl AsExchange {
             .ok_or(Krb5Error::ReplyValidation("exchange not complete"))
     }
 
+    /// The real preauth mechanism that produced the reply, if any (MIT
+    /// `ctx->selected_preauth_type`, saved as the `pa_type` cache config
+    /// entry, get_in_tkt.c:1149-1166).
+    pub fn selected_preauth_type(&self) -> Option<i32> {
+        self.selected_preauth_type
+    }
+
     /// Whether the reply negotiated FAST availability (RFC 6806 §11:
     /// ENC_PA_REP flag set and PA-FX-FAST in the encrypted padata;
     /// MIT `krb5int_fast_verify_nego`).
@@ -690,8 +702,11 @@ impl AsExchange {
             s2kparams: self.last_s2kparams.clone(),
         };
         let hint = || hint.clone();
+        // pa_type_allowed (preauth2.c:625-631, :667).
+        let only = self.config.allowed_preauth_type;
+        let allowed = move |t: i32| only.is_none_or(|a| a == t);
         #[cfg(feature = "pkinit")]
-        if self.pkinit_offered(method) {
+        if allowed(crate::pkinit::server::PA_PK_AS_REQ) && self.pkinit_offered(method) {
             self.selected_preauth_type = Some(crate::pkinit::server::PA_PK_AS_REQ);
             return Ok(PaData {
                 padata_type: crate::pkinit::server::PA_PK_AS_REQ,
@@ -699,6 +714,9 @@ impl AsExchange {
             });
         }
         for pa in method {
+            if !allowed(pa.padata_type) {
+                continue;
+            }
             match pa.padata_type {
                 t if t == PaDataType::EncryptedChallenge as i32 => {
                     // ec_process:26-33 — no armor key means we cannot

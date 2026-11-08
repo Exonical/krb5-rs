@@ -213,11 +213,25 @@ impl<T: KdcTransport> KerberosClient<T> {
         ))
     }
 
+    /// Drive an AS exchange to completion and return it, so the caller can
+    /// read [`AsExchange::credential`], [`AsExchange::fast_avail`] and
+    /// [`AsExchange::selected_preauth_type`] (`krb5_get_init_creds` with
+    /// an output cache, get_in_tkt.c:1615-1660).
+    pub async fn get_init_creds(&self, mut exchange: AsExchange) -> Result<AsExchange, Krb5Error> {
+        self.drive_as_exchange(&mut exchange).await?;
+        Ok(exchange)
+    }
+
     /// Drive an AS exchange to completion over the transport.
     pub(crate) async fn run_as_exchange(
         &self,
         mut exchange: AsExchange,
     ) -> Result<Credential, Krb5Error> {
+        self.drive_as_exchange(&mut exchange).await?;
+        exchange.credential().cloned()
+    }
+
+    async fn drive_as_exchange(&self, exchange: &mut AsExchange) -> Result<(), Krb5Error> {
         let mut kdc_reply = Vec::new();
 
         for _ in 0..MAX_EXCHANGE_STEPS {
@@ -238,9 +252,7 @@ impl<T: KdcTransport> KerberosClient<T> {
                          transport such as TcpTransport or UdpTcpTransport",
                     ));
                 }
-                StepResult::Complete => {
-                    return exchange.credential().cloned();
-                }
+                StepResult::Complete => return Ok(()),
             }
         }
 

@@ -11,7 +11,7 @@ use krb5_rs::ccache::{
 };
 use krb5_rs::client::{default_client_keytab_name, vfy::resolve_keytab, KerberosClient};
 use krb5_rs::profile::{string_to_deltat, Profile};
-use krb5_rs::protocol::{AsExchangeConfig, Credential, FastMode};
+use krb5_rs::protocol::{AsExchange, AsExchangeConfig, Credential, FastMode};
 use krb5_rs::types::{KdcOptions, KerberosFlags, PrincipalName};
 use krb5_rs::Krb5Error;
 use krb5_rs_clients::{
@@ -301,10 +301,15 @@ fn parse_options() -> Opts {
     o
 }
 
+/// Cache config keys (k5-int.h KRB5_CC_CONF_*).
+const CONF_FAST_AVAIL: &str = "fast_avail";
+const CONF_PA_TYPE: &str = "pa_type";
+
 struct K5 {
     ctx: CcContext,
     profile: Arc<Profile>,
     out_cc: AnyCcache,
+    in_cc: Option<AnyCcache>,
     me: PrincipalName,
     realm: String,
     name: String,
@@ -509,9 +514,10 @@ fn k5_begin(o: &mut Opts) -> Option<K5> {
             c
         }
     };
+    let mut in_cc = None;
     if let Some(n) = &o.in_cache {
         match resolve(&ctx, n) {
-            Ok(_) => {}
+            Ok(c) => in_cc = Some(c),
             Err(e) => {
                 com_err(e, &format!("resolving ccache {n}"));
                 return None;
@@ -530,6 +536,7 @@ fn k5_begin(o: &mut Opts) -> Option<K5> {
         ctx,
         profile,
         out_cc,
+        in_cc,
         me,
         realm,
         name,
@@ -764,14 +771,30 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
         }
     };
     let mut pwprompt = false;
+    let mut init_info: Option<(bool, Option<i32>)> = None;
     let result: Result<Credential, Krb5Error> = match o.action {
         Action::InitPw | Action::InitKt => {
-            let config = match as_config(k5, o) {
+            let mut config = match as_config(k5, o) {
                 Ok(c) => c,
                 Err(e) => {
                     com_err(e, "while getting initial credentials");
                     return false;
                 }
+            };
+            // read_allowed_preauth_type (get_in_tkt.c:731-753).
+            if let Some(in_cc) = &k5.in_cc {
+                let krbtgt = PrincipalName::new_srv_inst("krbtgt", &k5.realm);
+                let server = config.server.clone().unwrap_or(krbtgt);
+                config.allowed_preauth_type = in_cc
+                    .get_config(Some((&server, &k5.realm)), CONF_PA_TYPE)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| String::from_utf8(v).ok()?.parse().ok());
+            }
+            let mut run_init = |x: AsExchange| {
+                let x = rt.block_on(client.get_init_creds(x))?;
+                init_info = Some((x.fast_avail(), x.selected_preauth_type()));
+                x.credential().cloned()
             };
             if o.action == Action::InitKt {
                 let ktname = match (&o.keytab_name, o.use_client_keytab) {
@@ -813,7 +836,7 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
                             .filter(|e| e.kvno == max)
                             .map(|e| e.key)
                             .collect();
-                        rt.block_on(client.acquire_tgt_with_keys(config, keys))
+                        run_init(AsExchange::with_keys(config, keys))
                     }
                     None => {
                         com_err(
@@ -841,7 +864,7 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
                         }
                     }
                 };
-                rt.block_on(client.acquire_tgt_with_config(config, &password))
+                run_init(AsExchange::new(config, &password))
             }
         }
         Action::Renew | Action::Validate => {
@@ -911,7 +934,23 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
     if matches!(o.action, Action::InitPw | Action::InitKt) {
         // The gic out_ccache (get_in_tkt.c:1615-1660): stage in MEMORY,
         // then replace the output cache's contents.
-        if let Err(e) = store_primary(&mut k5.out_cc, &cred, &cprinc.0, &cprinc.1) {
+        let (fast_avail, pa_type) = init_info.unwrap_or_default();
+        let srv = (&cred.server, cred.srealm.as_str());
+        let stored = store_primary(&mut k5.out_cc, &cred, &cprinc.0, &cprinc.1)
+            .and_then(|()| match fast_avail {
+                true => k5
+                    .out_cc
+                    .set_config(Some(srv), CONF_FAST_AVAIL, Some(b"yes")),
+                false => Ok(()),
+            })
+            .and_then(|()| match pa_type {
+                Some(t) => {
+                    k5.out_cc
+                        .set_config(Some(srv), CONF_PA_TYPE, Some(t.to_string().as_bytes()))
+                }
+                None => Ok(()),
+            });
+        if let Err(e) = stored {
             com_err(e, "while storing credentials");
             return false;
         }
