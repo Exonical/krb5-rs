@@ -46,6 +46,11 @@ impl SeqState {
         }
     }
 
+    /// The initial receive sequence number.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
     /// Record receipt of `seq` and report the MIT supplementary status.
     pub fn check(&mut self, seq: u64) -> SeqStatus {
         if !self.do_replay && !self.do_sequence {

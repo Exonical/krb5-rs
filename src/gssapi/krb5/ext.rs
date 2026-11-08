@@ -201,7 +201,7 @@ impl Krb5Context {
     /// gss_inquire_sec_context_by_oid (gssapi_krb5.c:344-389): MIT's
     /// buffer-set results for the krb5 mechanism's context OIDs.
     /// GSS_KRB5_EXPORT_LUCID_SEC_CONTEXT returns a C structure pointer in
-    /// MIT and is `Unavailable` here.
+    /// MIT; use [`Krb5Context::export_lucid_sec_context`] instead.
     pub fn inquire_sec_context_by_oid(&self, oid: &[u8]) -> Result<Vec<Vec<u8>>, Krb5Error> {
         let key_result = |key: &EncryptionKey| {
             vec![
@@ -232,6 +232,44 @@ impl Krb5Context {
             Ok(vec![ssf.to_be_bytes().to_vec()])
         } else {
             Err(gss(GssError::Unavailable))
+        }
+    }
+}
+
+/// gss_krb5_lucid_context_v1_t for a CFX (protocol 1) context.
+#[derive(Debug, Clone)]
+pub struct LucidContext {
+    /// Structure version (1).
+    pub version: u32,
+    /// Whether this side initiated the context.
+    pub initiate: bool,
+    /// Context expiry (unix seconds).
+    pub endtime: u32,
+    /// Next send sequence number.
+    pub send_seq: u64,
+    /// Receive sequence number.
+    pub recv_seq: u64,
+    /// Protocol (always 1, CFX).
+    pub protocol: u32,
+    /// cfx_kd.ctx_key: the initiator subkey or session key.
+    pub ctx_key: EncryptionKey,
+    /// cfx_kd.acceptor_subkey when present.
+    pub acceptor_subkey: Option<EncryptionKey>,
+}
+
+impl Krb5Context {
+    /// gss_krb5_export_lucid_sec_context (lucid_context.c
+    /// make_external_lucid_ctx_v1); like MIT this consumes the context.
+    pub fn export_lucid_sec_context(self) -> LucidContext {
+        LucidContext {
+            version: 1,
+            initiate: self.initiate,
+            endtime: self.endtime.timestamp() as u32,
+            send_seq: self.seq_send,
+            recv_seq: self.seqstate.base(),
+            protocol: 1,
+            ctx_key: self.key,
+            acceptor_subkey: self.acceptor_subkey,
         }
     }
 }
