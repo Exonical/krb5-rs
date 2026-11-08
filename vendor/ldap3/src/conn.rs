@@ -493,7 +493,9 @@ impl LdapConnAsync {
             }
             Some(_) => return Err(LdapError::MismatchedStreamType),
         };
+        let peer_addr = stream.peer_addr().ok();
         let (mut conn, mut ldap) = Self::conn_pair(ConnType::Tcp(stream));
+        ldap.peer_addr = peer_addr;
         match scheme {
             "ldap" => (),
             #[cfg(any(any(), feature = "tls-rustls"))]
@@ -518,6 +520,19 @@ impl LdapConnAsync {
                     LdapConnAsync::create_tls_stream(settings, _hostname, stream).await?
                 } else {
                     panic!("underlying stream not TCP");
+                };
+                let suite = tls_stream
+                    .get_ref()
+                    .1
+                    .negotiated_cipher_suite()
+                    .map(|c| format!("{:?}", c.suite()))
+                    .unwrap_or_default();
+                ldap.tls_ssf = if suite.contains("AES_128") {
+                    128
+                } else if suite.contains("AES_256") || suite.contains("CHACHA20") {
+                    256
+                } else {
+                    0
                 };
                 conn.stream = parts.codec.framed(ConnType::Tls(tls_stream));
                 ldap.has_tls = true;
@@ -626,6 +641,8 @@ impl LdapConnAsync {
             sasl_param,
             client_ctx,
             has_tls: false,
+            tls_ssf: 0,
+            peer_addr: None,
             last_id: 0,
             timeout: None,
             controls: None,

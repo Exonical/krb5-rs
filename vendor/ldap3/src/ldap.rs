@@ -79,6 +79,8 @@ pub struct Ldap {
     pub(crate) sasl_param: Arc<RwLock<(bool, u32)>>, // sasl_wrap, sasl_max_send
     pub(crate) client_ctx: Arc<Mutex<Option<Box<dyn crate::SaslSecurityLayer>>>>,
     pub(crate) has_tls: bool,
+    pub(crate) tls_ssf: u32,
+    pub(crate) peer_addr: Option<std::net::SocketAddr>,
     pub timeout: Option<Duration>,
     pub controls: MaybeControls,
     pub search_opts: Option<SearchOptions>,
@@ -94,6 +96,8 @@ impl Clone for Ldap {
             sasl_param: self.sasl_param.clone(),
             client_ctx: self.client_ctx.clone(),
             has_tls: self.has_tls,
+            tls_ssf: self.tls_ssf,
+            peer_addr: self.peer_addr,
             last_id: 0,
             timeout: None,
             controls: None,
@@ -276,6 +280,16 @@ impl Ldap {
     /// Whether the connection is protected by TLS (`ldaps://` or StartTLS).
     pub fn has_tls(&self) -> bool {
         self.has_tls
+    }
+
+    /// The TLS cipher's key bits (libldap's `ldap_pvt_tls_get_strength`), or 0.
+    pub fn tls_ssf(&self) -> u32 {
+        self.tls_ssf
+    }
+
+    /// The TCP peer's address (`getpeername`), or `None` for `ldapi://`.
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer_addr
     }
 
     /// Do an SASL EXTERNAL bind on the connection. The identity of the client

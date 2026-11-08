@@ -938,6 +938,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-lookup"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "263c0ccfc6b3b6a93e959edad4f985779e76c0b36dbb2e13e3d27c690974adf1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "socket2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "doxygen-rs"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1915,10 +1927,13 @@ name = "krb5-rs-kdb-ldap"
 version = "0.1.0"
 dependencies = [
  "des",
+ "dns-lookup",
  "hmac 0.13.0",
  "krb5-rs",
  "ldap3",
+ "libc",
  "md-5",
+ "md4",
  "rand 0.10.3",
  "rasn",
  "rc4",
@@ -2149,6 +2164,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
 dependencies = [
  "cfg-if",
+ "digest 0.11.3",
+]
+
+[[package]]
+name = "md4"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd76fb0fd6b2e4be62a73f8e0858ca97f81babcb1af322dcaca196f735f17f80"
+dependencies = [
  "digest 0.11.3",
 ]
 
@@ -3053,6 +3077,7 @@ dependencies = [
  "hmac 0.12.1",
  "pbkdf2 0.12.2",
  "rand 0.8.8",
+ "serde",
  "serde_json",
  "sha1 0.10.7",
  "sha2 0.10.9",

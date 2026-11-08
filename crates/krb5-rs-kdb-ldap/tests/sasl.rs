@@ -63,20 +63,10 @@ fn bind(mech: &str, password: &str, authzid: Option<&str>) -> Bind {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs OpenLDAP slapd and Cyrus SASL modules"]
-async fn sasl_binds_against_openldap() {
-    if !Path::new("/usr/sbin/slapd").exists() {
-        eprintln!("slapd not installed; skipping");
-        return;
-    }
-    let dir = tempfile::tempdir().expect("tempdir");
-    let port = 20000 + (std::process::id() % 20000) as u16 + 1;
-    let _slapd = start_slapd(dir.path(), port, &[]);
-    let url = format!("ldap://127.0.0.1:{port}/");
-
+/// The root DSE's `supportedSASLMechanisms`.
+async fn offered(url: &str) -> Vec<String> {
     let mut anon = connect(
-        &url,
+        url,
         &Bind::Simple {
             dn: String::new(),
             password: String::new(),
@@ -102,6 +92,44 @@ async fn sasl_binds_against_openldap() {
         .cloned()
         .unwrap_or_default();
     eprintln!("server offers {offered:?}");
+    offered
+}
+
+async fn whoami(ldap: &mut ldap3::Ldap, mech: &str) {
+    let (exop, _) = ldap
+        .extended(WhoAmI)
+        .await
+        .expect("whoami")
+        .success()
+        .expect("whoami");
+    let who: WhoAmIResp = exop.parse();
+    assert_eq!(who.authzid, "dn:cn=kdcsasl,dc=example,dc=com", "{mech}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs OpenLDAP slapd and Cyrus SASL modules"]
+async fn sasl_binds_against_openldap() {
+    if !Path::new("/usr/sbin/slapd").exists() {
+        eprintln!("slapd not installed; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = 20000 + (std::process::id() % 20000) as u16 + 1;
+    let _slapd = start_slapd(dir.path(), port, &[]);
+    let url = format!("ldap://127.0.0.1:{port}/");
+
+    let offered = offered(&url).await;
+
+    // libldap's default SASL_SECPROPS (noplain,noanonymous) refuse PLAIN
+    // without TLS.
+    std::env::remove_var("LDAPSASL_SECPROPS");
+    if offered.iter().any(|m| m == "PLAIN") {
+        let err = connect(&url, &bind("PLAIN", "saslsecret", None))
+            .await
+            .expect_err("PLAIN without TLS");
+        assert!(err.to_string().contains("No worthy mechs found"), "{err}");
+    }
+    std::env::set_var("LDAPSASL_SECPROPS", "none");
 
     for mech in [
         "PLAIN",
@@ -110,6 +138,7 @@ async fn sasl_binds_against_openldap() {
         "DIGEST-MD5",
         "SCRAM-SHA-1",
         "SCRAM-SHA-256",
+        "NTLM",
     ] {
         if !offered.iter().any(|m| m == mech) {
             eprintln!("{mech} not offered; skipping");
@@ -155,6 +184,24 @@ async fn sasl_binds_against_openldap() {
         .await
         .expect_err("unknown mechanism");
     assert!(err.to_string().contains("NOSUCH-MECH"), "{err}");
+
+    // SASL_SECPROPS bounds DIGEST-MD5's layer.
+    if offered.iter().any(|m| m == "DIGEST-MD5") {
+        for props in ["maxssf=0", "maxssf=1", "maxssf=56", "minssf=128"] {
+            std::env::set_var("LDAPSASL_SECPROPS", props);
+            let mut ldap = connect(&url, &bind("DIGEST-MD5", "saslsecret", None))
+                .await
+                .unwrap_or_else(|e| panic!("{props}: {e}"));
+            whoami(&mut ldap, props).await;
+            ldap.unbind().await.ok();
+        }
+        std::env::set_var("LDAPSASL_SECPROPS", "minssf=129");
+        let err = connect(&url, &bind("DIGEST-MD5", "saslsecret", None))
+            .await
+            .expect_err("minssf above DIGEST-MD5's");
+        assert!(err.to_string().contains("No worthy mechs found"), "{err}");
+    }
+    std::env::remove_var("LDAPSASL_SECPROPS");
 }
 
 /// GSSAPI on krb5-rs's GSS-API against slapd's Cyrus GSSAPI (MIT
@@ -238,7 +285,19 @@ async fn gssapi_bind_against_openldap() {
         realm: None,
         password: None,
     };
-    let mut ldap = connect(&format!("ldap://localhost:{port}/"), &gss)
+    let url = format!("ldap://localhost:{port}/");
+    // libldap names the server by its address's reverse lookup, here this
+    // host's own name, for which the KDC has no ldap/ principal.
+    std::env::remove_var("LDAPSASL_NOCANON");
+    let canon = connect(&url, &gss).await;
+    if dns_lookup::get_hostname().is_ok_and(|h| h != "localhost") {
+        assert!(
+            canon.is_err(),
+            "bound as ldap/localhost without SASL_NOCANON"
+        );
+    }
+    std::env::set_var("LDAPSASL_NOCANON", "on");
+    let mut ldap = connect(&url, &gss)
         .await
         .unwrap_or_else(|e| panic!("GSSAPI: {e}"));
     let (exop, _) = ldap
@@ -264,4 +323,37 @@ async fn gssapi_bind_against_openldap() {
         assert_eq!(rs.len(), 1);
     }
     ldap.unbind().await.ok();
+
+    let offered = offered(&url).await;
+    for mech in ["GSS-SPNEGO", "GS2-KRB5", "GS2-IAKERB"] {
+        if !offered.iter().any(|m| m == mech) {
+            eprintln!("{mech} not offered; skipping");
+            continue;
+        }
+        let b = Bind::Sasl {
+            mech: mech.into(),
+            authcid: None,
+            authzid: None,
+            realm: None,
+            password: None,
+        };
+        let mut ldap = connect(&url, &b)
+            .await
+            .unwrap_or_else(|e| panic!("{mech}: {e}"));
+        whoami(&mut ldap, mech).await;
+        let (rs, _) = ldap
+            .search(
+                "dc=example,dc=com",
+                Scope::Subtree,
+                "(cn=kdcsasl)",
+                vec!["cn"],
+            )
+            .await
+            .expect("search")
+            .success()
+            .unwrap_or_else(|e| panic!("{mech} search: {e}"));
+        assert_eq!(rs.len(), 1, "{mech}");
+        ldap.unbind().await.ok();
+    }
+    std::env::remove_var("LDAPSASL_NOCANON");
 }

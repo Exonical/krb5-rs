@@ -105,8 +105,9 @@ async fn authenticate(ldap: &mut Ldap, server: &str, bind: &Bind) -> Result<(), 
                 realm: realm.clone(),
                 password: password.clone(),
             };
-            let host = crate::sasl::sasl_host(server);
-            crate::sasl::bind(ldap, mech, &host, &interact)
+            let opts = crate::ldapconf::LdapOptions::load();
+            let params = crate::sasl::Params::new(ldap, server, &opts);
+            crate::sasl::bind(ldap, mech, &params, &interact)
                 .await
                 .map_err(|e| {
                     access(format!(

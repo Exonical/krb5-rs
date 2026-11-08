@@ -2,11 +2,11 @@
 //! callback, kdb_ldap_conn.c:95-150, which hands the mechanism to Cyrus
 //! SASL).
 //!
-//! PLAIN, LOGIN, ANONYMOUS and SCRAM-SHA-1/256 come from `rsasl`; CRAM-MD5,
-//! DIGEST-MD5 and GSSAPI follow Cyrus SASL 2.1.28's client plugins, GSSAPI on
-//! krb5-rs's own GSS-API.  Security properties are libldap's defaults
-//! (`minssf=0,maxssf=INT_MAX,maxbufsize=65536`), so like Cyrus, GSSAPI and
-//! DIGEST-MD5 negotiate the strongest layer the server offers, even over TLS.
+//! PLAIN, LOGIN, ANONYMOUS, SCRAM-SHA-1/256 and OAUTHBEARER come from
+//! `rsasl`; CRAM-MD5, DIGEST-MD5, NTLM, GSSAPI, GSS-SPNEGO, GS2-KRB5 and
+//! GS2-IAKERB follow Cyrus SASL 2.1.28's client plugins, the GSS ones on
+//! krb5-rs's own GSS-API.  The security properties and server host name are
+//! libldap's ([`Params`]).
 
 use std::io;
 use std::sync::Arc;
@@ -14,6 +14,11 @@ use std::sync::Arc;
 use hmac::{Hmac, KeyInit, Mac};
 use ldap3::{Ldap, SaslSecurityLayer};
 use md5::{Digest, Md5};
+
+use crate::ldapconf::{self, LdapOptions, SecProps};
+
+mod gs2;
+mod ntlm;
 
 const MAXBUF: u32 = 65536;
 const SASL_BIND_IN_PROGRESS: u32 = 14;
@@ -42,17 +47,73 @@ trait Mech: Send {
     fn success(&mut self, data: Option<&[u8]>) -> Result<Option<Layer>, String>;
 }
 
-/// The host libldap gives Cyrus as the server FQDN (cyrus.c:509-534): the
-/// local host name for `ldapi://`, else the URL's host.
-pub fn sasl_host(url: &str) -> String {
-    let (scheme, rest) = url.split_once("://").unwrap_or(("ldap", url));
-    if scheme.eq_ignore_ascii_case("ldapi") {
-        return std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .ok()
-            .map(|h| h.trim().to_string())
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| "localhost".into());
+/// What libldap gives Cyrus besides the callbacks (cyrus.c:480-560).
+#[derive(Debug, Clone)]
+pub struct Params {
+    /// `serverFQDN`.
+    pub host: String,
+    /// `SASL_SSF_EXTERNAL`: the TLS cipher strength, or
+    /// `LDAP_PVT_SASL_LOCAL_SSF` for `ldapi://`.
+    pub external_ssf: u32,
+    /// `SASL_SECPROPS`.
+    pub props: SecProps,
+}
+
+const LOCAL_SSF: u32 = 71;
+
+impl Params {
+    /// The host is the local host name for `ldapi://`, the URL's host with
+    /// `SASL_NOCANON`, else the connected peer's name (cyrus.c:509-534).
+    pub fn new(ldap: &Ldap, url: &str, opts: &LdapOptions) -> Self {
+        let ldapi = url
+            .split_once("://")
+            .is_some_and(|(s, _)| s.eq_ignore_ascii_case("ldapi"));
+        let host = if ldapi {
+            local_hostname()
+        } else if opts.nocanon {
+            url_host(url)
+        } else {
+            host_connected_to(ldap.peer_addr())
+        };
+        Params {
+            host,
+            external_ssf: if ldapi { LOCAL_SSF } else { ldap.tls_ssf() },
+            props: opts.secprops,
+        }
     }
+
+    fn need(&self) -> u32 {
+        self.props.min_ssf.saturating_sub(self.external_ssf)
+    }
+
+    fn allowed(&self) -> u32 {
+        self.props.max_ssf.saturating_sub(self.external_ssf)
+    }
+}
+
+/// `ldap_int_hostname` (`ldap_pvt_get_fqdn(NULL)`, util-int.c:678-708).
+fn local_hostname() -> String {
+    let Ok(name) = dns_lookup::get_hostname() else {
+        return "localhost".into();
+    };
+    let hints = dns_lookup::AddrInfoHints {
+        flags: libc::AI_CANONNAME,
+        address: 0,
+        socktype: 0,
+        protocol: 0,
+    };
+    dns_lookup::getaddrinfo(Some(&name), None, Some(hints))
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(Result::ok)
+        .and_then(|a| a.canonname)
+        .filter(|c| !c.is_empty())
+        .unwrap_or(name)
+}
+
+/// The host part of an LDAP URL.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let hostport = rest.split('/').next().unwrap_or("");
     let host = match hostport.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
@@ -65,8 +126,63 @@ pub fn sasl_host(url: &str) -> String {
     }
 }
 
-/// Bind `ldap` with SASL mechanism `mech` against server `host`.
-pub async fn bind(ldap: &mut Ldap, mech: &str, host: &str, i: &Interact) -> Result<(), String> {
+/// `ldap_host_connected_to` (os-ip.c:1170-1240): the peer's reverse-DNS
+/// name; the local host name for loopback and unspecified addresses.
+fn host_connected_to(peer: Option<std::net::SocketAddr>) -> String {
+    use std::net::{IpAddr, Ipv4Addr};
+    let Some(peer) = peer else {
+        return local_hostname();
+    };
+    let ip = peer.ip();
+    let local = match ip {
+        IpAddr::V4(v4) => v4.is_unspecified() || v4 == Ipv4Addr::LOCALHOST,
+        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_loopback(),
+    };
+    if local {
+        return local_hostname();
+    }
+    dns_lookup::lookup_addr(&ip)
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "localhost".into())
+}
+
+/// `max_ssf` and `security_flags` of each client plugin.
+fn mech_props(mech: &str) -> Option<(u32, u32)> {
+    use ldapconf::{MUTUAL_AUTH, NOACTIVE, NOANONYMOUS, NOPLAINTEXT, PASS_CREDENTIALS};
+    const GSS: u32 = NOPLAINTEXT | NOACTIVE | NOANONYMOUS | MUTUAL_AUTH | PASS_CREDENTIALS;
+    Some(match mech {
+        "PLAIN" | "LOGIN" => (0, NOANONYMOUS | PASS_CREDENTIALS),
+        "ANONYMOUS" => (0, NOPLAINTEXT),
+        "CRAM-MD5" | "NTLM" => (0, NOPLAINTEXT | NOANONYMOUS),
+        "DIGEST-MD5" => (128, NOPLAINTEXT | NOANONYMOUS | MUTUAL_AUTH),
+        "SCRAM-SHA-1" | "SCRAM-SHA-256" => (0, NOPLAINTEXT | NOACTIVE | NOANONYMOUS | MUTUAL_AUTH),
+        "GSSAPI" | "GSS-SPNEGO" => (256, GSS),
+        // gs2.c:1337-1357 with MIT krb5's mechanism attributes.
+        "GS2-KRB5" | "GS2-IAKERB" => (0, GSS),
+        "OAUTHBEARER" => (0, NOANONYMOUS),
+        _ => return None,
+    })
+}
+
+/// The mechanism filter of `sasl_client_start` (client.c:520-600).
+fn check_mech(mech: &str, p: &Params) -> Result<(), String> {
+    let Some((max_ssf, flags)) = mech_props(mech) else {
+        return Err(format!(
+            "SASL(-4): no mechanism available: {mech} is not supported"
+        ));
+    };
+    let mut want = p.props.flags;
+    if p.props.min_ssf <= p.external_ssf && p.external_ssf > 1 {
+        want &= !ldapconf::NOPLAINTEXT;
+    }
+    if p.need() > max_ssf || ((want ^ flags) & want) != 0 {
+        return Err("SASL(-4): no mechanism available: No worthy mechs found".into());
+    }
+    Ok(())
+}
+
+pub async fn bind(ldap: &mut Ldap, mech: &str, p: &Params, i: &Interact) -> Result<(), String> {
     let upper = mech.to_ascii_uppercase();
     if upper == "EXTERNAL" {
         let authz = i.authzid.as_deref().unwrap_or("").as_bytes();
@@ -76,10 +192,15 @@ pub async fn bind(ldap: &mut Ldap, mech: &str, host: &str, i: &Interact) -> Resu
             .map_err(|e| e.to_string())?;
         return res.success().map(|_| ()).map_err(|e| e.to_string());
     }
+    check_mech(&upper, p)?;
     let mut m: Box<dyn Mech> = match upper.as_str() {
         "CRAM-MD5" => Box::new(CramMd5(i.clone())),
-        "DIGEST-MD5" => Box::new(DigestMd5::new(i.clone(), host)),
-        "GSSAPI" => Box::new(Gssapi::new(i.clone(), host).await?),
+        "DIGEST-MD5" => Box::new(DigestMd5::new(i.clone(), p)),
+        "NTLM" => Box::new(ntlm::Ntlm::new(i.clone())),
+        "GSSAPI" => Box::new(Gssapi::new(i.clone(), p, false).await?),
+        "GSS-SPNEGO" => Box::new(Gssapi::new(i.clone(), p, true).await?),
+        "GS2-KRB5" => Box::new(gs2::Gs2::krb5(i.clone(), p).await?),
+        "GS2-IAKERB" => Box::new(gs2::Gs2::iakerb(i.clone(), p)?),
         _ => Box::new(Rsasl::new(&upper, i)?),
     };
     let mut out = m.start()?;
@@ -123,6 +244,9 @@ impl rsasl::callback::SessionCallback for Creds {
         }
         if let Some(z) = &self.0.authzid {
             req.satisfy::<AuthzId>(z.as_str())?;
+        }
+        if let Some(t) = &self.0.password {
+            req.satisfy::<rsasl::property::OAuthBearerToken>(t.as_str())?;
         }
         Ok(())
     }
@@ -336,6 +460,8 @@ struct DigestMd5 {
     service: &'static str,
     host: String,
     ha1: [u8; 16],
+    props: SecProps,
+    external_ssf: u32,
     protection: Protection,
     server_maxbuf: u32,
     rspauth: Option<String>,
@@ -343,11 +469,13 @@ struct DigestMd5 {
 }
 
 impl DigestMd5 {
-    fn new(i: Interact, host: &str) -> Self {
+    fn new(i: Interact, p: &Params) -> Self {
         DigestMd5 {
             i,
             service: "ldap",
-            host: host.to_string(),
+            host: p.host.clone(),
+            props: p.props,
+            external_ssf: p.external_ssf,
             ha1: [0; 16],
             protection: Protection::None,
             server_maxbuf: MAXBUF,
@@ -405,23 +533,34 @@ impl DigestMd5 {
         if qops.is_empty() {
             qops.push("auth".into());
         }
-        // libldap's maxssf is INT_MAX and external SSF never reaches it, so
-        // the limit only rules out nothing: take the strongest offered layer.
-        self.protection = if qops.iter().any(|q| q == "auth-conf") {
-            Cipher::ALL
-                .iter()
-                .filter(|c| ciphers.iter().any(|n| n == c.1))
-                .max_by_key(|c| c.2)
-                .map(|c| Protection::Privacy(c.0))
-                .unwrap_or(Protection::None)
+        // digestmd5.c:4063-4140.
+        let (limit, musthave) = if self.props.maxbufsize == 0 {
+            (0, 0)
         } else {
-            Protection::None
+            (
+                self.props.max_ssf.saturating_sub(self.external_ssf),
+                self.props.min_ssf.saturating_sub(self.external_ssf),
+            )
         };
+        self.protection = Protection::None;
+        if limit > 1 && qops.iter().any(|q| q == "auth-conf") {
+            if let Some(c) = Cipher::ALL
+                .iter()
+                .filter(|c| limit >= c.2 && musthave <= c.2 && ciphers.iter().any(|n| n == c.1))
+                .max_by_key(|c| c.2)
+            {
+                self.protection = Protection::Privacy(c.0);
+            }
+        }
         if self.protection == Protection::None {
-            if qops.iter().any(|q| q == "auth-int") {
+            if limit >= 1 && musthave <= 1 && qops.iter().any(|q| q == "auth-int") {
                 self.protection = Protection::Integrity;
-            } else if !qops.iter().any(|q| q == "auth") {
-                return Err("Server doesn't support \"no layer\"".into());
+            } else if musthave == 0 {
+                if !qops.iter().any(|q| q == "auth") {
+                    return Err("Server doesn't support \"no layer\"".into());
+                }
+            } else {
+                return Err("Can't find an acceptable layer".into());
             }
         }
         let user = need(&self.i.authcid, "authcid")?.to_string();
@@ -487,7 +626,9 @@ impl DigestMd5 {
             let name = Cipher::ALL.iter().find(|x| x.0 == c).map_or("", |x| x.1);
             out.push(format!("cipher={name}"));
         }
-        out.push(format!("maxbuf={MAXBUF}"));
+        if self.props.maxbufsize != 0 {
+            out.push(format!("maxbuf={}", self.props.maxbufsize));
+        }
         if utf8 {
             out.push("charset=utf-8".into());
         }
@@ -784,7 +925,8 @@ impl SaslSecurityLayer for DigestLayer {
 
 // ---------------------------------------------------------------- GSSAPI
 
-use krb5_rs::gssapi::krb5::{GssFlags, InitStep, Krb5Context, Krb5Initiator};
+use krb5_rs::gssapi::krb5::{GssFlags, InitStep, Krb5Context, Krb5Initiator, MECH_KRB5};
+use krb5_rs::gssapi::spnego::SpnegoInitiator;
 
 const LAYER_NONE: u8 = 1;
 const LAYER_INTEGRITY: u8 = 2;
@@ -803,44 +945,95 @@ fn krb5_profile() -> Result<krb5_rs::profile::Profile, String> {
 }
 
 /// gssapi.c:1643-2170 `gssapi_client_mech_step`.
+enum GssInit {
+    Krb5(Krb5Initiator),
+    Spnego(SpnegoInitiator),
+}
+
+impl GssInit {
+    fn step(&mut self, input: Option<&[u8]>) -> Result<InitStep, String> {
+        match self {
+            GssInit::Krb5(i) => i.step(input),
+            GssInit::Spnego(i) => i.step(input),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    fn context(self) -> Result<Krb5Context, String> {
+        match self {
+            GssInit::Krb5(i) => i.context(),
+            GssInit::Spnego(i) => i.context(),
+        }
+        .map_err(|e| e.to_string())
+    }
+}
+
+/// The krb5 initiator for `ldap@host`, from the default ccache.
+async fn krb5_initiator(host: &str, flags: GssFlags) -> Result<Krb5Initiator, String> {
+    use krb5_rs::client::{GcOptions, HostCanonicalization, KerberosClient};
+    use krb5_rs::types::PrincipalName;
+    let profile = krb5_profile()?;
+    let srealm = krb5_rs::locate::host_realm(&profile, host)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let defrealm = profile
+        .get_string(&["libdefaults", "default_realm"])
+        .unwrap_or_else(|| srealm.clone());
+    let canon = HostCanonicalization::from_profile(&profile);
+    let profile = Arc::new(profile);
+    let transport = krb5_rs::transport::located::LocatedTransport::new(profile.clone(), None);
+    let client = KerberosClient::new(defrealm, transport).with_host_canonicalization(canon);
+    let ctx = krb5_rs::ccache::CcContext::from_env(Some(&profile));
+    let server = PrincipalName::new_srv_hst("ldap", host);
+    let (_, cred) = client
+        .get_default_credentials(&ctx, Some(&profile), GcOptions::empty(), server, &srealm)
+        .await
+        .map_err(|e| e.to_string())?;
+    Krb5Initiator::new(cred, None, flags, None).map_err(|e| e.to_string())
+}
+
+/// Cyrus's GSSAPI and GSS-SPNEGO client (gssapi.c:1640-2120).
 struct Gssapi {
     authzid: Option<String>,
-    init: Option<Krb5Initiator>,
+    init: Option<GssInit>,
     ctx: Option<Krb5Context>,
     layer: Option<Layer>,
+    spnego: bool,
+    need: u32,
+    allowed: u32,
+    maxbuf: u32,
     done: bool,
 }
 
 impl Gssapi {
-    async fn new(i: Interact, host: &str) -> Result<Self, String> {
-        use krb5_rs::client::{GcOptions, HostCanonicalization, KerberosClient};
-        use krb5_rs::types::PrincipalName;
-        let profile = krb5_profile()?;
-        let srealm = krb5_rs::locate::host_realm(&profile, host)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        let defrealm = profile
-            .get_string(&["libdefaults", "default_realm"])
-            .unwrap_or_else(|| srealm.clone());
-        let canon = HostCanonicalization::from_profile(&profile);
-        let profile = Arc::new(profile);
-        let transport = krb5_rs::transport::located::LocatedTransport::new(profile.clone(), None);
-        let client = KerberosClient::new(defrealm, transport).with_host_canonicalization(canon);
-        let ctx = krb5_rs::ccache::CcContext::from_env(Some(&profile));
-        let server = PrincipalName::new_srv_hst("ldap", host);
-        let (_, cred) = client
-            .get_default_credentials(&ctx, Some(&profile), GcOptions::empty(), server, &srealm)
-            .await
-            .map_err(|e| e.to_string())?;
-        // :1763-1773 — libldap's maxssf exceeds any external SSF.
-        let flags = GssFlags::MUTUAL | GssFlags::SEQUENCE | GssFlags::INTEG | GssFlags::CONF;
-        let init = Krb5Initiator::new(cred, None, flags, None).map_err(|e| e.to_string())?;
+    async fn new(i: Interact, p: &Params, spnego: bool) -> Result<Self, String> {
+        // gssapi.c:1762-1782.
+        let mut flags = GssFlags::MUTUAL | GssFlags::SEQUENCE;
+        if p.props.max_ssf > p.external_ssf {
+            flags |= GssFlags::INTEG;
+            if p.props.max_ssf - p.external_ssf > 1 {
+                flags |= GssFlags::CONF;
+            }
+        }
+        if p.props.flags & ldapconf::PASS_CREDENTIALS != 0 {
+            flags |= GssFlags::DELEG;
+        }
+        let inner = krb5_initiator(&p.host, flags).await?;
+        let init = if spnego {
+            GssInit::Spnego(SpnegoInitiator::new(inner, vec![MECH_KRB5.to_vec()]))
+        } else {
+            GssInit::Krb5(inner)
+        };
         Ok(Gssapi {
             authzid: i.authzid,
             init: Some(init),
             ctx: None,
             layer: None,
+            spnego,
+            need: p.need(),
+            allowed: p.allowed(),
+            maxbuf: p.props.maxbufsize.min(0xFF_FFFF),
             done: false,
         })
     }
@@ -850,17 +1043,34 @@ impl Gssapi {
             .init
             .as_mut()
             .ok_or("GSSAPI context already established")?;
-        match init.step(input).map_err(|e| e.to_string())? {
+        match init.step(input)? {
             InitStep::Continue(t) => Ok(t),
             InitStep::Complete(t) => {
                 let init = self.init.take().ok_or("GSSAPI context missing")?;
-                self.ctx = Some(init.context().map_err(|e| e.to_string())?);
+                let ctx = init.context()?;
+                if self.spnego {
+                    self.spnego_ssf(ctx);
+                } else {
+                    self.ctx = Some(ctx);
+                }
                 Ok(t.unwrap_or_default())
             }
         }
     }
 
-    /// SASL_GSSAPI_STATE_SSFCAP (:1922-2110).
+    /// `gssapi_spnego_ssf` (gssapi.c:742-780): the context's flags pick the
+    /// layer; there is no security-layer negotiation.
+    fn spnego_ssf(&mut self, ctx: Krb5Context) {
+        let f = ctx.flags();
+        if f.contains(GssFlags::INTEG) {
+            let conf = f.contains(GssFlags::CONF);
+            let limit = ctx.wrap_size_limit(conf, 0xFF_FFFF) as u32;
+            self.layer = Some((Box::new(GssLayer { ctx, conf }), limit));
+        }
+        self.done = true;
+    }
+
+    /// `SASL_GSSAPI_STATE_SSFCAP` (gssapi.c:1960-2090).
     fn ssfcap(&mut self, challenge: &[u8]) -> Result<Vec<u8>, String> {
         let mut ctx = self.ctx.take().ok_or("GSSAPI context missing")?;
         let caps = ctx.unwrap(challenge).map_err(|e| e.to_string())?.data;
@@ -869,17 +1079,26 @@ impl Gssapi {
         }
         let serverhas = caps[0];
         let server_max = u32::from_be_bytes([0, caps[1], caps[2], caps[3]]);
-        let choice = if serverhas & LAYER_CONFIDENTIALITY != 0 {
+        let f = ctx.flags();
+        let integ = f.contains(GssFlags::INTEG);
+        let conf = integ && f.contains(GssFlags::CONF);
+        let mech_ssf = ctx.sasl_ssf().unwrap_or(56);
+        let (need, allowed) = (self.need, self.allowed);
+        let choice = if conf
+            && allowed >= mech_ssf
+            && need <= mech_ssf
+            && serverhas & LAYER_CONFIDENTIALITY != 0
+        {
             LAYER_CONFIDENTIALITY
-        } else if serverhas & LAYER_INTEGRITY != 0 {
+        } else if integ && allowed >= 1 && need <= 1 && serverhas & LAYER_INTEGRITY != 0 {
             LAYER_INTEGRITY
-        } else if serverhas & LAYER_NONE != 0 {
+        } else if need == 0 && serverhas & LAYER_NONE != 0 {
             LAYER_NONE
         } else {
-            return Err("No suitable security layer".into());
+            return Err("SASL(-15): mechanism too weak for this user".into());
         };
         let mut reply = vec![choice];
-        let max = if choice > LAYER_NONE { MAXBUF } else { 0 };
+        let max = if choice > LAYER_NONE { self.maxbuf } else { 0 };
         reply.extend_from_slice(&max.to_be_bytes()[1..]);
         if let Some(z) = &self.authzid {
             reply.extend_from_slice(z.as_bytes());
@@ -910,7 +1129,12 @@ impl Mech for Gssapi {
         self.ssfcap(challenge)
     }
 
-    fn success(&mut self, _data: Option<&[u8]>) -> Result<Option<Layer>, String> {
+    fn success(&mut self, data: Option<&[u8]>) -> Result<Option<Layer>, String> {
+        if !self.done && self.init.is_some() {
+            if let Some(d) = data.filter(|d| !d.is_empty()) {
+                self.ctx_step(Some(d))?;
+            }
+        }
         if !self.done {
             return Err("server did not finish the SASL exchange".into());
         }
@@ -955,6 +1179,18 @@ impl SaslSecurityLayer for GssLayer {
 mod tests {
     use super::*;
 
+    fn params(host: &str, external_ssf: u32, secprops: &str) -> Params {
+        let mut props = SecProps::default();
+        if !secprops.is_empty() {
+            props.apply(secprops).unwrap();
+        }
+        Params {
+            host: host.into(),
+            external_ssf,
+            props,
+        }
+    }
+
     fn interact(user: &str, pass: &str) -> Interact {
         Interact {
             authcid: Some(user.into()),
@@ -965,12 +1201,94 @@ mod tests {
 
     #[test]
     fn host_from_url() {
-        assert_eq!(sasl_host("ldap://kdc.example.com:389/"), "kdc.example.com");
-        assert_eq!(sasl_host("ldaps://[::1]:636"), "::1");
-        assert_eq!(sasl_host("ldap://h"), "h");
+        assert_eq!(url_host("ldap://kdc.example.com:389/"), "kdc.example.com");
+        assert_eq!(url_host("ldaps://[::1]:636"), "::1");
+        assert_eq!(url_host("ldap://h"), "h");
     }
 
     /// RFC 2195 section 2 example.
+    #[test]
+    fn connected_host() {
+        let local = local_hostname();
+        assert!(!local.is_empty());
+        assert_eq!(host_connected_to(None), local);
+        assert_eq!(
+            host_connected_to(Some("127.0.0.1:389".parse().unwrap())),
+            local
+        );
+        assert_eq!(host_connected_to(Some("[::1]:389".parse().unwrap())), local);
+    }
+
+    #[test]
+    fn mechanism_filter() {
+        let worthy = |m: &str, ext: u32, sp: &str| check_mech(m, &params("h", ext, sp)).is_ok();
+        // libldap's defaults: noplain,noanonymous.
+        assert!(!worthy("PLAIN", 0, ""));
+        assert!(!worthy("LOGIN", 0, ""));
+        assert!(!worthy("ANONYMOUS", 0, ""));
+        assert!(!worthy("OAUTHBEARER", 0, ""));
+        for m in [
+            "CRAM-MD5",
+            "DIGEST-MD5",
+            "NTLM",
+            "SCRAM-SHA-256",
+            "GSSAPI",
+            "GS2-KRB5",
+        ] {
+            assert!(worthy(m, 0, ""), "{m}");
+        }
+        // TLS lifts noplain.
+        assert!(worthy("PLAIN", 128, ""));
+        assert!(worthy("OAUTHBEARER", 256, ""));
+        assert!(!worthy("PLAIN", 128, "minssf=256"));
+        assert!(worthy("PLAIN", 0, "none"));
+        assert!(worthy("ANONYMOUS", 0, "none"));
+        // minssf beyond a mechanism's max_ssf.
+        assert!(!worthy("CRAM-MD5", 0, "minssf=1"));
+        assert!(worthy("DIGEST-MD5", 0, "minssf=128"));
+        assert!(!worthy("DIGEST-MD5", 0, "minssf=129"));
+        assert!(worthy("DIGEST-MD5", 64, "minssf=129"));
+        assert!(worthy("GSSAPI", 0, "minssf=256"));
+        // noactive, nodict, forwardsec.
+        assert!(!worthy("DIGEST-MD5", 0, "noactive"));
+        assert!(worthy("SCRAM-SHA-1", 0, "noactive"));
+        assert!(!worthy("GSSAPI", 0, "forwardsec"));
+        assert!(!worthy("NOSUCH", 0, "none"));
+    }
+
+    #[test]
+    fn digest_layer_choice() {
+        let ch = r#"realm="r",nonce="n",qop="auth,auth-int,auth-conf",cipher="rc4-40,rc4-56,rc4,des,3des",maxbuf=1000,algorithm=md5-sess"#;
+        let pick = |ext: u32, sp: &str| {
+            let mut m = DigestMd5::new(interact("u", "p"), &params("h", ext, sp));
+            m.step(ch.as_bytes())
+                .map(|r| (m.protection, String::from_utf8(r).unwrap()))
+        };
+        let (prot, resp) = pick(0, "").unwrap();
+        assert_eq!(prot, Protection::Privacy(Cipher::Rc4));
+        assert!(resp.contains("maxbuf=65536"));
+        assert_eq!(
+            pick(0, "maxssf=112").unwrap().0,
+            Protection::Privacy(Cipher::TripleDes)
+        );
+        assert_eq!(
+            pick(0, "maxssf=56").unwrap().0,
+            Protection::Privacy(Cipher::Rc4_56)
+        );
+        assert_eq!(pick(0, "maxssf=1").unwrap().0, Protection::Integrity);
+        assert_eq!(pick(0, "maxssf=0").unwrap().0, Protection::None);
+        // TLS's SSF counts against maxssf.
+        assert_eq!(pick(128, "").unwrap().0, Protection::Privacy(Cipher::Rc4));
+        assert_eq!(pick(i32::MAX as u32, "").unwrap().0, Protection::None);
+        let (prot, resp) = pick(0, "maxbufsize=0").unwrap();
+        assert_eq!(prot, Protection::None);
+        assert!(!resp.contains("maxbuf="));
+        assert!(pick(0, "minssf=129").is_err());
+        let only_auth = r#"realm="r",nonce="n",qop="auth-int",algorithm=md5-sess"#;
+        let mut m = DigestMd5::new(interact("u", "p"), &params("h", 0, "maxssf=0"));
+        assert!(m.step(only_auth.as_bytes()).is_err());
+    }
+
     #[test]
     fn cram_md5_rfc2195() {
         let mut m = CramMd5(interact("tim", "tanstaaftanstaaf"));
@@ -983,7 +1301,10 @@ mod tests {
     /// RFC 2831 section 4 example (IMAP).
     #[test]
     fn digest_md5_rfc2831() {
-        let mut m = DigestMd5::new(interact("chris", "secret"), "elwood.innosoft.com");
+        let mut m = DigestMd5::new(
+            interact("chris", "secret"),
+            &params("elwood.innosoft.com", 0, ""),
+        );
         m.service = "imap";
         let ch = r#"realm="elwood.innosoft.com",nonce="OA6MG9tEQGm2hh",qop="auth",algorithm=md5-sess,charset=utf-8"#;
         let r = String::from_utf8(m.respond(ch, "OA6MHXh6VqTrRk").unwrap()).unwrap();
@@ -997,7 +1318,10 @@ mod tests {
         );
         m.step(b"rspauth=ea40f60335c427b5527b84dbabcdfffd").unwrap();
         assert!(m.success(None).unwrap().is_none());
-        let mut bad = DigestMd5::new(interact("chris", "secret"), "elwood.innosoft.com");
+        let mut bad = DigestMd5::new(
+            interact("chris", "secret"),
+            &params("elwood.innosoft.com", 0, ""),
+        );
         bad.respond(ch, "x").unwrap();
         assert!(bad.success(Some(b"rspauth=00")).is_err());
     }

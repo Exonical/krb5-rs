@@ -181,23 +181,33 @@ does; remove it once no file-store writer is running.
 - **Replication:** the directory replicates itself. As in MIT there is no
   update log, so `iprop_enable` with kldap stops kadmind at startup.
 
+SASL binds follow libldap and Cyrus SASL 2.1.28's client plugins.
+`EXTERNAL`, `PLAIN`, `LOGIN`, `ANONYMOUS`, `SCRAM-SHA-1`, `SCRAM-SHA-256` and
+`OAUTHBEARER` (the token is the bind secret) come from rsasl; `CRAM-MD5`,
+`DIGEST-MD5` (with the `auth-int`/`auth-conf` layers: rc4, rc4-56, rc4-40,
+des, 3des), `NTLM` (NTLMv1, as Cyrus without `ntlm_v2`), `GSSAPI`,
+`GSS-SPNEGO`, `GS2-KRB5` and `GS2-IAKERB` are written for krb5-rs, the GSS
+ones on its own GSS-API. As in libldap:
+
+- `SASL_SECPROPS` and `SASL_NOCANON` are read from `ldap.conf`, `ldaprc`,
+  `.ldaprc`, `LDAPCONF`, `LDAPRC` and the `LDAPSASL_*` variables, in
+  libldap's order; `LDAPNOINIT` skips them. The defaults are
+  `noplain,noanonymous`, `minssf` 0, `maxssf` unlimited and `maxbufsize`
+  65536, so PLAIN, LOGIN and OAUTHBEARER need TLS or `SASL_SECPROPS none`.
+- Mechanisms are filtered by `minssf` and the security flags as in
+  `sasl_client_start`, counting the TLS cipher's strength (71 for
+  `ldapi://`) as the external SSF. DIGEST-MD5 and GSSAPI pick their layer
+  from `minssf`, `maxssf` and `maxbufsize` the way Cyrus does; GSS-SPNEGO
+  takes it from the context's flags.
+- The SASL host is the local host name for `ldapi://`, the URL's host with
+  `SASL_NOCANON`, and otherwise the reverse-DNS name of the connected
+  address (the local host name for loopback).
+
 Differences from MIT:
 
 - `krb5-rs-kdb5-ldap-util create` accepts `-kv` and `-M`, but the master key
   is always `K/M` with kvno 1, as `krb5-rs-kdb create` makes it; another `-M`
   name is refused.
-- MIT binds with any mechanism libsasl2 provides. krb5-rs supports
-  `EXTERNAL`, `PLAIN`, `LOGIN`, `ANONYMOUS`, `SCRAM-SHA-1`, `SCRAM-SHA-256`
-  (rsasl), `CRAM-MD5`, `DIGEST-MD5` (with Cyrus's `auth-int`/`auth-conf`
-  layers: rc4, rc4-56, rc4-40, des, 3des) and `GSSAPI` (krb5-rs's own GSS-API,
-  with integrity/confidentiality layers). Other mechanisms (GSS-SPNEGO,
-  GS2-*, NTLM, OAUTHBEARER) are refused.
-- The SASL host is the LDAP URL's host (the local host name for `ldapi://`),
-  as with Cyrus's `SASL_NOCANON`; libldap's reverse lookup of the peer
-  address is not done.
-- Security-layer properties are Cyrus's defaults (`minssf` 0, `maxssf`
-  unlimited, `maxbufsize` 65536): the strongest layer the server offers is
-  used. `ldap.conf`'s `SASL_SECPROPS` is not read.
 - The master-key commands (`add_mkey`, `use_mkey`, `list_mkeys`,
   `purge_mkeys`, `update_princ_encryption`), `ark` and `tabdump` are refused
   on kldap.
