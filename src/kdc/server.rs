@@ -93,6 +93,9 @@ pub async fn serve_udp_with<S: PrincipalStore + 'static>(
         if let Some(log) = &options.logger {
             log(&summary, peer);
         }
+        if summary.lookaside == Some(super::LookasideHit::Dropped) {
+            continue;
+        }
         // MIT logs and drops on send failure (net-server.c:1112-1124).
         let _ = socket.send_to(&reply, peer).await;
     }
@@ -223,6 +226,9 @@ async fn serve_connection<S: PrincipalStore>(
         .await;
     if let Some(log) = logger {
         log(&summary, peer);
+    }
+    if summary.lookaside == Some(super::LookasideHit::Dropped) {
+        return Ok(());
     }
     write_framed(&mut stream, &reply).await
 }

@@ -544,6 +544,7 @@ mod tests {
             ticket_etype: None,
             gate_rejected: false,
             store_time: Duration::ZERO,
+            lookaside: None,
         });
 
         assert_eq!(metrics.local_db_errors.get(), 1);
@@ -562,6 +563,7 @@ mod tests {
             ticket_etype: None,
             gate_rejected: false,
             store_time: Duration::ZERO,
+            lookaside: None,
         });
         assert_eq!(
             metrics.local_db_errors.get(),
@@ -587,6 +589,7 @@ mod tests {
             ticket_etype: None,
             gate_rejected: true,
             store_time: Duration::ZERO,
+            lookaside: None,
         });
 
         assert_eq!(
