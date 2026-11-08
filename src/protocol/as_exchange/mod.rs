@@ -106,6 +106,18 @@ pub struct AsExchangeConfig {
     pub in_ccache: Option<InCcache>,
 }
 
+/// MIT's JSON strings are byte strings (`k5_json`, json.c:819-830 reads
+/// `\u00XX` as a byte and passes other bytes through): carry each byte as
+/// U+0000..U+00FF so binary values such as an OTP `tokenID` round-trip.
+fn latin1_string(b: &[u8]) -> String {
+    b.iter().map(|&c| char::from(c)).collect()
+}
+
+/// The inverse of [`latin1_string`]; `None` for a code point above U+00FF.
+fn latin1_bytes(s: &str) -> Option<Vec<u8>> {
+    s.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect()
+}
+
 /// Config-entry lookup on an input ccache: `(server, server realm, key)`
 /// to the entry's data, as `krb5_cc_get_config`.
 #[derive(Clone)]
@@ -290,11 +302,11 @@ pub struct AsExchange {
 
     /// String members of the input cache's `pa_config_data` JSON object
     /// (MIT `ctx->cc_config_in`, read before each request).
-    cc_config_in: std::collections::BTreeMap<String, String>,
+    cc_config_in: std::collections::BTreeMap<String, Vec<u8>>,
 
     /// Module settings to save as `pa_config_data` (MIT
     /// `ctx->cc_config_out`, cleared before each request).
-    cc_config_out: std::collections::BTreeMap<String, String>,
+    cc_config_out: std::collections::BTreeMap<String, Vec<u8>>,
     /// FAST armor key set as the AS key by OTP (preauth_otp.c:1118-1120).
     otp_key: Option<EncryptionKey>,
     /// Real preauth types that already failed this exchange
@@ -505,13 +517,13 @@ impl AsExchange {
         self.cc_config_out.clear();
         self.cc_config_in = self
             .in_cc_config("pa_config_data")
-            .and_then(|v| match serde_json::from_slice(&v).ok()? {
+            .and_then(|v| match serde_json::from_str(&latin1_string(&v)).ok()? {
                 serde_json::Value::Object(o) => Some(o),
                 _ => None,
             })
             .map(|o| {
                 o.into_iter()
-                    .filter_map(|(k, v)| Some((k, v.as_str()?.to_string())))
+                    .filter_map(|(k, v)| Some((k, latin1_bytes(v.as_str()?)?)))
                     .collect()
             })
             .unwrap_or_default();
@@ -526,7 +538,12 @@ impl AsExchange {
         if self.cc_config_out.is_empty() {
             return None;
         }
-        serde_json::to_vec(&self.cc_config_out).ok()
+        let map: serde_json::Map<String, serde_json::Value> = self
+            .cc_config_out
+            .iter()
+            .map(|(k, v)| (k.clone(), latin1_string(v).into()))
+            .collect();
+        latin1_bytes(&serde_json::to_string(&map).ok()?)
     }
 
     /// Rebuild the FAST request state for a (re)start

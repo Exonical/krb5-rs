@@ -140,6 +140,19 @@ fn test_exchange_pa_config_data() {
     );
     exchange.reset_cc_config();
     assert_eq!(exchange.cc_config_out_data(), None);
+
+    // A binary tokenID survives the cache round trip.
+    exchange.save_config_tokeninfo(&ti("B", b"\xff\x01\""));
+    let saved = exchange.cc_config_out_data().expect("saved");
+    let mut config = AsExchangeConfig::new(PrincipalName::new_principal("testuser"), "EXAMPLE.COM");
+    config.in_ccache = Some(super::InCcache(std::sync::Arc::new(move |_, _, key| {
+        (key == "pa_config_data").then(|| saved.clone())
+    })));
+    let mut exchange = AsExchange::new(config, "password");
+    exchange.reset_cc_config();
+    let mut tis = vec![ti("B", b"1"), ti("B", b"\xff\x01\"")];
+    exchange.filter_config_tokeninfos(&mut tis);
+    assert_eq!(tis, vec![ti("B", b"\xff\x01\"")]);
 }
 
 /// An input cache holding `pa_type` for krbtgt/EXAMPLE.COM only.

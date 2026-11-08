@@ -93,7 +93,7 @@ impl AsExchange {
     /// token matching the input cache's saved vendor/algID/tokenID, when
     /// exactly one matches.
     pub(super) fn filter_config_tokeninfos(&self, tis: &mut Vec<OtpTokenInfo>) {
-        let cfg = |k: &str| self.cc_config_in.get(k).map(String::as_bytes);
+        let cfg = |k: &str| self.cc_config_in.get(k).map(Vec::as_slice);
         let (vendor, alg_id, token_id) = (cfg("vendor"), cfg("algID"), cfg("tokenID"));
         let differs = |want: Option<&[u8]>, have: Option<&[u8]>| match (want, have) {
             (Some(w), Some(h)) => !h.is_empty() && w != h,
@@ -117,8 +117,7 @@ impl AsExchange {
     pub(super) fn save_config_tokeninfo(&mut self, ti: &OtpTokenInfo) {
         let mut set = |k: &str, v: Option<&[u8]>| {
             if let Some(v) = v.filter(|v| !v.is_empty()) {
-                self.cc_config_out
-                    .insert(k.to_string(), String::from_utf8_lossy(v).into_owned());
+                self.cc_config_out.insert(k.to_string(), v.to_vec());
             }
         };
         set("vendor", ti.vendor.as_ref().map(|v| v.as_bytes()));

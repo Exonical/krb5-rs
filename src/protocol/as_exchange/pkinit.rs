@@ -43,7 +43,10 @@ impl AsExchange {
             .configured_pkinit
             .get_or_insert_with(|| self.config.pkinit.clone())
             .clone();
-        let spec = self.cc_config_in.get("X509_user_identity");
+        let spec = self
+            .cc_config_in
+            .get("X509_user_identity")
+            .and_then(|v| std::str::from_utf8(v).ok());
         self.config.pkinit = match (base, spec) {
             (Some(cfg), Some(spec)) if cfg.identity.is_some() => {
                 match crate::pkinit::cms::Identity::load_all(spec) {
@@ -88,7 +91,7 @@ impl AsExchange {
         // pkinit_identity_prompt saves the signer identity.
         if let Some(id) = cfg.identity.as_ref().filter(|i| !i.name.is_empty()) {
             self.cc_config_out
-                .insert("X509_user_identity".into(), id.name.clone());
+                .insert("X509_user_identity".into(), id.name.clone().into_bytes());
         }
         slot.padata_value = value.into();
         self.pkinit_keypair = Some(keypair);
