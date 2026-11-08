@@ -13,6 +13,8 @@ mod error_codes;
 /// FAST (RFC 6113) armoring and encrypted challenge.
 pub mod fast;
 mod kdc_rep;
+/// kpasswd messages (RFC 3244).
+pub mod kpasswd;
 pub(crate) mod preauth;
 mod tgs_exchange;
 #[cfg(feature = "kdc")]

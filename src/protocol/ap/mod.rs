@@ -222,6 +222,7 @@ pub fn encrypt_ticket_part(
 }
 
 /// Authentication context — MIT `krb5_auth_context`.
+#[derive(Clone)]
 pub struct AuthContext {
     flags: AuthContextFlags,
     clockskew: Duration,
@@ -361,6 +362,11 @@ impl AuthContext {
     /// The context protocol/session key.
     pub fn session_key(&self) -> Option<&EncryptionKey> {
         self.key.as_ref()
+    }
+
+    /// MIT `krb5_auth_con_setrecvsubkey_k`.
+    pub fn set_recv_subkey(&mut self, k: Option<EncryptionKey>) {
+        self.recv_subkey = k;
     }
 
     /// Subkey for outgoing messages.

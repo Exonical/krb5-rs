@@ -25,8 +25,12 @@ pub mod primary;
 
 /// Host-based service name canonicalization (MIT os/sn2princ.c).
 pub mod canonprinc;
+/// Password changes over kpasswd.
+pub mod chpw;
 mod creds;
 mod s4u;
+/// Initial credential verification.
+pub mod vfy;
 
 use crate::protocol::{
     AsExchange, AsExchangeConfig, Credential, StepResult, TgsExchange, TgsOptions, TgsStepResult,
