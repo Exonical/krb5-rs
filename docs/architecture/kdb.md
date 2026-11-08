@@ -171,21 +171,29 @@ does; remove it once no file-store writer is running.
   `load -update` and the principal and policy commands work. A load without
   `-update` fails like MIT, and `destroy` fails with MIT's
   `KRB5_PLUGIN_OP_NOTSUPP` message.
+- **`krb5-rs-kdb5-ldap-util`:** MIT's `kdb5_ldap_util` (`ldap_util/`):
+  `create`, `modify`, `view`, `destroy`, `list`, `stashsrvpw` and the ticket
+  policy commands (`create_policy`, `modify_policy`, `view_policy`,
+  `destroy_policy`, `list_policy`), with MIT's `-D`/`-w`/`-H`/`-r`/`-P`/`-k`
+  /`-sf` options, ticket flag options, prompts and output. `destroy` deletes
+  the realm's principals, policies and realm object; a ticket policy that a
+  principal's `krbTicketPolicyReference` names is not deleted.
 - **Replication:** the directory replicates itself. As in MIT there is no
   update log, so `iprop_enable` with kldap stops kadmind at startup.
 
 Differences from MIT:
 
-- `kdb5_ldap_util` itself is not provided. Realm creation is `krb5-rs-kdb
-  create`; ticket policies (`create_policy`), `modify`, `view`, `list` and
-  `stashsrvpw` must be done with LDAP tools.
+- `krb5-rs-kdb5-ldap-util create` accepts `-kv` and `-M`, but the master key
+  is always `K/M` with kvno 1, as `krb5-rs-kdb create` makes it; another `-M`
+  name is refused.
 - SASL binds support `EXTERNAL` only (for `ldapi://` or TLS client
   certificates); MIT supports any mechanism libsasl2 provides.
 - The master-key commands (`add_mkey`, `use_mkey`, `list_mkeys`,
   `purge_mkeys`, `update_princ_encryption`), `ark` and `tabdump` are refused
   on kldap.
-- The integration test (`cargo test -p krb5-rs-kdb-ldap --test openldap --
-  --ignored`) needs `slapd`; `tests/slapd.sh` starts a private instance.
+- The integration tests (`cargo test -p krb5-rs-kdb-ldap --test openldap --
+  --ignored` and `cargo test -p krb5-rs-kdc --test kdb5_ldap_util --
+  --ignored`) need `slapd`; `tests/slapd.sh` starts a private instance.
 
 ### Password policy
 

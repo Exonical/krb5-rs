@@ -14,6 +14,11 @@
 #[path = "kadmind/modules.rs"]
 mod modules;
 
+#[cfg(feature = "kldap")]
+#[allow(dead_code)]
+#[path = "kdb/ldap_util.rs"]
+pub(crate) mod ldap_util;
+
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};

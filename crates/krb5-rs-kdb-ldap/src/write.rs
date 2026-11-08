@@ -16,7 +16,7 @@ use krb5_rs::kdc::kdb::mit::update_tl_data;
 
 /// `attributes_set` (ldap_principal.c): what deleting a directory user's
 /// last principal removes.
-const ATTRIBUTES_SET: [&str; 13] = [
+pub(crate) const ATTRIBUTES_SET: [&str; 13] = [
     "krbmaxticketlife",
     "krbmaxrenewableage",
     "krbticketflags",

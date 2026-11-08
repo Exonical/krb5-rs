@@ -11,6 +11,7 @@ pub mod raw;
 pub mod realm;
 pub mod store;
 pub mod traits;
+pub mod util;
 pub mod write;
 
 pub use store::LdapStore;
