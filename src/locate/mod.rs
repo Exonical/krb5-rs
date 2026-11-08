@@ -1,10 +1,6 @@
 //! KDC/service location (MIT lib/krb5/os/locate_kdc.c): profile entries,
 //! then DNS URI records, then SRV records.
 
-#[cfg(any(
-    feature = "kdc",
-    all(feature = "client", any(unix, windows, not(feature = "dns")))
-))]
 mod canon;
 mod dns;
 #[cfg(feature = "dns")]
@@ -12,10 +8,6 @@ mod hickory;
 mod hostrealm;
 mod uri;
 
-#[cfg(any(
-    feature = "kdc",
-    all(feature = "client", any(unix, windows, not(feature = "dns")))
-))]
 pub(crate) use canon::dns_canonical;
 pub use dns::{make_lookup_name, sort_srv, DnsResolver, SrvRecord, UriRecord};
 #[cfg(feature = "dns")]

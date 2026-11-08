@@ -315,20 +315,7 @@ fn fq_local_hostname() -> Result<String, i32> {
     if host.is_empty() {
         return Err(EAI_FAIL);
     }
-    #[cfg(any(
-        feature = "kdc",
-        all(feature = "client", any(unix, windows, not(feature = "dns")))
-    ))]
-    {
-        super::dns_canonical(&host, false).ok_or(EAI_FAIL)
-    }
-    #[cfg(not(any(
-        feature = "kdc",
-        all(feature = "client", any(unix, windows, not(feature = "dns")))
-    )))]
-    {
-        Ok(host)
-    }
+    super::dns_canonical(&host, false).ok_or(EAI_FAIL)
 }
 
 /// hostrealm_profile.c `profile_host_realm`: `[domain_realm]` for the host,
