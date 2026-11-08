@@ -91,6 +91,7 @@ cat > "$B/kdc.conf" <<EOF
   acl_file = $B/kadm5.acl
   supported_enctypes = aes256-cts-hmac-sha1-96:normal
   kpasswd_listen = 127.0.0.1:18464
+  kadmind_port = 18751
  }
 [dbmodules]
  $R = {
