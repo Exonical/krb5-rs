@@ -127,7 +127,7 @@ impl Decoder for LdapCodec {
             return res;
         }
         if buf.len() < U32_SIZE {
-            return Err(io::Error::new(io::ErrorKind::Other, "invalid SASL buffer"));
+            return Ok(None);
         }
         let sasl_len = u32::from_be_bytes(buf[0..U32_SIZE].try_into().unwrap());
         if buf.len() - U32_SIZE < sasl_len as usize {
