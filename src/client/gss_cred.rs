@@ -69,17 +69,52 @@ impl<T: KdcTransport> KerberosClient<T> {
     /// The service ticket gss_init_sec_context uses for `server` with
     /// `cred` (init_sec_context.c:120-215): with a proxy credential, the
     /// evidence ticket itself when `server` is the impersonator, else
-    /// S4U2Proxy; IAKERB credentials only look in the cache.  A MEMORY
-    /// credential's cache is a copy, so new tickets are not kept in `cred`.
+    /// S4U2Proxy; IAKERB credentials only look in the cache.  Tickets
+    /// fetched for a MEMORY credential are kept in `cred`, as in MIT's
+    /// in-process cache.
     pub async fn gss_service_cred(
+        &self,
+        ctx: &CcContext,
+        cred: &mut GssCred,
+        server: PrincipalName,
+        srealm: &str,
+    ) -> Result<Credential, Krb5Error> {
+        let (out, cache) = self.service_cred_inner(ctx, cred, server, srealm).await;
+        if let (Some(CredCache::Memory { creds, .. }), Some(cache)) = (&mut cred.ccache, cache) {
+            if let Ok(now) = cache.creds() {
+                *creds = now;
+            }
+            let _ = cache.destroy();
+        }
+        out
+    }
+
+    async fn service_cred_inner(
         &self,
         ctx: &CcContext,
         cred: &GssCred,
         server: PrincipalName,
         srealm: &str,
+    ) -> (Result<Credential, Krb5Error>, Option<AnyCcache>) {
+        let mut cache = match open_cache(ctx, cred) {
+            Ok(c) => c,
+            Err(e) => return (Err(e), None),
+        };
+        let out = self
+            .service_cred_with(&mut cache, cred, server, srealm)
+            .await;
+        let keep = matches!(cred.ccache, Some(CredCache::Memory { .. })).then_some(cache);
+        (out, keep)
+    }
+
+    async fn service_cred_with(
+        &self,
+        cache: &mut AnyCcache,
+        cred: &GssCred,
+        server: PrincipalName,
+        srealm: &str,
     ) -> Result<Credential, Krb5Error> {
         let (name, realm) = cred.principal().ok_or(gss(GssError::NoCred))?.clone();
-        let mut cache = open_cache(ctx, cred)?;
         let req = CredsRequest::new(name.clone(), &realm, server.clone(), srealm);
         let mut flags = GcOptions::empty();
         if let Some((imp, imp_realm)) = &cred.impersonator {
@@ -98,7 +133,7 @@ impl<T: KdcTransport> KerberosClient<T> {
                 let evidence = Credential::try_from(evidence)
                     .map_err(|_| gss(GssError::DefectiveCredential))?;
                 let out = self
-                    .get_credentials_for_proxy(&mut cache, GcOptions::CANONICALIZE, &req, &evidence)
+                    .get_credentials_for_proxy(cache, GcOptions::CANONICALIZE, &req, &evidence)
                     .await?;
                 if !same_principal(&out.client, &out.crealm, &name, &realm) {
                     return Err(gss(GssError::Failure));
@@ -109,6 +144,6 @@ impl<T: KdcTransport> KerberosClient<T> {
         if cred.iakerb_mech {
             flags |= GcOptions::CACHED;
         }
-        self.get_credentials(&mut cache, flags, &req).await
+        self.get_credentials(cache, flags, &req).await
     }
 }
