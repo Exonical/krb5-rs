@@ -42,6 +42,8 @@ pub struct Krb5Context {
     pub(super) authdata: Vec<AuthorizationDataElement>,
     /// The ticket session key (`krb5_auth_con_getkey_k`).
     pub(super) ticket_key: EncryptionKey,
+    /// Authdata context of the initiator name (acceptor only).
+    pub(super) name_attrs: super::name_attrs::NameAttrs,
 }
 
 impl Krb5Context {
@@ -73,6 +75,7 @@ impl Krb5Context {
             authtime: endtime,
             ticket_flags: KerberosFlags::default(),
             authdata: Vec::new(),
+            name_attrs: Default::default(),
         }
     }
 

@@ -10,38 +10,8 @@ use crate::crypto::find_etype;
 use crate::pac::AD_IF_RELEVANT;
 use crate::types::{AuthorizationDataElement, Checksum, EncTicketPart, EncryptionKey};
 
-/// `KRB5_AUTHDATA_CAMMAC`.
-pub(crate) const AD_CAMMAC: i32 = 96;
-/// `KRB5_AUTHDATA_AUTH_INDICATOR`.
-pub(crate) const AD_AUTH_INDICATOR: i32 = 97;
-/// `KRB5_KEYUSAGE_CAMMAC`.
-const KEYUSAGE_CAMMAC: i32 = 64;
-
-/// Verifier-MAC.
-#[derive(AsnType, Encode, Decode, Debug, Clone)]
-struct VerifierMac {
-    #[rasn(tag(explicit(context, 0)))]
-    identifier: Option<crate::types::PrincipalName>,
-    #[rasn(tag(explicit(context, 1)))]
-    kvno: Option<u32>,
-    #[rasn(tag(explicit(context, 2)))]
-    enctype: Option<i32>,
-    #[rasn(tag(explicit(context, 3)))]
-    mac: Checksum,
-}
-
-/// AD-CAMMAC.
-#[derive(AsnType, Encode, Decode, Debug, Clone)]
-struct Cammac {
-    #[rasn(tag(explicit(context, 0)))]
-    elements: SequenceOf<AuthorizationDataElement>,
-    #[rasn(tag(explicit(context, 1)))]
-    kdc_verifier: Option<VerifierMac>,
-    #[rasn(tag(explicit(context, 2)))]
-    svc_verifier: Option<VerifierMac>,
-    #[rasn(tag(explicit(context, 3)))]
-    other_verifiers: Option<SequenceOf<VerifierMac>>,
-}
+use crate::types::{find_authdata, Cammac, VerifierMac, KEYUSAGE_CAMMAC};
+pub(crate) use crate::types::{AD_AUTH_INDICATOR, AD_CAMMAC};
 
 fn checksum(key: &EncryptionKey, data: &[u8]) -> Result<Checksum, KdcError> {
     let profile = find_etype(key.keytype).map_err(|_| KdcError::generic("CAMMAC"))?;
@@ -118,21 +88,6 @@ pub(crate) fn add_auth_indicators(
             ad_data: rasn::der::encode(&inner)?.into(),
         });
     Ok(())
-}
-
-/// `krb5_find_authdata` for `ad_type`, looking inside AD-IF-RELEVANT.
-fn find_authdata(list: &[AuthorizationDataElement], ad_type: i32, out: &mut Vec<Vec<u8>>) {
-    for el in list {
-        if el.ad_type == ad_type {
-            out.push(el.ad_data.to_vec());
-        } else if el.ad_type == AD_IF_RELEVANT {
-            if let Ok(inner) =
-                rasn::der::decode::<Vec<AuthorizationDataElement>>(el.ad_data.as_ref())
-            {
-                find_authdata(&inner, ad_type, out);
-            }
-        }
-    }
 }
 
 /// `get_auth_indicators`: indicators from CAMMACs in `part` whose KDC

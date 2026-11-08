@@ -118,9 +118,11 @@ mod context;
 mod ext;
 mod initiator;
 mod iov;
+mod name_attrs;
 
 pub use acceptor::Krb5Acceptor;
 pub use context::{Krb5Context, Unwrapped};
 pub use ext::*;
 pub use initiator::Krb5Initiator;
 pub use iov::{GssIov, IovType};
+pub use name_attrs::NameAttrValue;

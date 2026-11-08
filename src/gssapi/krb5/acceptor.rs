@@ -67,9 +67,10 @@ impl Krb5Acceptor {
         }
 
         let mut ac = AuthContext::new();
-        let sname: Option<PrincipalName> = rasn::der::decode::<ApReq>(&body[2..])
+        let ap_ticket = rasn::der::decode::<ApReq>(&body[2..])
             .ok()
-            .map(|r| r.ticket.sname);
+            .map(|r| r.ticket);
+        let sname: Option<PrincipalName> = ap_ticket.as_ref().map(|t| t.sname.clone());
         let result = ac.rd_req(&body[2..], self.server.as_ref(), &*self.keys)?;
         ac.set_flags(ac.flags() | AuthContextFlags::DO_SEQUENCE);
 
@@ -117,6 +118,18 @@ impl Krb5Acceptor {
             .cloned()
             .collect();
         ctx.ticket_key = session.clone();
+        // rd_req_dec.c:640-649 krb5int_authdata_verify with the ticket key.
+        let tkt = ap_ticket.ok_or(Krb5Error::Gss(GssError::DefectiveToken))?;
+        let skey = self
+            .keys
+            .get_key(
+                &tkt.sname,
+                tkt.realm.as_bytes(),
+                tkt.enc_part.kvno,
+                tkt.enc_part.etype,
+            )
+            .map_err(|_| Krb5Error::Gss(GssError::Failure))?;
+        ctx.name_attrs = super::name_attrs::NameAttrs::import(&result.ticket, &skey)?;
         ctx.initial_ticket = result
             .ticket
             .flags
