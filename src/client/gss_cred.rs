@@ -206,8 +206,16 @@ impl<T: KdcTransport> KerberosClient<T> {
                         let tgt = self
                             .run_as_exchange(crate::protocol::AsExchange::with_keys(config, keys))
                             .await?;
+                        // write_out_ccache (get_in_tkt.c:1615-1660): stage
+                        // in MEMORY, then replace the cache's contents.
+                        let mut mcc = crate::ccache::MemoryCcache::new();
+                        mcc.initialize(&tgt.client, &tgt.crealm)?;
+                        Self::store_cred(&mut mcc, &tgt, None, false)?;
+                        let staged = mcc.creds()?;
                         cache.initialize(&tgt.client, &tgt.crealm)?;
-                        Self::store_cred(&mut cache, &tgt, None, false)?;
+                        for cr in &staged {
+                            cache.store(cr)?;
+                        }
                         // kg_cred_set_initial_refresh: refresh at half-life.
                         let t = CcCredential::from(&tgt);
                         let start = i64::from(if t.starttime != 0 {
