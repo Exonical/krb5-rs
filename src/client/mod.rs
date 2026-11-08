@@ -201,7 +201,8 @@ impl<T: KdcTransport> KerberosClient<T> {
         let mut kdc_reply = Vec::new();
         for _ in 0..MAX_EXCHANGE_STEPS {
             match exchange.step(&kdc_reply)? {
-                TgsStepResult::SendToKdc { data, realm } | TgsStepResult::RetryTcp { data, realm } => {
+                TgsStepResult::SendToKdc { data, realm }
+                | TgsStepResult::RetryTcp { data, realm } => {
                     kdc_reply = self.transport.send_recv(&realm, &data).await?;
                 }
                 TgsStepResult::Complete => return exchange.credential().cloned(),

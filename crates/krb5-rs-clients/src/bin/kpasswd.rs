@@ -59,10 +59,13 @@ fn main() {
         .map_or(FastMode::Disabled, |(_, r)| armor(&ccache, r));
     let defrealm = krb5_rs::locate::default_realm(&profile);
     if let Some(n) = pname {
-        princ = Some(
-            parse_principal(n, defrealm.as_deref())
-                .unwrap_or_else(|| fail("Malformed representation of principal", "parsing client name", 1)),
-        );
+        princ = Some(parse_principal(n, defrealm.as_deref()).unwrap_or_else(|| {
+            fail(
+                "Malformed representation of principal",
+                "parsing client name",
+                1,
+            )
+        }));
     }
     let (me, realm) = princ.unwrap_or_else(|| {
         let Some(user) = ["USER", "LOGNAME"]

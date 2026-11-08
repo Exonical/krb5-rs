@@ -10,6 +10,10 @@ repository = "https://github.com/structured-world/krb5-rs"
 publish = false
 
 [[bin]]
+name = "krb5-rs-kadmin"
+path = "src/bin/kadmin.rs"
+
+[[bin]]
 name = "krb5-rs-kinit"
 path = "src/bin/kinit.rs"
 
@@ -38,7 +42,7 @@ name = "krb5-rs-kswitch"
 path = "src/bin/kswitch.rs"
 
 [dependencies]
-krb5-rs = { path = "../..", features = ["client", "gssapi", "pkinit", "dns"] }
+krb5-rs = { path = "../..", features = ["client", "gssapi", "pkinit", "dns", "kdc"] }
 base64 = "0.22"
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "unstable-locales"] }
 rasn = "0.28"

@@ -83,10 +83,14 @@ pub(crate) fn validate_as_reply(
 
     // 6. A postdated reply starts when requested (get_in_tkt.c:243-245).
     if let Some(from) = &request_body.from {
-        if request_body.kdc_options.contains(crate::types::KdcOptions::POSTDATED)
+        if request_body
+            .kdc_options
+            .contains(crate::types::KdcOptions::POSTDATED)
             && enc_part.starttime.as_ref() != Some(from)
         {
-            return Err(Krb5Error::ReplyValidation("KDC reply did not match expectations"));
+            return Err(Krb5Error::ReplyValidation(
+                "KDC reply did not match expectations",
+            ));
         }
     }
 

@@ -201,8 +201,7 @@ fn parse_options() -> Opts {
                     match string_to_timestamp(&arg).filter(|&t| t != 0) {
                         Some(t) => {
                             o.starttime =
-                                i32::try_from(t - i64::from(krb5_rs_clients::now()))
-                                    .unwrap_or(0)
+                                i32::try_from(t - i64::from(krb5_rs_clients::now())).unwrap_or(0)
                         }
                         None => {
                             eprintln!("Bad start time value {arg}");
@@ -331,7 +330,11 @@ fn cache_type(c: &AnyCcache) -> &'static str {
 }
 
 /// `krb5_parse_name_flags`, with `KRB5_PRINCIPAL_PARSE_ENTERPRISE` for -E.
-fn parse_name(s: &str, enterprise: bool, defrealm: Option<&str>) -> Option<(PrincipalName, String)> {
+fn parse_name(
+    s: &str,
+    enterprise: bool,
+    defrealm: Option<&str>,
+) -> Option<(PrincipalName, String)> {
     if enterprise {
         // The whole string (with any unescaped '@' kept) is one component,
         // in the default realm unless a trailing realm follows a second '@'.
@@ -390,7 +393,10 @@ fn k5_begin(o: &mut Opts) -> Option<K5> {
         match parse_name(n, o.enterprise, defrealm.as_deref()) {
             Some(p) => me = Some(p),
             None => {
-                com_err("Malformed representation of principal", &format!("when parsing name {n}"));
+                com_err(
+                    "Malformed representation of principal",
+                    &format!("when parsing name {n}"),
+                );
                 return None;
             }
         }
@@ -419,7 +425,10 @@ fn k5_begin(o: &mut Opts) -> Option<K5> {
         }
     } else if o.action == Action::InitKt {
         let Some(host) = local_fqdn() else {
-            com_err("Hostname cannot be canonicalized", "when creating default server principal name");
+            com_err(
+                "Hostname cannot be canonicalized",
+                "when creating default server principal name",
+            );
             return None;
         };
         let realm = krb5_rs::locate::host_realm(&profile, &host)
@@ -444,7 +453,10 @@ fn k5_begin(o: &mut Opts) -> Option<K5> {
             match parse_name(&name, o.enterprise, defrealm.as_deref()) {
                 Some(p) => p,
                 None => {
-                    com_err("Malformed representation of principal", &format!("when parsing name {name}"));
+                    com_err(
+                        "Malformed representation of principal",
+                        &format!("when parsing name {name}"),
+                    );
                     return None;
                 }
             }
@@ -615,8 +627,7 @@ fn pkinit_config(
         }
         found.ok_or(last)?
     };
-    if o
-        .pa_opts
+    if o.pa_opts
         .iter()
         .any(|(k, v)| k == "disable_freshness" && v == "yes")
     {
@@ -722,7 +733,12 @@ fn as_config(k5: &K5, o: &Opts) -> Result<AsExchangeConfig, String> {
 
 /// Write `cred` as the cache's only credential (`krb5_cc_initialize` and
 /// `k5_cc_store_primary_cred`).
-fn store_primary(cache: &mut dyn Ccache, cred: &Credential, client: &PrincipalName, realm: &str) -> Result<(), CcError> {
+fn store_primary(
+    cache: &mut dyn Ccache,
+    cred: &Credential,
+    client: &PrincipalName,
+    realm: &str,
+) -> Result<(), CcError> {
     cache.initialize(client, realm)?;
     cache.store(&CcCredential::from(cred))
 }
@@ -739,7 +755,10 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
             .map(|r| Arc::new(r) as Arc<dyn krb5_rs::locate::DnsResolver + Send + Sync>);
     let transport = krb5_rs::transport::LocatedTransport::new(k5.profile.clone(), dns);
     let client = KerberosClient::new(k5.realm.clone(), transport);
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             com_err(e, "while initializing Kerberos 5 library");
@@ -830,14 +849,23 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
         Action::Renew | Action::Validate => {
             let server = match &o.service_name {
                 Some(s) => parse_principal(s, Some(&k5.realm)).map(|(p, _)| (p, k5.realm.clone())),
-                None => Some((PrincipalName::new_srv_inst("krbtgt", &k5.realm), k5.realm.clone())),
+                None => Some((
+                    PrincipalName::new_srv_inst("krbtgt", &k5.realm),
+                    k5.realm.clone(),
+                )),
             };
             let old = server.and_then(|(sp, sr)| {
-                k5.in_cc.as_ref().unwrap_or(&k5.out_cc).creds().ok()?.into_iter().find(|c| {
-                    c.server.name_string == sp.name_string
-                        && c.srealm == sr
-                        && c.client.name_string == k5.me.name_string
-                })
+                k5.in_cc
+                    .as_ref()
+                    .unwrap_or(&k5.out_cc)
+                    .creds()
+                    .ok()?
+                    .into_iter()
+                    .find(|c| {
+                        c.server.name_string == sp.name_string
+                            && c.srealm == sr
+                            && c.client.name_string == k5.me.name_string
+                    })
             });
             match old.map(|c| Credential::try_from(&c)) {
                 Some(Ok(old)) => {
@@ -853,7 +881,10 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
                     return false;
                 }
                 None => {
-                    com_err("Matching credential not found", &format!("while {}", valrenew_doing(o.action)));
+                    com_err(
+                        "Matching credential not found",
+                        &format!("while {}", valrenew_doing(o.action)),
+                    );
                     return false;
                 }
             }
@@ -906,13 +937,17 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
                 return false;
             }
         };
-        let moved = k5.out_cc.initialize(&cprinc.0, &cprinc.1).and_then(|()| {
-            staged.iter().try_for_each(|c| k5.out_cc.store(c))
-        });
+        let moved = k5
+            .out_cc
+            .initialize(&cprinc.0, &cprinc.1)
+            .and_then(|()| staged.iter().try_for_each(|c| k5.out_cc.store(c)));
         if let Err(e) = moved {
             com_err(
                 e,
-                &format!("while saving to cache {}", o.out_cache.as_deref().unwrap_or("")),
+                &format!(
+                    "while saving to cache {}",
+                    o.out_cache.as_deref().unwrap_or("")
+                ),
             );
             return false;
         }

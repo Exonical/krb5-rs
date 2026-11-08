@@ -58,8 +58,7 @@ pub fn profile() -> Profile {
             text.push('\n');
         }
     }
-    Profile::parse(&text)
-        .unwrap_or_else(|e| fail(e, "while initializing krb5", 1))
+    Profile::parse(&text).unwrap_or_else(|e| fail(e, "while initializing krb5", 1))
 }
 
 /// The `LC_TIME` locale (`setlocale(LC_ALL, "")`).
@@ -216,45 +215,6 @@ impl Iterator for Getopt {
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    fn opts(args: &[&str], spec: &'static str) -> (Vec<(char, Option<String>)>, Vec<String>) {
-        let mut g = Getopt::from_args(args.iter().map(|s| s.to_string()).collect(), spec);
-        let v: Vec<_> = g.by_ref().collect();
-        (v, g.rest().to_vec())
-    }
-
-    #[test]
-    fn getopt_like_posix() {
-        let (v, rest) = opts(&["-ef", "-cFILE:x", "-p", "a@R", "name", "-q"], "efc:p:q");
-        assert_eq!(
-            v,
-            [
-                ('e', None),
-                ('f', None),
-                ('c', Some("FILE:x".into())),
-                ('p', Some("a@R".into()))
-            ]
-        );
-        assert_eq!(rest, ["name", "-q"]);
-        let (v, rest) = opts(&["-x", "--", "-q"], "q");
-        assert_eq!(v, [('?', None)]);
-        assert_eq!(rest, ["-q"]);
-        let (v, _) = opts(&["-c"], "c:");
-        assert_eq!(v, [('?', None)]);
-    }
-
-    #[test]
-    fn etype_strings() {
-        assert_eq!(etype_string(18), "aes256-cts-hmac-sha1-96");
-        assert_eq!(etype_string(23), "DEPRECATED:arcfour-hmac");
-        assert_eq!(etype_string(999), "etype 999");
-    }
-}
-
 /// `krb5int_libdefault_string`: `[libdefaults] realm = { name }`, then
 /// `[libdefaults] name`.
 pub fn libdefault_string(profile: &Profile, realm: &str, name: &str) -> Option<String> {
@@ -265,12 +225,10 @@ pub fn libdefault_string(profile: &Profile, realm: &str, name: &str) -> Option<S
 
 /// `krb5int_libdefault_boolean`.
 pub fn libdefault_boolean(profile: &Profile, realm: &str, name: &str) -> Option<bool> {
-    libdefault_string(profile, realm, name).and_then(|s| {
-        match s.to_ascii_lowercase().as_str() {
-            "y" | "yes" | "true" | "t" | "1" | "on" => Some(true),
-            "n" | "no" | "false" | "nil" | "0" | "off" => Some(false),
-            _ => None,
-        }
+    libdefault_string(profile, realm, name).and_then(|s| match s.to_ascii_lowercase().as_str() {
+        "y" | "yes" | "true" | "t" | "1" | "on" => Some(true),
+        "n" | "no" | "false" | "nil" | "0" | "off" => Some(false),
+        _ => None,
     })
 }
 
@@ -320,7 +278,12 @@ pub fn string_to_timestamp(s: &str) -> Option<i64> {
     ];
     const NO_SEC: [&str; 1] = ["%y%m%d%H%M"];
     const TIME: [&str; 4] = ["%H%M%S", "%H%M", "%T", "%R"];
-    let local = |n: NaiveDateTime| Local.from_local_datetime(&n).earliest().map(|t| t.timestamp());
+    let local = |n: NaiveDateTime| {
+        Local
+            .from_local_datetime(&n)
+            .earliest()
+            .map(|t| t.timestamp())
+    };
     for f in FULL.iter().chain(NO_SEC.iter()) {
         if let Ok(n) = NaiveDateTime::parse_from_str(s, f) {
             return local(n);
@@ -346,15 +309,56 @@ pub fn kerberos_client(
         .ok()
         .map(|r| std::sync::Arc::new(r) as Dns);
     let transport = krb5_rs::transport::LocatedTransport::new(profile.clone(), dns);
-    krb5_rs::client::KerberosClient::new(realm.to_string(), transport).with_host_canonicalization(
-        krb5_rs::client::HostCanonicalization::from_profile(profile),
-    )
+    krb5_rs::client::KerberosClient::new(realm.to_string(), transport)
+        .with_host_canonicalization(krb5_rs::client::HostCanonicalization::from_profile(profile))
 }
 
 /// A current-thread runtime for the async client calls.
 pub fn runtime() -> tokio::runtime::Runtime {
-    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => fail(e, "while initializing krb5 library", 1),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn opts(args: &[&str], spec: &'static str) -> (Vec<(char, Option<String>)>, Vec<String>) {
+        let mut g = Getopt::from_args(args.iter().map(|s| s.to_string()).collect(), spec);
+        let v: Vec<_> = g.by_ref().collect();
+        (v, g.rest().to_vec())
+    }
+
+    #[test]
+    fn getopt_like_posix() {
+        let (v, rest) = opts(&["-ef", "-cFILE:x", "-p", "a@R", "name", "-q"], "efc:p:q");
+        assert_eq!(
+            v,
+            [
+                ('e', None),
+                ('f', None),
+                ('c', Some("FILE:x".into())),
+                ('p', Some("a@R".into()))
+            ]
+        );
+        assert_eq!(rest, ["name", "-q"]);
+        let (v, rest) = opts(&["-x", "--", "-q"], "q");
+        assert_eq!(v, [('?', None)]);
+        assert_eq!(rest, ["-q"]);
+        let (v, _) = opts(&["-c"], "c:");
+        assert_eq!(v, [('?', None)]);
+    }
+
+    #[test]
+    fn etype_strings() {
+        assert_eq!(etype_string(18), "aes256-cts-hmac-sha1-96");
+        assert_eq!(etype_string(23), "DEPRECATED:arcfour-hmac");
+        assert_eq!(etype_string(999), "etype 999");
     }
 }

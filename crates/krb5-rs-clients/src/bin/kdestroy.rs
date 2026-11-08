@@ -21,8 +21,7 @@ fn usage() -> ! {
 
 /// kdestroy.c `print_remaining_cc_warning`.
 fn print_remaining_cc_warning(ctx: &CcContext) {
-    let caches =
-        collection(ctx).unwrap_or_else(|e| fail(e, "while listing credential caches", 1));
+    let caches = collection(ctx).unwrap_or_else(|e| fail(e, "while listing credential caches", 1));
     if !caches.is_empty() {
         eprintln!("Other credential caches present, use -A to destroy all");
     }

@@ -99,7 +99,11 @@ impl<T> Subsystem<T> {
             (LIST_NAMES, "List available requests."),
             (QUIT_NAMES, "Exit program."),
         ] {
-            let tmp = [Request::<()> { names, info, func: |_, _| {} }];
+            let tmp = [Request::<()> {
+                names,
+                info,
+                func: |_, _| {},
+            }];
             let l = list_requests(self.name, &tmp);
             s.push_str(l.split_once("\n\n").map_or("", |(_, r)| r));
         }
@@ -110,7 +114,10 @@ impl<T> Subsystem<T> {
     pub fn execute_line(&self, state: &mut T, line: &str) -> Exec {
         let line = line.trim_start_matches([' ', '\t']);
         if let Some(cmd) = line.strip_prefix('!') {
-            let _ = std::process::Command::new("/bin/sh").arg("-c").arg(cmd).status();
+            let _ = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(cmd)
+                .status();
             return Exec::Done;
         }
         let Some(argv) = parse(line) else {
@@ -193,7 +200,11 @@ mod tests {
     #[test]
     fn list_requests_layout() {
         let t = [
-            Request::<()> { names: &["list", "l"], info: "List the current keylist.", func: |_, _| {} },
+            Request::<()> {
+                names: &["list", "l"],
+                info: "List the current keylist.",
+                func: |_, _| {},
+            },
             Request::<()> {
                 names: &["get_principals", "getprincs", "listprincs"],
                 info: "List principals",

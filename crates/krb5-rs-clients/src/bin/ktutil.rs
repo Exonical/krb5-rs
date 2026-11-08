@@ -196,9 +196,9 @@ fn add_entry(k: &mut Ktutil, argv: &[String]) {
         }
         i += 1;
     }
-    let Some(princ) = princ.filter(|_| {
-        use_pass + use_key == 1 && use_kvno != 0 && !(fetch != 0 && salt.is_some())
-    }) else {
+    let Some(princ) = princ
+        .filter(|_| use_pass + use_key == 1 && use_kvno != 0 && !(fetch != 0 && salt.is_some()))
+    else {
         eprintln!(
             "usage: {} (-key | -password) -p principal -k kvno [-e enctype] [-f|-s salt]",
             argv[0]
@@ -233,7 +233,9 @@ fn atoi(s: &str) -> i64 {
     let n = digits
         .bytes()
         .take_while(u8::is_ascii_digit)
-        .fold(0i64, |n, d| n.wrapping_mul(10).wrapping_add(i64::from(d - b'0')));
+        .fold(0i64, |n, d| {
+            n.wrapping_mul(10).wrapping_add(i64::from(d - b'0'))
+        });
     if neg {
         -n
     } else {
@@ -250,7 +252,11 @@ fn delete_entry(k: &mut Ktutil, argv: &[String]) {
     if idx >= 1 && (idx as usize) <= k.list.len() {
         k.list.remove(idx as usize - 1);
     } else {
-        err(&argv[0], "Invalid argument", &format!("while deleting entry {idx}"));
+        err(
+            &argv[0],
+            "Invalid argument",
+            &format!("while deleting entry {idx}"),
+        );
     }
 }
 
@@ -267,10 +273,18 @@ fn list(k: &mut Ktutil, argv: &[String]) {
             }
         }
     }
-    print!("{}", list_output(&k.list, show_time, show_keys, show_enctype));
+    print!(
+        "{}",
+        list_output(&k.list, show_time, show_keys, show_enctype)
+    );
 }
 
-fn list_output(list: &[KeytabEntry], show_time: bool, show_keys: bool, show_enctype: bool) -> String {
+fn list_output(
+    list: &[KeytabEntry],
+    show_time: bool,
+    show_keys: bool,
+    show_enctype: bool,
+) -> String {
     let mut out = String::new();
     if show_time {
         out.push_str("slot KVNO Timestamp         Principal\n");
@@ -303,20 +317,59 @@ fn list_output(list: &[KeytabEntry], show_time: bool, show_keys: bool, show_enct
 }
 
 static TABLE: &[Request<Ktutil>] = &[
-    Request { names: &["clear_list", "clear"], info: "Clear the current keylist.", func: clear_list },
-    Request { names: &["read_kt", "rkt"], info: "Read a krb5 keytab into the current keylist.", func: read_v5 },
-    Request { names: &["read_st", "rst"], info: "Deprecated and removed.", func: read_v4 },
-    Request { names: &["write_kt", "wkt"], info: "Write the current keylist to a krb5 keytab.", func: write_v5 },
-    Request { names: &["write_st", "wst"], info: "Deprecated and removed.", func: write_v4 },
-    Request { names: &["add_entry", "addent"], info: "Add an entry to the current keylist.", func: add_entry },
-    Request { names: &["delete_entry", "delent"], info: "Delete an entry from the current keylist.", func: delete_entry },
-    Request { names: &["list", "l"], info: "List the current keylist.", func: list },
+    Request {
+        names: &["clear_list", "clear"],
+        info: "Clear the current keylist.",
+        func: clear_list,
+    },
+    Request {
+        names: &["read_kt", "rkt"],
+        info: "Read a krb5 keytab into the current keylist.",
+        func: read_v5,
+    },
+    Request {
+        names: &["read_st", "rst"],
+        info: "Deprecated and removed.",
+        func: read_v4,
+    },
+    Request {
+        names: &["write_kt", "wkt"],
+        info: "Write the current keylist to a krb5 keytab.",
+        func: write_v5,
+    },
+    Request {
+        names: &["write_st", "wst"],
+        info: "Deprecated and removed.",
+        func: write_v4,
+    },
+    Request {
+        names: &["add_entry", "addent"],
+        info: "Add an entry to the current keylist.",
+        func: add_entry,
+    },
+    Request {
+        names: &["delete_entry", "delent"],
+        info: "Delete an entry from the current keylist.",
+        func: delete_entry,
+    },
+    Request {
+        names: &["list", "l"],
+        info: "List the current keylist.",
+        func: list,
+    },
 ];
 
 fn main() {
     let profile = Arc::new(krb5_rs_clients::profile());
-    let mut k = Ktutil { profile, list: Vec::new() };
-    Subsystem { name: "ktutil", table: TABLE }.listen(&mut k);
+    let mut k = Ktutil {
+        profile,
+        list: Vec::new(),
+    };
+    Subsystem {
+        name: "ktutil",
+        table: TABLE,
+    }
+    .listen(&mut k);
 }
 
 #[cfg(test)]

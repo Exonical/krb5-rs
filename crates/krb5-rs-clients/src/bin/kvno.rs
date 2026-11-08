@@ -177,7 +177,11 @@ fn read_pem_file(path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// `krb5_parse_name_flags` with optional `KRB5_PRINCIPAL_PARSE_ENTERPRISE`.
-fn parse_name(s: &str, enterprise: bool, defrealm: Option<&str>) -> Option<(PrincipalName, String)> {
+fn parse_name(
+    s: &str,
+    enterprise: bool,
+    defrealm: Option<&str>,
+) -> Option<(PrincipalName, String)> {
     if enterprise {
         let (name, realm) = match s.rsplit_once('@') {
             Some((n, r)) if n.contains('@') => (n.to_string(), r.to_string()),
@@ -212,7 +216,10 @@ fn sname_to_principal(
 
 /// `krb5_server_decrypt_ticket_keytab` (srv_dec_tkt.c:74-131): try every
 /// entry with the ticket's enctype.
-fn keytab_decrypts(kt: &dyn krb5_rs::client::vfy::VerifyKeytab, ticket: &Ticket) -> Result<(), String> {
+fn keytab_decrypts(
+    kt: &dyn krb5_rs::client::vfy::VerifyKeytab,
+    ticket: &Ticket,
+) -> Result<(), String> {
     let etype = ticket.enc_part.etype;
     let mut found = false;
     for e in kt.entries().map_err(|e| e.to_string())? {
@@ -267,7 +274,10 @@ fn kvno(o: &Opts, cx: &Ctx, ccache: &mut AnyCcache, name: &str) -> Option<Creden
     let (me, mrealm) = &cx.me;
     let result = if cx.for_user.is_some() || cx.user_cert.is_some() {
         if !o.proxy && !(server.name_string == me.name_string && srealm == *mrealm) {
-            err("Invalid argument", "client and server principal names must match");
+            err(
+                "Invalid argument",
+                "client and server principal names must match",
+            );
             return None;
         }
         let (fu, fr) = cx
@@ -292,7 +302,10 @@ fn kvno(o: &Opts, cx: &Ctx, ccache: &mut AnyCcache, name: &str) -> Option<Creden
     let creds = match result {
         Ok(c) => c,
         Err(e) => {
-            err(krb5_message(&e), &format!("while getting credentials for {princ}"));
+            err(
+                krb5_message(&e),
+                &format!("while getting credentials for {princ}"),
+            );
             return None;
         }
     };
@@ -312,12 +325,7 @@ fn kvno(o: &Opts, cx: &Ctx, ccache: &mut AnyCcache, name: &str) -> Option<Creden
         println!("{princ}: kvno = {kvno}");
     }
     if o.proxy {
-        let req = CredsRequest::new(
-            creds.client.clone(),
-            creds.crealm.clone(),
-            server,
-            srealm,
-        );
+        let req = CredsRequest::new(creds.client.clone(), creds.crealm.clone(), server, srealm);
         return match cx.rt.block_on(cx.client.get_credentials_for_proxy(
             ccache,
             GcOptions::CANONICALIZE,
@@ -326,7 +334,10 @@ fn kvno(o: &Opts, cx: &Ctx, ccache: &mut AnyCcache, name: &str) -> Option<Creden
         )) {
             Ok(c) => Some(c),
             Err(e) => {
-                err(krb5_message(&e), &format!("{princ}: constrained delegation failed"));
+                err(
+                    krb5_message(&e),
+                    &format!("{princ}: constrained delegation failed"),
+                );
                 None
             }
         };
@@ -369,9 +380,8 @@ fn main() {
     let profile = Arc::new(krb5_rs_clients::profile());
     let ctx = CcContext::from_env(Some(&profile));
     let etype = match &o.etype {
-        Some(s) => krb5_rs::crypto::enctype_from_name(s).unwrap_or_else(|| {
-            die("Invalid encryption type", "while converting etype")
-        }),
+        Some(s) => krb5_rs::crypto::enctype_from_name(s)
+            .unwrap_or_else(|| die("Invalid encryption type", "while converting etype")),
         None => 0,
     };
     let mut ccache = match &o.ccache {
@@ -379,12 +389,14 @@ fn main() {
         None => default_cache(&ctx),
     }
     .unwrap_or_else(|e| die(e, "while opening ccache"));
-    let mut out_ccache = o.out_ccname.as_ref().map(|n| {
-        resolve(&ctx, n).unwrap_or_else(|e| die(e, "while resolving output ccache"))
-    });
-    let keytab = o.keytab.as_ref().map(|n| {
-        resolve_keytab(n).unwrap_or_else(|e| die(e, &format!("resolving keytab {n}")))
-    });
+    let mut out_ccache = o
+        .out_ccname
+        .as_ref()
+        .map(|n| resolve(&ctx, n).unwrap_or_else(|e| die(e, "while resolving output ccache")));
+    let keytab = o
+        .keytab
+        .as_ref()
+        .map(|n| resolve_keytab(n).unwrap_or_else(|e| die(e, &format!("resolving keytab {n}"))));
     let defrealm = krb5_rs::locate::default_realm(&profile);
     let for_user = o.for_user.as_ref().map(|u| {
         parse_name(u, o.for_user_enterprise, defrealm.as_deref()).unwrap_or_else(|| {
@@ -395,13 +407,11 @@ fn main() {
         })
     });
     let user_cert = o.for_user_cert_file.as_ref().map(|f| {
-        read_pem_file(f)
-            .unwrap_or_else(|e| die(e, &format!("while reading certificate file {f}")))
+        read_pem_file(f).unwrap_or_else(|e| die(e, &format!("while reading certificate file {f}")))
     });
     let u2u_ticket = o.u2u_ccname.as_ref().map(|n| {
-        get_u2u_ticket(&ctx, n).unwrap_or_else(|e| {
-            die(e, &format!("while getting user-to-user ticket from {n}"))
-        })
+        get_u2u_ticket(&ctx, n)
+            .unwrap_or_else(|e| die(e, &format!("while getting user-to-user ticket from {n}")))
     });
     if u2u_ticket.is_some() {
         options |= GcOptions::USER_USER;

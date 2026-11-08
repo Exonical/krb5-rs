@@ -161,10 +161,8 @@ fn keytab_full_name(name: &str) -> String {
 
 fn do_keytab(o: &Opts, profile: &krb5_rs::profile::Profile, name: Option<&str>) -> i32 {
     let ktname = match name {
-        None if o.use_client_keytab => {
-            krb5_rs::client::default_client_keytab_name(Some(profile))
-                .unwrap_or_else(|e| fail(e, "while getting default client keytab", 1))
-        }
+        None if o.use_client_keytab => krb5_rs::client::default_client_keytab_name(Some(profile))
+            .unwrap_or_else(|e| fail(e, "while getting default client keytab", 1)),
         None => krb5_rs::ccache::expand_path_tokens(&krb5_rs::client::vfy::default_keytab_name(
             Some(profile),
         ))
@@ -192,9 +190,7 @@ fn do_keytab(o: &Opts, profile: &krb5_rs::profile::Profile, name: Option<&str>) 
         println!("{}", "-".repeat(78usize.saturating_sub(o.width + 5)));
     } else {
         println!("KVNO Principal");
-        println!(
-            "---- --------------------------------------------------------------------------"
-        );
+        println!("---- --------------------------------------------------------------------------");
     }
     for e in entries {
         let mut line = format!("{:4} ", e.kvno);
@@ -446,7 +442,11 @@ fn show_credential(o: &Opts, cred: &CcCredential, defname: &str) {
         ccol = 8;
         for (i, c) in cred.server.name_string.iter().enumerate().skip(1) {
             let s = String::from_utf8_lossy(c.as_bytes());
-            let s = if i > 1 { format!("({s})") } else { s.into_owned() };
+            let s = if i > 1 {
+                format!("({s})")
+            } else {
+                s.into_owned()
+            };
             ccol += s.len();
             out.push_str(&s);
         }
@@ -516,8 +516,7 @@ fn show_credential(o: &Opts, cred: &CcCredential, defname: &str) {
     if let Some(t) = &tkt {
         let same = t.realm.as_bytes() == cred.srealm.as_bytes()
             && t.sname.name_string.len() == cred.server.name_string.len()
-            && t
-                .sname
+            && t.sname
                 .name_string
                 .iter()
                 .zip(&cred.server.name_string)

@@ -176,11 +176,17 @@ impl Handle {
     pub fn init(p: &InitParams<'_>, auth: &Auth) -> Result<Handle, Error> {
         let rt = crate::runtime();
         let rpc = rt.block_on(Self::connect(p, auth))?;
-        let mut h = Handle { rt, rpc, api: API_VERSION_4 };
+        let mut h = Handle {
+            rt,
+            rpc,
+            api: API_VERSION_4,
+        };
         loop {
             let reply = h.call(proc_::INIT, &ReadArgs::Api(h.api).encode())?;
             match h.check(decode_generic_ret(&reply)) {
-                Err(Error::Kadm5(c)) if c == code::NEW_SERVER_API_VERSION && h.api > API_VERSION_2 => {
+                Err(Error::Kadm5(c))
+                    if c == code::NEW_SERVER_API_VERSION && h.api > API_VERSION_2 =>
+                {
                     h.api -= 1;
                 }
                 Err(e) => return Err(e),
@@ -335,19 +341,32 @@ impl Handle {
         passwd: Option<String>,
     ) -> Result<(), Error> {
         let api_version = self.api;
-        self.write(WriteArgs::CreatePrincipal { api_version, rec: Box::new(rec), mask, ks_tuple, passwd })
+        self.write(WriteArgs::CreatePrincipal {
+            api_version,
+            rec: Box::new(rec),
+            mask,
+            ks_tuple,
+            passwd,
+        })
     }
 
     /// `kadm5_delete_principal`.
     pub fn delete_principal(&mut self, princ: &str) -> Result<(), Error> {
         let api_version = self.api;
-        self.write(WriteArgs::DeletePrincipal { api_version, princ: Some(princ.into()) })
+        self.write(WriteArgs::DeletePrincipal {
+            api_version,
+            princ: Some(princ.into()),
+        })
     }
 
     /// `kadm5_modify_principal`.
     pub fn modify_principal(&mut self, rec: PrincipalEnt, mask: i32) -> Result<(), Error> {
         let api_version = self.api;
-        self.write(WriteArgs::ModifyPrincipal { api_version, rec: Box::new(rec), mask })
+        self.write(WriteArgs::ModifyPrincipal {
+            api_version,
+            rec: Box::new(rec),
+            mask,
+        })
     }
 
     /// `kadm5_rename_principal`.
@@ -416,14 +435,21 @@ impl Handle {
 
     /// `kadm5_get_principal`.
     pub fn get_principal(&mut self, princ: &str, mask: i32) -> Result<PrincipalEnt, Error> {
-        let a = ReadArgs::GetPrincipal { api_version: self.api, princ: Some(princ.into()), mask };
+        let a = ReadArgs::GetPrincipal {
+            api_version: self.api,
+            princ: Some(princ.into()),
+            mask,
+        };
         let reply = self.read(proc_::GET_PRINCIPAL, a)?;
         self.need(decode_gprinc_ret(&reply))
     }
 
     /// `kadm5_get_principals`.
     pub fn get_principals(&mut self, exp: Option<&str>) -> Result<Vec<String>, Error> {
-        let a = ReadArgs::Name { api_version: self.api, name: exp.map(str::to_string) };
+        let a = ReadArgs::Name {
+            api_version: self.api,
+            name: exp.map(str::to_string),
+        };
         let reply = self.read(proc_::GET_PRINCS, a)?;
         Ok(self.check(decode_names_ret(&reply))?.unwrap_or_default())
     }
@@ -431,31 +457,48 @@ impl Handle {
     /// `kadm5_create_policy`.
     pub fn create_policy(&mut self, rec: PolicyEnt, mask: i32) -> Result<(), Error> {
         let api_version = self.api;
-        self.write(WriteArgs::CreatePolicy { api_version, rec: Box::new(rec), mask })
+        self.write(WriteArgs::CreatePolicy {
+            api_version,
+            rec: Box::new(rec),
+            mask,
+        })
     }
 
     /// `kadm5_modify_policy`.
     pub fn modify_policy(&mut self, rec: PolicyEnt, mask: i32) -> Result<(), Error> {
         let api_version = self.api;
-        self.write(WriteArgs::ModifyPolicy { api_version, rec: Box::new(rec), mask })
+        self.write(WriteArgs::ModifyPolicy {
+            api_version,
+            rec: Box::new(rec),
+            mask,
+        })
     }
 
     /// `kadm5_delete_policy`.
     pub fn delete_policy(&mut self, name: &str) -> Result<(), Error> {
         let api_version = self.api;
-        self.write(WriteArgs::DeletePolicy { api_version, name: Some(name.into()) })
+        self.write(WriteArgs::DeletePolicy {
+            api_version,
+            name: Some(name.into()),
+        })
     }
 
     /// `kadm5_get_policy`.
     pub fn get_policy(&mut self, name: &str) -> Result<PolicyEnt, Error> {
-        let a = ReadArgs::Name { api_version: self.api, name: Some(name.into()) };
+        let a = ReadArgs::Name {
+            api_version: self.api,
+            name: Some(name.into()),
+        };
         let reply = self.read(proc_::GET_POLICY, a)?;
         self.need(decode_gpol_ret(&reply))
     }
 
     /// `kadm5_get_policies`.
     pub fn get_policies(&mut self, exp: Option<&str>) -> Result<Vec<String>, Error> {
-        let a = ReadArgs::Name { api_version: self.api, name: exp.map(str::to_string) };
+        let a = ReadArgs::Name {
+            api_version: self.api,
+            name: exp.map(str::to_string),
+        };
         let reply = self.read(proc_::GET_POLS, a)?;
         Ok(self.check(decode_names_ret(&reply))?.unwrap_or_default())
     }
@@ -463,7 +506,8 @@ impl Handle {
     /// `kadm5_get_privs`.
     pub fn get_privs(&mut self) -> Result<i32, Error> {
         let reply = self.read(proc_::GET_PRIVS, ReadArgs::Api(self.api))?;
-        let (_, c, privs) = decode_getprivs_ret(&reply).map_err(|_| Error::Kadm5(code::RPC_ERROR))?;
+        let (_, c, privs) =
+            decode_getprivs_ret(&reply).map_err(|_| Error::Kadm5(code::RPC_ERROR))?;
         if c == code::OK {
             Ok(privs)
         } else {
@@ -474,12 +518,19 @@ impl Handle {
     /// `kadm5_purgekeys`.
     pub fn purgekeys(&mut self, princ: &str, keepkvno: i32) -> Result<(), Error> {
         let api_version = self.api;
-        self.write(WriteArgs::Purgekeys { api_version, princ: Some(princ.into()), keepkvno })
+        self.write(WriteArgs::Purgekeys {
+            api_version,
+            princ: Some(princ.into()),
+            keepkvno,
+        })
     }
 
     /// `kadm5_get_strings`.
     pub fn get_strings(&mut self, princ: &str) -> Result<Vec<(String, String)>, Error> {
-        let a = ReadArgs::Name { api_version: self.api, name: Some(princ.into()) };
+        let a = ReadArgs::Name {
+            api_version: self.api,
+            name: Some(princ.into()),
+        };
         let reply = self.read(proc_::GET_STRINGS, a)?;
         Ok(self.check(decode_gstrings_ret(&reply))?.unwrap_or_default())
     }
@@ -497,8 +548,12 @@ impl Handle {
 
     /// `kadm5_get_principal_keys`.
     pub fn get_principal_keys(&mut self, princ: &str, kvno: u32) -> Result<Vec<KeyData>, Error> {
-        let (p, b) = WriteArgs::ExtractKeys { api_version: self.api, princ: Some(princ.into()), kvno }
-            .encode();
+        let (p, b) = WriteArgs::ExtractKeys {
+            api_version: self.api,
+            princ: Some(princ.into()),
+            kvno,
+        }
+        .encode();
         let reply = self.call(p, &b)?;
         Ok(self.check(decode_getpkeys_ret(&reply))?.unwrap_or_default())
     }
@@ -520,9 +575,18 @@ mod tests {
 
     #[test]
     fn admin_server_port_forms() {
-        assert_eq!(parse_admin_server_port("kdc.example.com"), ("kdc.example.com".into(), None));
-        assert_eq!(parse_admin_server_port("kdc:7490"), ("kdc".into(), Some(7490)));
-        assert_eq!(parse_admin_server_port("[::1]:750"), ("::1".into(), Some(750)));
+        assert_eq!(
+            parse_admin_server_port("kdc.example.com"),
+            ("kdc.example.com".into(), None)
+        );
+        assert_eq!(
+            parse_admin_server_port("kdc:7490"),
+            ("kdc".into(), Some(7490))
+        );
+        assert_eq!(
+            parse_admin_server_port("[::1]:750"),
+            ("::1".into(), Some(750))
+        );
         assert_eq!(parse_admin_server_port("[::1]"), ("::1".into(), None));
     }
 
@@ -532,9 +596,15 @@ mod tests {
             "[realms]\n R = {\n  admin_server = a.example:900\n }\n S = {\n  admin_server = b\n  kadmind_port = 7000\n }\n",
         )
         .unwrap();
-        assert_eq!(admin_server(&p, "R", None).unwrap(), ("a.example".into(), 900));
+        assert_eq!(
+            admin_server(&p, "R", None).unwrap(),
+            ("a.example".into(), 900)
+        );
         assert_eq!(admin_server(&p, "S", None).unwrap(), ("b".into(), 7000));
-        assert_eq!(admin_server(&p, "S", Some("c")).unwrap(), ("c".into(), 7000));
+        assert_eq!(
+            admin_server(&p, "S", Some("c")).unwrap(),
+            ("c".into(), 7000)
+        );
         assert!(matches!(
             admin_server(&p, "T", None),
             Err(Error::Kadm5(code::MISSING_KRB5_CONF_PARAMS))

@@ -1714,7 +1714,11 @@ fn decode_ret<T>(
     let mut r = XdrReader::new(b);
     let v = r.u32()?;
     let c = r.u32()?;
-    let out = if c == code::OK { Some(f(&mut r, v)?) } else { None };
+    let out = if c == code::OK {
+        Some(f(&mut r, v)?)
+    } else {
+        None
+    };
     r.finish()?;
     Ok((v, c, out))
 }
@@ -1755,7 +1759,7 @@ pub fn decode_gstrings_ret(b: &[u8]) -> Result<Ret<Vec<(String, String)>>, XdrEr
 
 /// Decode a `gpol_ret`.
 pub fn decode_gpol_ret(b: &[u8]) -> Result<Ret<PolicyEnt>, XdrError> {
-    decode_ret(b, |r, v| PolicyEnt::decode(r, v))
+    decode_ret(b, PolicyEnt::decode)
 }
 
 /// Decode a `gprinc_ret`.
@@ -1809,9 +1813,20 @@ mod client_tests {
                 ks_tuple: None,
                 passwd: None,
             },
-            WriteArgs::DeletePrincipal { api_version: v, princ: n("a") },
-            WriteArgs::ModifyPrincipal { api_version: v, rec: Box::new(rec), mask: 4 },
-            WriteArgs::RenamePrincipal { api_version: v, src: n("a"), dest: n("b") },
+            WriteArgs::DeletePrincipal {
+                api_version: v,
+                princ: n("a"),
+            },
+            WriteArgs::ModifyPrincipal {
+                api_version: v,
+                rec: Box::new(rec),
+                mask: 4,
+            },
+            WriteArgs::RenamePrincipal {
+                api_version: v,
+                src: n("a"),
+                dest: n("b"),
+            },
             WriteArgs::ChpassPrincipal {
                 api_version: v,
                 princ: n("a"),
@@ -1833,51 +1848,130 @@ mod client_tests {
                 keepold: true,
                 keys: SetKeys::V4(vec![KeyData {
                     kvno: 2,
-                    key: KeyBlock { enctype: 18, contents: vec![1; 32] },
+                    key: KeyBlock {
+                        enctype: 18,
+                        contents: vec![1; 32],
+                    },
                     salt_type: 0,
                     salt: Vec::new(),
                 }]),
             },
-            WriteArgs::CreatePolicy { api_version: v, rec: Box::new(pol.clone()), mask: 9 },
-            WriteArgs::ModifyPolicy { api_version: API_VERSION_2, rec: Box::new(PolicyEnt { pw_max_fail: 0, allowed_keysalts: None, ..pol }), mask: 9 },
-            WriteArgs::DeletePolicy { api_version: v, name: n("p") },
-            WriteArgs::Purgekeys { api_version: v, princ: n("a"), keepkvno: -1 },
-            WriteArgs::SetString { api_version: v, princ: n("a"), key: n("k"), value: None },
-            WriteArgs::ExtractKeys { api_version: v, princ: n("a"), kvno: 0 },
-            WriteArgs::CreateAlias { api_version: v, alias: n("x"), target: n("a") },
+            WriteArgs::CreatePolicy {
+                api_version: v,
+                rec: Box::new(pol.clone()),
+                mask: 9,
+            },
+            WriteArgs::ModifyPolicy {
+                api_version: API_VERSION_2,
+                rec: Box::new(PolicyEnt {
+                    pw_max_fail: 0,
+                    allowed_keysalts: None,
+                    ..pol
+                }),
+                mask: 9,
+            },
+            WriteArgs::DeletePolicy {
+                api_version: v,
+                name: n("p"),
+            },
+            WriteArgs::Purgekeys {
+                api_version: v,
+                princ: n("a"),
+                keepkvno: -1,
+            },
+            WriteArgs::SetString {
+                api_version: v,
+                princ: n("a"),
+                key: n("k"),
+                value: None,
+            },
+            WriteArgs::ExtractKeys {
+                api_version: v,
+                princ: n("a"),
+                kvno: 0,
+            },
+            WriteArgs::CreateAlias {
+                api_version: v,
+                alias: n("x"),
+                target: n("a"),
+            },
         ];
         for c in cases {
             let (p, b) = c.encode();
-            assert_eq!(WriteArgs::decode(p, &b).expect("handled").expect("decode"), c);
+            assert_eq!(
+                WriteArgs::decode(p, &b).expect("handled").expect("decode"),
+                c
+            );
         }
         for (p, c) in [
             (proc_::INIT, ReadArgs::Api(v)),
-            (proc_::GET_PRINCIPAL, ReadArgs::GetPrincipal { api_version: v, princ: n("a"), mask: 7 }),
-            (proc_::GET_PRINCS, ReadArgs::Name { api_version: v, name: None }),
+            (
+                proc_::GET_PRINCIPAL,
+                ReadArgs::GetPrincipal {
+                    api_version: v,
+                    princ: n("a"),
+                    mask: 7,
+                },
+            ),
+            (
+                proc_::GET_PRINCS,
+                ReadArgs::Name {
+                    api_version: v,
+                    name: None,
+                },
+            ),
         ] {
-            assert_eq!(ReadArgs::decode(p, &c.encode()).expect("handled").expect("decode"), c);
+            assert_eq!(
+                ReadArgs::decode(p, &c.encode())
+                    .expect("handled")
+                    .expect("decode"),
+                c
+            );
         }
     }
 
     #[test]
     fn rets_round_trip() {
         let v = API_VERSION_4;
-        assert_eq!(decode_generic_ret(&generic_ret(v, 5)).expect("g"), (v, 5, None));
+        assert_eq!(
+            decode_generic_ret(&generic_ret(v, 5)).expect("g"),
+            (v, 5, None)
+        );
         let names = vec![b"a@R".to_vec(), b"b@R".to_vec()];
         assert_eq!(
             decode_names_ret(&names_ret(v, 0, &names)).expect("n").2,
             Some(vec!["a@R".to_string(), "b@R".to_string()])
         );
-        assert_eq!(decode_getprivs_ret(&getprivs_ret(v, 0, 0x3f)).expect("p"), (v, 0, 0x3f));
+        assert_eq!(
+            decode_getprivs_ret(&getprivs_ret(v, 0, 0x3f)).expect("p"),
+            (v, 0, 0x3f)
+        );
         let strs = vec![(b"k".to_vec(), b"v".to_vec())];
         assert_eq!(
-            decode_gstrings_ret(&gstrings_ret(v, 0, &strs)).expect("s").2,
+            decode_gstrings_ret(&gstrings_ret(v, 0, &strs))
+                .expect("s")
+                .2,
             Some(vec![("k".into(), "v".into())])
         );
-        let ent = PrincipalEnt { principal: Some(b"a@R".to_vec()), kvno: 3, ..PrincipalEnt::default() };
-        assert_eq!(decode_gprinc_ret(&gprinc_ret(v, 0, Some(&ent))).expect("e").2, Some(ent));
-        let kb = vec![KeyBlock { enctype: 17, contents: vec![2; 16] }];
-        assert_eq!(decode_chrand_ret(&chrand_ret(v, 0, &kb)).expect("c").2, Some(kb));
+        let ent = PrincipalEnt {
+            principal: Some(b"a@R".to_vec()),
+            kvno: 3,
+            ..PrincipalEnt::default()
+        };
+        assert_eq!(
+            decode_gprinc_ret(&gprinc_ret(v, 0, Some(&ent)))
+                .expect("e")
+                .2,
+            Some(ent)
+        );
+        let kb = vec![KeyBlock {
+            enctype: 17,
+            contents: vec![2; 16],
+        }];
+        assert_eq!(
+            decode_chrand_ret(&chrand_ret(v, 0, &kb)).expect("c").2,
+            Some(kb)
+        );
     }
 }
 
