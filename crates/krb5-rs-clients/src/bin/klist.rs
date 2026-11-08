@@ -67,6 +67,7 @@ fn usage() -> ! {
 }
 
 fn main() {
+    krb5_rs_clients::set_extended_com_err();
     let mut o = Opts::default();
     let mut mode = Mode::Default;
     let mut print_version = false;

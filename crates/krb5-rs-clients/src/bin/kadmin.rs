@@ -248,6 +248,7 @@ fn os_user() -> Option<String> {
 
 /// `kadmin_startup` and `main` (kadmin.c:288-610, ss_wrapper.c).
 fn main() {
+    krb5_rs_clients::set_extended_com_err();
     let argv: Vec<String> = std::env::args().collect();
     let whoami = argv
         .first()

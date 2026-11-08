@@ -27,18 +27,35 @@ pub fn progname() -> &'static str {
 pub mod kadm5;
 pub mod ss;
 
+static EXTENDED_COM_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `set_com_err_hook(extended_com_err_fn)`, as kinit, klist, kvno and
+/// kadmin do: messages end with `"\n"` instead of com_err's `"\r\n"`.
+pub fn set_extended_com_err() {
+    EXTENDED_COM_ERR.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn com_err_eol() -> &'static str {
+    if EXTENDED_COM_ERR.load(std::sync::atomic::Ordering::Relaxed) {
+        "\n"
+    } else {
+        // default_com_err_proc (com_err.c:90-92).
+        "\r\n"
+    }
+}
+
 /// `com_err(progname, code, fmt)`: `prog: message context`.
 pub fn com_err(msg: impl std::fmt::Display, context: &str) {
     if context.is_empty() {
-        eprintln!("{}: {msg}", progname());
+        eprint!("{}: {msg}{}", progname(), com_err_eol());
     } else {
-        eprintln!("{}: {msg} {context}", progname());
+        eprint!("{}: {msg} {context}{}", progname(), com_err_eol());
     }
 }
 
 /// `com_err(whoami, 0, msg)` with an explicit `whoami` (`ss_error`).
 pub fn com_err_as(whoami: &str, msg: impl std::fmt::Display) {
-    eprintln!("{whoami}: {msg}");
+    eprint!("{whoami}: {msg}{}", com_err_eol());
 }
 
 /// [`com_err`], then `exit(code)`.

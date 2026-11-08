@@ -91,6 +91,7 @@ fn usage() -> ! {
         "\t-I input credential cache",
         "\t-T armor credential cache",
         "\t-X <attribute>[=<value>]",
+        "\t--{,no}-request-pac request KDC include/exclude a PAC",
     ] {
         eprintln!("{l}");
     }
@@ -973,6 +974,7 @@ fn valrenew_doing(a: Action) -> &'static str {
 }
 
 fn main() {
+    krb5_rs_clients::set_extended_com_err();
     let mut o = parse_options();
     let authed = match k5_begin(&mut o) {
         Some(mut k5) => k5_kinit(&o, &mut k5),
