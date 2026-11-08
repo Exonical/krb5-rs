@@ -596,7 +596,13 @@ impl AsExchange {
                 self.last_preauth_etype = Some(hint.etype);
             }
             Err(e) => {
-                if self.last_preauth_etype.is_none() && !pkinit_offered {
+                // OTP's reply key is the armor key, so it needs no hint.
+                let otp_offered = self.config.otp.is_some()
+                    && !self.preauth_failed.contains(&crate::otp::PA_OTP_CHALLENGE)
+                    && method
+                        .iter()
+                        .any(|p| p.padata_type == crate::otp::PA_OTP_CHALLENGE);
+                if self.last_preauth_etype.is_none() && !pkinit_offered && !otp_offered {
                     return Err(e);
                 }
             }

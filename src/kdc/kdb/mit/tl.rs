@@ -210,6 +210,40 @@ pub fn set_string_attr(
     Ok(())
 }
 
+/// [`set_string_attr`] on a bare tl-data list.
+pub fn set_string_attr_in(
+    tl_data: &mut Vec<TlData>,
+    key: &[u8],
+    value: Option<&[u8]>,
+) -> Result<(), StoreError> {
+    let mut pairs = attr_pairs_in(tl_data)?;
+    let had = tl_data.iter().any(|tl| tl.kind == STRING_ATTRS);
+    pairs.retain(|(k, _)| value.is_some() || k != key);
+    match (value, pairs.iter_mut().find(|(k, _)| k == key)) {
+        (Some(v), Some(pair)) => pair.1 = v.to_vec(),
+        (Some(v), None) => pairs.push((key.to_vec(), v.to_vec())),
+        (None, _) => {}
+    }
+    if pairs.is_empty() && !had {
+        return Ok(());
+    }
+    let mut data = Vec::new();
+    for (k, v) in &pairs {
+        data.extend_from_slice(k);
+        data.push(0);
+        data.extend_from_slice(v);
+        data.push(0);
+    }
+    match tl_data.iter_mut().find(|tl| tl.kind == STRING_ATTRS) {
+        Some(tl) => tl.data = data,
+        None => tl_data.push(TlData {
+            kind: STRING_ATTRS,
+            data,
+        }),
+    }
+    Ok(())
+}
+
 /// Decode the NUL-terminated key/value list in `STRING_ATTRS`.
 pub fn string_attributes(entry: &MitEntry) -> Result<Vec<StringAttribute>, StoreError> {
     attr_pairs(entry)

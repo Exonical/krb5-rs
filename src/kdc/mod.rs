@@ -61,7 +61,8 @@ pub use server::{
 pub use summary::{Outcome, RequestKind, RequestSummary, Transport};
 
 pub use config::{
-    default_realm, parse_listen_addresses, ConfigError, DbModuleConfig, IpropConfig, RealmConfig,
+    default_realm, otp_config_error, parse_listen_addresses, ConfigError, DbModuleConfig,
+    IpropConfig, RealmConfig,
 };
 pub use db::{
     keys_from_password, random_keys, salt_bytes, KeyEntry, MemoryStore, PrincipalAttributes,

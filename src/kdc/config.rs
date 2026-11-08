@@ -204,6 +204,12 @@ pub struct IpropConfig {
 }
 
 /// The realm to serve when none is given: the only `[realms]` subsection of
+/// Why the OTP module fails to initialize (`otp_init`), for the KDC to log
+/// as `kdc_preauth.c:212-218` does before skipping it.
+pub fn otp_config_error(kdc_conf: &Profile, krb5_conf: Option<&Profile>) -> Option<String> {
+    super::otp::token_types(kdc_conf, krb5_conf, std::path::Path::new(KDC_DIR)).err()
+}
+
 /// kdc.conf, else krb5.conf `[libdefaults] default_realm`.
 pub fn default_realm(kdc_conf: &Profile, krb5_conf: Option<&Profile>) -> Option<String> {
     let realms = kdc_conf.subsection_names(&["realms"]);
