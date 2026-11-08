@@ -397,7 +397,7 @@ pub(super) fn new_cache_for_name(ctx: &CcContext) -> Result<AnyCcache, Krb5Error
     let (cctype, _) = crate::ccache::split_name(&name);
     // krb5_cc_support_switch: DIR, KEYRING and KCM collections.
     let have_collection = matches!(cctype, "DIR" | "KEYRING" | "KCM");
-    // KRB5_FCC_NOFILE; FILE reports a missing file as I/O.
+    // KRB5_FCC_NOFILE.
     let empty = match defcc.principal() {
         Err(CcError::NoFile(_)) => true,
         Err(CcError::Io(e)) => e.kind() == std::io::ErrorKind::NotFound,

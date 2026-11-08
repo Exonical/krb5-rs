@@ -39,14 +39,14 @@ impl FileCcache {
         &self.path
     }
 
-    /// `fcc_destroy`: remove the cache file.
+    /// `fcc_destroy`: remove the cache file; a missing file is plain
+    /// `KRB5_FCC_NOFILE` (cc_file.c:1355).
     pub fn destroy(&self) -> Result<(), CcError> {
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(CcError::NoFile(format!(
-                "No credentials cache found (filename: {})",
-                self.path.display()
-            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(CcError::NoFile("No credentials cache found".into()))
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -125,7 +125,17 @@ impl FileCcache {
     /// Read the file, returning (data, version, creds-region offset).
     /// Also records any DELTATIME offset found.
     fn read_all(&self) -> Result<(Vec<u8>, u8, usize), CcError> {
-        let data = std::fs::read(&self.path)?;
+        // fcc_open (cc_file.c:122): a missing file is KRB5_FCC_NOFILE.
+        let data = std::fs::read(&self.path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CcError::NoFile(format!(
+                    "No credentials cache found (filename: {})",
+                    self.path.display()
+                ))
+            } else {
+                CcError::Io(e)
+            }
+        })?;
         let (version, hdr_len, offset) = Self::parse_header(&data)?;
         if offset.is_some() {
             self.time_offset.set(offset);

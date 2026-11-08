@@ -236,12 +236,23 @@ pub fn libdefault_boolean(profile: &Profile, realm: &str, name: &str) -> Option<
 pub fn krb5_message(e: &krb5_rs::Krb5Error) -> String {
     use krb5_rs::Krb5Error as E;
     match e {
-        E::KdcError(m) => {
-            let base = krb5_rs::protocol::ErrorCode::from_i32(m.error_code)
-                .map(|c| c.description().to_string())
-                .unwrap_or_else(|| format!("KDC error {}", m.error_code));
-            base
+        // get_in_tkt.c:1936-1946 and gc_via_tkt.c:202-214 name the principal.
+        E::KdcError(m) if m.error_code == 6 && m.cname.is_some() => {
+            let (Some(c), Some(r)) = (&m.cname, &m.crealm) else {
+                return "Client not found in Kerberos database".into();
+            };
+            format!(
+                "Client '{}' not found in Kerberos database",
+                krb5_rs::ccache::unparse_name(c, &String::from_utf8_lossy(r.as_ref()))
+            )
         }
+        E::KdcError(m) if m.error_code == 7 => format!(
+            "Server {} not found in Kerberos database",
+            krb5_rs::ccache::unparse_name(&m.sname, &String::from_utf8_lossy(m.realm.as_ref()))
+        ),
+        E::KdcError(m) => krb5_rs::protocol::ErrorCode::from_i32(m.error_code)
+            .map(|c| c.description().to_string())
+            .unwrap_or_else(|| format!("KDC error {}", m.error_code)),
         E::DecryptionFailed => "Decrypt integrity check failed".into(),
         E::PreauthFailed => "Preauthentication failed".into(),
         E::ClockSkew { .. } => "Clock skew too great".into(),

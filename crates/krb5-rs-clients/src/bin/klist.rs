@@ -183,7 +183,7 @@ fn do_keytab(o: &Opts, profile: &krb5_rs::profile::Profile, name: Option<&str>) 
         .unwrap_or_else(|e| fail(e, "while starting keytab scan", 1));
     if o.show_time {
         print!("KVNO Timestamp");
-        print!("{}", " ".repeat((o.width + 2).saturating_sub(9)));
+        print!("{}", " ".repeat((o.width + 2).saturating_sub(10)));
         println!("Principal");
         print!("---- ");
         print!("{} ", "-".repeat(o.width));
