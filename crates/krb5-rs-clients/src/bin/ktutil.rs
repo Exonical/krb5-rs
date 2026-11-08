@@ -101,7 +101,7 @@ fn ktutil_add(
         None => 0,
     };
     let key = if use_pass {
-        let pw = rpassword::prompt_password(format!("Password for {princ_full}: "))
+        let pw = krb5_rs_clients::prompt_password(&format!("Password for {princ_full}"))
             .map_err(|_| "Cannot read password")?;
         let (salt, params) = if !fetch {
             let salt = match salt_str {

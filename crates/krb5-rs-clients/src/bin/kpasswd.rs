@@ -15,8 +15,8 @@ use krb5_rs_clients::{com_err, fail, krb5_message};
 
 /// `krb5_read_password` (read_pwd.c): prompt twice; the entries must match.
 fn read_password(p1: &str, p2: &str) -> Result<String, &'static str> {
-    let a = rpassword::prompt_password(format!("{p1}: ")).map_err(|_| "Cannot read password")?;
-    let b = rpassword::prompt_password(format!("{p2}: ")).map_err(|_| "Cannot read password")?;
+    let a = krb5_rs_clients::prompt_password(p1).map_err(|_| "Cannot read password")?;
+    let b = krb5_rs_clients::prompt_password(p2).map_err(|_| "Cannot read password")?;
     if a != b {
         return Err("Password mismatch");
     }
@@ -93,7 +93,7 @@ fn main() {
     let rt = krb5_rs_clients::runtime();
     let client = krb5_rs_clients::kerberos_client(&profile, &realm);
     let name = unparse_name(&me, &realm);
-    let pw = rpassword::prompt_password(format!("Password for {name}: "))
+    let pw = krb5_rs_clients::prompt_password(&format!("Password for {name}"))
         .unwrap_or_else(|_| fail("Cannot read password", "getting initial ticket", 1));
     let creds = match rt.block_on(client.acquire_tgt_with_config(config, &pw)) {
         Ok(c) => c,

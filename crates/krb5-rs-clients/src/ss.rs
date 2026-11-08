@@ -153,13 +153,12 @@ impl<T> Subsystem<T> {
 
     /// `ss_listen`: prompt `"<name>:  "`, run lines until EOF or `quit`.
     pub fn listen(&self, state: &mut T) {
-        let stdin = std::io::stdin();
-        let mut input = stdin.lock();
         loop {
             print!("{}:  ", self.name);
             let _ = std::io::stdout().flush();
             let mut line = String::new();
-            match input.read_line(&mut line) {
+            // Lock per line: commands read passwords from stdin too.
+            match std::io::stdin().lock().read_line(&mut line) {
                 Ok(0) | Err(_) => return,
                 Ok(_) => {}
             }

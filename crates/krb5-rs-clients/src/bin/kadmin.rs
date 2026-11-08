@@ -373,7 +373,7 @@ fn main() {
         };
         let pw = match password {
             Some(p) => p,
-            None => rpassword::prompt_password(format!("Password for {princstr}: "))
+            None => krb5_rs_clients::prompt_password(&format!("Password for {princstr}"))
                 .unwrap_or_else(|e| {
                     die(
                         &whoami,
@@ -442,8 +442,8 @@ fn quit(st: &mut Kadmin) -> bool {
 
 /// `krb5_read_password`: prompt twice; the entries must match.
 fn read_password(p1: &str, p2: &str) -> Result<String, &'static str> {
-    let a = rpassword::prompt_password(format!("{p1}: ")).map_err(|_| "Cannot read password")?;
-    let b = rpassword::prompt_password(format!("{p2}: ")).map_err(|_| "Cannot read password")?;
+    let a = krb5_rs_clients::prompt_password(p1).map_err(|_| "Cannot read password")?;
+    let b = krb5_rs_clients::prompt_password(p2).map_err(|_| "Cannot read password")?;
     if a != b {
         return Err("Password mismatch");
     }

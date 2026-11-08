@@ -835,7 +835,7 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
                     String::new()
                 } else {
                     pwprompt = true;
-                    match rpassword::prompt_password(format!("Password for {}: ", k5.name)) {
+                    match krb5_rs_clients::prompt_password(&format!("Password for {}", k5.name)) {
                         Ok(p) => p,
                         Err(_) => {
                             com_err("Cannot read password", "while getting initial credentials");

@@ -232,6 +232,29 @@ pub fn libdefault_boolean(profile: &Profile, realm: &str, name: &str) -> Option<
     })
 }
 
+/// `krb5_prompter_posix` (prompter.c): the prompt goes to stdout and the
+/// reply comes from stdin, with echo off only when stdin is a terminal;
+/// a newline follows the hidden reply either way.
+pub fn prompt_password(prompt: &str) -> std::io::Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if std::io::stdin().is_terminal() {
+        return rpassword::prompt_password(format!("{prompt}: "));
+    }
+    let mut out = std::io::stdout();
+    write!(out, "{prompt}: ")?;
+    out.flush()?;
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line)?;
+    writeln!(out)?;
+    if n == 0 {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    if line.ends_with('\n') {
+        line.pop();
+    }
+    Ok(line)
+}
+
 /// The `krb5_err.et` / `com_err` text for a library error.
 pub fn krb5_message(e: &krb5_rs::Krb5Error) -> String {
     use krb5_rs::Krb5Error as E;
