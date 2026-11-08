@@ -201,7 +201,7 @@ impl AsExchange {
             None => self.default_salt(),
         };
 
-        if self.long_term_key.is_some() {
+        if self.long_term_keys.is_some() {
             let key = self.long_term_key(hint.etype, &salt, hint.s2kparams.as_deref())?;
             return build_pa_enc_timestamp_with_key(&key, now, Some(usec));
         }
@@ -216,7 +216,7 @@ impl AsExchange {
     }
 
     /// The client's long-term key for `etype`: the supplied key
-    /// ([`AsExchange::with_key`]; salt and string-to-key parameters are
+    /// ([`AsExchange::with_keys`]; salt and string-to-key parameters are
     /// irrelevant) or the password-derived one.
     pub(super) fn long_term_key(
         &self,
@@ -224,11 +224,12 @@ impl AsExchange {
         salt: &[u8],
         s2kparams: Option<&[u8]>,
     ) -> Result<EncryptionKey, Krb5Error> {
-        if let Some(key) = &self.long_term_key {
-            if key.keytype != etype {
-                return Err(Krb5Error::UnsupportedEtype(etype));
-            }
-            return Ok(key.clone());
+        if let Some(keys) = &self.long_term_keys {
+            return keys
+                .iter()
+                .find(|k| k.keytype == etype)
+                .cloned()
+                .ok_or(Krb5Error::UnsupportedEtype(etype));
         }
         let profile = find_etype(etype).map_err(|_| Krb5Error::UnsupportedEtype(etype))?;
         Ok(EncryptionKey::new(

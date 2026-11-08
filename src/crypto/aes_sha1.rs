@@ -11,7 +11,7 @@ use super::aes_cts::{aes_cts_decrypt_iv, aes_cts_encrypt, aes_cts_encrypt_iv};
 use super::dk::{derive_key, dk};
 use super::hmac_sha1::hmac_sha1_96;
 use super::util::generate_random;
-use super::{CryptoError, EtypeProfile, KeyPurpose};
+use super::{iov_gather, iov_scatter, CryptoError, CryptoIov, EtypeProfile, KeyPurpose};
 
 const AES_BLOCK: usize = 16;
 const HMAC_TRAILER: usize = 12; // HMAC-SHA1-96 = 96 bits
@@ -44,6 +44,55 @@ fn aes_encrypt(
     let mut ct = aes_cts_encrypt_iv(&ke, state, &data)?;
     ct.extend_from_slice(&hmac);
     Ok(ct)
+}
+
+/// enc_dk_hmac.c krb5int_dk_encrypt: HMAC(Ki, conf | regions), then
+/// E(Ke, conf | DATA).
+fn aes_encrypt_iov(
+    key: &[u8],
+    key_usage: i32,
+    iov: &mut [CryptoIov<'_>],
+    expected_key_len: usize,
+) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    validate_exact_key_len(key, expected_key_len)?;
+    let ke = derive_key(key, key_usage, 0xAA)?;
+    let ki = derive_key(key, key_usage, 0x55)?;
+    let confounder = generate_random(AES_BLOCK);
+    let mut sign = Zeroizing::new(confounder.clone());
+    sign.extend_from_slice(&iov_gather(iov, false));
+    let hmac = hmac_sha1_96(&ki, &sign);
+    let mut plain = Zeroizing::new(confounder);
+    plain.extend_from_slice(&iov_gather(iov, true));
+    let ct = aes_cts_encrypt_iv(&ke, &mut [0u8; AES_BLOCK], &plain)?;
+    iov_scatter(iov, &ct[AES_BLOCK..]);
+    Ok((ct[..AES_BLOCK].to_vec(), hmac))
+}
+
+/// enc_dk_hmac.c krb5int_dk_decrypt.
+fn aes_decrypt_iov(
+    key: &[u8],
+    key_usage: i32,
+    header: &[u8],
+    iov: &mut [CryptoIov<'_>],
+    trailer: &[u8],
+    expected_key_len: usize,
+) -> Result<(), CryptoError> {
+    validate_exact_key_len(key, expected_key_len)?;
+    if header.len() != AES_BLOCK || trailer.len() != HMAC_TRAILER {
+        return Err(CryptoError::InputTooShort);
+    }
+    let ke = derive_key(key, key_usage, 0xAA)?;
+    let ki = derive_key(key, key_usage, 0x55)?;
+    let mut ct = header.to_vec();
+    ct.extend_from_slice(&iov_gather(iov, true));
+    let plain = Zeroizing::new(aes_cts_decrypt_iv(&ke, &mut [0u8; AES_BLOCK], &ct)?);
+    iov_scatter(iov, &plain[AES_BLOCK..]);
+    let mut sign = Zeroizing::new(plain[..AES_BLOCK].to_vec());
+    sign.extend_from_slice(&iov_gather(iov, false));
+    if !bool::from(hmac_sha1_96(&ki, &sign).ct_eq(trailer)) {
+        return Err(CryptoError::IntegrityFailure);
+    }
+    Ok(())
 }
 
 fn aes_decrypt(
@@ -181,6 +230,26 @@ macro_rules! impl_aes_sha1_profile {
                     self.key_length(),
                     &mut [0u8; AES_BLOCK],
                 )
+            }
+
+            fn encrypt_iov(
+                &self,
+                key: &[u8],
+                key_usage: i32,
+                iov: &mut [CryptoIov<'_>],
+            ) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+                aes_encrypt_iov(key, key_usage, iov, self.key_length())
+            }
+
+            fn decrypt_iov(
+                &self,
+                key: &[u8],
+                key_usage: i32,
+                header: &[u8],
+                iov: &mut [CryptoIov<'_>],
+                trailer: &[u8],
+            ) -> Result<(), CryptoError> {
+                aes_decrypt_iov(key, key_usage, header, iov, trailer, self.key_length())
             }
 
             fn decrypt(

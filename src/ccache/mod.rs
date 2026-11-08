@@ -402,3 +402,9 @@ pub(crate) fn config_matches(
         }
     }
 }
+
+/// `krb5_parse_name` into a principal and realm (`defrealm` when the name
+/// has none); `None` if the name has no realm and there is no default.
+pub fn parse_principal(s: &str, defrealm: Option<&str>) -> Option<(PrincipalName, String)> {
+    select::parse_name(s, defrealm)
+}

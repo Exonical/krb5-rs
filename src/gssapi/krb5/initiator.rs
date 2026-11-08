@@ -69,6 +69,24 @@ impl Krb5Initiator {
         })
     }
 
+    fn new_context(&self, flags: GssFlags, key: EncryptionKey, seq_send: u64) -> Krb5Context {
+        let mut ctx = Krb5Context::partial(
+            flags,
+            true,
+            self.cred.client.clone(),
+            self.cred.crealm.clone(),
+            self.cred.server.clone(),
+            self.cred.times.endtime,
+            key,
+            seq_send,
+        );
+        ctx.mech = self.mech;
+        ctx.authtime = self.cred.times.authtime;
+        ctx.ticket_flags = self.cred.flags;
+        ctx.ticket_key = self.cred.session_key.clone();
+        ctx
+    }
+
     /// Run as the IAKERB mechanism (iakerb.c:1014-1041): tokens carry the
     /// IAKERB OID, and a nonempty `conv` (every IAKERB token exchanged)
     /// adds the GSS_EXTS_FINISHED checksum extension.
@@ -185,30 +203,12 @@ impl Krb5Initiator {
 
         if flags.contains(GssFlags::MUTUAL) {
             self.ac = Some(ac);
-            self.ctx = Some(Krb5Context::partial(
-                flags,
-                true,
-                self.cred.client.clone(),
-                self.cred.crealm.clone(),
-                self.cred.server.clone(),
-                self.cred.times.endtime,
-                key,
-                seq_send,
-            ));
+            self.ctx = Some(self.new_context(flags, key, seq_send));
             self.awaiting_rep = true;
             Ok(InitStep::Continue(token))
         } else {
             // init_sec_context.c:632-641 — no AP-REP; seq_recv = seq_send.
-            let mut ctx = Krb5Context::partial(
-                flags | GssFlags::PROT_READY,
-                true,
-                self.cred.client.clone(),
-                self.cred.crealm.clone(),
-                self.cred.server.clone(),
-                self.cred.times.endtime,
-                key,
-                seq_send,
-            );
+            let mut ctx = self.new_context(flags | GssFlags::PROT_READY, key, seq_send);
             ctx.seqstate = SeqState::new(
                 seq_send,
                 flags.contains(GssFlags::REPLAY),

@@ -9,6 +9,7 @@
 
 mod ap;
 mod basic;
+mod cammac;
 mod enums;
 mod error_msg;
 mod fast;
@@ -22,6 +23,7 @@ mod ticket;
 
 pub use ap::*;
 pub use basic::*;
+pub use cammac::*;
 pub use enums::*;
 pub use error_msg::*;
 pub use fast::*;

@@ -204,3 +204,87 @@ fn wrap_size_limit_matches_mit() {
     // integrity-only: output - 16 - cksumlen.
     assert_eq!(ic.wrap_size_limit(false, 1000), 972);
 }
+
+// --- IOV (k5sealv3iov.c, k5unsealiov.c) ---------------------------------------
+
+use krb5_rs::gssapi::krb5::{GssIov, IovType};
+
+fn iov(kinds: &[(IovType, &[u8])]) -> Vec<GssIov> {
+    kinds.iter().map(|(k, b)| GssIov::new(*k, *b)).collect()
+}
+
+#[test]
+fn wrap_iov_without_trailer_is_a_flat_token() {
+    for conf in [true, false] {
+        let (mut ic, mut ac) = established_pair(true, GssFlags::empty());
+        let mut v = iov(&[(IovType::Header, b""), (IovType::Data, b"hello iov")]);
+        assert_eq!(ic.wrap_iov(conf, &mut v).expect("wrap"), conf);
+        let mut flat = v[0].buf.clone();
+        flat.extend_from_slice(&v[1].buf);
+        let out = ac.unwrap(&flat).expect("unwrap");
+        assert_eq!((out.data.as_slice(), out.conf), (&b"hello iov"[..], conf));
+        // And a flat token unwraps through a STREAM buffer.
+        let token = ac.wrap(conf, b"stream me").expect("wrap");
+        let mut s = iov(&[(IovType::Stream, &token), (IovType::Data, b"")]);
+        let (c, _) = ic.unwrap_iov(&mut s).expect("stream");
+        assert_eq!((s[1].buf.as_slice(), c), (&b"stream me"[..], conf));
+    }
+}
+
+#[test]
+fn wrap_iov_sign_only_and_trailer_round_trip() {
+    for conf in [true, false] {
+        let (mut ic, mut ac) = established_pair(true, GssFlags::empty());
+        let mut v = iov(&[
+            (IovType::Header, b""),
+            (IovType::SignOnly, b"assoc"),
+            (IovType::Data, b"secret"),
+            (IovType::Padding, b""),
+            (IovType::Trailer, b""),
+        ]);
+        let mut sized = v.clone();
+        ic.wrap_iov_length(conf, &mut sized).expect("length");
+        ic.wrap_iov(conf, &mut v).expect("wrap");
+        assert_eq!(sized[0].buf.len(), v[0].buf.len());
+        assert_eq!(sized[4].buf.len(), v[4].buf.len());
+        assert_eq!(v[1].buf, b"assoc");
+        assert_eq!(v[2].buf == b"secret", !conf);
+        let mut tampered = v.clone();
+        let (c, _) = ac.unwrap_iov(&mut v).expect("unwrap");
+        assert_eq!((v[2].buf.as_slice(), c), (&b"secret"[..], conf));
+        tampered[1].buf[0] ^= 1;
+        assert!(matches!(
+            ac.unwrap_iov(&mut tampered),
+            Err(Krb5Error::Gss(GssError::BadSig))
+        ));
+    }
+}
+
+#[test]
+fn wrap_iov_without_data_is_integrity_only() {
+    let (mut ic, mut ac) = established_pair(true, GssFlags::empty());
+    let mut v = iov(&[(IovType::Header, b""), (IovType::SignOnly, b"only")]);
+    assert!(!ic.wrap_iov(true, &mut v).expect("wrap"));
+    assert_eq!(v[0].buf[2] & 0x02, 0);
+    assert!(!ac.unwrap_iov(&mut v).expect("unwrap").0);
+}
+
+#[test]
+fn mic_iov_matches_flat_mic() {
+    let (mut ic, mut ac) = established_pair(true, GssFlags::empty());
+    let mut v = iov(&[
+        (IovType::Data, b"part one, "),
+        (IovType::Data, b"part two"),
+        (IovType::MicToken, b""),
+    ]);
+    let mut sized = v.clone();
+    ic.get_mic_iov_length(&mut sized).expect("length");
+    ic.get_mic_iov(&mut v).expect("mic");
+    assert_eq!(sized[2].buf.len(), v[2].buf.len());
+    ac.verify_mic(b"part one, part two", &v[2].buf).expect("flat verify");
+    let mic = ac.get_mic(b"back").expect("mic");
+    let mut w = iov(&[(IovType::Data, b"back"), (IovType::MicToken, &mic)]);
+    ic.verify_mic_iov(&mut w).expect("iov verify");
+    w[0].buf[0] ^= 1;
+    assert!(ic.verify_mic_iov(&mut w).is_err());
+}

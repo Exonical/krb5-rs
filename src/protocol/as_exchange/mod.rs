@@ -224,7 +224,7 @@ pub struct AsExchange {
     config: AsExchangeConfig,
     password: Zeroizing<String>,
     /// A long-term key used instead of the password ([`AsExchange::with_key`]).
-    long_term_key: Option<EncryptionKey>,
+    long_term_keys: Option<Vec<EncryptionKey>>,
     nonce: u32,
     /// The most recent AS-REQ body (for validation on reply).
     last_req_body: Option<KdcReqBody>,
@@ -307,7 +307,7 @@ impl AsExchange {
             state: AsState::Initial,
             config,
             password: Zeroizing::new(password.into()),
-            long_term_key: None,
+            long_term_keys: None,
             nonce: 0,
             last_req_body: None,
             last_req_bytes: Vec::new(),
@@ -338,14 +338,28 @@ impl AsExchange {
         }
     }
 
-    /// Create an AS exchange that authenticates with a long-term key
-    /// instead of a password (MIT `krb5_get_init_creds_keytab`): the key's
-    /// enctype is the only one requested, and the salt and string-to-key
-    /// parameters the KDC reports are irrelevant.
+    /// Create an AS exchange that authenticates with one long-term key
+    /// instead of a password: the key's enctype is the only one requested.
     pub fn with_key(mut config: AsExchangeConfig, key: EncryptionKey) -> Self {
         config.etypes = vec![key.keytype];
+        Self::with_keys(config, vec![key])
+    }
+
+    /// Create an AS exchange that authenticates with keytab keys instead
+    /// of a password (MIT `krb5_get_init_creds_keytab`): the keys' enctypes
+    /// move to the front of the request list (sort_enctypes,
+    /// gic_keytab.c:149-174), and the reply is decrypted with the key of
+    /// the enctype the KDC chose.
+    pub fn with_keys(mut config: AsExchangeConfig, keys: Vec<EncryptionKey>) -> Self {
+        let (mut etypes, rest): (Vec<i32>, Vec<i32>) = config
+            .etypes
+            .iter()
+            .copied()
+            .partition(|e| keys.iter().any(|k| k.keytype == *e));
+        etypes.extend(rest);
+        config.etypes = etypes;
         let mut exchange = Self::new(config, String::new());
-        exchange.long_term_key = Some(key);
+        exchange.long_term_keys = Some(keys);
         exchange
     }
 

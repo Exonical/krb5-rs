@@ -332,30 +332,7 @@ impl<T: KdcTransport> KerberosClient<T> {
                 }
                 cache
             }
-            Err(_) => {
-                let defcc = crate::ccache::default_cache(ctx)?;
-                let name = defcc.name();
-                let (cctype, _) = crate::ccache::split_name(&name);
-                // krb5_cc_support_switch: DIR, KEYRING and KCM collections.
-                let have_collection = matches!(cctype, "DIR" | "KEYRING" | "KCM");
-                // KRB5_FCC_NOFILE; FILE reports a missing file as I/O.
-                let empty = match defcc.principal() {
-                    Err(CcError::NoFile(_)) => true,
-                    Err(CcError::Io(e)) => e.kind() == std::io::ErrorKind::NotFound,
-                    _ => false,
-                };
-                if empty {
-                    defcc
-                } else if have_collection {
-                    crate::ccache::new_unique(ctx, cctype)?
-                } else {
-                    return Err(CcError::code(
-                        "KG_CCACHE_NOMATCH",
-                        "Principal in credential cache does not match desired name".to_string(),
-                    )
-                    .into());
-                }
-            }
+            Err(_) => new_cache_for_name(ctx)?,
         };
         let config = crate::protocol::AsExchangeConfig::new(client, &realm);
         let tgt = self.acquire_tgt_with_config(config, password).await?;
@@ -408,5 +385,33 @@ impl<T: KdcTransport> KerberosClient<T> {
                 .with_second_ticket(req.second_ticket.clone()),
         )
         .await
+    }
+}
+
+/// get_cache_for_name's fallback (acquire_cred.c:446-505) when no cache in
+/// the collection matches: an empty default cache, else a new cache in the
+/// default collection.
+pub(super) fn new_cache_for_name(ctx: &CcContext) -> Result<AnyCcache, Krb5Error> {
+    let defcc = crate::ccache::default_cache(ctx)?;
+    let name = defcc.name();
+    let (cctype, _) = crate::ccache::split_name(&name);
+    // krb5_cc_support_switch: DIR, KEYRING and KCM collections.
+    let have_collection = matches!(cctype, "DIR" | "KEYRING" | "KCM");
+    // KRB5_FCC_NOFILE; FILE reports a missing file as I/O.
+    let empty = match defcc.principal() {
+        Err(CcError::NoFile(_)) => true,
+        Err(CcError::Io(e)) => e.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    };
+    if empty {
+        Ok(defcc)
+    } else if have_collection {
+        Ok(crate::ccache::new_unique(ctx, cctype)?)
+    } else {
+        Err(CcError::code(
+            "KG_CCACHE_NOMATCH",
+            "Principal in credential cache does not match desired name".to_string(),
+        )
+        .into())
     }
 }

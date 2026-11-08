@@ -32,6 +32,18 @@ pub struct Krb5Context {
     /// Acceptor side: the service ticket carried `TKT_FLG_INITIAL`
     /// (`gss_krb5_get_tkt_flags`).
     pub(super) initial_ticket: bool,
+    /// MIT `ctx->mech_used`.
+    pub(super) mech: &'static [u8],
+    /// MIT `ctx->krb_times.authtime`.
+    pub(super) authtime: KerberosTime,
+    /// MIT `ctx->krb_flags`.
+    pub(super) ticket_flags: KerberosFlags<TicketFlags>,
+    /// Acceptor: ticket plus authenticator authdata (`ctx->authdata`).
+    pub(super) authdata: Vec<AuthorizationDataElement>,
+    /// The ticket session key (`krb5_auth_con_getkey_k`).
+    pub(super) ticket_key: EncryptionKey,
+    /// Authdata context of the initiator name (acceptor only).
+    pub(super) name_attrs: super::name_attrs::NameAttrs,
 }
 
 impl Krb5Context {
@@ -53,11 +65,17 @@ impl Krb5Context {
             crealm,
             acceptor,
             endtime,
+            ticket_key: key.clone(),
             key,
             acceptor_subkey: None,
             seq_send,
             seqstate: SeqState::new(0, false, false, true),
             initial_ticket: false,
+            mech: MECH_KRB5,
+            authtime: endtime,
+            ticket_flags: KerberosFlags::default(),
+            authdata: Vec::new(),
+            name_attrs: Default::default(),
         }
     }
 
@@ -109,7 +127,7 @@ impl Krb5Context {
 
     /// The per-message key: acceptor subkey when present, else `key`
     /// (k5sealv3.c:86-93).
-    fn msg_key(&self) -> &EncryptionKey {
+    pub(super) fn msg_key(&self) -> &EncryptionKey {
         self.acceptor_subkey.as_ref().unwrap_or(&self.key)
     }
 
@@ -298,7 +316,7 @@ impl Krb5Context {
     /// Header checks shared by unwrap/verify_mic: length, direction
     /// (k5sealv3iov.c:314-318), tok id, filler byte.  Returns the 16-byte
     /// header as received.
-    fn check_common(&self, token: &[u8], tok_id: u16) -> Result<Vec<u8>, Krb5Error> {
+    pub(super) fn check_common(&self, token: &[u8], tok_id: u16) -> Result<Vec<u8>, Krb5Error> {
         if token.len() < 16 {
             return Err(gss(GssError::DefectiveToken));
         }
@@ -322,7 +340,11 @@ impl Krb5Context {
     /// The peer's per-message key and usage (seal vs sign).  The acceptor
     /// subkey is used only when we have it AND the token flags it
     /// (k5sealv3iov.c:322-329).
-    fn recv_key_usage(&self, token: &[u8], seal: bool) -> Result<(&EncryptionKey, i32), Krb5Error> {
+    pub(super) fn recv_key_usage(
+        &self,
+        token: &[u8],
+        seal: bool,
+    ) -> Result<(&EncryptionKey, i32), Krb5Error> {
         let usage = if seal {
             if self.initiate {
                 USAGE_ACCEPTOR_SEAL
