@@ -18,27 +18,11 @@ use crate::protocol::ap::{AuthContext, AuthContextFlags, KeySource};
 use crate::types::error_codes::KRB_AP_ERR_REPEAT;
 use crate::types::{HostAddress, KrbErrorMsg, PrincipalName, TicketFlags};
 
-/// `DEFAULT_KPASSWD_PORT` (`include/osconf.hin`).
-pub const KPASSWD_PORT: u16 = 464;
-/// Set-password protocol version (`RFC3244_VERSION`, `schpw.c`).
-pub const RFC3244_VERSION: u16 = 0xff80;
-
-/// `KRB5_KPASSWD_SUCCESS`.
-pub const KPASSWD_SUCCESS: u16 = 0;
-/// `KRB5_KPASSWD_MALFORMED`.
-pub const KPASSWD_MALFORMED: u16 = 1;
-/// `KRB5_KPASSWD_HARDERROR`.
-pub const KPASSWD_HARDERROR: u16 = 2;
-/// `KRB5_KPASSWD_AUTHERROR`.
-pub const KPASSWD_AUTHERROR: u16 = 3;
-/// `KRB5_KPASSWD_SOFTERROR`.
-pub const KPASSWD_SOFTERROR: u16 = 4;
-/// `KRB5_KPASSWD_ACCESSDENIED`.
-pub const KPASSWD_ACCESSDENIED: u16 = 5;
-/// `KRB5_KPASSWD_BAD_VERSION`.
-pub const KPASSWD_BAD_VERSION: u16 = 6;
-/// `KRB5_KPASSWD_INITIAL_FLAG_NEEDED`.
-pub const KPASSWD_INITIAL_FLAG_NEEDED: u16 = 7;
+pub use crate::protocol::kpasswd::{
+    ChangePasswdData, KPASSWD_ACCESSDENIED, KPASSWD_AUTHERROR, KPASSWD_BAD_VERSION,
+    KPASSWD_HARDERROR, KPASSWD_INITIAL_FLAG_NEEDED, KPASSWD_MALFORMED, KPASSWD_PORT,
+    KPASSWD_SOFTERROR, KPASSWD_SUCCESS, RFC3244_VERSION,
+};
 
 const KRB_ERR_MAX: i32 = 127;
 const KRB_ERR_GENERIC: i32 = 60;
@@ -53,21 +37,6 @@ const PASSWORD_IN_DICTIONARY: &str =
 const WHILE_TRYING_TO_CHANGE: &str = "while trying to change password.";
 const PASSWORD_REUSE: &str =
     "New password was used previously. Please choose a different password.";
-
-/// `ChangePasswdData` (RFC 3244 §2; `krb5_setpw_req`,
-/// `asn1_k_encode.c`).
-#[derive(AsnType, Encode, Decode, Debug, Clone, PartialEq, Eq)]
-pub struct ChangePasswdData {
-    /// New password.
-    #[rasn(tag(explicit(context, 0)))]
-    pub newpasswd: OctetString,
-    /// Target principal name.
-    #[rasn(tag(explicit(context, 1)))]
-    pub targname: Option<PrincipalName>,
-    /// Target principal realm.
-    #[rasn(tag(explicit(context, 2)))]
-    pub targrealm: Option<GeneralString>,
-}
 
 /// A framed request split into its parts.
 #[derive(Debug, PartialEq, Eq)]
