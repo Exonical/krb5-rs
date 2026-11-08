@@ -51,14 +51,10 @@ pub fn changepw_principal() -> PrincipalName {
 
 /// `locate_kpasswd` (changepw.c:59-87): kpasswd servers, else the admin
 /// servers on the kpasswd port over TCP or UDP.
-fn locate_kpasswd(
-    locator: &Locator<'_>,
-    realm: &str,
-    no_udp: bool,
-) -> Result<Vec<ServerEntry>, Krb5Error> {
-    match locator.locate_server(realm, LocateService::Kpasswd, no_udp) {
-        Err(LocateError::RealmUnknown) => {
-            let mut list = locator.locate_server(realm, LocateService::Kadmin, no_udp)?;
+fn locate_kpasswd(locator: &Locator<'_>, realm: &str) -> Result<Vec<ServerEntry>, Krb5Error> {
+    match locator.locate_server(realm, LocateService::Kpasswd, false) {
+        Err(LocateError::RealmUnknown | LocateError::RealmCantResolve) => {
+            let mut list = locator.locate_server(realm, LocateService::Kadmin, true)?;
             for s in &mut list {
                 if s.transport == Transport::Tcp {
                     s.transport = Transport::TcpOrUdp;
@@ -213,12 +209,10 @@ async fn change_set_password(
 
     // Non-UDP first, then UDP only when every server was unreachable
     // (changepw.c:233-262).
-    let servers = locate_kpasswd(locator, realm, true)?;
+    let servers = locate_kpasswd(locator, realm)?;
     let mut r = send(&servers, false, &base, &ap_req, newpw, target).await;
     if matches!(r, Err(Krb5Error::Sendto(SendtoError::KdcUnreach))) {
-        if let Ok(servers) = locate_kpasswd(locator, realm, false) {
-            r = send(&servers, true, &base, &ap_req, newpw, target).await;
-        }
+        r = send(&servers, true, &base, &ap_req, newpw, target).await;
     }
     let (mut ctx, reply) = r?;
     let (code, result_string) = kpasswd::rd_chpw_rep(&mut ctx, &reply)?;
@@ -281,7 +275,7 @@ mod tests {
     fn kpasswd_falls_back_to_admin_server_on_port_464() {
         let p = Profile::parse("[realms]\nR = {\n admin_server = adm.r:749\n}\n").expect("profile");
         let loc = Locator::new(&p, None);
-        let l = locate_kpasswd(&loc, "R", true).expect("servers");
+        let l = locate_kpasswd(&loc, "R").expect("servers");
         assert_eq!(l.len(), 1);
         assert_eq!((l[0].hostname.as_str(), l[0].port), ("adm.r", KPASSWD_PORT));
         assert_eq!(l[0].transport, Transport::TcpOrUdp);
@@ -290,13 +284,8 @@ mod tests {
         )
         .expect("profile");
         let loc = Locator::new(&p, None);
-        let l = locate_kpasswd(&loc, "R", false).expect("servers");
+        let l = locate_kpasswd(&loc, "R").expect("servers");
         assert_eq!((l[0].hostname.as_str(), l[0].port), ("pw.r", 1464));
-        assert!(locate_kpasswd(
-            &Locator::new(&Profile::parse("").expect("p"), None),
-            "R",
-            false
-        )
-        .is_err());
+        assert!(locate_kpasswd(&Locator::new(&Profile::parse("").expect("p"), None), "R").is_err());
     }
 }
