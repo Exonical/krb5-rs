@@ -51,7 +51,7 @@ fn nofail(opts: &VerifyInitCredsOptions<'_>, creds: &Credential) -> bool {
         return v;
     }
     opts.profile
-        .and_then(|p| libdefault_boolean(p, &creds.srealm, "verify_ap_req_nofail"))
+        .and_then(|p| libdefault_boolean(p, &creds.crealm, "verify_ap_req_nofail"))
         .unwrap_or(false)
 }
 
