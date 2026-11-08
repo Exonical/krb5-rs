@@ -201,7 +201,7 @@ impl AsExchange {
             None => self.default_salt(),
         };
 
-        if !self.long_term_keys.is_empty() {
+        if self.long_term_keys.is_some() {
             let key = self.long_term_key(hint.etype, &salt, hint.s2kparams.as_deref())?;
             return build_pa_enc_timestamp_with_key(&key, now, Some(usec));
         }
@@ -224,9 +224,8 @@ impl AsExchange {
         salt: &[u8],
         s2kparams: Option<&[u8]>,
     ) -> Result<EncryptionKey, Krb5Error> {
-        if !self.long_term_keys.is_empty() {
-            return self
-                .long_term_keys
+        if let Some(keys) = &self.long_term_keys {
+            return keys
                 .iter()
                 .find(|k| k.keytype == etype)
                 .cloned()

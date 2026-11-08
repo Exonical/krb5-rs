@@ -224,7 +224,7 @@ pub struct AsExchange {
     config: AsExchangeConfig,
     password: Zeroizing<String>,
     /// A long-term key used instead of the password ([`AsExchange::with_key`]).
-    long_term_keys: Vec<EncryptionKey>,
+    long_term_keys: Option<Vec<EncryptionKey>>,
     nonce: u32,
     /// The most recent AS-REQ body (for validation on reply).
     last_req_body: Option<KdcReqBody>,
@@ -307,7 +307,7 @@ impl AsExchange {
             state: AsState::Initial,
             config,
             password: Zeroizing::new(password.into()),
-            long_term_keys: Vec::new(),
+            long_term_keys: None,
             nonce: 0,
             last_req_body: None,
             last_req_bytes: Vec::new(),
@@ -359,7 +359,7 @@ impl AsExchange {
         etypes.extend(rest);
         config.etypes = etypes;
         let mut exchange = Self::new(config, String::new());
-        exchange.long_term_keys = keys;
+        exchange.long_term_keys = Some(keys);
         exchange
     }
 
