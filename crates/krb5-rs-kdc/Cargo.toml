@@ -31,6 +31,11 @@ path = "src/bin/krb5-rs-kadmind.rs"
 required-features = ["klmdb"]
 
 [[bin]]
+name = "krb5-rs-kdb5-ldap-util"
+path = "src/bin/krb5-rs-kdb5-ldap-util.rs"
+required-features = ["klmdb", "kldap"]
+
+[[bin]]
 name = "krb5-rs-kproplog"
 path = "src/bin/krb5-rs-kproplog.rs"
 
@@ -48,6 +53,7 @@ turso = ["dep:krb5-rs-kdb-turso"]
 cockroach = ["dep:krb5-rs-kdb-cockroach", "turso"]
 
 [dependencies]
+rpassword = "7"
 krb5-rs-kdb-lmdb = { path = "../krb5-rs-kdb-lmdb", optional = true }
 krb5-rs-kdb-ldap = { path = "../krb5-rs-kdb-ldap", optional = true }
 libc = "0.2"

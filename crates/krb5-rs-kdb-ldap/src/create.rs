@@ -156,6 +156,17 @@ impl LdapStore {
         opts: &RealmOptions,
     ) -> Result<Self, StoreError> {
         let cfg = LdapConfig::new(&config.db_module, db_args, ServerType::Admin)?;
+        Self::create_realm_with(cfg, config, master, opts).await
+    }
+
+    /// As [`LdapStore::create_realm`] with an already-built LDAP
+    /// configuration (`kdb5_ldap_util`'s `-D`, `-w` and `-H`).
+    pub async fn create_realm_with(
+        cfg: LdapConfig,
+        config: &RealmConfig,
+        master: &EncryptionKey,
+        opts: &RealmOptions,
+    ) -> Result<Self, StoreError> {
         let container = cfg
             .container_dn
             .clone()
@@ -236,8 +247,7 @@ impl LdapStore {
                 Err(e) => return Err(ldap_err("Creating realm", e)),
             }
         }
-        let store =
-            LdapStore::open_without_master(config, db_args, ServerType::Admin, master).await?;
+        let store = LdapStore::open_with_config(cfg, &realm, master).await?;
         for e in initial_entries(config, master)? {
             store.add_entry(&e).await?;
         }

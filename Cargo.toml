@@ -124,3 +124,4 @@ members = [
     "crates/krb5-rs-kdb-lmdb",
     "crates/krb5-rs-kdb-ldap",
 ]
+exclude = ["vendor/ldap3"]

@@ -7,10 +7,16 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-krb5-rs = { path = "../..", features = ["kdc", "tokio"] }
+krb5-rs = { path = "../..", features = ["kdc", "client", "tokio"] }
 rasn = "0.28"
-ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
+ldap3 = { path = "../../vendor/ldap3", version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 tokio = { version = "1.53.2", features = ["rt", "sync"] }
+rsasl = { version = "2.3.1", default-features = false, features = ["provider", "config_builder", "plain", "login", "anonymous", "scram-sha-1", "scram-sha-2"] }
+md-5 = "0.11"
+hmac = "0.13"
+rand = "0.10"
+rc4 = "0.1"
+des = "0.8"
 
 [dev-dependencies]
 tempfile = "3.27"

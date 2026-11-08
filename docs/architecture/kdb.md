@@ -171,21 +171,41 @@ does; remove it once no file-store writer is running.
   `load -update` and the principal and policy commands work. A load without
   `-update` fails like MIT, and `destroy` fails with MIT's
   `KRB5_PLUGIN_OP_NOTSUPP` message.
+- **`krb5-rs-kdb5-ldap-util`:** MIT's `kdb5_ldap_util` (`ldap_util/`):
+  `create`, `modify`, `view`, `destroy`, `list`, `stashsrvpw` and the ticket
+  policy commands (`create_policy`, `modify_policy`, `view_policy`,
+  `destroy_policy`, `list_policy`), with MIT's `-D`/`-w`/`-H`/`-r`/`-P`/`-k`
+  /`-sf` options, ticket flag options, prompts and output. `destroy` deletes
+  the realm's principals, policies and realm object; a ticket policy that a
+  principal's `krbTicketPolicyReference` names is not deleted.
 - **Replication:** the directory replicates itself. As in MIT there is no
   update log, so `iprop_enable` with kldap stops kadmind at startup.
 
 Differences from MIT:
 
-- `kdb5_ldap_util` itself is not provided. Realm creation is `krb5-rs-kdb
-  create`; ticket policies (`create_policy`), `modify`, `view`, `list` and
-  `stashsrvpw` must be done with LDAP tools.
-- SASL binds support `EXTERNAL` only (for `ldapi://` or TLS client
-  certificates); MIT supports any mechanism libsasl2 provides.
+- `krb5-rs-kdb5-ldap-util create` accepts `-kv` and `-M`, but the master key
+  is always `K/M` with kvno 1, as `krb5-rs-kdb create` makes it; another `-M`
+  name is refused.
+- MIT binds with any mechanism libsasl2 provides. krb5-rs supports
+  `EXTERNAL`, `PLAIN`, `LOGIN`, `ANONYMOUS`, `SCRAM-SHA-1`, `SCRAM-SHA-256`
+  (rsasl), `CRAM-MD5`, `DIGEST-MD5` (with Cyrus's `auth-int`/`auth-conf`
+  layers: rc4, rc4-56, rc4-40, des, 3des) and `GSSAPI` (krb5-rs's own GSS-API,
+  with integrity/confidentiality layers). Other mechanisms (GSS-SPNEGO,
+  GS2-*, NTLM, OAUTHBEARER) are refused.
+- The SASL host is the LDAP URL's host (the local host name for `ldapi://`),
+  as with Cyrus's `SASL_NOCANON`; libldap's reverse lookup of the peer
+  address is not done.
+- Security-layer properties are Cyrus's defaults (`minssf` 0, `maxssf`
+  unlimited, `maxbufsize` 65536): the strongest layer the server offers is
+  used. `ldap.conf`'s `SASL_SECPROPS` is not read.
 - The master-key commands (`add_mkey`, `use_mkey`, `list_mkeys`,
   `purge_mkeys`, `update_princ_encryption`), `ark` and `tabdump` are refused
   on kldap.
-- The integration test (`cargo test -p krb5-rs-kdb-ldap --test openldap --
-  --ignored`) needs `slapd`; `tests/slapd.sh` starts a private instance.
+- The integration tests (`cargo test -p krb5-rs-kdb-ldap --test openldap --
+  --ignored` and `cargo test -p krb5-rs-kdc --test kdb5_ldap_util --
+  --ignored`, `cargo test -p krb5-rs-kdb-ldap --test sasl -- --ignored`)
+  need `slapd`; `tests/slapd.sh` starts a private instance. The GSSAPI bind
+  test also needs MIT's `krb5kdc`.
 
 ### Password policy
 

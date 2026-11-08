@@ -30,6 +30,7 @@ COPY Cargo.toml Cargo.lock README.md LICENSE ./
 COPY src ./src
 COPY examples ./examples
 COPY crates ./crates
+COPY vendor ./vendor
 
 # The default build includes the klmdb module (LMDB C library).
 # FEATURES=cockroach additionally enables rustls/aws-lc-rs and Turso's

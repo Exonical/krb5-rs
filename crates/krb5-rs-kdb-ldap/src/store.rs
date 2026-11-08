@@ -115,6 +115,16 @@ impl LdapStore {
         master: &EncryptionKey,
     ) -> Result<Self, StoreError> {
         let cfg = LdapConfig::new(&config.db_module, db_args, srv)?;
+        Self::open_with_config(cfg, &config.kdc.realm.to_string(), master).await
+    }
+
+    /// As [`LdapStore::open_without_master`] with an already-built LDAP
+    /// configuration.
+    pub async fn open_with_config(
+        cfg: LdapConfig,
+        realm: &str,
+        master: &EncryptionKey,
+    ) -> Result<Self, StoreError> {
         let container = cfg.container_dn.clone().ok_or_else(|| {
             StoreError::new(
                 StoreErrorKind::Rejected,
@@ -123,7 +133,7 @@ impl LdapStore {
             )
         })?;
         let pool = Pool::open(&cfg).await?;
-        let realm = config.kdc.realm.to_string();
+        let realm = realm.to_string();
         let realm_dn = format!("cn={realm},{container}");
         let params = {
             let mut h = pool.get().await?;
