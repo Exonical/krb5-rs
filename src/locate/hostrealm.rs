@@ -2,7 +2,10 @@
 //! `krb5_get_host_realm`, `krb5_get_fallback_host_realm` and
 //! `krb5_get_default_realm` ask each module in turn. The built-in modules
 //! are MIT's `profile` (`[domain_realm]`, `default_realm`), `dns` and
-//! `domain` (realm_try_domains / parent-domain heuristics); modules
+//! `domain` (realm_try_domains / parent-domain heuristics); `dns` asks
+//! `_kerberos` TXT records when `dns_lookup_realm` is on, through the
+//! system resolver (feature `dns`) or one passed to the `_with_dns`
+//! functions; modules
 //! configured as `[plugins] hostrealm { module = name:unix:path=... }` run
 //! as separate processes over [`crate::plugin::rpc`] and come first, as in
 //! MIT's plugin order.
@@ -10,12 +13,15 @@
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
+use super::DnsResolver;
 use crate::plugin::rpc::{self, Message, PLUGIN_NO_HANDLE};
 use crate::plugin::{self as plugins, Configured};
 use crate::profile::Profile;
 
 /// `KRB5_CONFIG_NODEFREALM`.
 pub const CONFIG_NODEFREALM: i32 = rpc::ERROR_TABLE_BASE_KRB5 + 224;
+/// `KRB5_EAI_FAIL`.
+pub const EAI_FAIL: i32 = rpc::ERROR_TABLE_BASE_KRB5 + 239;
 /// `KRB5_PLUGIN_BAD_MODULE_SPEC`.
 pub const PLUGIN_BAD_MODULE_SPEC: i32 = -1_750_600_192 + 1;
 /// [`rpc::call::INITIALIZE`]'s string for a hostrealm module.
@@ -148,28 +154,172 @@ impl Module {
         }
     }
 
-    fn fallback_realm(&self, profile: &Profile, host: &str) -> Result<Vec<String>, i32> {
+    fn fallback_realm(
+        &self,
+        profile: &Profile,
+        dns: Option<&dyn DnsResolver>,
+        host: &str,
+    ) -> Result<Vec<String>, i32> {
         match self {
             Module::Domain => domain_fallback_realm(profile, host),
+            Module::Dns => dns_fallback_realm(profile, dns, host),
             Module::Remote(c) => {
                 let mut m = Message::new(call::FALLBACK_REALM);
                 m.put_str(Some(host));
                 remote_call(c, &m)
             }
-            Module::Profile | Module::Dns => Err(PLUGIN_NO_HANDLE),
+            Module::Profile => Err(PLUGIN_NO_HANDLE),
         }
     }
 
-    fn default_realm(&self, profile: &Profile) -> Result<Vec<String>, i32> {
+    fn default_realm(
+        &self,
+        profile: &Profile,
+        dns: Option<&dyn DnsResolver>,
+    ) -> Result<Vec<String>, i32> {
         match self {
+            Module::Dns => dns_default_realm(profile, dns),
             Module::Profile => profile
                 .get_string(&["libdefaults", "default_realm"])
                 .map(|r| vec![r])
                 .ok_or(PLUGIN_NO_HANDLE),
             Module::Remote(c) => remote_call(c, &Message::new(call::DEFAULT_REALM)),
-            Module::Domain | Module::Dns => Err(PLUGIN_NO_HANDLE),
+            Module::Domain => Err(PLUGIN_NO_HANDLE),
         }
     }
+}
+
+/// The system resolver the `dns` module uses when none is passed in; MIT
+/// built without KRB5_DNS_LOOKUP (no feature `dns` here) has none, and the
+/// module declines.
+fn system_dns() -> Option<&'static dyn DnsResolver> {
+    #[cfg(feature = "dns")]
+    {
+        static RESOLVER: std::sync::OnceLock<Option<super::HickoryResolver>> =
+            std::sync::OnceLock::new();
+        RESOLVER
+            .get_or_init(|| super::HickoryResolver::new().ok())
+            .as_ref()
+            .map(|r| r as &dyn DnsResolver)
+    }
+    #[cfg(not(feature = "dns"))]
+    {
+        None
+    }
+}
+
+/// `_krb5_use_dns_realm` (locate_kdc.c:95-99): `dns_lookup_realm`, else
+/// `dns_fallback`, default false.
+fn use_dns_realm(profile: &Profile) -> bool {
+    super::maybe_use_dns(profile, "dns_lookup_realm", false)
+}
+
+/// txt_lookup_name (dnsglue.c:368-397): `prefix.name.`, or the bare
+/// prefix (left to the resolver's search list) when there is no name.
+fn txt_lookup_name(prefix: &str, name: Option<&str>) -> String {
+    match name {
+        Some(n) if !n.is_empty() => {
+            let mut s = format!("{prefix}.{n}");
+            if !s.ends_with('.') {
+                s.push('.');
+            }
+            s
+        }
+        _ => prefix.to_string(),
+    }
+}
+
+/// k5_try_realm_txt_rr (dnsglue.c:449-498): the first string of the first
+/// TXT answer, less one trailing dot.
+fn try_realm_txt(dns: &dyn DnsResolver, prefix: &str, name: Option<&str>) -> Option<String> {
+    let txtname = txt_lookup_name(prefix, name);
+    let answers = match dns.txt(&txtname) {
+        Ok(a) => a,
+        Err(()) => {
+            crate::k5trace!(
+                "TXT record {} not found",
+                crate::trace::data(txtname.as_bytes())
+            );
+            return None;
+        }
+    };
+    let mut realm = answers.into_iter().next()?;
+    // "Avoid a common error."
+    if realm.ends_with('.') {
+        realm.pop();
+    }
+    crate::k5trace!(
+        "TXT record {} found: {}",
+        crate::trace::data(txtname.as_bytes()),
+        crate::trace::data(realm.as_bytes())
+    );
+    Some(realm)
+}
+
+/// hostrealm_dns.c `txt_lookup`: `_kerberos.<fqdn>` and each parent
+/// domain.
+fn txt_lookup(dns: &dyn DnsResolver, fqdn: &str) -> Option<String> {
+    let mut rest = Some(fqdn);
+    while let Some(f) = rest.filter(|f| !f.is_empty()) {
+        if let Some(r) = try_realm_txt(dns, "_kerberos", Some(f)) {
+            return Some(r);
+        }
+        rest = f.find('.').map(|d| &f[d + 1..]);
+    }
+    None
+}
+
+/// hostrealm_dns.c `dns_fallback_realm`.
+fn dns_fallback_realm(
+    profile: &Profile,
+    dns: Option<&dyn DnsResolver>,
+    host: &str,
+) -> Result<Vec<String>, i32> {
+    let Some(dns) = dns else {
+        return Err(PLUGIN_NO_HANDLE);
+    };
+    if !use_dns_realm(profile) || is_numeric_address(host) {
+        return Err(PLUGIN_NO_HANDLE);
+    }
+    txt_lookup(dns, host)
+        .map(|r| vec![r])
+        .ok_or(PLUGIN_NO_HANDLE)
+}
+
+/// hostrealm_dns.c `dns_default_realm`: the local host's domains, then a
+/// global `_kerberos` record.
+fn dns_default_realm(profile: &Profile, dns: Option<&dyn DnsResolver>) -> Result<Vec<String>, i32> {
+    let Some(dns) = dns else {
+        return Err(PLUGIN_NO_HANDLE);
+    };
+    if !use_dns_realm(profile) {
+        return Err(PLUGIN_NO_HANDLE);
+    }
+    let localhost = fq_local_hostname()?;
+    txt_lookup(dns, &localhost)
+        .or_else(|| try_realm_txt(dns, "_kerberos", None))
+        .map(|r| vec![r])
+        .ok_or(PLUGIN_NO_HANDLE)
+}
+
+/// krb5int_get_fq_local_hostname (hostrealm.c:255-279): `gethostname`,
+/// forward-canonicalized with `AI_CANONNAME`.
+fn fq_local_hostname() -> Result<String, i32> {
+    #[cfg(unix)]
+    let host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(unix))]
+    let host = std::env::var("COMPUTERNAME").unwrap_or_default();
+    if host.is_empty() {
+        return Err(EAI_FAIL);
+    }
+    // Targets without getaddrinfo have no canonical name to look up.
+    if cfg!(not(any(unix, windows))) {
+        return Ok(host);
+    }
+    super::dns_canonical(&host, false).ok_or(EAI_FAIL)
 }
 
 /// hostrealm_profile.c `profile_host_realm`: `[domain_realm]` for the host,
@@ -246,26 +396,49 @@ pub fn get_host_realm(profile: &Profile, host: &str) -> Result<Vec<String>, i32>
 /// `krb5_get_fallback_host_realm`: the first module's realms, else the
 /// default realm.
 pub fn get_fallback_host_realm(profile: &Profile, host: &str) -> Result<Vec<String>, i32> {
+    get_fallback_host_realm_with_dns(profile, host, system_dns())
+}
+
+/// [`get_fallback_host_realm`] with the `dns` module asking `dns`
+/// (`None`: the module declines).
+pub fn get_fallback_host_realm_with_dns(
+    profile: &Profile,
+    host: &str,
+    dns: Option<&dyn DnsResolver>,
+) -> Result<Vec<String>, i32> {
     let host = clean(host);
     let mods = modules(profile)?;
     for m in &mods {
-        match m.fallback_realm(profile, &host) {
+        match m.fallback_realm(profile, dns, &host) {
             Err(PLUGIN_NO_HANDLE) => {}
             r => return r,
         }
     }
-    get_default_realm_with(profile, &mods).map(|r| vec![r])
+    get_default_realm_with(profile, dns, &mods).map(|r| vec![r])
 }
 
 /// `krb5_get_default_realm`: the first realm of the first module that
 /// answers, or `KRB5_CONFIG_NODEFREALM`.
 pub fn get_default_realm(profile: &Profile) -> Result<String, i32> {
-    get_default_realm_with(profile, &modules(profile)?)
+    get_default_realm_with_dns(profile, system_dns())
 }
 
-fn get_default_realm_with(profile: &Profile, mods: &[Module]) -> Result<String, i32> {
+/// [`get_default_realm`] with the `dns` module asking `dns` (`None`: the
+/// module declines).
+pub fn get_default_realm_with_dns(
+    profile: &Profile,
+    dns: Option<&dyn DnsResolver>,
+) -> Result<String, i32> {
+    get_default_realm_with(profile, dns, &modules(profile)?)
+}
+
+fn get_default_realm_with(
+    profile: &Profile,
+    dns: Option<&dyn DnsResolver>,
+    mods: &[Module],
+) -> Result<String, i32> {
     for m in mods {
-        match m.default_realm(profile) {
+        match m.default_realm(profile, dns) {
             Ok(r) => return r.into_iter().next().ok_or(CONFIG_NODEFREALM),
             Err(PLUGIN_NO_HANDLE) => {}
             Err(e) => return Err(e),

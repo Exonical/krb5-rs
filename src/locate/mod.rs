@@ -1,10 +1,6 @@
 //! KDC/service location (MIT lib/krb5/os/locate_kdc.c): profile entries,
 //! then DNS URI records, then SRV records.
 
-#[cfg(any(
-    feature = "kdc",
-    all(feature = "client", any(unix, windows, not(feature = "dns")))
-))]
 mod canon;
 mod dns;
 #[cfg(feature = "dns")]
@@ -12,17 +8,14 @@ mod hickory;
 mod hostrealm;
 mod uri;
 
-#[cfg(any(
-    feature = "kdc",
-    all(feature = "client", any(unix, windows, not(feature = "dns")))
-))]
 pub(crate) use canon::dns_canonical;
 pub use dns::{make_lookup_name, sort_srv, DnsResolver, SrvRecord, UriRecord};
 #[cfg(feature = "dns")]
 pub use hickory::HickoryResolver;
 pub use hostrealm::{
-    default_realm, fallback_host_realm, get_default_realm, get_fallback_host_realm, get_host_realm,
-    host_realm, realm_domain, serve_hostrealm, HostRealm,
+    default_realm, fallback_host_realm, get_default_realm, get_default_realm_with_dns,
+    get_fallback_host_realm, get_fallback_host_realm_with_dns, get_host_realm, host_realm,
+    realm_domain, serve_hostrealm, HostRealm,
 };
 pub use uri::{is_string_numeric, parse_host_string, parse_uri_fields, parse_uri_if_https};
 
@@ -106,6 +99,18 @@ fn service_info(svc: LocateService) -> (&'static str, u16, &'static str) {
     }
 }
 
+/// maybe_use_dns (locate_kdc.c:51-73): named key, else dns_fallback,
+/// else `default`.
+pub(crate) fn maybe_use_dns(profile: &Profile, name: &str, default: bool) -> bool {
+    let v = profile
+        .get_string(&["libdefaults", name])
+        .or_else(|| profile.get_string(&["libdefaults", "dns_fallback"]));
+    match v.as_deref().and_then(crate::profile::conf_boolean) {
+        Some(b) => b,
+        None => default,
+    }
+}
+
 /// KDC locator bound to a profile and an optional injected DNS resolver.
 pub struct Locator<'a> {
     profile: &'a Profile,
@@ -118,17 +123,8 @@ impl<'a> Locator<'a> {
         Locator { profile, dns }
     }
 
-    /// maybe_use_dns (locate_kdc.c:51-73): named key, else dns_fallback,
-    /// else `default`.
     fn use_dns(&self, name: &str, default: bool) -> bool {
-        let v = self
-            .profile
-            .get_string(&["libdefaults", name])
-            .or_else(|| self.profile.get_string(&["libdefaults", "dns_fallback"]));
-        match v.as_deref().and_then(crate::profile::conf_boolean) {
-            Some(b) => b,
-            None => default,
-        }
+        maybe_use_dns(self.profile, name, default)
     }
 
     /// use_dns_uri (locate_kdc.c:76-85): dns_uri_lookup only, default TRUE.
