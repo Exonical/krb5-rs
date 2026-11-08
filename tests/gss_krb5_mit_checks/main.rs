@@ -389,7 +389,9 @@ fn accept_channel_bindings_rules() {
     );
 
     // (e) CHANNEL_BOUND + cb vs acceptor without cb → Complete.
-    let mut acc = Krb5Acceptor::new(Box::new(OneKey(skey)), Some(service()), None);
+    let mut acc = Krb5Acceptor::new(Box::new(OneKey(skey)), Some(service()), None).with_rcache(
+        Some(krb5_rs::protocol::ap::Rcache::resolve("none:").expect("none")),
+    );
     acc.step(&token).expect("accept ok");
 }
 
@@ -458,3 +460,37 @@ fn accept_non_8003_checksum_paths() {
 }
 
 include!("wrap.rs");
+
+/// acquire_cred.c:172-178 / accept_sec_context.c:808-813: the acceptor
+/// stores the authenticator in the credential's replay cache, so a second
+/// acceptor (or process) using the same file2 cache refuses the token.
+#[test]
+fn accept_uses_persistent_rcache() {
+    use krb5_rs::protocol::ap::Rcache;
+    let path = std::env::temp_dir().join(format!("krb5rs-gss-rc-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let rc = Rcache::resolve(&format!("file2:{}", path.display())).expect("rcache");
+    let skey = random_key(18);
+    let (cred, _session) = svc_cred(&skey, 18);
+    let mut init = Krb5Initiator::new(cred, None, GssFlags::empty(), None).expect("new");
+    let token = init_complete(init.step(None).expect("step")).expect("token");
+
+    let mut acc = Krb5Acceptor::new(Box::new(OneKey(skey.clone())), Some(service()), None)
+        .with_rcache(Some(rc.clone()));
+    acc.step(&token).expect("first accept");
+    let mut acc = Krb5Acceptor::new(Box::new(OneKey(skey.clone())), Some(service()), None)
+        .with_rcache(Some(rc));
+    let err = acc.step(&token).expect_err("replay");
+    assert!(format!("{err:?}").contains("Repeat"), "{err:?}");
+    assert!(std::fs::metadata(&path).expect("file").len() > 16);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("file").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let mut acc = Krb5Acceptor::new(Box::new(OneKey(skey)), Some(service()), None)
+        .with_rcache(Some(Rcache::resolve("none:").expect("none")));
+    acc.step(&token).expect("none: accepts the replay");
+    let _ = std::fs::remove_file(&path);
+}

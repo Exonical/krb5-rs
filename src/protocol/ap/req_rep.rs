@@ -221,9 +221,17 @@ impl AuthContext {
             if cipher.len() < tag_len {
                 return Err(ApError::BadIntegrity.into());
             }
-            let tag = cipher[cipher.len() - tag_len..].to_vec();
-            if !self.rcache.insert(tag) {
-                return Err(ApError::Repeat.into());
+            let tag = &cipher[cipher.len() - tag_len..];
+            if self.rcache.is_none() {
+                self.rcache = Some(Rcache::default(None)?);
+            }
+            let now = (Utc::now() + self.time_offset).timestamp() as u32;
+            let skew = u32::try_from(self.clockskew.as_secs()).unwrap_or(u32::MAX);
+            if let Some(rc) = &self.rcache {
+                rc.store(tag, now, skew).map_err(|e| match e {
+                    RcacheError::Repeat => Krb5Error::Ap(ApError::Repeat),
+                    e => e.into(),
+                })?;
             }
         }
 

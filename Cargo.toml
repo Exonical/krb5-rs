@@ -33,6 +33,9 @@ zeroize = { version = "1", features = ["derive"] }
 # Flags
 bitflags = "2"
 
+# file2 replay cache record hashing (MIT k5_siphash24)
+siphasher = "1"
+
 # Network
 tokio = { version = "1.50", features = ["net", "io-util", "time", "sync", "rt", "rt-multi-thread", "macros"], optional = true }
 
@@ -70,7 +73,7 @@ const-oid = { version = "0.9", features = ["db"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-rustix = { version = "1.1", features = ["fs", "system"] }
+rustix = { version = "1.1", features = ["fs", "process", "system"] }
 
 # localauth RULE regexps where there is no system regcomp.
 [target.'cfg(not(unix))'.dependencies]
