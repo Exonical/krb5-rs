@@ -93,6 +93,13 @@ pub struct AsExchangeConfig {
     /// Answer to a KDC's PA-OTP-CHALLENGE (MIT responder question
     /// `otp`); `None` skips OTP. Requires FAST armor.
     pub otp: Option<crate::otp::OtpAnswer>,
+    /// Seconds from now until the ticket becomes valid (MIT `start_time`);
+    /// non-zero requests a postdated ticket (get_in_tkt.c:928-929).
+    /// Default: 0.
+    pub start_time: u32,
+    /// Addresses for the request body (`krb5_get_init_creds_opt_set_address_list`).
+    /// Default: none.
+    pub addresses: Option<Vec<crate::types::HostAddress>>,
 }
 
 /// Default provides sensible options (etypes, flags, lifetimes) but leaves
@@ -120,6 +127,8 @@ impl Default for AsExchangeConfig {
             subject_cert: None,
             spake_groups: vec![crate::spake::Group::Edwards25519],
             otp: None,
+            start_time: 0,
+            addresses: None,
         }
     }
 }
@@ -236,6 +245,9 @@ pub struct AsExchange {
     last_s2kparams: Option<Vec<u8>>,
     /// Persisted etype from preauth hint (for hint-less MORE_PREAUTH_DATA).
     last_preauth_etype: Option<i32>,
+    /// `krb5_get_etype_info`: stop at the first PREAUTH_REQUIRED or AS-REP
+    /// and record its etype-info.
+    pub(crate) etype_probe: bool,
     /// PA-FX-COOKIE from the most recent KDC error, echoed verbatim in the
     /// next AS-REQ (MIT preauth2.c:856-884 `copy_cookie`). Not cached:
     /// an error without a cookie clears it.
@@ -314,6 +326,7 @@ impl AsExchange {
             last_preauth_salt: None,
             last_s2kparams: None,
             last_preauth_etype: None,
+            etype_probe: false,
             cookie: None,
             info_pa_permitted: true,
             restarted: false,
@@ -432,6 +445,26 @@ impl AsExchange {
         Ok(())
     }
 
+    /// `k5_get_etype_info`: the preferred etype-info entry, if any.
+    fn note_etype_info(&mut self, padata: &[PaData]) {
+        if let Ok(hint) = extract_preauth_hint_padata(padata, &self.config.etypes) {
+            self.last_preauth_etype = Some(hint.etype);
+            self.last_preauth_salt = hint.salt;
+            self.last_s2kparams = hint.s2kparams;
+        }
+    }
+
+    /// The etype, salt and s2kparams recorded by an etype-info probe
+    /// (`krb5_get_etype_info`); the salt defaults to the principal's.
+    pub(crate) fn etype_info(&self) -> Option<(i32, Vec<u8>, Option<Vec<u8>>)> {
+        let etype = self.last_preauth_etype?;
+        let salt = self
+            .last_preauth_salt
+            .clone()
+            .unwrap_or_else(|| self.default_salt());
+        Some((etype, salt, self.last_s2kparams.clone()))
+    }
+
     /// Process a KDC response.
     fn process_kdc_reply(&mut self, kdc_reply: &[u8]) -> Result<StepResult, Krb5Error> {
         if kdc_reply.is_empty() {
@@ -445,6 +478,11 @@ impl AsExchange {
             }
             // get_in_tkt.c:1786-1789: any reply means the client exists here.
             if self.config.identify_realm {
+                self.state = AsState::Complete;
+                return Ok(StepResult::Complete);
+            }
+            if self.etype_probe {
+                self.note_etype_info(as_rep.0.padata.as_deref().unwrap_or(&[]));
                 self.state = AsState::Complete;
                 return Ok(StepResult::Complete);
             }
@@ -477,6 +515,13 @@ impl AsExchange {
         #[cfg(feature = "pkinit")]
         if let Some(result) = self.pkinit_error(&krb_error, err_padata.as_deref()) {
             return result;
+        }
+
+        // get_etype_info.c get_from_error: only PREAUTH_REQUIRED carries it.
+        if self.etype_probe && krb_error.error_code == KDC_ERR_PREAUTH_REQUIRED {
+            self.note_etype_info(err_padata.as_deref().unwrap_or(&[]));
+            self.state = AsState::Complete;
+            return Ok(StepResult::Complete);
         }
 
         match krb_error.error_code {

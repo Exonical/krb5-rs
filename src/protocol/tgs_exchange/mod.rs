@@ -64,6 +64,10 @@ pub struct TgsOptions {
     /// Whether to set DISABLE-TRANSITED-CHECK (`KRB5_GC_NO_TRANSIT_CHECK`).
     /// Default: false.
     pub disable_transited_check: bool,
+    /// `KDC_OPT_RENEW` or `KDC_OPT_VALIDATE` to renew or validate the TGT
+    /// itself (val_renew.c `get_new_creds`): the request then carries these
+    /// options plus the TGT's `FLAGS2OPTS` bits. Default: none.
+    pub valrenew: Option<KdcOptions>,
 }
 
 impl Default for TgsOptions {
@@ -76,6 +80,7 @@ impl Default for TgsOptions {
             max_clock_skew: DEFAULT_MAX_CLOCK_SKEW,
             pac_options: true,
             disable_transited_check: false,
+            valrenew: None,
         }
     }
 }

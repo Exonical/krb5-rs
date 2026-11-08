@@ -38,7 +38,11 @@ impl AsExchange {
             .unwrap_or_else(|| PrincipalName::new_srv_inst("krbtgt", &self.config.realm));
 
         // Compute till and rtime using checked arithmetic to avoid panic on overflow
-        let now = now_kerberos();
+        // get_in_tkt.c:1252-1260: from = now + start_time, and the
+        // lifetimes count from there.
+        let now = now_kerberos()
+            .checked_add_signed(chrono::Duration::seconds(i64::from(self.config.start_time)))
+            .ok_or(Krb5Error::ReplyValidation("start time overflow"))?;
         let till_dur = chrono::Duration::seconds(duration_secs_i64(self.config.tkt_lifetime));
         let till = match now.checked_add_signed(till_dur) {
             Some(t) => t,
@@ -72,20 +76,25 @@ impl AsExchange {
             cname.name_type = NT_WELLKNOWN;
         }
         let req_body = KdcReqBody {
-            kdc_options: if anonymous {
-                KerberosFlags::new(*self.config.kdc_options | KdcOptions::REQUEST_ANONYMOUS)
-            } else {
-                self.config.kdc_options
+            kdc_options: {
+                let mut o = *self.config.kdc_options;
+                if anonymous {
+                    o |= KdcOptions::REQUEST_ANONYMOUS;
+                }
+                if self.config.start_time > 0 {
+                    o |= KdcOptions::ALLOW_POSTDATE | KdcOptions::POSTDATED;
+                }
+                KerberosFlags::new(o)
             },
             cname: Some(cname),
             realm: realm.clone(),
             sname: Some(sname),
-            from: None,
+            from: (self.config.start_time > 0).then_some(now),
             till,
             rtime,
             nonce: self.nonce,
             etype: self.config.etypes.clone(),
-            addresses: None,
+            addresses: self.config.addresses.clone(),
             enc_authorization_data: None,
             additional_tickets: None,
         };

@@ -152,6 +152,13 @@ async fn expand_hostname(c: &HostCanonicalization, host: &str, use_dns: bool) ->
 }
 
 /// `split_trailer` (sn2princ.c): a ":port" suffix kept off the host.
+/// The host part of `krb5_sname_to_principal` when canonicalization is
+/// not delayed (sn2princ.c:372-375): `host` qualified, lowercased and, with
+/// `use_dns`, DNS-canonicalized.
+pub async fn canonicalize_hostname(c: &HostCanonicalization, host: &str, use_dns: bool) -> String {
+    expand_hostname(c, host, use_dns).await
+}
+
 fn split_trailer(s: &str) -> (&str, &str) {
     match s.find(':') {
         Some(i) if s.len() - i != 1 && !s[i + 1..].contains(':') => (&s[..i], &s[i..]),

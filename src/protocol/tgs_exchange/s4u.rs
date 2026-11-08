@@ -188,7 +188,7 @@ fn convert_to_enterprise(name: &PrincipalName, realm: &str) -> Result<PrincipalN
 }
 
 /// `FLAGS2OPTS` (get_creds.c:244).
-fn flags2opts(tgt: &Credential) -> KdcOptions {
+pub(super) fn flags2opts(tgt: &Credential) -> KdcOptions {
     KdcOptions::from_bits_truncate(tgt.flags.bits() & KDC_TKT_COMMON_MASK)
 }
 
