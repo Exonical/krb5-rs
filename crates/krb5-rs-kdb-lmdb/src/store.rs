@@ -2686,6 +2686,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_file_with_a_named_master_key_converts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let master = krb5_rs::kdc::kdb::master::master_key_from_password_named(
+            "LMDB.TEST",
+            "kdc/master",
+            "master password",
+            18,
+        )
+        .expect("master key");
+        let file = FileStore::create_named(&path, "LMDB.TEST", &master, &[18], "kdc/master")
+            .expect("create file db");
+        file.create_principal(principal("alice"), None)
+            .await
+            .expect("add alice to file db");
+        let (expected_records, _) = file.export_records().expect("snapshot");
+        drop(file);
+
+        let mut config = test_config(&path);
+        config.master_key_name = "kdc/master".into();
+        let converted = LmdbStore::open(&config, &master).expect("auto convert");
+        assert_eq!(
+            converted.list_records_sync().expect("records").len(),
+            expected_records.len()
+        );
+        assert_eq!(
+            converted.master_key_list().expect("master keys").keys.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_file_auto_conversion_is_recoverable_and_idempotent() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("principal");
