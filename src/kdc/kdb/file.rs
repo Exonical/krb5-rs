@@ -120,6 +120,8 @@ pub struct FileStore {
     path: PathBuf,
     realm: String,
     master: EncryptionKey,
+    /// The master key principal (`master_key_name`, default `K/M`).
+    master_name: PrincipalName,
     /// Master-key list from `K/M`, reloaded with the cache.
     masters: RwLock<MasterKeys>,
     cache: RwLock<Cache>,
@@ -432,10 +434,23 @@ impl FileStore {
         master: &EncryptionKey,
         tgt_etypes: &[i32],
     ) -> Result<Self, StoreError> {
+        Self::create_named(path, realm, master, tgt_etypes, "K/M")
+    }
+
+    /// [`FileStore::create_with`] with the master key principal
+    /// `master_key_name` (without the realm).
+    pub fn create_named(
+        path: &Path,
+        realm: &str,
+        master: &EncryptionKey,
+        tgt_etypes: &[i32],
+        master_key_name: &str,
+    ) -> Result<Self, StoreError> {
         if path.exists() {
             return Err(err(format!("database {} already exists", path.display())));
         }
-        let store = Self::new(path, realm, master, MasterKeys::single(master.clone()));
+        let mut store = Self::new(path, realm, master, MasterKeys::single(master.clone()));
+        store.master_name = super::master::master_principal_named(master_key_name)?;
         let now = kerberos_time(Utc::now().timestamp());
         let km_key = KeyEntry {
             kvno: 1,
@@ -452,7 +467,7 @@ impl FileStore {
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
-            name: master_principal()?,
+            name: store.master_name.clone(),
             realm: realm.to_string(),
             attributes: PrincipalAttributes::DISALLOW_ALL_TIX
                 | PrincipalAttributes::REQUIRES_PRE_AUTH
@@ -511,9 +526,18 @@ impl FileStore {
     /// Open an existing database. `master` must open the newest `K/M` key,
     /// directly or through `KRB5_TL_MKEY_AUX` (`krb5_db_fetch_mkey_list`).
     pub fn open(path: &Path, master: &EncryptionKey) -> Result<Self, StoreError> {
+        Self::open_named(path, master, "K/M")
+    }
+
+    /// [`FileStore::open`] with the master key principal `master_key_name`.
+    pub fn open_named(
+        path: &Path,
+        master: &EncryptionKey,
+        master_key_name: &str,
+    ) -> Result<Self, StoreError> {
         let (_, file) = read_file(path)?;
         let realm = String::from_utf8_lossy(file.realm.as_bytes()).to_string();
-        let master_name = master_principal()?;
+        let master_name = super::master::master_principal_named(master_key_name)?;
         let km = file
             .principals
             .iter()
@@ -522,7 +546,8 @@ impl FileStore {
         let keys = stored_of(km)
             .master_keys(master)
             .map_err(|_| err("incorrect master key"))?;
-        let store = Self::new(path, &realm, master, keys);
+        let mut store = Self::new(path, &realm, master, keys);
+        store.master_name = master_name;
         store.refresh(true)?;
         Ok(store)
     }
@@ -532,6 +557,10 @@ impl FileStore {
             path: path.to_path_buf(),
             realm: realm.to_string(),
             master: master.clone(),
+            master_name: master_principal().unwrap_or(PrincipalName {
+                name_type: 1,
+                name_string: Vec::new(),
+            }),
             masters: RwLock::new(masters),
             cache: RwLock::new(Cache::default()),
             ulog: None,
@@ -654,7 +683,7 @@ impl FileStore {
     /// under a stale active key (`kdb_get_active_mkey` rereads `K/M`,
     /// `server_kdb.c:84-98`).
     fn masters_in(&self, list: &[KdbPrincipal]) -> Result<MasterKeys, StoreError> {
-        let km_name = master_principal()?;
+        let km_name = self.master_name.clone();
         let Some(km) = list.iter().find(|p| is_km(p, &km_name, &self.realm)) else {
             return Ok(self.master_keys());
         };
@@ -705,7 +734,7 @@ impl FileStore {
             return Ok(());
         }
         let (stamp, file) = read_file(&self.path)?;
-        let km_name = master_principal()?;
+        let km_name = self.master_name.clone();
         if let Some(km) = file
             .principals
             .iter()
