@@ -35,6 +35,47 @@ pub const SAM_INVALID_ETYPE: i32 = ERROR_TABLE_BASE_KRB5 + 226;
 /// `KRB5_SAM_NO_CHECKSUM`.
 pub const SAM_NO_CHECKSUM: i32 = ERROR_TABLE_BASE_KRB5 + 227;
 
+/// `KRB5_LIBOS_CANTREADPWD`.
+pub const LIBOS_CANTREADPWD: i32 = ERROR_TABLE_BASE_KRB5 + 130;
+/// `KRB5KRB_AP_ERR_BAD_INTEGRITY`.
+pub const AP_ERR_BAD_INTEGRITY: i32 = ERROR_TABLE_BASE_KRB5 + 31;
+
+/// The prompt MIT's `sam2` client module shows (preauth_sam2.c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sam2Prompt {
+    /// Prompter name: `sam-type-name`, or "SAM Authentication".
+    pub name: String,
+    /// Prompter banner: `sam-challenge-label`, or a label for the SAM type.
+    pub banner: String,
+    /// "Challenge is [<challenge>], " (if there is a challenge), then
+    /// `sam-response-prompt` or "passcode". The answer is hidden.
+    pub prompt: String,
+}
+
+/// Answers a [`Sam2Prompt`] with the single-use authentication data, as
+/// MIT's prompter does; `None` fails the mechanism.
+#[derive(Clone)]
+pub struct Sam2Responder(pub std::sync::Arc<dyn Fn(&Sam2Prompt) -> Option<String> + Send + Sync>);
+
+impl std::fmt::Debug for Sam2Responder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sam2Responder")
+    }
+}
+
+/// `sam_challenge_banner` (preauth_sam2.c).
+pub fn challenge_banner(sam_type: i32) -> &'static str {
+    match sam_type {
+        1 => "Challenge for Enigma Logic mechanism",
+        2 | 8 => "Challenge for Digital Pathways mechanism",
+        6 | 7 => "Challenge for Activcard mechanism",
+        3 => "Challenge for Enhanced S/Key mechanism",
+        4 => "Challenge for Traditional S/Key mechanism",
+        TYPE_SECURID | 129 => "Challenge for Security Dynamics mechanism",
+        _ => "Challenge from authentication server",
+    }
+}
+
 bitflags::bitflags! {
     /// `sam-flags` (`KRB5_SAM_*`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

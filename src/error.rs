@@ -115,6 +115,10 @@ pub enum Krb5Error {
     /// Miscellaneous protocol failure.
     #[error("protocol error: {0}")]
     Protocol(String),
+
+    /// A failure MIT reports with this error-table code and message.
+    #[error("{1}")]
+    Mit(i32, &'static str),
 }
 
 impl Krb5Error {
