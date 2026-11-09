@@ -171,6 +171,15 @@ impl<S: PrincipalStore> Kdc<S> {
             ctx.cname = Some(client.name.clone());
             return Err(KdcError::new(KDC_ERR_WRONG_REALM, "REFERRAL"));
         }
+        if self.config.alias_requires_canonicalize
+            && client.name != *cname
+            && !(opts.contains(KdcOptions::CANONICALIZE) || cname.name_type == 10 || cert.is_some())
+        {
+            return Err(KdcError::new(
+                KDC_ERR_C_PRINCIPAL_UNKNOWN,
+                "CLIENT_NOT_FOUND",
+            ));
+        }
         let local_tgt = self.require_local_tgt().await?;
         self.consistency_gate(&[
             GateSubject {

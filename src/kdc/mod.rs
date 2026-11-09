@@ -158,6 +158,10 @@ pub struct KdcConfig {
     /// SPAKE groups the KDC permits (`[libdefaults] spake_preauth_groups`);
     /// empty, the MIT KDC default, disables SPAKE.
     pub spake_groups: Vec<crate::spake::Group>,
+    /// krb5-rs extension: refuse an AS-REQ for a local alias of the client
+    /// unless the client asked for canonicalization (or sent an enterprise
+    /// name). MIT issues the ticket to the alias instead. Default false.
+    pub alias_requires_canonicalize: bool,
     /// Optimistic challenge group (`[kdcdefaults] spake_preauth_kdc_challenge`).
     pub spake_challenge: Option<crate::spake::Group>,
     /// Auth indicators for SPAKE (`[realms] spake_preauth_indicator`).
@@ -198,6 +202,7 @@ impl KdcConfig {
             tgs_recheck_client: true,
             restrict_anonymous_to_tgt: false,
             spake_groups: Vec::new(),
+            alias_requires_canonicalize: false,
             spake_challenge: None,
             spake_indicators: Vec::new(),
             encrypted_challenge_indicator: None,
