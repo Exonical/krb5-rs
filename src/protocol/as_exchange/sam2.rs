@@ -81,7 +81,7 @@ impl AsExchange {
                 samdata(&body.response_prompt, "passcode", 55),
             ),
         };
-        let sad = (responder.0)(&prompt).ok_or_else(cant_read)?;
+        let sad = zeroize::Zeroizing::new((responder.0)(&prompt).ok_or_else(cant_read)?);
 
         if use_sad {
             let k = profile
