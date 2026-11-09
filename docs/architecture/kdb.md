@@ -205,9 +205,9 @@ ones on its own GSS-API. As in libldap:
 
 Differences from MIT:
 
-- `krb5-rs-kdb5-ldap-util create` accepts `-kv` and `-M`, but the master key
-  is always `K/M` with kvno 1, as `krb5-rs-kdb create` makes it; another `-M`
-  name is refused.
+- `krb5-rs-kdb5-ldap-util create` accepts `-kv`, but the master key always
+  has kvno 1, as `krb5-rs-kdb create` makes it. `-M` names the master key
+  principal, as in MIT.
 - The master-key commands (`add_mkey`, `use_mkey`, `list_mkeys`,
   `purge_mkeys`, `update_princ_encryption`), `ark` and `tabdump` are refused
   on kldap.
