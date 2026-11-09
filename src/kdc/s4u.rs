@@ -622,6 +622,7 @@ impl<S: PrincipalStore> Kdc<S> {
     pub(super) fn check_s4u2proxy_policy(
         &self,
         req: &KdcReq,
+        client: (&PrincipalName, &str),
         impersonator_name: (&PrincipalName, &str),
         impersonator: &PrincipalEntry,
         resource_name: (&PrincipalName, &str),
@@ -658,6 +659,9 @@ impl<S: PrincipalStore> Kdc<S> {
                 .allowed_to_delegate_to
                 .iter()
                 .any(|e| list_names(e, &impersonator.realm, resource_name.0, resource_name.1))
+                && self
+                    .store
+                    .authorize_s4u2proxy(client, impersonator, resource_name)
             {
                 return Ok(());
             }

@@ -625,6 +625,7 @@ impl<S: PrincipalStore> Kdc<S> {
         if let Some(e) = &stkt {
             self.check_s4u2proxy_policy(
                 req,
+                (&e.part.cname, &realm_string(&e.part.crealm)),
                 (&header.cname, &client_realm),
                 &e.server,
                 (sname, &realm_string(&body.realm)),

@@ -415,6 +415,20 @@ pub trait PrincipalStore: Send + Sync {
             "issue_pac is not supported",
         ))
     }
+
+    /// Extra S4U2Proxy check once `server`'s `allowed_to_delegate_to` names
+    /// `proxy`: may `server` get a ticket to `proxy` for `client`? Stores
+    /// that apply their own access policy to the impersonated client refuse
+    /// here; the default allows.
+    fn authorize_s4u2proxy(
+        &self,
+        client: (&PrincipalName, &str),
+        server: &PrincipalEntry,
+        proxy: (&PrincipalName, &str),
+    ) -> bool {
+        let _ = (client, server, proxy);
+        true
+    }
 }
 
 /// Read access to policies (MIT `krb5_db_get_policy`).
@@ -617,6 +631,15 @@ impl<T: PrincipalStore + ?Sized> PrincipalStore for Arc<T> {
 
     fn issue_pac(&self, req: IssuePac<'_>) -> Result<(), StoreError> {
         (**self).issue_pac(req)
+    }
+
+    fn authorize_s4u2proxy(
+        &self,
+        client: (&PrincipalName, &str),
+        server: &PrincipalEntry,
+        proxy: (&PrincipalName, &str),
+    ) -> bool {
+        (**self).authorize_s4u2proxy(client, server, proxy)
     }
 }
 
