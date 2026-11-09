@@ -419,6 +419,9 @@ impl AuthdataContext {
             let authdata = match authdata.filter(|a| !a.is_empty()) {
                 Some(a) => a,
                 None => {
+                    // Deviation from MIT, which keeps kdc_issued_flag here
+                    // and so vouches for data the client chose.
+                    kdc_issued_flag = false;
                     let ticket_usage = inst.flags & (AD_USAGE_AS_REQ | AD_USAGE_TGS_REQ) != 0;
                     let authen_usage = inst.flags & AD_USAGE_AP_REQ != 0;
                     find_authdata(

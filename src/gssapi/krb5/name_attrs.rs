@@ -640,6 +640,28 @@ mod tests {
     }
 
     #[test]
+    fn greet_client_does_not_trust_an_authenticator_greeting_beside_other_kdc_data() {
+        install();
+        let skey = EncryptionKey::new(18, generate_random(32));
+        let session = EncryptionKey::new(18, vec![0; 32]);
+        // Valid AD-KDC-ISSUED that holds no greeting.
+        let issued = crate::authdata::make_authdata_kdc_issued(
+            &session,
+            Some((&PrincipalName::new_principal("krbtgt/R"), "R")),
+            &[el(-4299, b"other")],
+        )
+        .expect("kdc issued");
+        let inner = rasn::der::encode(&vec![issued]).expect("enc");
+        let mut t = ticket(vec![el(1, &inner)]);
+        t.key = session;
+        let authen = [el(AD_GREET, b"from client")];
+        let c = ctx_with(NameAttrs::import(&t, Some(&authen), &skey).expect("import"));
+        let v = c.get_name_attribute(GREET_ATTR).expect("greeting");
+        assert_eq!(v[0].value, b"from client");
+        assert!(!v[0].authenticated);
+    }
+
+    #[test]
     fn only_informational_module_errors_are_ignored() {
         install();
         let skey = EncryptionKey::new(18, generate_random(32));
