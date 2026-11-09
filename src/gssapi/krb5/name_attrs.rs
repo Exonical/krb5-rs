@@ -28,18 +28,8 @@ const MSPAC_ATTRS: &[(Option<u32>, &str)] = &[
     (Some(PAC_UPN_DNS_INFO), "urn:mspac:upn-dns-info"),
 ];
 
-/// One value of a name attribute (gss_get_name_attribute outputs).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NameAttrValue {
-    /// value.
-    pub value: Vec<u8>,
-    /// display_value (always empty for the built-in modules).
-    pub display_value: Vec<u8>,
-    /// authenticated.
-    pub authenticated: bool,
-    /// complete.
-    pub complete: bool,
-}
+pub use crate::authdata::NameAttrValue;
+use crate::authdata::{AuthdataContext, AD_USAGE_MASK, ENOENT, EPERM};
 
 /// The authdata context of a name (`krb5_authdata_context`).
 #[derive(Debug, Clone, Default)]
@@ -47,6 +37,8 @@ pub(super) struct NameAttrs {
     pub(super) pac: Option<Pac>,
     pub(super) pac_verified: bool,
     pub(super) indicators: Vec<String>,
+    /// The installed client authdata modules (`crate::authdata`).
+    pub(super) modules: AuthdataContext,
 }
 
 /// mspac_attr2type: `Some(None)` is the whole PAC.
@@ -73,13 +65,31 @@ fn unavailable() -> Krb5Error {
     gss(GssError::Unavailable)
 }
 
+/// kg_map_name_error.
+fn map_name_error(code: i32) -> Krb5Error {
+    if code == ENOENT || code == EPERM {
+        unavailable()
+    } else {
+        gss(GssError::Failure)
+    }
+}
+
 impl NameAttrs {
-    /// krb5int_authdata_verify (authdata.c:613-725) for the mspac and
-    /// auth-indicators modules, with `key` the ticket's service key.
-    pub(super) fn import(ticket: &EncTicketPart, key: &EncryptionKey) -> Result<Self, Krb5Error> {
+    /// krb5int_authdata_verify (authdata.c:613-725) with usage
+    /// AD_USAGE_MASK (rd_req_dec.c:643), for the mspac and auth-indicators
+    /// modules then the installed ones, with `key` the ticket's service key
+    /// and `authen_ad` the authenticator's authorization data.
+    pub(super) fn import(
+        ticket: &EncTicketPart,
+        authen_ad: Option<&[AuthorizationDataElement]>,
+        key: &EncryptionKey,
+    ) -> Result<Self, Krb5Error> {
         let failure = || gss(GssError::Failure);
         let ticket_ad = ticket.authorization_data.as_deref().unwrap_or(&[]);
         let mut attrs = NameAttrs::default();
+
+        // k5_get_kdc_issued_authdata: a bad checksum is ignored.
+        let kdc_issued = crate::authdata::get_kdc_issued_authdata(ticket).map_err(|_| failure())?;
 
         // get_cammac_authdata / extract_cammacs: CAMMACs whose service
         // verifier fails are ignored; undecodable ones or ones without a
@@ -134,6 +144,19 @@ impl NameAttrs {
                 .indicators
                 .extend(list.into_iter().map(|s| s.to_string()));
         }
+
+        attrs.modules = AuthdataContext::new();
+        attrs
+            .modules
+            .verify(
+                AD_USAGE_MASK,
+                ticket,
+                key,
+                authen_ad,
+                kdc_issued.as_ref(),
+                (!verified.is_empty()).then_some(&verified[..]),
+            )
+            .map_err(|_| failure())?;
         Ok(attrs)
     }
 }
@@ -143,7 +166,8 @@ impl NameAttrs {
     /// modules (authdata.c, pac.c mspac_externalize, ai_authdata.c
     /// authind_externalize).
     fn externalize(&self) -> Vec<u8> {
-        let mut out = 2u32.to_be_bytes().to_vec();
+        let loaded = self.modules.externalize(AD_USAGE_MASK);
+        let mut out = (2 + loaded.len() as u32).to_be_bytes().to_vec();
         let mut module = |name: &str, body: Vec<u8>| {
             out.extend_from_slice(&(name.len() as u32).to_be_bytes());
             out.extend_from_slice(name.as_bytes());
@@ -166,6 +190,9 @@ impl NameAttrs {
             ind.extend_from_slice(i.as_bytes());
         }
         module("authentication-indicators", ind);
+        for (name, body) in loaded {
+            module(&name, body);
+        }
         out
     }
 }
@@ -210,6 +237,7 @@ impl Krb5Context {
         if !self.name_attrs.indicators.is_empty() {
             out.push(AUTH_INDICATORS.to_string());
         }
+        out.extend(self.name_attrs.modules.get_attribute_types());
         out
     }
 
@@ -246,7 +274,7 @@ impl Krb5Context {
                 })
                 .collect());
         }
-        Err(unavailable())
+        attrs.modules.get_attribute(attr).map_err(map_name_error)
     }
 
     /// gss_set_name_attribute (krb5_authdata_set_attribute): only PAC
@@ -254,7 +282,7 @@ impl Krb5Context {
     /// whole PAC is unverified.  `auth-indicators` is refused.
     pub fn set_name_attribute(
         &mut self,
-        _complete: bool,
+        complete: bool,
         attr: &str,
         value: &[u8],
     ) -> Result<(), Krb5Error> {
@@ -277,20 +305,29 @@ impl Krb5Context {
                 None => {}
             }
         }
+        // authind_set_attribute: EPERM, which ends the loop.
         if attr.as_bytes() == AUTH_INDICATORS.as_bytes() {
-            return Err(unavailable());
+            return Err(map_name_error(EPERM));
         }
-        if found {
+        let n = attrs
+            .modules
+            .set_attribute(complete, attr, value)
+            .map_err(map_name_error)?;
+        if found || n > 0 {
             Ok(())
         } else {
             Err(unavailable())
         }
     }
 
-    /// gss_delete_name_attribute: neither built-in module deletes
-    /// attributes, so this is always `GssError::Unavailable`.
-    pub fn delete_name_attribute(&mut self, _attr: &str) -> Result<(), Krb5Error> {
-        Err(unavailable())
+    /// gss_delete_name_attribute (krb5_authdata_delete_attribute): neither
+    /// built-in module deletes attributes, so only installed modules can.
+    pub fn delete_name_attribute(&mut self, attr: &str) -> Result<(), Krb5Error> {
+        match self.name_attrs.modules.delete_attribute(attr) {
+            Ok(0) => Err(unavailable()),
+            Ok(_) => Ok(()),
+            Err(e) => Err(map_name_error(e)),
+        }
     }
 
     /// gss_localname for the initiator name (krb5_aname_to_localname).
@@ -397,7 +434,7 @@ mod tests {
             cammac(&key, &["otp", "hw"]),
             cammac(&other, &["forged"]),
         ]);
-        let c = ctx_with(NameAttrs::import(&t, &key).expect("import"));
+        let c = ctx_with(NameAttrs::import(&t, None, &key).expect("import"));
         assert_eq!(c.inquire_name(), vec!["auth-indicators"]);
         let vals = c.get_name_attribute("auth-indicators").expect("attr");
         let got: Vec<&[u8]> = vals.iter().map(|v| v.value.as_slice()).collect();
@@ -408,6 +445,9 @@ mod tests {
             c.set_name_attribute(true, "auth-indicators", b"x"),
             Err(Krb5Error::Gss(GssError::Unavailable))
         ));
+        // Neither built-in module deletes; installed modules (greet, from
+        // other tests) are left out here.
+        c.name_attrs.modules = AuthdataContext::default();
         assert!(c.delete_name_attribute("auth-indicators").is_err());
         assert!(c.get_name_attribute("urn:mspac:").is_err());
     }
@@ -432,8 +472,9 @@ mod tests {
                 ad_data: rasn::der::encode(&inner).expect("enc").into(),
             }
         };
-        let c =
-            ctx_with(NameAttrs::import(&ticket(vec![ad(signed.clone())]), &key).expect("import"));
+        let c = ctx_with(
+            NameAttrs::import(&ticket(vec![ad(signed.clone())]), None, &key).expect("import"),
+        );
         let names = c.inquire_name();
         assert_eq!(names[0], "urn:mspac:");
         assert!(names.contains(&"urn:mspac:client-info".to_string()));
@@ -444,11 +485,191 @@ mod tests {
         assert!(c.get_name_attribute("urn:mspac:client-info").is_ok());
         assert!(c.get_name_attribute("urn:mspac:logon-info").is_err());
         // Verified with the wrong key: present but hidden.
-        let c = ctx_with(NameAttrs::import(&ticket(vec![ad(signed)]), &kdc).expect("import"));
+        let c = ctx_with(NameAttrs::import(&ticket(vec![ad(signed)]), None, &kdc).expect("import"));
         assert!(!c.inquire_name().is_empty());
         assert!(c.get_name_attribute("urn:mspac:").is_err());
         assert_eq!(mspac_attr2type("urn:mspac:42"), Some(Some(42)));
         assert_eq!(mspac_attr2type("urn:mspac:0"), None);
         assert_eq!(mspac_attr2type("urn:mspac:4x"), None);
+    }
+
+    use crate::authdata::greet::{GreetClient, AD_GREET, GREET_ATTR};
+    use crate::authdata::{
+        register_module, AuthdataModule, AuthdataRequestContext, AD_INFORMATIONAL, AD_USAGE_AP_REQ,
+    };
+    use std::sync::Arc;
+
+    /// A module whose import always fails, for `ad_type`.
+    struct Failing(i32, u32);
+    struct FailingCtx;
+    impl AuthdataRequestContext for FailingCtx {
+        fn import_authdata(
+            &mut self,
+            _: &[AuthorizationDataElement],
+            _: bool,
+            _: Option<&crate::authdata::Principal>,
+        ) -> Result<(), i32> {
+            Err(22)
+        }
+    }
+    impl AuthdataModule for Failing {
+        fn name(&self) -> &str {
+            if self.1 & AD_INFORMATIONAL != 0 {
+                "failing-informational"
+            } else {
+                "failing"
+            }
+        }
+        fn ad_types(&self) -> &[i32] {
+            std::slice::from_ref(&self.0)
+        }
+        fn flags(&self, _: i32) -> u32 {
+            self.1
+        }
+        fn request_init(&self) -> Result<Box<dyn AuthdataRequestContext>, i32> {
+            Ok(Box::new(FailingCtx))
+        }
+    }
+
+    fn install() {
+        register_module(Arc::new(GreetClient)).expect("greet");
+        register_module(Arc::new(Failing(-4242, AD_USAGE_AP_REQ | AD_INFORMATIONAL)))
+            .expect("informational");
+        register_module(Arc::new(Failing(-4243, AD_USAGE_AP_REQ))).expect("failing");
+    }
+
+    fn el(ad_type: i32, data: &[u8]) -> AuthorizationDataElement {
+        AuthorizationDataElement {
+            ad_type,
+            ad_data: data.to_vec().into(),
+        }
+    }
+
+    fn greeting_ticket(sign_key: &EncryptionKey) -> EncTicketPart {
+        let issued = crate::authdata::make_authdata_kdc_issued(
+            sign_key,
+            Some((&PrincipalName::new_principal("krbtgt/R"), "R")),
+            &[el(AD_GREET, b"hello")],
+        )
+        .expect("kdc issued");
+        let inner = rasn::der::encode(&vec![issued]).expect("enc");
+        let mut t = ticket(vec![el(1, &inner)]);
+        t.key = EncryptionKey::new(18, generate_random(32));
+        if sign_key.key_bytes() == [0u8; 32] {
+            t.key = sign_key.clone();
+        }
+        t
+    }
+
+    #[test]
+    fn greet_client_reads_the_kdc_issued_greeting() {
+        install();
+        let skey = EncryptionKey::new(18, generate_random(32));
+        let session = EncryptionKey::new(18, vec![0; 32]);
+        let t = greeting_ticket(&session);
+        let mut c = ctx_with(NameAttrs::import(&t, None, &skey).expect("import"));
+        assert_eq!(c.inquire_name(), vec![GREET_ATTR.to_string()]);
+        let v = c.get_name_attribute(GREET_ATTR).expect("greeting");
+        assert_eq!(
+            v,
+            vec![NameAttrValue {
+                value: b"hello".to_vec(),
+                display_value: b"hello".to_vec(),
+                authenticated: true,
+                complete: true,
+            }]
+        );
+        assert!(matches!(
+            c.get_name_attribute("urn:greet:other"),
+            Err(Krb5Error::Gss(GssError::Unavailable))
+        ));
+
+        // Copies and the composite name keep the greeting.
+        let copy = c.name_attrs.clone();
+        assert_eq!(
+            ctx_with(copy).get_name_attribute(GREET_ATTR).expect("copy"),
+            v
+        );
+        let ext = c.name_attrs.externalize();
+        assert_eq!(&ext[..4], &3u32.to_be_bytes());
+        let tail = [
+            &5u32.to_be_bytes()[..],
+            b"greet",
+            &5u32.to_be_bytes(),
+            b"hello",
+            &1u32.to_be_bytes(),
+        ]
+        .concat();
+        assert!(ext.ends_with(&tail));
+
+        // greet_set_attribute: EEXIST, which is GSS_S_FAILURE.
+        assert!(matches!(
+            c.set_name_attribute(true, GREET_ATTR, b"x"),
+            Err(Krb5Error::Gss(GssError::Failure))
+        ));
+        c.delete_name_attribute(GREET_ATTR).expect("delete");
+        assert!(c.inquire_name().is_empty());
+        c.set_name_attribute(true, GREET_ATTR, b"set").expect("set");
+        let v = c.get_name_attribute(GREET_ATTR).expect("set");
+        assert_eq!(v[0].value, b"set");
+        assert!(!v[0].authenticated);
+    }
+
+    #[test]
+    fn greet_client_ignores_a_forged_kdc_issued_greeting() {
+        install();
+        let skey = EncryptionKey::new(18, generate_random(32));
+        // Signed with a key other than the ticket session key.
+        let t = greeting_ticket(&EncryptionKey::new(18, generate_random(32)));
+        let c = ctx_with(NameAttrs::import(&t, None, &skey).expect("import"));
+        assert!(c.get_name_attribute(GREET_ATTR).is_err());
+        // From the authenticator: imported, but not authenticated.
+        let authen = [el(AD_GREET, b"from client")];
+        let c = ctx_with(NameAttrs::import(&t, Some(&authen), &skey).expect("import"));
+        let v = c.get_name_attribute(GREET_ATTR).expect("greeting");
+        assert_eq!(v[0].value, b"from client");
+        assert!(!v[0].authenticated);
+        // KDC-only types are not taken from the authenticator.
+        let authen = [el(crate::types::AD_KDC_ISSUED, b"x"), el(AD_GREET, b"y")];
+        let c =
+            ctx_with(NameAttrs::import(&ticket(Vec::new()), Some(&authen), &skey).expect("import"));
+        assert_eq!(
+            c.get_name_attribute(GREET_ATTR).expect("greeting")[0].value,
+            b"y"
+        );
+    }
+
+    #[test]
+    fn greet_client_does_not_trust_an_authenticator_greeting_beside_other_kdc_data() {
+        install();
+        let skey = EncryptionKey::new(18, generate_random(32));
+        let session = EncryptionKey::new(18, vec![0; 32]);
+        // Valid AD-KDC-ISSUED that holds no greeting.
+        let issued = crate::authdata::make_authdata_kdc_issued(
+            &session,
+            Some((&PrincipalName::new_principal("krbtgt/R"), "R")),
+            &[el(-4299, b"other")],
+        )
+        .expect("kdc issued");
+        let inner = rasn::der::encode(&vec![issued]).expect("enc");
+        let mut t = ticket(vec![el(1, &inner)]);
+        t.key = session;
+        let authen = [el(AD_GREET, b"from client")];
+        let c = ctx_with(NameAttrs::import(&t, Some(&authen), &skey).expect("import"));
+        let v = c.get_name_attribute(GREET_ATTR).expect("greeting");
+        assert_eq!(v[0].value, b"from client");
+        assert!(!v[0].authenticated);
+    }
+
+    #[test]
+    fn only_informational_module_errors_are_ignored() {
+        install();
+        let skey = EncryptionKey::new(18, generate_random(32));
+        let t = ticket(Vec::new());
+        NameAttrs::import(&t, Some(&[el(-4242, b"x")]), &skey).expect("informational");
+        assert!(matches!(
+            NameAttrs::import(&t, Some(&[el(-4243, b"x")]), &skey),
+            Err(Krb5Error::Gss(GssError::Failure))
+        ));
     }
 }

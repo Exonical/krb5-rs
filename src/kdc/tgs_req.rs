@@ -884,6 +884,11 @@ impl<S: PrincipalStore> Kdc<S> {
                         .as_ref()
                         .map(|s| (s.user.clone(), s.user_realm.clone())),
                     enc_tkt_req: Some(subject_tkt.clone()),
+                    client_entry: client.clone(),
+                    server_entry: Some(server.clone()),
+                    header_server_entry: Some(
+                        stkt.as_ref().map_or(&header_server, |e| &e.server).clone(),
+                    ),
                 }
             },
         )?;

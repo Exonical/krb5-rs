@@ -1220,7 +1220,7 @@ cases against the daemon.
 
 MIT's `kdcauthdata` interface (`kdcauthdata_plugin.h`, `kdc/kdc_authdata.c`)
 is `krb5_rs::kdc::plugins::KdcAuthdata`. Modules run in another process and
-are reached over the same socket RPC as kdcpolicy (`KRB5RS-KDCAUTHDATA-V-1`,
+are reached over the same socket RPC as kdcpolicy (`KRB5RS-KDCAUTHDATA-V-2`,
 `plugins::rpc::serve_kdcauthdata`), configured the same way:
 
 ```text
@@ -1233,9 +1233,13 @@ are reached over the same socket RPC as kdcpolicy (`KRB5RS-KDCAUTHDATA-V-1`,
 - **Loading:** as `load_authdata_plugins`, a module that cannot be reached,
   refuses the version, or fails `init` is logged and skipped.
 - **Arguments:** `handle` gets MIT's `flags` (`KRB5_KDB_FLAG_*`), the client,
-  server and header/evidence server, the client (or TGS reply), server and
+  server and header/evidence server with their database entries (MIT's
+  `krb5_db_entry`: attributes, lifetimes, expirations, keys, delegation
+  lists, string attributes, policy), the client (or TGS reply), server and
   header keys, the DER request, the S4U client and the header ticket, and
-  may change the reply ticket's authorization data.
+  may change the reply ticket's authorization data. The module gets the
+  entries as values, since it runs in another process; as in MIT, changes
+  it makes to them are not written to the database.
 - **Order:** as `handle_authdata`: for TGS after the request's authdata is
   copied and before the header ticket's; for AS and TGS before the PAC is
   added; never for an anonymous ticket. A module error is logged as
@@ -1247,6 +1251,36 @@ are reached over the same socket RPC as kdcpolicy (`KRB5RS-KDCAUTHDATA-V-1`,
   key (key usage 19) and naming the header ticket's server.
   `make_authdata_kdc_issued` and `verify_authdata_kdc_issued` are MIT's
   `krb5_make_authdata_kdc_issued` and `krb5_verify_authdata_kdc_issued`.
+
+### Client authdata modules
+
+MIT's client authdata interface (`authdata_plugin.h`, `lib/krb5/krb/authdata.c`)
+is `krb5_rs::authdata::{AuthdataModule, AuthdataRequestContext}`. MIT loads
+these modules from `plugin_base_dir/authdata`; here a program installs one
+with `krb5_rs::authdata::register_module`. Installed modules run after the
+built-in mspac and auth-indicators modules, in installation order.
+
+- **Import:** as `krb5int_authdata_verify` with `AD_USAGE_MASK`: the ticket's
+  first AD-KDC-ISSUED element is verified with the ticket session key (a bad
+  checksum is ignored); a module with `AD_USAGE_KDC_ISSUED` or
+  `AD_CAMMAC_PROTECTED` gets its type from the verified data, otherwise from
+  the ticket (`AD_USAGE_AS_REQ`/`TGS_REQ`) or the authenticator
+  (`AD_USAGE_AP_REQ`, where KDC-only types are skipped). Errors from an
+  `AD_INFORMATIONAL` module are ignored; others fail the AP-REQ.
+  Difference from MIT: when the verified data lacks the module's type and
+  the type is taken from the ticket or authenticator instead, the module is
+  told it is not KDC-issued. MIT still says it is, so a client-chosen
+  authenticator greeting beside unrelated AD-KDC-ISSUED data was marked
+  authenticated.
+- **Name attributes:** `gss_inquire_name`, `gss_get_name_attribute`,
+  `gss_set_name_attribute` and `gss_delete_name_attribute` reach the modules
+  as MIT's `krb5_authdata_*_attribute` do; `ENOENT` and `EPERM` are
+  `GSS_S_UNAVAILABLE`, other errors `GSS_S_FAILURE`. Exported contexts,
+  copies and `gss_export_name_composite` carry each module's externalized
+  state.
+- **`greet_client`:** `krb5_rs::authdata::greet::GreetClient` reads the
+  type -42 greeting as `urn:greet:greeting`, authenticated when it came from
+  verified AD-KDC-ISSUED data.
 
 ### OTP pre-authentication
 

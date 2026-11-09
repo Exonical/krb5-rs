@@ -162,7 +162,11 @@ impl Krb5Acceptor {
                 tkt.enc_part.etype,
             )
             .map_err(|_| Krb5Error::Gss(GssError::Failure))?;
-        ctx.name_attrs = super::name_attrs::NameAttrs::import(&result.ticket, &skey)?;
+        ctx.name_attrs = super::name_attrs::NameAttrs::import(
+            &result.ticket,
+            auth.authorization_data.as_deref(),
+            &skey,
+        )?;
         let t = &result.ticket;
         let secs = |t: &KerberosTime| t.timestamp() as u32;
         self.accepted = Some(crate::ccache::CcCredential {

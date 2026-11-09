@@ -8,7 +8,8 @@ use crate::gssapi::seqstate::SeqState;
 
 /// Marks the start and end of a serialized context (ser_sctx.c `KG_CONTEXT`).
 const CONTEXT_MAGIC: u32 = 0x4b35_4743;
-const VERSION: u32 = 1;
+/// 2 adds the client authdata modules' state; 1 is still imported.
+const VERSION: u32 = 2;
 
 struct Writer(Vec<u8>);
 
@@ -115,6 +116,12 @@ impl Krb5Context {
         for i in &n.indicators {
             w.bytes(i.as_bytes());
         }
+        let loaded = n.modules.externalize(crate::authdata::AD_USAGE_MASK);
+        w.u32(loaded.len() as u32);
+        for (name, body) in &loaded {
+            w.bytes(name.as_bytes());
+            w.bytes(body);
+        }
         w.u32(CONTEXT_MAGIC);
 
         let mut out = Vec::with_capacity(4 + self.mech.len() + w.0.len());
@@ -132,7 +139,11 @@ impl Krb5Context {
             .into_iter()
             .find(|m| *m == oid)
             .ok_or(Krb5Error::Gss(GssError::BadMech))?;
-        if r.u32()? != CONTEXT_MAGIC || r.u32()? != VERSION {
+        if r.u32()? != CONTEXT_MAGIC {
+            return Err(defective());
+        }
+        let version = r.u32()?;
+        if !(1..=VERSION).contains(&version) {
             return Err(defective());
         }
         let flags = GssFlags::from_bits(r.u32()?).ok_or_else(defective)?;
@@ -172,6 +183,17 @@ impl Krb5Context {
         for _ in 0..count {
             indicators.push(String::from_utf8(r.bytes()?.to_vec()).map_err(|_| defective())?);
         }
+        let mut modules = crate::authdata::AuthdataContext::new();
+        let n = if version >= 2 { r.u32()? } else { 0 };
+        for _ in 0..n {
+            let name = std::str::from_utf8(r.bytes()?).map_err(|_| defective())?;
+            let mut body = r.bytes()?;
+            // k5_ad_internalize: an unknown module is an error.
+            match modules.internalize(crate::authdata::AD_USAGE_MASK, name, &mut body) {
+                Ok(true) if body.is_empty() => {}
+                _ => return Err(defective()),
+            }
+        }
         if r.u32()? != CONTEXT_MAGIC || !r.0.is_empty() {
             return Err(defective());
         }
@@ -196,6 +218,7 @@ impl Krb5Context {
                 pac,
                 pac_verified,
                 indicators,
+                modules,
             },
         })
     }

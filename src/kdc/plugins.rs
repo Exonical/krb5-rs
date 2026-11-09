@@ -262,6 +262,12 @@ pub struct AuthdataRequest {
     pub for_user: Option<Principal>,
     /// `enc_tkt_req`: for TGS, the header or evidence ticket.
     pub enc_tkt_req: Option<crate::types::EncTicketPart>,
+    /// The database entry of [`Self::client`] (`client`), if it has one.
+    pub client_entry: Option<super::PrincipalEntry>,
+    /// The database entry of [`Self::server`] (`server`).
+    pub server_entry: Option<super::PrincipalEntry>,
+    /// The database entry of [`Self::header_server`] (`header_server`).
+    pub header_server_entry: Option<super::PrincipalEntry>,
 }
 
 /// A KDC authdata module (`krb5_kdcauthdata_vtable`).
