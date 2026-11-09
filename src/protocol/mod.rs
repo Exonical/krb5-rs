@@ -16,6 +16,7 @@ mod kdc_rep;
 /// kpasswd messages (RFC 3244).
 pub mod kpasswd;
 pub(crate) mod preauth;
+pub mod sendauth;
 mod tgs_exchange;
 #[cfg(feature = "kdc")]
 pub(crate) mod transit;

@@ -37,13 +37,12 @@ pub const KPROP_SERVICE: &str = "krb5_prop";
 pub const KPROP_PORT: u16 = 754;
 /// Application protocol version (`kprop.h` `KPROP_PROT_VERSION`).
 pub const KPROP_PROT_VERSION: &str = "kprop5_01";
-/// Sendauth protocol version (`sendauth.c` `sendauth_version`).
-pub const SENDAUTH_VERSION: &str = "KRB5_SENDAUTH_V1.0";
+pub use crate::protocol::sendauth::{read_message, write_message, SENDAUTH_VERSION};
 /// Database block size (`kprop.h` `KPROP_BUFSIZ`).
 pub const KPROP_BUFSIZ: usize = 32768;
 /// Largest message accepted. MIT reads any length; a KRB-PRIV block of
 /// [`KPROP_BUFSIZ`] bytes is far below this.
-pub const MAX_MESSAGE: usize = 1024 * 1024;
+pub use crate::protocol::sendauth::MAX_MESSAGE;
 
 /// Errors of a kprop exchange.
 #[derive(Debug)]
@@ -115,34 +114,6 @@ fn nul_terminated(s: &str) -> Vec<u8> {
     let mut v = s.as_bytes().to_vec();
     v.push(0);
     v
-}
-
-/// `krb5_write_message`: 4-byte big-endian length, then the data.
-pub async fn write_message<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> io::Result<()> {
-    let len = u32::try_from(data.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "message too long"))?;
-    let mut buf = Vec::with_capacity(4 + data.len());
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(data);
-    w.write_all(&buf).await?;
-    w.flush().await
-}
-
-/// `krb5_read_message`.
-pub async fn read_message<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len).await?;
-    let len = usize::try_from(u32::from_be_bytes(len))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "message too long"))?;
-    if len > MAX_MESSAGE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("message of {len} bytes exceeds {MAX_MESSAGE}"),
-        ));
-    }
-    let mut data = vec![0u8; len];
-    r.read_exact(&mut data).await?;
-    Ok(data)
 }
 
 /// `encode_database_size` (kprop_util.c): four bytes for 1..=2^32-1,

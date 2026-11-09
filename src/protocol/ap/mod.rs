@@ -162,6 +162,38 @@ pub struct ApReqOptions {
     pub cbt: bool,
 }
 
+/// KRB_AP_ERR_ILL_CR_TKT (not in [`crate::types::error_codes`]).
+const KRB_AP_ERR_ILL_CR_TKT: i32 = 43;
+
+/// Protocol error code of an AP failure (`retval - ERROR_TABLE_BASE_krb5`,
+/// or `KRB_ERR_GENERIC` for library-only codes).
+pub fn ap_error_code(e: ApError) -> i32 {
+    match e {
+        ApError::BadIntegrity => crate::types::error_codes::KRB_AP_ERR_BAD_INTEGRITY,
+        ApError::TktExpired => crate::types::error_codes::KRB_AP_ERR_TKT_EXPIRED,
+        ApError::TktNyv | ApError::TktInvalid => crate::types::error_codes::KRB_AP_ERR_TKT_NYV,
+        ApError::Repeat => crate::types::error_codes::KRB_AP_ERR_REPEAT,
+        ApError::NotUs => crate::types::error_codes::KRB_AP_ERR_NOT_US,
+        ApError::BadMatch => crate::types::error_codes::KRB_AP_ERR_BADMATCH,
+        ApError::Skew => crate::types::error_codes::KRB_AP_ERR_SKEW,
+        ApError::BadAddr => crate::types::error_codes::KRB_AP_ERR_BADADDR,
+        ApError::BadVersion => crate::types::error_codes::KRB_AP_ERR_BADVERSION,
+        ApError::MsgType => crate::types::error_codes::KRB_AP_ERR_MSG_TYPE,
+        ApError::Modified => crate::types::error_codes::KRB_AP_ERR_MODIFIED,
+        ApError::BadOrder => crate::types::error_codes::KRB_AP_ERR_BADORDER,
+        ApError::BadKeyver => crate::types::error_codes::KRB_AP_ERR_BADKEYVER,
+        ApError::NoKey => crate::types::error_codes::KRB_AP_ERR_NOKEY,
+        ApError::MutualFailed => crate::types::error_codes::KRB_AP_ERR_MUT_FAIL,
+        ApError::InappCksum => crate::types::error_codes::KRB_AP_ERR_INAPP_CKSUM,
+        ApError::SumTypeNoSupp => crate::types::error_codes::KDC_ERR_SUMTYPE_NOSUPP,
+        ApError::IllCrTkt => KRB_AP_ERR_ILL_CR_TKT,
+        ApError::NoPermEtype
+        | ApError::LocalAddrRequired
+        | ApError::NoTktSupplied
+        | ApError::WrongPrinc => crate::types::error_codes::KRB_ERR_GENERIC,
+    }
+}
+
 /// Result of a successful rd_req (MIT `krb5_rd_req` outputs).
 #[derive(Debug)]
 pub struct RdReqResult {

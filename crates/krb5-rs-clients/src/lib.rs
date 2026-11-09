@@ -413,3 +413,67 @@ mod tests {
         assert_eq!(etype_string(999), "etype 999");
     }
 }
+
+/// `krb5_sname_to_principal(host, sname, KRB5_NT_SRV_HST)`: this host when
+/// `host` is `None`; the realm is empty when it is left to referrals.
+pub fn sname_to_principal(
+    rt: &tokio::runtime::Runtime,
+    profile: &std::sync::Arc<Profile>,
+    host: Option<&str>,
+    sname: &str,
+) -> (krb5_rs::types::PrincipalName, String) {
+    use krb5_rs::client::{canonicalize_hostname, CanonHost, HostCanonicalization};
+    let host = match host {
+        Some(h) => h.to_string(),
+        None => krb5_rs::kdc::kdb::kprop::local_hostname()
+            .unwrap_or_else(|e| fail(e, "while generating service name", 1)),
+    };
+    let canon = HostCanonicalization::from_profile(profile);
+    if canon.dns_canonicalize_hostname == CanonHost::Fallback {
+        let h = host.to_ascii_lowercase();
+        return (
+            krb5_rs::types::PrincipalName::new_srv_hst(sname, &h),
+            String::new(),
+        );
+    }
+    let use_dns = canon.dns_canonicalize_hostname == CanonHost::True;
+    let h = rt.block_on(canonicalize_hostname(&canon, &host, use_dns));
+    let realm = krb5_rs::locate::host_realm(profile, &h)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    (krb5_rs::types::PrincipalName::new_srv_hst(sname, &h), realm)
+}
+
+/// `krb5_auth_con_genaddrs` with `GENERATE_{LOCAL,REMOTE}_FULL_ADDR`: the
+/// addresses and ports of both ends of a connected socket.
+pub fn set_full_addrs(
+    ctx: &mut krb5_rs::protocol::ap::AuthContext,
+    local: &std::net::SocketAddr,
+    remote: &std::net::SocketAddr,
+) {
+    use krb5_rs::kdc::kdb::kprop::host_address;
+    let port = |p: u16| krb5_rs::types::HostAddress {
+        addr_type: ADDRTYPE_IPPORT,
+        address: rasn::types::OctetString::from(p.to_be_bytes().to_vec()),
+    };
+    ctx.set_addrs(Some(host_address(local)), Some(host_address(remote)));
+    ctx.set_ports(Some(port(local.port())), Some(port(remote.port())));
+}
+
+/// `ADDRTYPE_IPPORT` (krb5.h).
+const ADDRTYPE_IPPORT: i32 = 0x0101;
+
+/// `LOG_DAEMON | LOG_ERR`.
+pub const LOG_DAEMON_ERR: u8 = 3 * 8 + 3;
+
+/// `openlog(ident, 0, LOG_DAEMON); syslog(pri, msg)` over `/dev/log`; a
+/// missing syslog daemon is ignored, as syslog(3) does.
+pub fn syslog(ident: &str, pri: u8, msg: &str) {
+    #[cfg(unix)]
+    if let Ok(s) = std::os::unix::net::UnixDatagram::unbound() {
+        let _ = s.send_to(format!("<{pri}>{ident}: {msg}").as_bytes(), "/dev/log");
+    }
+    #[cfg(not(unix))]
+    let _ = (ident, pri, msg);
+}

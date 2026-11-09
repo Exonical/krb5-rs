@@ -6,7 +6,6 @@ use chrono::{DateTime, Timelike, Utc};
 use rasn::types::{GeneralString, OctetString};
 use rasn::{AsnType, Decode, Decoder, Encode, Encoder};
 
-use crate::protocol::ap::ApError;
 use crate::types::error_codes::*;
 use crate::types::{KrbErrorMsg, PaData, PrincipalName};
 use crate::Krb5Error;
@@ -82,32 +81,7 @@ impl From<Krb5Error> for KdcError {
 
 /// Protocol code for an AP-layer error (`errcode_to_protocol`, kdc_util.c:
 /// 692-698; codes outside the protocol range become `KRB_ERR_GENERIC`).
-pub(crate) fn ap_error_code(e: ApError) -> i32 {
-    match e {
-        ApError::BadIntegrity => KRB_AP_ERR_BAD_INTEGRITY,
-        ApError::TktExpired => KRB_AP_ERR_TKT_EXPIRED,
-        ApError::TktNyv | ApError::TktInvalid => KRB_AP_ERR_TKT_NYV,
-        ApError::Repeat => KRB_AP_ERR_REPEAT,
-        ApError::NotUs => KRB_AP_ERR_NOT_US,
-        ApError::BadMatch => KRB_AP_ERR_BADMATCH,
-        ApError::Skew => KRB_AP_ERR_SKEW,
-        ApError::BadAddr => KRB_AP_ERR_BADADDR,
-        ApError::BadVersion => KRB_AP_ERR_BADVERSION,
-        ApError::MsgType => KRB_AP_ERR_MSG_TYPE,
-        ApError::Modified => KRB_AP_ERR_MODIFIED,
-        ApError::BadOrder => KRB_AP_ERR_BADORDER,
-        ApError::BadKeyver => KRB_AP_ERR_BADKEYVER,
-        ApError::NoKey => KRB_AP_ERR_NOKEY,
-        ApError::MutualFailed => KRB_AP_ERR_MUT_FAIL,
-        ApError::InappCksum => KRB_AP_ERR_INAPP_CKSUM,
-        ApError::SumTypeNoSupp => KDC_ERR_SUMTYPE_NOSUPP,
-        ApError::IllCrTkt => KRB_AP_ERR_ILL_CR_TKT,
-        ApError::NoPermEtype
-        | ApError::LocalAddrRequired
-        | ApError::NoTktSupplied
-        | ApError::WrongPrinc => KRB_ERR_GENERIC,
-    }
-}
+pub(crate) use crate::protocol::ap::ap_error_code;
 
 /// Request-derived fields echoed in a KRB-ERROR.
 #[derive(Debug, Clone)]
