@@ -148,6 +148,7 @@ impl<S: PrincipalStore> Kdc<S> {
         let client =
             found.ok_or_else(|| KdcError::new(KDC_ERR_C_PRINCIPAL_UNKNOWN, "CLIENT_NOT_FOUND"))?;
         *audited = Some(client.clone());
+        ctx.audit_stage = crate::kdc::plugins::AuditStage::SrvcPrinc;
         let server = self
             .lookup(sname, realm, "LOOKING_UP_SERVER")
             .await?
@@ -180,6 +181,7 @@ impl<S: PrincipalStore> Kdc<S> {
         ])
         .await?;
 
+        ctx.audit_stage = crate::kdc::plugins::AuditStage::ValidatePol;
         validate_as_request(opts, &client, &server, kdc_time)?;
         // check_anon (kdc_util.c:701-712, :795-798).
         if self.config.restrict_anonymous_to_tgt
@@ -217,6 +219,7 @@ impl<S: PrincipalStore> Kdc<S> {
         )?;
 
         let permitted = self.permitted();
+        ctx.audit_stage = crate::kdc::plugins::AuditStage::IssueTkt;
         let session_etype = select_session_keytype(&server, &body.etype, &permitted)
             .ok_or_else(|| KdcError::new(KDC_ERR_ETYPE_NOSUPP, "BAD_ENCRYPTION_TYPE"))?;
         let session_key = random_key(session_etype)?;
@@ -624,6 +627,7 @@ impl<S: PrincipalStore> Kdc<S> {
         super::cammac::check_indicators(server.require_auth.as_deref(), &indicators)?;
         let kvno =
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;
+        ctx.audit_tkt = Some(part.clone());
         let ticket =
             encrypt_ticket_part(&server_key.key, Some(kvno), realm, tkt_sname.clone(), &part)?;
 

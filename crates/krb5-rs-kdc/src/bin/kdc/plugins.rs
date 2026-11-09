@@ -29,6 +29,14 @@ fn configured(profiles: &[&Profile], iface: &str) -> Result<Vec<(String, PathBuf
 
 use plugin::connector;
 
+#[path = "audit_simple.rs"]
+mod audit_simple;
+
+/// MIT's `simple` audit module (`k5audit.so`), which krb5-rs builds in.
+fn is_simple_audit(name: &str, path: &std::path::Path) -> bool {
+    name == "simple" && path.extension().is_some_and(|e| e == "so")
+}
+
 /// The configured modules.
 pub type Modules = (
     Vec<Arc<dyn KdcPolicy>>,
@@ -73,6 +81,19 @@ pub fn load(profiles: &[&Profile]) -> Result<Modules, String> {
     }
     let mut audit: Vec<Arc<dyn Audit>> = Vec::new();
     for (name, path) in configured(profiles, "audit")? {
+        if is_simple_audit(&name, &path) {
+            // au_simple_main.c: open fails with KRB5_PLUGIN_NO_HANDLE when
+            // audit_open does, which stops the KDC.
+            match audit_simple::SimpleAudit::open() {
+                Some(m) => audit.push(Arc::new(m)),
+                None => {
+                    return Err(format!(
+                        "audit plugin {name} failed to open. error={PLUGIN_NO_HANDLE}"
+                    ))
+                }
+            }
+            continue;
+        }
         match rpc::audit(&name, connector(path.clone())) {
             Ok(m) => audit.push(Arc::new(m)),
             Err(InitError::Refused((PLUGIN_VER_NOTSUPP, _))) => {}
