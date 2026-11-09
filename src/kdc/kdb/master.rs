@@ -20,10 +20,38 @@ fn err(msg: impl Into<String>) -> StoreError {
 
 /// The master principal `K/M@REALM` name components.
 pub(super) fn master_principal() -> Result<PrincipalName, StoreError> {
-    let part = |s: &str| GeneralString::from_bytes(s.as_bytes()).map_err(|_| err("bad name"));
+    master_principal_named(MASTER_NAME)
+}
+
+/// The master principal named `name` (`master_key_name`, without the
+/// realm), as `krb5_db_setup_mkey_name` parses `name@REALM` (kdb5.c:1479).
+pub fn master_principal_named(name: &str) -> Result<PrincipalName, StoreError> {
+    let bad = || err(format!("bad master key name {name:?}"));
+    let mut comps = vec![Vec::new()];
+    let mut chars = name.bytes();
+    while let Some(c) = chars.next() {
+        match c {
+            b'\\' => {
+                let e = chars.next().ok_or_else(bad)?;
+                comps.last_mut().ok_or_else(bad)?.push(match e {
+                    b'n' => b'\n',
+                    b't' => b'\t',
+                    b'b' => 8,
+                    b'0' => 0,
+                    other => other,
+                });
+            }
+            b'/' => comps.push(Vec::new()),
+            b'@' => return Err(bad()),
+            other => comps.last_mut().ok_or_else(bad)?.push(other),
+        }
+    }
     Ok(PrincipalName {
         name_type: 1,
-        name_string: MASTER_NAME.split('/').map(part).collect::<Result<_, _>>()?,
+        name_string: comps
+            .iter()
+            .map(|c| GeneralString::from_bytes(c).map_err(|_| bad()))
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -35,9 +63,22 @@ pub fn master_key_from_password(
     password: &str,
     etype: i32,
 ) -> Result<EncryptionKey, StoreError> {
+    master_key_from_password_named(realm, MASTER_NAME, password, etype)
+}
+
+/// [`master_key_from_password`] for the master key principal
+/// `master_key_name`, whose components make the salt.
+pub fn master_key_from_password_named(
+    realm: &str,
+    master_key_name: &str,
+    password: &str,
+    etype: i32,
+) -> Result<EncryptionKey, StoreError> {
     let profile =
         find_etype(etype).map_err(|_| err(format!("unsupported master key enctype {etype}")))?;
-    let salt = default_salt(realm, &[b"K".as_slice(), b"M".as_slice()]);
+    let name = master_principal_named(master_key_name)?;
+    let comps: Vec<&[u8]> = name.name_string.iter().map(|c| c.as_bytes()).collect();
+    let salt = default_salt(realm, &comps);
     let key = profile
         .string_to_key(password.as_bytes(), &salt, None)
         .map_err(|e| err(e.to_string()))?;
@@ -92,19 +133,40 @@ pub fn write_stash(path: &Path, realm: &str, key: &EncryptionKey) -> Result<(), 
     write_stash_list(path, realm, &[(1, key.clone())])
 }
 
+/// [`write_stash`] for the master key principal `master_key_name`.
+pub fn write_stash_named(
+    path: &Path,
+    realm: &str,
+    master_key_name: &str,
+    key: &EncryptionKey,
+) -> Result<(), StoreError> {
+    write_stash_list_named(path, realm, master_key_name, &[(1, key.clone())])
+}
+
 /// Write the stash file holding each `(kvno, key)` of a master-key list.
 pub fn write_stash_list(
     path: &Path,
     realm: &str,
     keys: &[(u16, EncryptionKey)],
 ) -> Result<(), StoreError> {
+    write_stash_list_named(path, realm, MASTER_NAME, keys)
+}
+
+/// [`write_stash_list`] for the master key principal `master_key_name`.
+pub fn write_stash_list_named(
+    path: &Path,
+    realm: &str,
+    master_key_name: &str,
+    keys: &[(u16, EncryptionKey)],
+) -> Result<(), StoreError> {
+    let principal = master_principal_named(master_key_name)?;
     let tmp = tmp_path(path);
     let _ = std::fs::remove_file(&tmp);
     let mut kt = FileKeytab::new(&tmp);
     let timestamp = u32::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
     for (kvno, key) in keys {
         kt.add_entry(&KeytabEntry {
-            principal: master_principal()?,
+            principal: principal.clone(),
             realm: realm.to_string(),
             timestamp,
             kvno: u32::from(*kvno),
@@ -124,16 +186,26 @@ pub fn write_stash_list(
 /// [`read_stash`] with the stored key version (1 for MIT's old raw format,
 /// `kdb_default.c:283-284`).
 pub fn read_stash_kvno(path: &Path, realm: &str) -> Result<(u32, EncryptionKey), StoreError> {
+    read_stash_kvno_named(path, realm, MASTER_NAME)
+}
+
+/// [`read_stash_kvno`] for the master key principal `master_key_name`.
+pub fn read_stash_kvno_named(
+    path: &Path,
+    realm: &str,
+    master_key_name: &str,
+) -> Result<(u32, EncryptionKey), StoreError> {
+    let principal = master_principal_named(master_key_name)?;
     let bytes =
         std::fs::read(path).map_err(|e| err(format!("reading stash {}: {e}", path.display())))?;
     if bytes.first() == Some(&5) {
         let kt = FileKeytab::new(path);
         let entry = kt
-            .get_entry(&master_principal()?, realm, None, None)
-            .map_err(|e| err(format!("stash has no K/M@{realm}: {e}")))?;
+            .get_entry(&principal, realm, None, None)
+            .map_err(|e| err(format!("stash has no {master_key_name}@{realm}: {e}")))?;
         return Ok((entry.kvno, entry.key));
     }
-    Ok((1, read_stash(path, realm)?))
+    Ok((1, read_stash_named(path, realm, master_key_name)?))
 }
 
 /// Read the master key from a stash file: the keytab format written by
@@ -141,13 +213,23 @@ pub fn read_stash_kvno(path: &Path, realm: &str) -> Result<(u32, EncryptionKey),
 /// format (`u16` enctype, `u32` length, key bytes, host byte order — read
 /// as little-endian) (kdb_default.c:216-259).
 pub fn read_stash(path: &Path, realm: &str) -> Result<EncryptionKey, StoreError> {
+    read_stash_named(path, realm, MASTER_NAME)
+}
+
+/// [`read_stash`] for the master key principal `master_key_name`.
+pub fn read_stash_named(
+    path: &Path,
+    realm: &str,
+    master_key_name: &str,
+) -> Result<EncryptionKey, StoreError> {
+    let principal = master_principal_named(master_key_name)?;
     let bytes =
         std::fs::read(path).map_err(|e| err(format!("reading stash {}: {e}", path.display())))?;
     if bytes.first() == Some(&5) {
         let kt = FileKeytab::new(path);
         let entry = kt
-            .get_entry(&master_principal()?, realm, None, None)
-            .map_err(|e| err(format!("stash has no K/M@{realm}: {e}")))?;
+            .get_entry(&principal, realm, None, None)
+            .map_err(|e| err(format!("stash has no {master_key_name}@{realm}: {e}")))?;
         return Ok(entry.key);
     }
     if bytes.len() < 6 {
@@ -163,6 +245,34 @@ pub fn read_stash(path: &Path, realm: &str) -> Result<EncryptionKey, StoreError>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn named_master_key_principal_salt_and_stash() {
+        let name = master_principal_named("kdc/mas\\/ter").expect("name");
+        let comps: Vec<&[u8]> = name.name_string.iter().map(|c| c.as_bytes()).collect();
+        assert_eq!(comps, [b"kdc".as_slice(), b"mas/ter".as_slice()]);
+        assert!(master_principal_named("K/M@R").is_err());
+
+        let default = master_key_from_password("R", "pw", 18).expect("default");
+        let km = master_key_from_password_named("R", "K/M", "pw", 18).expect("K/M");
+        assert_eq!(default.key_bytes(), km.key_bytes());
+        let custom = master_key_from_password_named("R", "kdc/master", "pw", 18).expect("custom");
+        let expected = find_etype(18)
+            .expect("aes256")
+            .string_to_key(b"pw", b"Rkdcmaster", None)
+            .expect("s2k");
+        assert_eq!(custom.key_bytes(), expected.as_slice());
+        assert_ne!(custom.key_bytes(), default.key_bytes());
+
+        let path = std::env::temp_dir().join(format!("krb5-rs-named-stash-{}", std::process::id()));
+        write_stash_named(&path, "R", "kdc/master", &custom).expect("write");
+        let read = read_stash_named(&path, "R", "kdc/master").expect("read");
+        assert_eq!(read.key_bytes(), custom.key_bytes());
+        let (_, kvno_key) = read_stash_kvno_named(&path, "R", "kdc/master").expect("kvno");
+        assert_eq!(kvno_key.key_bytes(), custom.key_bytes());
+        assert!(read_stash(&path, "R").is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
     use super::*;
 
     #[test]

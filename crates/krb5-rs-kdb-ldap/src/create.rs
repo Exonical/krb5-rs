@@ -82,10 +82,7 @@ pub fn initial_entries(
         password_history: None,
     };
     let single = MasterKeys::single(master.clone());
-    let km_name = PrincipalName {
-        name_type: 1,
-        name_string: vec![ks(b"K")?, ks(b"M")?],
-    };
+    let km_name = krb5_rs::kdc::kdb::master::master_principal_named(&config.master_key_name)?;
     let km_record = record(
         km_name,
         PrincipalAttributes::DISALLOW_ALL_TIX | PrincipalAttributes::LOCKDOWN_KEYS,
@@ -172,6 +169,7 @@ impl LdapStore {
             .clone()
             .ok_or_else(|| StoreError::rejected("Kerberos Container information is missing"))?;
         let realm = config.kdc.realm.to_string();
+        krb5_rs::kdc::kdb::master::master_principal_named(&config.master_key_name)?;
         {
             let pool = Pool::open(&cfg).await?;
             let mut h = pool.get().await?;
@@ -247,6 +245,8 @@ impl LdapStore {
                 Err(e) => return Err(ldap_err("Creating realm", e)),
             }
         }
+        let mut cfg = cfg;
+        cfg.master_key_name = config.master_key_name.clone();
         let store = LdapStore::open_with_config(cfg, &realm, master).await?;
         for e in initial_entries(config, master)? {
             store.add_entry(&e).await?;

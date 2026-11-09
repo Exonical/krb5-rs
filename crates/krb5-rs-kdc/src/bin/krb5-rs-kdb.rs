@@ -27,7 +27,7 @@ use krb5_rs::kdc::kdb::admin::{
     format_policy, format_principal, parse_lifetime, parse_principal, parse_time, AdminModules,
     AdminOps, AttrChange, PolicyChange, PrincipalOptions,
 };
-use krb5_rs::kdc::kdb::master::{read_stash_kvno, write_stash_list};
+use krb5_rs::kdc::kdb::master::{read_stash_kvno_named, write_stash_list_named};
 use krb5_rs::kdc::kdb::mit::dump::{
     policy_record, principal_record, read_dump, read_records, DumpVersion, IpropHeader,
     LoadFailure, Record,
@@ -36,7 +36,7 @@ use krb5_rs::kdc::kdb::mit::mkey::MasterKeys;
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Time, Ulog, UpdateStatus};
 use krb5_rs::kdc::kdb::mit::{unparse_name, MitEntry, MitPolicy};
 use krb5_rs::kdc::kdb::pwqual::PwQualModules;
-use krb5_rs::kdc::kdb::{master_key_from_password, write_stash, FileStore};
+use krb5_rs::kdc::kdb::{master_key_from_password_named, write_stash_named, FileStore};
 use krb5_rs::kdc::{
     default_realm, AdminStore, IpropConfig, RealmConfig, StoreError, StoreErrorKind,
 };
@@ -206,8 +206,9 @@ fn create_master_key(
             password
         }
     };
-    ok(master_key_from_password(
+    ok(master_key_from_password_named(
         realm,
+        &cfg.master_key_name,
         &password,
         cfg.master_key_type,
     ))
@@ -250,8 +251,9 @@ fn fetch_master_kvno(
     master_password_file: Option<&str>,
 ) -> Option<(Option<u32>, krb5_rs::types::EncryptionKey)> {
     if let Some(path) = master_password_file {
-        let key = ok(master_key_from_password(
+        let key = ok(master_key_from_password_named(
             realm,
+            &cfg.master_key_name,
             &read_secret_file(path),
             cfg.master_key_type,
         ));
@@ -260,7 +262,10 @@ fn fetch_master_kvno(
     let stash = &cfg.key_stash_file;
     let fetched = std::fs::metadata(stash)
         .map_err(|e| com_err_text(&e.to_string()))
-        .and_then(|_| read_stash_kvno(stash, realm).map_err(|e| com_err_text(e.message())));
+        .and_then(|_| {
+            read_stash_kvno_named(stash, realm, &cfg.master_key_name)
+                .map_err(|e| com_err_text(e.message()))
+        });
     match fetched {
         Ok((kvno, key)) => Some((Some(kvno), key)),
         Err(reason) => {
@@ -335,8 +340,9 @@ fn stash_source<T>(
         Some(path) => read_secret_file(path),
         None => read_password("Enter KDC database master key", "reading master key"),
     };
-    let key = ok(master_key_from_password(
+    let key = ok(master_key_from_password_named(
         realm,
+        &cfg.master_key_name,
         &password,
         cfg.master_key_type,
     ));
@@ -389,17 +395,23 @@ fn init(
     let store = if cfg.database_name.exists() {
         ok(open_file(cfg, &key))
     } else {
-        let store = ok(FileStore::create_with(
+        let store = ok(FileStore::create_named(
             &cfg.database_name,
             realm,
             &key,
             &etypes,
+            &cfg.master_key_name,
         ));
         println!("Database {} created.", cfg.database_name.display());
         store
     };
     if stash && !cfg.key_stash_file.exists() {
-        ok(write_stash(&cfg.key_stash_file, realm, &key));
+        ok(write_stash_named(
+            &cfg.key_stash_file,
+            realm,
+            &cfg.master_key_name,
+            &key,
+        ));
         println!("Stash {} written.", cfg.key_stash_file.display());
     }
     let admin = Blocking::new(
@@ -499,6 +511,7 @@ fn run() {
     let mut master_password_file: Option<String> = None;
     let mut database: Option<PathBuf> = None;
     let mut db_args: Vec<String> = Vec::new();
+    let mut master_key_name: Option<String> = None;
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     while let Some(first) = args.first().map(String::as_str) {
         match first {
@@ -509,6 +522,7 @@ fn run() {
             | "-r"
             | "-d"
             | "-x"
+            | "-M"
             | "--master-password-file" => {
                 if args.len() < 2 {
                     usage();
@@ -520,6 +534,7 @@ fn run() {
                     "--realm" | "-r" => realm = Some(value),
                     "-d" => database = Some(PathBuf::from(value)),
                     "-x" => db_args.push(value),
+                    "-M" => master_key_name = Some(value),
                     _ => master_password_file = Some(value),
                 }
             }
@@ -561,6 +576,9 @@ fn run() {
             fail("Configuration file does not specify default realm while getting default realm")
         });
     let mut cfg = ok(RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm));
+    if let Some(name) = master_key_name {
+        cfg.master_key_name = name;
+    }
     if let Some(database) = database {
         if kdc_conf
             .get_string(&["realms", &realm, "iprop_logfile"])
@@ -623,7 +641,7 @@ fn run() {
             cockroach_command(&cmd, args, &cfg, &realm, master_password_file.as_deref());
             return;
         }
-        Some(other) => fail(format!("unknown db_library {other:?}")),
+        Some(other) => fail(cfg.db_module.unknown_library_error(other)),
     }
     if matches!(cmd.as_str(), "database" | "replication") {
         fail(format!("`{cmd}` needs db_library = krb5-rs-cockroach"));
@@ -639,13 +657,19 @@ fn run() {
             let stash = args.iter().any(|a| a == "-s");
             let key = create_master_key(&cfg, &realm, master_password_file.as_deref());
             let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
-            let store = FileStore::create_with(&cfg.database_name, &realm, &key, &etypes)
-                .unwrap_or_else(|e| {
-                    fail(format!(
-                        "{e} while creating database '{}'",
-                        cfg.database_name.display()
-                    ))
-                });
+            let store = FileStore::create_named(
+                &cfg.database_name,
+                &realm,
+                &key,
+                &etypes,
+                &cfg.master_key_name,
+            )
+            .unwrap_or_else(|e| {
+                fail(format!(
+                    "{e} while creating database '{}'",
+                    cfg.database_name.display()
+                ))
+            });
             let admin =
                 krb5_rs::kdc::kdb::admin::Admin::new(&store, cfg.supported_keysalts.clone());
             for (name, attrs, life) in ADMIN_PRINCS {
@@ -653,7 +677,12 @@ fn run() {
                 ok(admin.add_principal(&name, &r, None, &admin_princ_options(attrs, life)));
             }
             if stash {
-                ok(write_stash(&cfg.key_stash_file, &realm, &key));
+                ok(write_stash_named(
+                    &cfg.key_stash_file,
+                    &realm,
+                    &cfg.master_key_name,
+                    &key,
+                ));
             }
             // As for klmdb, the new database's principals are not logged.
             if cfg.iprop.enabled {
@@ -664,10 +693,15 @@ fn run() {
         "stash" => {
             let (keyfile, key) =
                 stash_source(&args, &cfg, &realm, master_password_file.as_deref(), |k| {
-                    FileStore::open(&cfg.database_name, k)
+                    FileStore::open_named(&cfg.database_name, k, &cfg.master_key_name)
                 });
             let keys = ok(key.master_key_list());
-            ok(write_stash_list(&keyfile, &realm, &keys.keys));
+            ok(write_stash_list_named(
+                &keyfile,
+                &realm,
+                &cfg.master_key_name,
+                &keys.keys,
+            ));
             return;
         }
         "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
@@ -683,32 +717,45 @@ fn run() {
         }
         "dump" => {
             let etype = cfg.master_key_type;
-            dump_command(args, iprop, &realm, etype, |convert| {
-                let opened = match fetch_master(&cfg, &realm, master_password_file.as_deref()) {
-                    Some(key) => match FileStore::open(&cfg.database_name, &key) {
-                        Ok(store) => Some(store),
-                        Err(e) if convert && wrong_master_key(&e) => {
-                            no_master_list(&e);
-                            None
+            dump_command(
+                args,
+                iprop,
+                &realm,
+                &cfg.master_key_name,
+                etype,
+                |convert| {
+                    let opened = match fetch_master(&cfg, &realm, master_password_file.as_deref()) {
+                        Some(key) => {
+                            match FileStore::open_named(
+                                &cfg.database_name,
+                                &key,
+                                &cfg.master_key_name,
+                            ) {
+                                Ok(store) => Some(store),
+                                Err(e) if convert && wrong_master_key(&e) => {
+                                    no_master_list(&e);
+                                    None
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
-                        Err(e) => return Err(e),
-                    },
-                    None if convert => None,
-                    None => std::process::exit(exit_status()),
-                };
-                let store = match opened {
-                    Some(store) => store,
-                    None => {
-                        keyboard_master(&realm, etype, |k| FileStore::open(&cfg.database_name, k))
-                    }
-                };
-                let keys = if convert {
-                    Some(store.master_key_list()?)
-                } else {
-                    None
-                };
-                Ok((store.dump_entries()?, keys))
-            });
+                        None if convert => None,
+                        None => std::process::exit(exit_status()),
+                    };
+                    let store = match opened {
+                        Some(store) => store,
+                        None => keyboard_master(&realm, &cfg.master_key_name, etype, |k| {
+                            FileStore::open_named(&cfg.database_name, k, &cfg.master_key_name)
+                        }),
+                    };
+                    let keys = if convert {
+                        Some(store.master_key_list()?)
+                    } else {
+                        None
+                    };
+                    Ok((store.dump_entries()?, keys))
+                },
+            );
             return;
         }
         "load" => {
@@ -721,10 +768,11 @@ fn run() {
                 iprop,
                 |entries, policies, update, iprop_load, log_from| {
                     let master = master_key(&cfg, &realm, master_password_file.as_deref());
-                    FileStore::load_dump(
+                    FileStore::load_dump_named(
                         &cfg.database_name,
                         &realm,
                         &master,
+                        &cfg.master_key_name,
                         entries,
                         policies,
                         update,
@@ -754,7 +802,7 @@ fn open_file(
     cfg: &RealmConfig,
     master: &krb5_rs::types::EncryptionKey,
 ) -> Result<FileStore, StoreError> {
-    FileStore::open(&cfg.database_name, master)?.with_iprop(&cfg.iprop)
+    FileStore::open_named(&cfg.database_name, master, &cfg.master_key_name)?.with_iprop(&cfg.iprop)
 }
 
 type DumpEntries = (Vec<MitEntry>, Vec<MitPolicy>);
@@ -767,6 +815,7 @@ fn dump_command(
     args: Vec<String>,
     iprop: Option<&IpropConfig>,
     realm: &str,
+    master_key_name: &str,
     master_key_type: i32,
     read: impl FnOnce(bool) -> Result<(DumpEntries, Option<MasterKeys>), StoreError>,
 ) {
@@ -820,9 +869,14 @@ fn dump_command(
         }
     }
     let ((entries, policies), keys) = ok(read(mkey_convert));
-    let is_km = |e: &MitEntry| e.principal == km_principal() && e.realm == realm;
+    let is_km = |e: &MitEntry| e.principal == km_principal(master_key_name) && e.realm == realm;
     let convert = keys.map(|keys| {
-        let new = new_master_key(realm, master_key_type, new_mkey_file.as_deref());
+        let new = new_master_key(
+            realm,
+            master_key_name,
+            master_key_type,
+            new_mkey_file.as_deref(),
+        );
         // `get_next_kvno(master_entry)`, before K/M itself is converted.
         let kvno = entries.iter().find(|e| is_km(e)).map_or(1, next_kvno);
         (keys, new, kvno)
@@ -901,11 +955,17 @@ fn dump_command(
 /// keyboard (`dump.c:1247-1261`).
 fn keyboard_master<T>(
     realm: &str,
+    master_key_name: &str,
     etype: i32,
     open: impl FnOnce(&krb5_rs::types::EncryptionKey) -> Result<T, StoreError>,
 ) -> T {
     let password = read_password("Enter KDC database master key", "reading master key");
-    let key = ok(master_key_from_password(realm, &password, etype));
+    let key = ok(master_key_from_password_named(
+        realm,
+        master_key_name,
+        &password,
+        etype,
+    ));
     open(&key).unwrap_or_else(|e| {
         com_err(format!("{} while verifying master key", e.message()));
         std::process::exit(1)
@@ -914,7 +974,12 @@ fn keyboard_master<T>(
 
 /// `dump -mkey_convert`'s new master key (`dump.c:1263-1290`): the newest
 /// key of the `-new_mkey_file` stash, else a password read twice.
-fn new_master_key(realm: &str, etype: i32, file: Option<&str>) -> krb5_rs::types::EncryptionKey {
+fn new_master_key(
+    realm: &str,
+    master_key_name: &str,
+    etype: i32,
+    file: Option<&str>,
+) -> krb5_rs::types::EncryptionKey {
     let Some(file) = file else {
         println!("Please enter new master key....");
         let context = "reading new master key";
@@ -924,12 +989,18 @@ fn new_master_key(realm: &str, etype: i32, file: Option<&str>) -> krb5_rs::types
             com_err(format!("Password mismatch while {context}"));
             std::process::exit(1);
         }
-        return ok(master_key_from_password(realm, &password, etype));
+        return ok(master_key_from_password_named(
+            realm,
+            master_key_name,
+            &password,
+            etype,
+        ));
     };
     let fetched = std::fs::metadata(file)
         .map_err(|e| com_err_text(&e.to_string()))
         .and_then(|_| {
-            read_stash_kvno(Path::new(file), realm).map_err(|e| com_err_text(e.message()))
+            read_stash_kvno_named(Path::new(file), realm, master_key_name)
+                .map_err(|e| com_err_text(e.message()))
         });
     fetched.map(|(_, key)| key).unwrap_or_else(|reason| {
         com_err(format!(
@@ -1169,7 +1240,12 @@ fn klmdb_command(
                 ok(LmdbStore::open(cfg, &master))
             };
             if stash && !cfg.key_stash_file.exists() {
-                ok(write_stash(&cfg.key_stash_file, realm, &master));
+                ok(write_stash_named(
+                    &cfg.key_stash_file,
+                    realm,
+                    &cfg.master_key_name,
+                    &master,
+                ));
                 println!("Stash {} written.", cfg.key_stash_file.display());
             }
             let admin = Blocking::new(
@@ -1190,7 +1266,12 @@ fn klmdb_command(
             let master = create_master_key(cfg, realm, global_master_password_file);
             create_klmdb(rt, cfg, realm, &master);
             if stash {
-                ok(write_stash(&cfg.key_stash_file, realm, &master));
+                ok(write_stash_named(
+                    &cfg.key_stash_file,
+                    realm,
+                    &cfg.master_key_name,
+                    &master,
+                ));
             }
         }
         "stash" => {
@@ -1200,7 +1281,12 @@ fn klmdb_command(
                     LmdbStore::open(cfg, k)
                 });
             let keys = ok(store.master_key_list());
-            ok(write_stash_list(&keyfile, realm, &keys.keys));
+            ok(write_stash_list_named(
+                &keyfile,
+                realm,
+                &cfg.master_key_name,
+                &keys.keys,
+            ));
         }
         "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
             require_klmdb(cfg);
@@ -1222,18 +1308,20 @@ fn klmdb_command(
             // Without a master key MIT still dumps: the keys stay encrypted.
             let store = store.unwrap_or_else(|| ok(LmdbStore::open_without_master(cfg)));
             let etype = cfg.master_key_type;
-            dump_command(args, iprop, realm, etype, |convert| {
+            dump_command(args, iprop, realm, &cfg.master_key_name, etype, |convert| {
                 let keys = match (convert, valid_master_key) {
                     (false, _) => None,
                     (true, true) => Some(store.master_key_list()?),
                     // The environment is already open, so verify the key
                     // against its K/M rather than opening it again.
-                    (true, false) => Some(keyboard_master(realm, etype, |k| {
-                        let km = store
-                            .raw_entry(&km_principal(), realm)?
-                            .ok_or_else(|| StoreError::backend(BAD_MASTER))?;
-                        MasterKeys::fetch(&km, k)
-                    })),
+                    (true, false) => {
+                        Some(keyboard_master(realm, &cfg.master_key_name, etype, |k| {
+                            let km = store
+                                .raw_entry(&km_principal(&cfg.master_key_name), realm)?
+                                .ok_or_else(|| StoreError::backend(BAD_MASTER))?;
+                            MasterKeys::fetch(&km, k)
+                        }))
+                    }
                 };
                 Ok((store.dump_entries()?, keys))
             });
@@ -1741,7 +1829,11 @@ fn cockroach_command(
                 .or(global_master_password_file)
                 .unwrap_or_else(|| fail("init requires --master-password-file"));
             let key = master_key(cfg, realm, Some(master_file));
-            let store = ok(rt.block_on(CockroachStore::connect(config, key.clone(), realm)));
+            let store = ok(rt.block_on(async {
+                CockroachStore::connect(config, key.clone(), realm)
+                    .await?
+                    .with_master_key_name(&cfg.master_key_name)
+            }));
             let created = match rt.block_on(store.verify_master()) {
                 Ok(()) => false,
                 Err(error) if error.kind() == StoreErrorKind::NotFound => {
@@ -1767,7 +1859,12 @@ fn cockroach_command(
                 println!("Realm {realm} already exists.");
             }
             if stash && !cfg.key_stash_file.exists() {
-                ok(write_stash(&cfg.key_stash_file, realm, &key));
+                ok(write_stash_named(
+                    &cfg.key_stash_file,
+                    realm,
+                    &cfg.master_key_name,
+                    &key,
+                ));
                 println!("Stash {} written.", cfg.key_stash_file.display());
             }
             let admin = Blocking::new(
@@ -1828,34 +1925,64 @@ fn cockroach_command(
                 "Enter KDC database master key",
                 "reading master key from keyboard",
             );
-            let key = ok(master_key_from_password(
+            let key = ok(master_key_from_password_named(
                 realm,
+                &cfg.master_key_name,
                 &password,
                 cfg.master_key_type,
             ));
             let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
-            let store = ok(rt.block_on(CockroachStore::connect(config, key.clone(), realm)));
+            let store = ok(rt.block_on(async {
+                CockroachStore::connect(config, key.clone(), realm)
+                    .await?
+                    .with_master_key_name(&cfg.master_key_name)
+            }));
             ok(rt.block_on(store.create_realm(&etypes)));
             if stash {
-                ok(write_stash(&cfg.key_stash_file, realm, &key));
+                ok(write_stash_named(
+                    &cfg.key_stash_file,
+                    realm,
+                    &cfg.master_key_name,
+                    &key,
+                ));
             }
         }
         "stash" => {
             let (keyfile, key) =
                 stash_source(&args, cfg, realm, global_master_password_file, |k| {
-                    rt.block_on(CockroachStore::open(config.clone(), k.clone(), realm))
+                    rt.block_on(CockroachStore::open_named(
+                        config.clone(),
+                        k.clone(),
+                        realm,
+                        &cfg.master_key_name,
+                    ))
                 });
-            ok(write_stash_list(&keyfile, realm, &key.master_keys().keys));
+            ok(write_stash_list_named(
+                &keyfile,
+                realm,
+                &cfg.master_key_name,
+                &key.master_keys().keys,
+            ));
         }
         "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
             mkey_command(cmd, args, cfg, realm, global_master_password_file, |k| {
-                let store = rt.block_on(CockroachStore::open(config.clone(), k.clone(), realm))?;
+                let store = rt.block_on(CockroachStore::open_named(
+                    config.clone(),
+                    k.clone(),
+                    realm,
+                    &cfg.master_key_name,
+                ))?;
                 Ok(CockroachMkey { rt: &rt, store })
             });
         }
         "replication" => {
             let master = master_key(cfg, realm, global_master_password_file);
-            let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
+            let store = ok(rt.block_on(CockroachStore::open_named(
+                config,
+                master,
+                realm,
+                &cfg.master_key_name,
+            )));
             let sub = if args.is_empty() {
                 usage()
             } else {
@@ -1917,7 +2044,12 @@ fn cockroach_command(
         }
         _ => {
             let master = master_key(cfg, realm, global_master_password_file);
-            let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
+            let store = ok(rt.block_on(CockroachStore::open_named(
+                config,
+                master,
+                realm,
+                &cfg.master_key_name,
+            )));
             let admin = Blocking::new(
                 rt,
                 store,
@@ -1964,7 +2096,12 @@ fn kldap_command(
             );
             add_admin_princs(&admin, realm);
             if stash {
-                ok(write_stash(&cfg.key_stash_file, realm, &key));
+                ok(write_stash_named(
+                    &cfg.key_stash_file,
+                    realm,
+                    &cfg.master_key_name,
+                    &key,
+                ));
             }
         }
         "stash" => {
@@ -1977,16 +2114,29 @@ fn kldap_command(
             // The key must decrypt K/M (`krb5_db_fetch_mkey_list`).
             rt.block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &key))
                 .unwrap_or_else(|e| fail(format!("{e} while getting master key list")));
-            ok(write_stash(&keyfile, realm, &key));
+            ok(write_stash_named(
+                &keyfile,
+                realm,
+                &cfg.master_key_name,
+                &key,
+            ));
         }
         "dump" => {
-            dump_command(args, None, realm, cfg.master_key_type, |convert| {
-                let key = fetch_master(cfg, realm, master_password_file)
-                    .unwrap_or_else(|| std::process::exit(exit_status()));
-                let store = rt.block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &key))?;
-                let entries = rt.block_on(store.dump_entries())?;
-                Ok((entries, convert.then(|| store.master_keys())))
-            });
+            dump_command(
+                args,
+                None,
+                realm,
+                &cfg.master_key_name,
+                cfg.master_key_type,
+                |convert| {
+                    let key = fetch_master(cfg, realm, master_password_file)
+                        .unwrap_or_else(|| std::process::exit(exit_status()));
+                    let store =
+                        rt.block_on(LdapStore::open(cfg, db_args, ServerType::Admin, &key))?;
+                    let entries = rt.block_on(store.dump_entries())?;
+                    Ok((entries, convert.then(|| store.master_keys())))
+                },
+            );
         }
         // kldap refuses the "temporary" database a full load creates
         // (ldap_misc.c:215, dump.c:1505).
@@ -2046,14 +2196,10 @@ fn cockroach_command(
     fail("db_library krb5-rs-cockroach needs a krb5-rs-kdb built with the `cockroach` feature");
 }
 
-fn km_principal() -> krb5_rs::types::PrincipalName {
-    krb5_rs::types::PrincipalName {
-        name_type: 1,
-        name_string: [b"K", b"M"]
-            .iter()
-            .map(|s| ok(krb5_rs::types::KerberosString::from_bytes(*s)))
-            .collect(),
-    }
+fn km_principal(master_key_name: &str) -> krb5_rs::types::PrincipalName {
+    ok(krb5_rs::kdc::kdb::master::master_principal_named(
+        master_key_name,
+    ))
 }
 
 /// MIT `strdate` (`kdb5_mkey.c:29-40`).
@@ -2289,8 +2435,8 @@ fn mkey_command<S: MkeyStore>(
         no_master_keylist(cmd, &args)
     };
     let keys = ok(store.master_key_list());
-    let km = km_principal();
-    let fullname = format!("K/M@{realm}");
+    let km = km_principal(&cfg.master_key_name);
+    let fullname = format!("{}@{realm}", cfg.master_key_name);
     let modifier = fullname.clone().into_bytes();
     let now = now();
     match cmd {
@@ -2320,7 +2466,12 @@ fn mkey_command<S: MkeyStore>(
             if password != again {
                 fail("Password mismatch while reading new master key from keyboard");
             }
-            let new = ok(master_key_from_password(realm, &password, etype));
+            let new = ok(master_key_from_password_named(
+                realm,
+                &cfg.master_key_name,
+                &password,
+                etype,
+            ));
             let mut kvno = 0;
             ok(store.update_raw(&km, realm, |entry, keys| {
                 kvno = add_new_mkey(entry, keys, &new)?;
@@ -2328,7 +2479,12 @@ fn mkey_command<S: MkeyStore>(
                 Ok(true)
             }));
             if stash {
-                if let Err(e) = write_stash_list(&cfg.key_stash_file, realm, &[(kvno, new)]) {
+                if let Err(e) = write_stash_list_named(
+                    &cfg.key_stash_file,
+                    realm,
+                    &cfg.master_key_name,
+                    &[(kvno, new)],
+                ) {
                     com_err(format!("{e} while storing key"));
                     println!("Warning: couldn't stash master key.");
                 }

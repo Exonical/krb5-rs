@@ -410,20 +410,20 @@ impl TursoReplica {
 
     /// `krb5_db_fetch_mkey_list` against the replicated `K/M`.
     async fn reload_masters(&self, inner: &Inner, realm: &str) -> Result<(), StoreError> {
+        let km_key = krb5_rs::kdc::replication::encode_principal_key(
+            &krb5_rs::kdc::kdb::master::master_principal_named(&self.0.options.master_key_name)?,
+        )?;
         let rows = {
             let conn = inner.conn().await;
             query(
                 &conn,
                 LOOKUP_SQL,
-                vec![
-                    Value::Text(realm.to_string()),
-                    Value::Text("K/M".to_string()),
-                ],
+                vec![Value::Text(realm.to_string()), Value::Text(km_key.clone())],
             )
             .await
             .map_err(map_err)?
         };
-        let km = principal_from_rows(realm, "K/M", &rows)?
+        let km = principal_from_rows(realm, &km_key, &rows)?
             .ok_or_else(|| StoreError::not_found(format!("realm {realm} has no K/M entry")))?;
         let keys = km.master_keys(&self.0.master)?;
         *self.0.masters.write().unwrap_or_else(|e| e.into_inner()) = keys;

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use krb5_rs::gssapi::krb5::{GssFlags, Krb5Initiator};
 use krb5_rs::kdc::kdb::kprop::{self, ErrorParties, ReplayCache, KPROP_SERVICE};
 use krb5_rs::kdc::kdb::mit::ulog::{Last, Ulog, UpdateStatus, XdrReader, XdrWriter};
-use krb5_rs::kdc::kdb::read_stash;
+use krb5_rs::kdc::kdb::read_stash_named;
 use krb5_rs::kdc::{RealmConfig, StoreError};
 use krb5_rs::keytab::{key_for_principal, FileKeytab};
 use krb5_rs::profile::Profile;
@@ -499,7 +499,7 @@ impl Server {
     /// denies or fails a request, after which MIT's kpropd exits.
     async fn do_iprop(&self, ip: &Iprop) -> Result<(), String> {
         self.debug("Incremental propagation enabled");
-        let master = read_stash(&ip.cfg.key_stash_file, &self.realm)
+        let master = read_stash_named(&ip.cfg.key_stash_file, &self.realm, &ip.cfg.master_key_name)
             .map_err(|e| format!("{e} while reading master key"))?;
         let ulog = Ulog::map(&ip.cfg.iprop.logfile, ip.cfg.iprop.ulogsize)
             .map_err(|e| format!("{e} while mapping log"))?;
@@ -688,10 +688,17 @@ fn replay(
     updates: &[krb5_rs::kdc::kdb::mit::ulog::Update],
 ) -> Result<(), StoreError> {
     match cfg.db_module.library.as_deref() {
-        Some("krb5-rs-file") => krb5_rs::kdc::kdb::FileStore::open(&cfg.database_name, master)?
-            .with_iprop(&cfg.iprop)?
-            .replay_updates(updates),
-        _ => LmdbStore::open(cfg, master)?.replay_updates(updates),
+        Some("krb5-rs-file") => krb5_rs::kdc::kdb::FileStore::open_named(
+            &cfg.database_name,
+            master,
+            &cfg.master_key_name,
+        )?
+        .with_iprop(&cfg.iprop)?
+        .replay_updates(updates),
+        None | Some("klmdb") => LmdbStore::open(cfg, master)?.replay_updates(updates),
+        Some(other) => Err(StoreError::backend(
+            cfg.db_module.unknown_library_error(other),
+        )),
     }
 }
 

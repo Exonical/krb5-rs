@@ -205,9 +205,9 @@ ones on its own GSS-API. As in libldap:
 
 Differences from MIT:
 
-- `krb5-rs-kdb5-ldap-util create` accepts `-kv` and `-M`, but the master key
-  is always `K/M` with kvno 1, as `krb5-rs-kdb create` makes it; another `-M`
-  name is refused.
+- `krb5-rs-kdb5-ldap-util create` accepts `-kv`, but the master key always
+  has kvno 1, as `krb5-rs-kdb create` makes it. `-M` names the master key
+  principal, as in MIT.
 - The master-key commands (`add_mkey`, `use_mkey`, `list_mkeys`,
   `purge_mkeys`, `update_princ_encryption`), `ark` and `tabdump` are refused
   on kldap.
@@ -245,6 +245,26 @@ loaded principals and policies use epoch zero. MIT key-data has no
 `krb5rs_allowed_to_delegate_from`; MIT db2/klmdb do not define a native field
 for resource-based delegation. klmdb is the default `db_library`;
 `db_library = krb5-rs-file` selects `FileStore`. MIT dump/load is described below.
+
+### kdc.conf master key name, module directory and TCP backlog
+
+- **`master_key_name`** (`[realms]`, default `K/M`) names the master key
+  principal without the realm, as MIT (`kdc/main.c:246-252`,
+  `alt_prof.c:538`). It is used for the master key's salt, the stash entry,
+  and the database's master key entry in every store (file, klmdb, kldap,
+  CockroachDB and Turso), by the KDC, kadmind, kpropd and `krb5-rs-kdb`,
+  whose `-M` sets it as `kdb5_util -M` does.
+- **`kdc_tcp_listen_backlog`** (`[kdcdefaults]`, default 5, MIT's
+  `DEFAULT_TCP_LISTEN_BACKLOG`) is the KDC's TCP `listen()` backlog.
+- **`db_module_dir`** (`[dbmodules]`) lists directories MIT searches for a
+  `db_library` shared library before its default one (`kdb5.c:409-443`).
+  krb5-rs's database modules are built in, so the built-in names never look
+  there. For any other `db_library` the directories are searched the same
+  way: a missing module fails with MIT's "Unable to find requested database
+  type", and a shared library that is found is refused. A C KDB module calls
+  into MIT's `libkdb5` and `libkrb5` and passes MIT's own structures
+  (`krb5_context`, `krb5_db_entry`), which krb5-rs doesn't provide. This is
+  the one difference from MIT.
 
 ### MIT master-key rotation
 

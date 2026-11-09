@@ -13,8 +13,8 @@ use krb5_rs_kdb_ldap::LdapStore;
 
 use super::{
     add_admin_princs, bump_exit_status, com_err, default_realm, exit_status, fail,
-    master_key_from_password, ok, read_password, read_secret_file, runtime, write_stash, Blocking,
-    Profile, RealmConfig,
+    master_key_from_password_named, ok, read_password, read_secret_file, runtime,
+    write_stash_named, Blocking, Profile, RealmConfig,
 };
 
 const COMMANDS: [&str; 11] = [
@@ -276,13 +276,6 @@ pub(crate) fn main() {
     if help {
         usage();
     }
-    if let Some(name) = &g.mkey_name {
-        if name != "K/M" {
-            fail(format!(
-                "master key name '{name}' is not supported; kldap uses K/M"
-            ));
-        }
-    }
 
     let config = g
         .config
@@ -317,8 +310,12 @@ pub(crate) fn main() {
     if let Some(sf) = &g.stash_file {
         cfg.key_stash_file = sf.clone();
     }
+    if let Some(name) = &g.mkey_name {
+        cfg.master_key_name = name.clone();
+    }
     let mut lcfg = LdapConfig::new(&cfg.db_module, &[], ServerType::Admin)
         .unwrap_or_else(|e| fail(format!("{e} while reading ldap configuration")));
+    lcfg.master_key_name = cfg.master_key_name.clone();
     if let Some(dn) = &g.bind_dn {
         let pwd = match g.bind_pwd.take() {
             Some(p) => p,
@@ -472,8 +469,9 @@ fn create(args: &[String], g: &Globals, cfg: &RealmConfig, mut lcfg: LdapConfig,
             lcfg.container_dn = Some(line.trim_end_matches(['\r', '\n']).to_string());
         }
     }
-    let key = master_key_from_password(realm, &password, cfg.master_key_type)
-        .unwrap_or_else(|e| fail(format!("{e} while transforming master key from password")));
+    let key =
+        master_key_from_password_named(realm, &cfg.master_key_name, &password, cfg.master_key_type)
+            .unwrap_or_else(|e| fail(format!("{e} while transforming master key from password")));
     let rt = runtime();
     {
         let util = connect(&rt, &lcfg);
@@ -505,7 +503,7 @@ fn create(args: &[String], g: &Globals, cfg: &RealmConfig, mut lcfg: LdapConfig,
     );
     add_admin_princs(&admin, realm);
     if r.stash {
-        if let Err(e) = write_stash(&cfg.key_stash_file, realm, &key) {
+        if let Err(e) = write_stash_named(&cfg.key_stash_file, realm, &cfg.master_key_name, &key) {
             com_err(format!("{e} while storing key"));
             println!("Warning: couldn't stash master key.");
             bump_exit_status();

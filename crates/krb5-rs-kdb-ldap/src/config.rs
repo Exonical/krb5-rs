@@ -23,6 +23,8 @@ pub const DEFAULT_CONNS_PER_SERVER: u32 = 5;
 pub struct LdapConfig {
     /// `ldap_servers` (default `ldapi://`).
     pub servers: Vec<String>,
+    /// `master_key_name` (empty for `K/M`).
+    pub master_key_name: String,
     /// `ldap_kerberos_container_dn`.
     pub container_dn: Option<String>,
     /// `ldap_kdc_dn` / `ldap_kadmind_dn` or `-x binddn`.
@@ -59,6 +61,16 @@ fn boolean(v: Option<&str>) -> bool {
 }
 
 impl LdapConfig {
+    /// The master key principal (`master_key_name`, default `K/M`).
+    pub fn master_principal(&self) -> Result<krb5_rs::types::PrincipalName, StoreError> {
+        let name = if self.master_key_name.is_empty() {
+            "K/M"
+        } else {
+            &self.master_key_name
+        };
+        krb5_rs::kdc::kdb::master::master_principal_named(name)
+    }
+
     /// Settings from `db_args` then the `[dbmodules]` section, as MIT reads
     /// them (db args win).
     pub fn new(
@@ -206,6 +218,7 @@ mod tests {
     fn module(pairs: &[(&str, &str)]) -> DbModuleConfig {
         DbModuleConfig {
             library: Some("kldap".into()),
+            module_dirs: Vec::new(),
             options: pairs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

@@ -84,6 +84,10 @@ pub struct DbModuleConfig {
     /// Every other key of the section, for the plug-in to interpret
     /// (`replica_path`, `turso_pool_size`, ...).
     pub options: std::collections::BTreeMap<String, String>,
+    /// `[dbmodules] db_module_dir`: directories searched for a
+    /// `db_library` that is not built in, before the default one
+    /// (kdb5.c:409-443).
+    pub module_dirs: Vec<std::path::PathBuf>,
 }
 
 impl DbModuleConfig {
@@ -91,7 +95,33 @@ impl DbModuleConfig {
     pub fn get(&self, key: &str) -> Option<&str> {
         self.options.get(key).map(String::as_str)
     }
+
+    /// The error for a `db_library` that is not built in. MIT's
+    /// `load_library` looks for `<name>.so` in `db_module_dir`, then in
+    /// the default directory; a shared library found there can't be
+    /// loaded here, since KDB modules are built in.
+    pub fn unknown_library_error(&self, name: &str) -> String {
+        let found = self
+            .module_dirs
+            .iter()
+            .chain(std::iter::once(&std::path::PathBuf::from(
+                DEFAULT_KDB_LIB_PATH,
+            )))
+            .flat_map(|d| [d.join(format!("{name}.so")), d.join(name)])
+            .find(|p| p.is_file());
+        match found {
+            Some(path) => format!(
+                "Unable to load requested database module '{name}': {} is a shared \
+                 library, and only built-in database modules can be loaded",
+                path.display()
+            ),
+            None => format!("Unable to find requested database type: {name}"),
+        }
+    }
 }
+
+/// MIT's default KDB module directory (`DEFAULT_KDB_LIB_PATH`).
+const DEFAULT_KDB_LIB_PATH: &str = "/usr/local/lib/krb5/plugins/kdb";
 
 /// Keys of a `[dbmodules]` section that plug-ins may read.
 const DBMODULE_OPTION_KEYS: &[&str] = &[
@@ -167,6 +197,10 @@ pub struct RealmConfig {
     pub database_name: PathBuf,
     /// Path of the master key stash (`key_stash_file`).
     pub key_stash_file: PathBuf,
+    /// `[realms] master_key_name`: the master key principal's name without
+    /// the realm, default `K/M` (`KRB5_KDB_M_NAME`, kdc/main.c:246-252,
+    /// alt_prof.c:538).
+    pub master_key_name: String,
     /// Master key enctype (`master_key_type`).
     pub master_key_type: i32,
     /// Key/salt combinations generated for new keys (`supported_enctypes`).
@@ -186,6 +220,9 @@ pub struct RealmConfig {
     /// TCP listen addresses (`kdc_tcp_listen` / `kdc_tcp_ports`, defaulting
     /// to the UDP list as in kdc/main.c:969-971).
     pub tcp_listen: Vec<SocketAddr>,
+    /// `[kdcdefaults] kdc_tcp_listen_backlog`, default 5
+    /// (`DEFAULT_TCP_LISTEN_BACKLOG`, kdc/main.c:639-644).
+    pub tcp_listen_backlog: u32,
     /// The database module (`[dbmodules]`).
     pub db_module: DbModuleConfig,
     /// Incremental propagation settings.
@@ -364,6 +401,8 @@ impl RealmConfig {
             &["kdcdefaults", "kdc_max_dgram_reply_size"],
             MAX_DGRAM_SIZE as i64,
         )?;
+        let tcp_listen_backlog =
+            kdc_conf.get_integer(&["kdcdefaults", "kdc_tcp_listen_backlog"], 5)?;
 
         let default_etypes = [18, 17, 20, 19];
         let supported_enctypes =
@@ -463,6 +502,15 @@ impl RealmConfig {
                 .iter()
                 .filter_map(|k| module_value(k).map(|v| ((*k).to_string(), v)))
                 .collect(),
+            module_dirs: kdc_conf
+                .get_values(&["dbmodules", "db_module_dir"])
+                .into_iter()
+                .chain(
+                    krb5_conf
+                        .map_or_else(Vec::new, |p| p.get_values(&["dbmodules", "db_module_dir"])),
+                )
+                .map(std::path::PathBuf::from)
+                .collect(),
         };
         #[cfg(feature = "pkinit")]
         {
@@ -502,6 +550,7 @@ impl RealmConfig {
         Ok(Self {
             kdc,
             database_name,
+            master_key_name: r("master_key_name").unwrap_or_else(|| "K/M".to_string()),
             key_stash_file: r("key_stash_file")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(format!("{KDC_DIR}/.k5.{realm}"))),
@@ -516,6 +565,8 @@ impl RealmConfig {
             ),
             udp_listen: parse_listen_addresses(&udp_str, DEFAULT_PORT)?,
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
+            tcp_listen_backlog: u32::try_from(tcp_listen_backlog.clamp(0, i64::from(i32::MAX)))
+                .unwrap_or(5),
             db_module,
             iprop,
         })
@@ -830,6 +881,48 @@ mod dbmodule_tests {
 #[cfg(test)]
 mod db_module_tests {
     use super::*;
+
+    #[test]
+    fn tcp_listen_backlog_and_master_key_name() {
+        let kdc = Profile::parse("[realms]\n R = {\n }\n").expect("kdc.conf");
+        let c = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
+        assert_eq!(c.tcp_listen_backlog, 5);
+        assert_eq!(c.master_key_name, "K/M");
+        let kdc = Profile::parse(
+            "[kdcdefaults]\n kdc_tcp_listen_backlog = 64\n[realms]\n R = {\n  \
+             master_key_name = kdc/master\n }\n",
+        )
+        .expect("kdc.conf");
+        let c = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
+        assert_eq!(c.tcp_listen_backlog, 64);
+        assert_eq!(c.master_key_name, "kdc/master");
+    }
+
+    #[test]
+    fn db_module_dir_is_searched_for_unknown_db_library() {
+        let dir =
+            std::env::temp_dir().join(format!("krb5-rs-db-module-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("mymod.so"), b"").expect("so");
+        let kdc = Profile::parse(&format!(
+            "[realms]\n R = {{\n }}\n[dbmodules]\n db_module_dir = {}\n R = {{\n  \
+             db_library = mymod\n }}\n",
+            dir.display()
+        ))
+        .expect("kdc.conf");
+        let c = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
+        assert_eq!(c.db_module.module_dirs, std::slice::from_ref(&dir));
+        let found = c.db_module.unknown_library_error("mymod");
+        assert!(
+            found.contains("mymod.so") && found.contains("only built-in"),
+            "{found}"
+        );
+        assert_eq!(
+            c.db_module.unknown_library_error("other"),
+            "Unable to find requested database type: other"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn db_library_and_plugin_options_come_from_dbmodules() {
