@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
-use krb5_rs::kdc::kdb::{master_key_from_password, read_stash, FileStore};
+use krb5_rs::kdc::kdb::{master_key_from_password_named, read_stash_named, FileStore};
 #[cfg(feature = "cockroach")]
 use krb5_rs::kdc::GateSubject;
 use krb5_rs::kdc::{
@@ -745,9 +745,17 @@ async fn config_mode(
             if password.is_empty() {
                 return Err(io_err(format!("{} is empty", path.display())));
             }
-            master_key_from_password(&realm, password, cfg.master_key_type).map_err(io_err)?
+            master_key_from_password_named(
+                &realm,
+                &cfg.master_key_name,
+                password,
+                cfg.master_key_type,
+            )
+            .map_err(io_err)?
         }
-        None => read_stash(&cfg.key_stash_file, &realm).map_err(io_err)?,
+        None => {
+            read_stash_named(&cfg.key_stash_file, &realm, &cfg.master_key_name).map_err(io_err)?
+        }
     };
 
     match cfg.db_module.library.as_deref() {
@@ -770,7 +778,7 @@ async fn config_mode(
     let mut parts = ModeParts::default();
     let mut waiting = false;
     let store = loop {
-        match FileStore::open(&cfg.database_name, &master) {
+        match FileStore::open_named(&cfg.database_name, &master, &cfg.master_key_name) {
             Ok(store) => break Arc::new(store),
             Err(e) if cli.wait_for_database => waiting = database_wait(waiting, &e).await,
             Err(e) => return Err(io_err(e)),

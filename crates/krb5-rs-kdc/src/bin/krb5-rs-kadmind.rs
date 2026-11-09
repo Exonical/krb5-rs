@@ -27,7 +27,7 @@ use krb5_rs::kdc::kdb::mit::{parse_name_with_default, MitEntry};
 use krb5_rs::kdc::kdb::mit::{
     set_key_change, set_mod_princ, set_string_attr, KeyData as MitKeyData, TlData,
 };
-use krb5_rs::kdc::kdb::read_stash;
+use krb5_rs::kdc::kdb::read_stash_named;
 use krb5_rs::kdc::kdb::restrictions::AclRestrictions;
 use krb5_rs::kdc::kdb::restrictions::RestrictedEntry;
 use krb5_rs::kdc::kerberos_time;
@@ -2517,7 +2517,7 @@ async fn kadmind(args: Args) {
         // (alt_prof.c:699, loop_add_rpc_service).
         None => 0,
     });
-    let master = read_stash(&cfg.key_stash_file, &realm)
+    let master = read_stash_named(&cfg.key_stash_file, &realm, &cfg.master_key_name)
         .unwrap_or_else(|e| die(format!("{e} while reading master key")));
     let db = match cfg.db_module.library.as_deref() {
         #[cfg(feature = "cockroach")]
@@ -2559,7 +2559,7 @@ async fn kadmind(args: Args) {
             die("db_library kldap needs a krb5-rs-kadmind built with the `kldap` feature")
         }
         Some("krb5-rs-file") => Db::File(Arc::new(
-            krb5_rs::kdc::kdb::FileStore::open(&cfg.database_name, &master)
+            krb5_rs::kdc::kdb::FileStore::open_named(&cfg.database_name, &master, &cfg.master_key_name)
                 .and_then(|store| store.with_iprop(&cfg.iprop))
                 .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
         )),

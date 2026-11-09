@@ -24,4 +24,7 @@ pub mod restrictions;
 
 pub use crate::kdc::store::PrincipalRecord;
 pub use file::{FileCaller, FileStore};
-pub use master::{master_key_from_password, read_stash, write_stash};
+pub use master::{
+    master_key_from_password, master_key_from_password_named, read_stash, read_stash_named,
+    write_stash, write_stash_named,
+};

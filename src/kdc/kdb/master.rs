@@ -133,6 +133,16 @@ pub fn write_stash(path: &Path, realm: &str, key: &EncryptionKey) -> Result<(), 
     write_stash_list(path, realm, &[(1, key.clone())])
 }
 
+/// [`write_stash`] for the master key principal `master_key_name`.
+pub fn write_stash_named(
+    path: &Path,
+    realm: &str,
+    master_key_name: &str,
+    key: &EncryptionKey,
+) -> Result<(), StoreError> {
+    write_stash_list_named(path, realm, master_key_name, &[(1, key.clone())])
+}
+
 /// Write the stash file holding each `(kvno, key)` of a master-key list.
 pub fn write_stash_list(
     path: &Path,
