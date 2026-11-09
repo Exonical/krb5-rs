@@ -1267,6 +1267,11 @@ built-in mspac and auth-indicators modules, in installation order.
   the ticket (`AD_USAGE_AS_REQ`/`TGS_REQ`) or the authenticator
   (`AD_USAGE_AP_REQ`, where KDC-only types are skipped). Errors from an
   `AD_INFORMATIONAL` module are ignored; others fail the AP-REQ.
+  Difference from MIT: when the verified data lacks the module's type and
+  the type is taken from the ticket or authenticator instead, the module is
+  told it is not KDC-issued. MIT still says it is, so a client-chosen
+  authenticator greeting beside unrelated AD-KDC-ISSUED data was marked
+  authenticated.
 - **Name attributes:** `gss_inquire_name`, `gss_get_name_attribute`,
   `gss_set_name_attribute` and `gss_delete_name_attribute` reach the modules
   as MIT's `krb5_authdata_*_attribute` do; `ENOENT` and `EPERM` are
