@@ -118,6 +118,10 @@ dns = ["dep:hickory-resolver", "dep:tokio"]  # Real DNS resolver for KDC locatio
 name = "gen_pkinit_pki"
 required-features = ["test-pki"]
 
+[[example]]
+name = "kdcauthdata_greet"
+required-features = ["kdc"]
+
 [workspace]
 members = [
     ".",

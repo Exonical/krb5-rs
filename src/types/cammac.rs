@@ -61,3 +61,25 @@ pub fn find_authdata(list: &[AuthorizationDataElement], ad_type: i32, out: &mut 
         }
     }
 }
+
+/// `KRB5_AUTHDATA_KDC_ISSUED`.
+pub const AD_KDC_ISSUED: i32 = 4;
+/// `KRB5_KEYUSAGE_AD_KDCISSUED_CKSUM`.
+pub const KEYUSAGE_AD_KDCISSUED_CKSUM: i32 = 19;
+
+/// AD-KDCIssued (RFC 4120 §5.2.6.2).
+#[derive(AsnType, Encode, Decode, Debug, Clone)]
+pub struct AdKdcIssued {
+    /// ad-checksum.
+    #[rasn(tag(explicit(context, 0)))]
+    pub ad_checksum: Checksum,
+    /// i-realm.
+    #[rasn(tag(explicit(context, 1)))]
+    pub i_realm: Option<super::Realm>,
+    /// i-sname.
+    #[rasn(tag(explicit(context, 2)))]
+    pub i_sname: Option<PrincipalName>,
+    /// elements.
+    #[rasn(tag(explicit(context, 3)))]
+    pub elements: Vec<AuthorizationDataElement>,
+}

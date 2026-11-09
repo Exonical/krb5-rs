@@ -13,12 +13,18 @@ pub use crate::plugin::rpc::{
     Message, Stream, ERROR_TABLE_BASE_KRB5, PLUGIN_NO_HANDLE, PLUGIN_VER_NOTSUPP, PROTOCOL_VERSION,
 };
 
-use super::{Audit, AuditStage, AuditState, KdcPolicy, PolicyLimits, PolicyRefusal, PolicyRequest};
+use super::{
+    Audit, AuditStage, AuditState, AuthdataRequest, KdcAuthdata, KdcPolicy, PolicyLimits,
+    PolicyRefusal, PolicyRequest,
+};
+use crate::types::{AuthorizationDataElement, EncTicketPart, EncryptionKey, PrincipalName};
 
 /// [`call::INITIALIZE`]'s string for a kdcpolicy module.
 pub const KDCPOLICY_HANDSHAKE: &str = "KRB5RS-KDCPOLICY-V-1";
 /// [`call::INITIALIZE`]'s string for an audit module.
 pub const AUDIT_HANDSHAKE: &str = "KRB5RS-AUDIT-V-1";
+/// [`call::INITIALIZE`]'s string for a KDC authdata module.
+pub const KDCAUTHDATA_HANDSHAKE: &str = "KRB5RS-KDCAUTHDATA-V-1";
 
 /// Call numbers.
 pub mod call {
@@ -42,6 +48,137 @@ pub mod call {
     pub const S4U2PROXY: u32 = 10;
     /// `u2u`, as [`AS_REQ`].
     pub const U2U: u32 = 11;
+    /// authdata `handle`: `ii` flags and message type; client, server,
+    /// header server and S4U client each as `ay` DER PrincipalName (empty
+    /// for none) and `s` realm; `ay ay ay` client, server and header keys
+    /// (DER EncryptionKey, empty for none); `ay` request; `ay ay` request
+    /// and reply tickets (DER EncTicketPart, empty for none). Answered with
+    /// `ay` the reply ticket's authorization data (DER, empty for none).
+    pub const HANDLE: u32 = 12;
+}
+
+fn der_opt<T: rasn::Encode>(v: Option<&T>) -> io::Result<Vec<u8>> {
+    v.map_or(Ok(Vec::new()), |v| {
+        rasn::der::encode(v).map_err(|e| bad(e.to_string()))
+    })
+}
+
+fn opt_der<T: rasn::Decode>(b: &[u8]) -> io::Result<Option<T>> {
+    if b.is_empty() {
+        return Ok(None);
+    }
+    rasn::der::decode(b)
+        .map(Some)
+        .map_err(|e| bad(e.to_string()))
+}
+
+fn put_principal(m: &mut Message, p: Option<&super::Principal>) -> io::Result<()> {
+    m.put_bytes(&der_opt(p.map(|(n, _)| n))?)
+        .put_str(p.map(|(_, r)| r.as_str()));
+    Ok(())
+}
+
+fn get_principal(m: &mut Message) -> io::Result<Option<super::Principal>> {
+    let name: Option<PrincipalName> = opt_der(&m.get_bytes()?)?;
+    let realm = m.get_str()?;
+    Ok(name.map(|n| (n, realm.unwrap_or_default())))
+}
+
+fn put_authdata(m: &mut Message, r: &AuthdataRequest, reply: &EncTicketPart) -> io::Result<()> {
+    m.put_i32(r.flags).put_i32(r.msg_type);
+    for p in [&r.client, &r.server, &r.header_server, &r.for_user] {
+        put_principal(m, p.as_ref())?;
+    }
+    for k in [&r.client_key, &r.server_key, &r.header_key] {
+        m.put_bytes(&der_opt(k.as_ref())?);
+    }
+    m.put_bytes(&r.req_pkt)
+        .put_bytes(&der_opt(r.enc_tkt_req.as_ref())?)
+        .put_bytes(&der_opt(Some(reply))?);
+    Ok(())
+}
+
+fn get_authdata(m: &mut Message) -> io::Result<(AuthdataRequest, EncTicketPart)> {
+    let flags = m.get_i32()?;
+    let msg_type = m.get_i32()?;
+    let client = get_principal(m)?;
+    let server = get_principal(m)?;
+    let header_server = get_principal(m)?;
+    let for_user = get_principal(m)?;
+    let client_key: Option<EncryptionKey> = opt_der(&m.get_bytes()?)?;
+    let server_key: Option<EncryptionKey> = opt_der(&m.get_bytes()?)?;
+    let header_key: Option<EncryptionKey> = opt_der(&m.get_bytes()?)?;
+    let req_pkt = m.get_bytes()?;
+    let enc_tkt_req: Option<EncTicketPart> = opt_der(&m.get_bytes()?)?;
+    let reply: EncTicketPart = opt_der(&m.get_bytes()?)?.ok_or_else(|| bad("missing ticket"))?;
+    m.finish()?;
+    let r = AuthdataRequest {
+        flags,
+        msg_type,
+        client,
+        server,
+        header_server,
+        client_key,
+        server_key,
+        header_key,
+        req_pkt,
+        for_user,
+        enc_tkt_req,
+    };
+    Ok((r, reply))
+}
+
+/// Serve `module` as a KDC authdata module on `stream`.
+pub fn serve_kdcauthdata<S: Read + Write>(stream: S, module: &dyn KdcAuthdata) -> io::Result<()> {
+    serve(stream, KDCAUTHDATA_HANDSHAKE, |req| {
+        let mut answer = Message::new(req.call);
+        Ok(match req.call {
+            call::INITIALIZE => module.init().map(|()| answer).map_err(|c| (c, None)),
+            call::FINALIZE => {
+                module.fini();
+                Ok(answer)
+            }
+            call::HANDLE => {
+                let (r, mut reply) = get_authdata(req)?;
+                match module.handle(&r, &mut reply) {
+                    Ok(()) => {
+                        answer.put_bytes(&der_opt(reply.authorization_data.as_ref())?);
+                        Ok(answer)
+                    }
+                    Err(c) => Err((c, None)),
+                }
+            }
+            _ => Err((PLUGIN_NO_HANDLE, None)),
+        })
+    })
+}
+
+/// A KDC authdata module reached over RPC; a call that fails is an error,
+/// which the KDC logs.
+pub struct RemoteAuthdata(Conn);
+
+impl KdcAuthdata for RemoteAuthdata {
+    fn name(&self) -> &str {
+        &self.0.name
+    }
+    fn handle(&self, req: &AuthdataRequest, reply: &mut EncTicketPart) -> Result<(), i32> {
+        let generic = ERROR_TABLE_BASE_KRB5 + KRB_ERR_GENERIC;
+        let mut m = Message::new(call::HANDLE);
+        put_authdata(&mut m, req, reply).map_err(|_| generic)?;
+        match self.0.call(&m) {
+            Ok(Ok(mut a)) => {
+                let mut list = || -> io::Result<Option<Vec<AuthorizationDataElement>>> {
+                    let b = a.get_bytes()?;
+                    a.finish()?;
+                    opt_der(&b)
+                };
+                reply.authorization_data = list().map_err(|_| generic)?;
+                Ok(())
+            }
+            Ok(Err((code, _))) => Err(code),
+            Err(_) => Err(generic),
+        }
+    }
 }
 
 fn put_request(m: &mut Message, r: &PolicyRequest) {
@@ -281,6 +418,11 @@ impl Audit for RemoteAudit {
 /// Connect to the kdcpolicy module `name`.
 pub fn kdcpolicy(name: &str, connect: Connect) -> Result<RemotePolicy, InitError> {
     Conn::open(name, KDCPOLICY_HANDSHAKE, connect).map(RemotePolicy)
+}
+
+/// Connect to the KDC authdata module `name`.
+pub fn kdcauthdata(name: &str, connect: Connect) -> Result<RemoteAuthdata, InitError> {
+    Conn::open(name, KDCAUTHDATA_HANDSHAKE, connect).map(RemoteAuthdata)
 }
 
 /// Connect to the audit module `name`.

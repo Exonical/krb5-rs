@@ -1,4 +1,5 @@
-//! kdcpolicy and audit modules (MIT `kdc/policy.c`, `kdc/kdc_audit.c`),
+//! kdcpolicy, audit and authdata modules (MIT `kdc/policy.c`,
+//! `kdc/kdc_audit.c`, `kdc/kdc_authdata.c`),
 //! run as separate processes and reached over RPC
 //! ([`krb5_rs::kdc::plugins::rpc`]), the way p11-kit remotes PKCS #11
 //! modules.
@@ -9,9 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use krb5_rs::kdc::plugins::rpc::{self, InitError, PLUGIN_NO_HANDLE, PLUGIN_VER_NOTSUPP};
-use krb5_rs::kdc::plugins::{Audit, KdcPolicy};
+use krb5_rs::kdc::plugins::{Audit, AuthdataRequest, KdcAuthdata, KdcPolicy};
 use krb5_rs::plugin;
 use krb5_rs::profile::Profile;
+use krb5_rs::types::EncTicketPart;
 
 /// The enabled modules of `iface` in MIT's order, with their sockets.
 fn configured(profiles: &[&Profile], iface: &str) -> Result<Vec<(String, PathBuf)>, String> {
@@ -27,7 +29,26 @@ fn configured(profiles: &[&Profile], iface: &str) -> Result<Vec<(String, PathBuf
 use plugin::connector;
 
 /// The configured modules.
-pub type Modules = (Vec<Arc<dyn KdcPolicy>>, Vec<Arc<dyn Audit>>);
+pub type Modules = (
+    Vec<Arc<dyn KdcPolicy>>,
+    Vec<Arc<dyn Audit>>,
+    Vec<Arc<dyn KdcAuthdata>>,
+);
+
+/// An authdata module whose errors are logged, as `handle_authdata` logs
+/// them (kdc_authdata.c:607-609).
+struct Logged(rpc::RemoteAuthdata);
+
+impl KdcAuthdata for Logged {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn handle(&self, req: &AuthdataRequest, reply: &mut EncTicketPart) -> Result<(), i32> {
+        self.0.handle(req, reply).inspect_err(|e| {
+            tracing::error!("{e} from authdata module {}", self.0.name());
+        })
+    }
+}
 
 /// `load_kdcpolicy_plugins` and `load_audit_modules`. A module that cannot
 /// be reached, or refuses the protocol version, is logged and skipped, as
@@ -61,7 +82,22 @@ pub fn load(profiles: &[&Profile]) -> Result<Modules, String> {
             }
         }
     }
-    Ok((policy, audit))
+    // load_authdata_plugins (kdc_authdata.c:84-155): a module that fails to
+    // initialize is logged and skipped.
+    let mut authdata: Vec<Arc<dyn KdcAuthdata>> = Vec::new();
+    for (name, path) in configured(profiles, "kdcauthdata")? {
+        match rpc::kdcauthdata(&name, connector(path.clone())) {
+            Ok(m) => authdata.push(Arc::new(Logged(m))),
+            Err(InitError::Refused((PLUGIN_VER_NOTSUPP, _))) => {}
+            Err(InitError::Unavailable(e)) => {
+                tracing::error!("authdata module {name} ({}): {e}", path.display());
+            }
+            Err(InitError::Refused((e, _))) => {
+                tracing::error!("{e} while initializing authdata module {name}");
+            }
+        }
+    }
+    Ok((policy, audit, authdata))
 }
 
 #[cfg(all(test, unix))]
@@ -117,7 +153,7 @@ mod tests {
         ));
         let lib = Profile::parse(&format!("[libdefaults]\n plugin_base_dir = {base}\n"))
             .expect("profile");
-        let (policy, audit) = load(&[&p, &lib]).expect("load");
+        let (policy, audit, _) = load(&[&p, &lib]).expect("load");
         assert!(audit.is_empty());
         let names: Vec<&str> = policy.iter().map(|m| m.name()).collect();
         assert_eq!(names, ["a", "b"]);
@@ -142,5 +178,47 @@ mod tests {
         ));
         assert_eq!(load(&[&p]).expect("load").0.len(), 1);
         assert!(load(&[&conf("  module = a\n")]).is_err());
+    }
+
+    struct FailInit;
+    impl KdcAuthdata for FailInit {
+        fn name(&self) -> &str {
+            "bad"
+        }
+        fn init(&self) -> Result<(), i32> {
+            Err(5)
+        }
+        fn handle(&self, _: &AuthdataRequest, _: &mut EncTicketPart) -> Result<(), i32> {
+            Ok(())
+        }
+    }
+
+    fn listen_authdata(dir: &Path, name: &str, module: &'static dyn KdcAuthdata) -> PathBuf {
+        let path = dir.join(format!("{name}.sock"));
+        let l = UnixListener::bind(&path).expect("bind");
+        std::thread::spawn(move || {
+            for s in l.incoming().map_while(Result::ok) {
+                std::thread::spawn(move || rpc::serve_kdcauthdata(s, module));
+            }
+        });
+        path
+    }
+
+    #[test]
+    fn authdata_modules_that_fail_to_initialize_are_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let greet = listen_authdata(dir.path(), "greet", &krb5_rs::kdc::plugins::greet::Greet);
+        let bad = listen_authdata(dir.path(), "bad", &FailInit);
+        let p = Profile::parse(&format!(
+            "[plugins]\n kdcauthdata = {{\n  module = bad:unix:path={}\n  \
+             module = greet:unix:path={}\n  module = gone:unix:path=/nonexistent.sock\n }}\n",
+            bad.display(),
+            greet.display()
+        ))
+        .expect("profile");
+        let (policy, audit, authdata) = load(&[&p]).expect("load");
+        assert!(policy.is_empty() && audit.is_empty());
+        let names: Vec<&str> = authdata.iter().map(|m| m.name()).collect();
+        assert_eq!(names, ["greet"]);
     }
 }

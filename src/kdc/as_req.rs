@@ -583,6 +583,26 @@ impl<S: PrincipalStore> Kdc<S> {
             &local_tgt,
             include_pac_p(request.padata.as_deref()),
             &indicators,
+            || {
+                use super::plugins::{kdb_flags, AuthdataRequest, MSG_AS_REQ};
+                // KRB5_NT_ENTERPRISE_PRINCIPAL.
+                let enterprise = body.cname.as_ref().is_some_and(|c| c.name_type == 10);
+                AuthdataRequest {
+                    flags: kdb_flags::CLIENT
+                        | if canonicalize || enterprise {
+                            kdb_flags::REFERRAL_OK
+                        } else {
+                            0
+                        },
+                    msg_type: MSG_AS_REQ,
+                    client: Some((client.name.clone(), client.realm.clone())),
+                    server: Some((server.name.clone(), server.realm.clone())),
+                    client_key: client_key.as_ref().map(|k| k.entry.key.clone()),
+                    server_key: Some(server_key.key.clone()),
+                    req_pkt: raw.to_vec(),
+                    ..AuthdataRequest::default()
+                }
+            },
         )?;
         // check_indicators (do_as_req.c:284-288).
         super::cammac::check_indicators(server.require_auth.as_deref(), &indicators)?;

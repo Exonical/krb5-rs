@@ -10,6 +10,7 @@
 use super::cammac::add_auth_indicators;
 use super::db::KvnoSel;
 use super::error::KdcError;
+use super::plugins::AuthdataRequest;
 use super::{PrincipalAttributes, PrincipalEntry, PrincipalStore};
 use crate::crypto::find_etype;
 use crate::pac::{
@@ -151,7 +152,21 @@ impl<S: PrincipalStore> super::Kdc<S> {
         Err(KdcError::new(KRB_AP_ERR_MODIFIED, "HEADER_PAC"))
     }
 
+    /// The module step of `handle_authdata` (kdc_authdata.c:601-612): each
+    /// KDC authdata module in turn, none for an anonymous ticket. A module's
+    /// error doesn't stop the request, as in MIT, where it is only logged.
+    fn run_authdata_modules(&self, part: &mut EncTicketPart, ad: impl FnOnce() -> AuthdataRequest) {
+        if self.kdcauthdata.is_empty() || part.flags.contains(TicketFlags::ANONYMOUS) {
+            return;
+        }
+        let req = ad();
+        for m in &self.kdcauthdata {
+            let _ = m.handle(&req, part);
+        }
+    }
+
     /// `handle_pac` for an AS request (kdc_authdata.c:462-575).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn issue_as_pac(
         &self,
         part: &mut EncTicketPart,
@@ -160,7 +175,9 @@ impl<S: PrincipalStore> super::Kdc<S> {
         local_tgt: &PrincipalEntry,
         include_pac: bool,
         indicators: &[String],
+        ad: impl FnOnce() -> AuthdataRequest,
     ) -> Result<(), KdcError> {
+        self.run_authdata_modules(part, ad);
         // handle_authdata (kdc_authdata.c:477-493, 517): indicators go in
         // before the ticket is signed.
         if server
@@ -204,6 +221,7 @@ impl<S: PrincipalStore> super::Kdc<S> {
         subject_pac: Option<&Pac>,
         s4u: S4uPac<'_>,
         indicators: &[String],
+        ad: impl FnOnce() -> AuthdataRequest,
     ) -> Result<(), KdcError> {
         let mut list: Vec<AuthorizationDataElement> = Vec::new();
         if let Some((enc, session, subkey)) = request_authdata {
@@ -213,13 +231,16 @@ impl<S: PrincipalStore> super::Kdc<S> {
             }
             list.extend(filtered(&decoded));
         }
+        part.authorization_data = (!list.is_empty()).then_some(list);
+        self.run_authdata_modules(part, ad);
         if let Some(tgt_authdata) = subject_tkt.authorization_data.as_deref() {
             if has_mandatory_for_kdc(tgt_authdata) {
                 return Err(KdcError::new(KDC_ERR_POLICY, "HANDLE_AUTHDATA"));
             }
+            let mut list = part.authorization_data.take().unwrap_or_default();
             list.extend(filtered(tgt_authdata));
+            part.authorization_data = (!list.is_empty()).then_some(list);
         }
-        part.authorization_data = (!list.is_empty()).then_some(list);
 
         if server
             .attributes

@@ -212,6 +212,7 @@ pub struct Kdc<S: PrincipalStore> {
     reporter: Arc<dyn LockoutReporter>,
     kdcpolicy: Vec<Arc<dyn plugins::KdcPolicy>>,
     audit: Vec<Arc<dyn plugins::Audit>>,
+    kdcauthdata: Vec<Arc<dyn plugins::KdcAuthdata>>,
     lookaside: lookaside::Lookaside,
 }
 
@@ -232,6 +233,7 @@ pub struct KdcBuilder<S: PrincipalStore> {
     reporter: Arc<dyn LockoutReporter>,
     kdcpolicy: Vec<Arc<dyn plugins::KdcPolicy>>,
     audit: Vec<Arc<dyn plugins::Audit>>,
+    kdcauthdata: Vec<Arc<dyn plugins::KdcAuthdata>>,
 }
 
 impl<S: PrincipalStore> KdcBuilder<S> {
@@ -273,6 +275,12 @@ impl<S: PrincipalStore> KdcBuilder<S> {
         self
     }
 
+    /// Run `modules` (in order) as MIT's KDC authdata modules.
+    pub fn kdcauthdata(mut self, modules: Vec<Arc<dyn plugins::KdcAuthdata>>) -> Self {
+        self.kdcauthdata = modules;
+        self
+    }
+
     /// Finish.
     pub fn build(self) -> Kdc<S> {
         Kdc {
@@ -284,6 +292,7 @@ impl<S: PrincipalStore> KdcBuilder<S> {
             reporter: self.reporter,
             kdcpolicy: self.kdcpolicy,
             audit: self.audit,
+            kdcauthdata: self.kdcauthdata,
             lookaside: lookaside::Lookaside::default(),
         }
     }
@@ -309,6 +318,13 @@ impl<S: PrincipalStore> Kdc<S> {
         self
     }
 
+    /// Replace the KDC authdata modules (see [`KdcBuilder::kdcauthdata`]).
+    #[must_use]
+    pub fn with_kdcauthdata(mut self, modules: Vec<Arc<dyn plugins::KdcAuthdata>>) -> Self {
+        self.kdcauthdata = modules;
+        self
+    }
+
     /// Start a [`KdcBuilder`].
     pub fn builder(config: KdcConfig, store: S) -> KdcBuilder<S> {
         KdcBuilder {
@@ -320,6 +336,7 @@ impl<S: PrincipalStore> Kdc<S> {
             reporter: Arc::new(NoopLockoutReporter),
             kdcpolicy: Vec::new(),
             audit: Vec::new(),
+            kdcauthdata: Vec::new(),
         }
     }
 
