@@ -108,6 +108,9 @@ spec:
             - name: stash
               mountPath: /stash
               readOnly: true
+            # Replay cache (MIT dfl: $KRB5RCACHEDIR, default /var/tmp).
+            - name: rcache
+              mountPath: /var/tmp
       volumes:
         - name: config
           configMap:
@@ -130,4 +133,6 @@ spec:
         - name: stash
           emptyDir:
             medium: Memory
+        - name: rcache
+          emptyDir: {}
 {{- end }}

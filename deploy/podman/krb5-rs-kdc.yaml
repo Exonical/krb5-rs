@@ -203,6 +203,8 @@ spec:
         - name: config
           mountPath: /etc/krb5-rs
           readOnly: true
+        - name: rcache
+          mountPath: /var/tmp
     - name: kdc
       image: ghcr.io/exonical/krb5-rs-kdc:latest
       args:
@@ -237,6 +239,9 @@ spec:
           mountPath: /secrets
           readOnly: true
   volumes:
+    # Replay cache for kadmind (MIT dfl: $KRB5RCACHEDIR, default /var/tmp).
+    - name: rcache
+      emptyDir: {}
     - name: data
       persistentVolumeClaim:
         claimName: krb5-rs-kdc-data

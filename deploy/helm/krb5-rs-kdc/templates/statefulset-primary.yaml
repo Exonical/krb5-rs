@@ -215,6 +215,9 @@ spec:
             - name: keytab
               mountPath: /keytab
               readOnly: true
+            # Replay cache (MIT dfl: $KRB5RCACHEDIR, default /var/tmp).
+            - name: rcache
+              mountPath: /var/tmp
         {{- end }}
         {{- if and (gt (int .Values.replicas.replicaCount) 0) (not .Values.propagation.iprop.enabled) }}
         # Push the database to every replica's kpropd (MIT kprop).
@@ -277,6 +280,8 @@ spec:
             secretName: {{ include "krb5-rs-kdc.secretName" . }}
             defaultMode: 0440
         - name: keytab
+          emptyDir: {}
+        - name: rcache
           emptyDir: {}
         {{- if not .Values.primary.persistence.enabled }}
         - name: data

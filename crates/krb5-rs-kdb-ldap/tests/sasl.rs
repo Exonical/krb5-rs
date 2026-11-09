@@ -114,7 +114,7 @@ async fn sasl_binds_against_openldap() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let port = 20000 + (std::process::id() % 20000) as u16 + 1;
+    let port = free_port();
     let _slapd = start_slapd(dir.path(), port, &[]);
     let url = format!("ldap://127.0.0.1:{port}/");
 
@@ -356,4 +356,13 @@ async fn gssapi_bind_against_openldap() {
         ldap.unbind().await.ok();
     }
     std::env::remove_var("LDAPSASL_NOCANON");
+}
+
+/// A port that was free a moment ago (the kernel picks it), so slapd
+/// doesn't collide with another listener.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("free port")
+        .port()
 }

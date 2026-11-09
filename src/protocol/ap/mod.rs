@@ -6,6 +6,8 @@
 //! addr_srch.c, os/mk_faddr.c, rcache/rc_base.c.
 
 mod cred;
+mod rcache;
+pub use rcache::{Rcache, RcacheError};
 mod req_rep;
 mod safe_priv;
 mod util;
@@ -275,7 +277,10 @@ pub struct AuthContext {
     remote_seq: u32,
     negotiated_etype: i32,
     authentp: Option<Authenticator>,
-    rcache: HashSet<Vec<u8>>,
+    /// `memrcache` for KRB-SAFE/KRB-PRIV/KRB-CRED (privsafe.c:134-140).
+    memrcache: HashSet<Vec<u8>>,
+    /// The replay cache rd_req stores authenticators in.
+    rcache: Option<Rcache>,
     conn_sane_seq: bool,
     conn_heimdal_seq: bool,
     /// KDC mode (MIT `krb5_rd_req_decoded_anyflag`): TGS authenticator key
@@ -312,7 +317,8 @@ impl AuthContext {
             remote_seq: 0,
             negotiated_etype: 0,
             authentp: None,
-            rcache: HashSet::new(),
+            memrcache: HashSet::new(),
+            rcache: None,
             conn_sane_seq: false,
             conn_heimdal_seq: false,
             tgs_req: false,
@@ -325,6 +331,18 @@ impl AuthContext {
     #[cfg(feature = "kdc")]
     pub(crate) fn set_tgs_req(&mut self, tgs_req: bool) {
         self.tgs_req = tgs_req;
+    }
+
+    /// `krb5_auth_con_setrcache`: the replay cache rd_req uses. Without
+    /// one, rd_req with `DO_TIME` opens the default cache
+    /// ([`Rcache::default`] with no profile; rd_req_dec.c:543-548).
+    pub fn set_rcache(&mut self, rcache: Option<Rcache>) {
+        self.rcache = rcache;
+    }
+
+    /// `krb5_auth_con_getrcache`.
+    pub fn rcache(&self) -> Option<&Rcache> {
+        self.rcache.as_ref()
     }
 
     /// Set the auth-context flags.
@@ -550,7 +568,7 @@ impl AuthContext {
         if let Some(t) = rdata_time {
             self.check_clockskew(t)?;
         }
-        if !self.rcache.insert(tag) {
+        if !self.memrcache.insert(tag) {
             return Err(ApError::Repeat);
         }
         Ok(())

@@ -73,6 +73,9 @@ pub struct RequestSummary {
     pub gate_rejected: bool,
     /// Time spent awaiting KDC stores during request processing.
     pub store_time: Duration,
+    /// The request repeated a recent packet and was answered from the
+    /// lookaside cache instead of being processed.
+    pub lookaside: Option<super::LookasideHit>,
 }
 
 impl RequestSummary {
@@ -168,6 +171,7 @@ impl RequestSummary {
             ticket_etype,
             gate_rejected,
             store_time: Duration::ZERO,
+            lookaside: None,
         }
     }
 
@@ -175,6 +179,22 @@ impl RequestSummary {
     /// `AS_REQ (2 etypes {18 17}) 10.0.0.1:50000: ISSUE: user@R for krbtgt/R@R, etypes {rep=18 tkt=18}`
     /// or `AS_REQ (1 etypes {18}) 10.0.0.1:50000: NEEDED_PREAUTH: user@R for krbtgt/R@R, error 25`.
     pub fn log_line(&self, peer: SocketAddr) -> String {
+        // dispatch.c:117-133.
+        match self.lookaside {
+            Some(super::LookasideHit::Resent) => {
+                return format!(
+                    "DISPATCH: repeated (retransmitted?) request from {}, resending previous response",
+                    peer.ip()
+                )
+            }
+            Some(super::LookasideHit::Dropped) => {
+                return format!(
+                    "DISPATCH: repeated (retransmitted?) request from {} during request processing, dropping repeated request",
+                    peer.ip()
+                )
+            }
+            None => {}
+        }
         let kind = match self.kind {
             RequestKind::As => "AS_REQ",
             RequestKind::Tgs => "TGS_REQ",
@@ -311,6 +331,30 @@ mod tests {
             "AS_REQ (4 etypes {18 17 20 19}) 192.0.2.7:4000: NEEDED_PREAUTH: \
              alice@R for krbtgt/R@R, error 25"
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_request_is_answered_from_the_lookaside_cache() {
+        let kdc = kdc();
+        let mut ex = AsExchange::new(
+            AsExchangeConfig::new(PrincipalName::new_principal("alice"), REALM),
+            "pw",
+        );
+        let StepResult::SendToKdc { data, .. } = ex.step(&[]).expect("step") else {
+            panic!("expected a request");
+        };
+        let (first, s) = kdc.handle_summarized(&data, Transport::Tcp).await;
+        assert_eq!(s.lookaside, None);
+        let (again, s) = kdc.handle_summarized(&data, Transport::Udp).await;
+        assert_eq!(again, first);
+        assert_eq!(s.lookaside, Some(crate::kdc::LookasideHit::Resent));
+        assert_eq!(
+            s.log_line(peer()),
+            "DISPATCH: repeated (retransmitted?) request from 192.0.2.7, \
+             resending previous response"
+        );
+        // Library callers are not cached.
+        assert_ne!(kdc.handle(&data).await, Vec::<u8>::new());
     }
 
     #[tokio::test]

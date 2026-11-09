@@ -74,6 +74,10 @@ pub enum Krb5Error {
     #[error("AP error: {0}")]
     Ap(#[from] crate::protocol::ap::ApError),
 
+    /// Replay cache error (MIT KRB5_RC_* codes).
+    #[error("replay cache error: {0}")]
+    Rcache(#[from] crate::protocol::ap::RcacheError),
+
     /// GSS-API error (GSS_S_* major status).
     #[error("GSS error: {0}")]
     Gss(#[from] crate::gssapi::GssError),
