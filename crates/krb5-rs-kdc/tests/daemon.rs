@@ -727,6 +727,11 @@ impl krb5_rs::kdc::plugins::Audit for AuditLog {
     }
     fn as_req(&self, ok: bool, st: &krb5_rs::kdc::plugins::AuditState) {
         self.push("as_req", ok, Some(st));
+        let json = krb5_rs::kdc::plugins::jenc::as_req(ok, st);
+        self.0
+            .lock()
+            .expect("lock")
+            .push(String::from_utf8_lossy(&json).into_owned());
     }
     fn tgs_req(&self, ok: bool, st: &krb5_rs::kdc::plugins::AuditState) {
         self.push("tgs_req", ok, Some(st));
@@ -805,9 +810,25 @@ async fn kdcpolicy_and_audit_modules_like_mit() {
         "{lines:?}"
     );
     let has = |want: &str| lines.iter().any(|l| l == want);
+    // The seed event before each request is processed (do_as_req.c:520).
+    assert!(has("as_req 1 127.0.0.1 - - - 0 0"), "{lines:?}");
+    let issued = lines
+        .iter()
+        .find(|l| l.contains(r#""stage":5,"event_success":true"#))
+        .expect("issued AS_REQ JSON");
+    for key in [
+        r#""req.client":{"components":["alice"]"#,
+        r#""rep.ticket":{"cname":{"components":["alice"]"#,
+        r#""sname":{"components":["krbtgt","#,
+        r#""rep_etype":"#,
+    ] {
+        assert!(issued.contains(key), "{key} not in {issued}");
+    }
+    // do_as_req.c leaves the status unset on success.
+    assert!(!issued.contains("kdc_status"), "{issued}");
     assert!(
         has(&format!(
-            "as_req 1 127.0.0.1 ISSUE alice@{REALM} krbtgt/{REALM}@{REALM} 0 0"
+            "as_req 1 127.0.0.1 - alice@{REALM} krbtgt/{REALM}@{REALM} 0 0"
         )),
         "{lines:?}"
     );

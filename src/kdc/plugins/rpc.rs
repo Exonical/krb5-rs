@@ -23,7 +23,7 @@ use crate::types::{AuthorizationDataElement, EncTicketPart, EncryptionKey, Princ
 /// [`call::INITIALIZE`]'s string for a kdcpolicy module.
 pub const KDCPOLICY_HANDSHAKE: &str = "KRB5RS-KDCPOLICY-V-1";
 /// [`call::INITIALIZE`]'s string for an audit module.
-pub const AUDIT_HANDSHAKE: &str = "KRB5RS-AUDIT-V-1";
+pub const AUDIT_HANDSHAKE: &str = "KRB5RS-AUDIT-V-2";
 /// [`call::INITIALIZE`]'s string for a KDC authdata module.
 pub const KDCAUTHDATA_HANDSHAKE: &str = "KRB5RS-KDCAUTHDATA-V-2";
 
@@ -364,6 +364,165 @@ pub fn serve_kdcpolicy<S: Read + Write>(stream: S, module: &dyn KdcPolicy) -> io
     })
 }
 
+fn put_aprinc(m: &mut Message, p: Option<&super::AuditPrincipal>) {
+    m.put_i32(i32::from(p.is_some()));
+    if let Some(p) = p {
+        m.put_i32(p.name_type).put_i32(p.components.len() as i32);
+        for c in &p.components {
+            m.put_bytes(c);
+        }
+        m.put_bytes(&p.realm);
+    }
+}
+
+fn get_aprinc(m: &mut Message) -> io::Result<Option<super::AuditPrincipal>> {
+    if m.get_i32()? == 0 {
+        return Ok(None);
+    }
+    let name_type = m.get_i32()?;
+    let n = get_count(m)?;
+    let components = (0..n).map(|_| m.get_bytes()).collect::<io::Result<_>>()?;
+    Ok(Some(super::AuditPrincipal {
+        name_type,
+        components,
+        realm: m.get_bytes()?,
+    }))
+}
+
+fn get_count(m: &mut Message) -> io::Result<usize> {
+    usize::try_from(m.get_i32()?)
+        .ok()
+        .filter(|n| *n <= 4096)
+        .ok_or_else(|| bad("bad count"))
+}
+
+fn put_i32s(m: &mut Message, v: Option<&[i32]>) {
+    m.put_i32(v.map_or(-1, |v| v.len() as i32));
+    for x in v.unwrap_or_default() {
+        m.put_i32(*x);
+    }
+}
+
+fn get_i32s(m: &mut Message) -> io::Result<Option<Vec<i32>>> {
+    let n = match m.get_i32()? {
+        -1 => return Ok(None),
+        n => usize::try_from(n)
+            .ok()
+            .filter(|n| *n <= 4096)
+            .ok_or_else(|| bad("bad count"))?,
+    };
+    Ok(Some(
+        (0..n).map(|_| m.get_i32()).collect::<io::Result<_>>()?,
+    ))
+}
+
+fn put_arequest(m: &mut Message, r: Option<&super::AuditRequest>) {
+    m.put_i32(i32::from(r.is_some()));
+    let Some(r) = r else { return };
+    put_aprinc(m, r.client.as_ref());
+    put_aprinc(m, r.server.as_ref());
+    m.put_i32(r.kdc_options)
+        .put_i32(r.from)
+        .put_i32(r.till)
+        .put_i32(r.rtime);
+    put_i32s(m, Some(&r.etypes));
+    put_i32s(m, r.pa_types.as_deref());
+    m.put_i32(r.addresses.as_ref().map_or(-1, |a| a.len() as i32));
+    for (t, a) in r.addresses.iter().flatten() {
+        m.put_i32(*t).put_bytes(a);
+    }
+    put_aprinc(m, r.second_ticket.as_ref().map(|t| &t.0));
+    m.put_i32(r.second_ticket.as_ref().map_or(0, |t| t.1));
+}
+
+fn get_arequest(m: &mut Message) -> io::Result<Option<super::AuditRequest>> {
+    if m.get_i32()? == 0 {
+        return Ok(None);
+    }
+    let client = get_aprinc(m)?;
+    let server = get_aprinc(m)?;
+    let (kdc_options, from, till, rtime) = (m.get_i32()?, m.get_i32()?, m.get_i32()?, m.get_i32()?);
+    let etypes = get_i32s(m)?.unwrap_or_default();
+    let pa_types = get_i32s(m)?;
+    let addresses = match m.get_i32()? {
+        -1 => None,
+        n => {
+            let n = usize::try_from(n)
+                .ok()
+                .filter(|n| *n <= 4096)
+                .ok_or_else(|| bad("bad count"))?;
+            Some(
+                (0..n)
+                    .map(|_| Ok((m.get_i32()?, m.get_bytes()?)))
+                    .collect::<io::Result<_>>()?,
+            )
+        }
+    };
+    let second = get_aprinc(m)?;
+    let second_etype = m.get_i32()?;
+    Ok(Some(super::AuditRequest {
+        client,
+        server,
+        kdc_options,
+        from,
+        till,
+        rtime,
+        etypes,
+        pa_types,
+        addresses,
+        second_ticket: second.map(|p| (p, second_etype)),
+    }))
+}
+
+fn put_areply(m: &mut Message, r: Option<&super::AuditReply>) {
+    m.put_i32(i32::from(r.is_some()));
+    let Some(r) = r else { return };
+    put_aprinc(m, r.ticket_server.as_ref());
+    m.put_i32(r.ticket_etype);
+    m.put_i32(i32::from(r.ticket_part.is_some()));
+    if let Some(p) = &r.ticket_part {
+        put_aprinc(m, Some(&p.client));
+        m.put_i32(p.flags)
+            .put_i32(p.session_etype)
+            .put_i32(p.start)
+            .put_i32(p.end)
+            .put_i32(p.renew_till)
+            .put_i32(p.authtime)
+            .put_bytes(&p.tr_contents);
+    }
+    m.put_i32(r.etype);
+    put_i32s(m, r.pa_types.as_deref());
+}
+
+fn get_areply(m: &mut Message) -> io::Result<Option<super::AuditReply>> {
+    if m.get_i32()? == 0 {
+        return Ok(None);
+    }
+    let ticket_server = get_aprinc(m)?;
+    let ticket_etype = m.get_i32()?;
+    let ticket_part = if m.get_i32()? != 0 {
+        Some(super::AuditTicketPart {
+            client: get_aprinc(m)?.unwrap_or_default(),
+            flags: m.get_i32()?,
+            session_etype: m.get_i32()?,
+            start: m.get_i32()?,
+            end: m.get_i32()?,
+            renew_till: m.get_i32()?,
+            authtime: m.get_i32()?,
+            tr_contents: m.get_bytes()?,
+        })
+    } else {
+        None
+    };
+    Ok(Some(super::AuditReply {
+        ticket_server,
+        ticket_etype,
+        ticket_part,
+        etype: m.get_i32()?,
+        pa_types: get_i32s(m)?,
+    }))
+}
+
 fn put_state(m: &mut Message, st: &AuditState) {
     let addr = st.cl_addr.map(|a| a.to_string());
     m.put_str(Some(&st.req_id))
@@ -380,6 +539,9 @@ fn put_state(m: &mut Message, st: &AuditState) {
         .put_str(st.cl_realm.as_deref())
         .put_str(st.s4u2self_user.as_deref())
         .put_i32(st.violation);
+    put_aprinc(m, st.s4u2self_principal.as_ref());
+    put_arequest(m, st.request.as_ref());
+    put_areply(m, st.reply.as_ref());
 }
 
 fn get_state(m: &mut Message) -> io::Result<AuditState> {
@@ -408,6 +570,9 @@ fn get_state(m: &mut Message) -> io::Result<AuditState> {
         cl_realm: m.get_str()?,
         s4u2self_user: m.get_str()?,
         violation: m.get_i32()?,
+        s4u2self_principal: get_aprinc(m)?,
+        request: get_arequest(m)?,
+        reply: get_areply(m)?,
     };
     m.finish()?;
     Ok(st)

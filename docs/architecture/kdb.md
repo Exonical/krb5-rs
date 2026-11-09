@@ -1187,7 +1187,7 @@ in MIT, with a socket in place of the shared library:
   byte each way, then messages of `id`, options length and buffer length
   (big-endian `u32`), with a call number, a type signature and the fields. The
   first call is `INITIALIZE` with `KRB5RS-KDCPOLICY-V-1` or
-  `KRB5RS-AUDIT-V-1`; errors carry MIT com_err codes. `serve_kdcpolicy` and
+  `KRB5RS-AUDIT-V-2`; errors carry MIT com_err codes. `serve_kdcpolicy` and
   `serve_audit` run a module written in Rust on any stream, and the module
   docs specify the calls for other languages.
 - **kdcpolicy:** `check_as` runs after the AS ticket times are computed and
@@ -1199,19 +1199,46 @@ in MIT, with a socket in place of the shared library:
   client. Both get the request's authentication indicators (below).
 - **audit:** `kdc_start` runs when the KDC starts serving and `kdc_stop` on
   shutdown, after open connections finish. Every decoded AS or TGS request
-  reports `as_req` or `tgs_req` with its outcome, describing the inner request
-  for FAST. TGS requests with PA-FOR-USER or PA-S4U-X509-USER also report
+  first reports a successful `as_req` or `tgs_req` describing the request
+  (do_as_req.c:520, do_tgs_req.c:1184), then reports it again with its
+  outcome, describing the inner request for FAST. TGS requests with PA-FOR-USER or PA-S4U-X509-USER also report
   `s4u2self`, `cname-in-addl-tkt` ones `s4u2proxy` and `enc-tkt-in-skey` ones
   `u2u`, before `tgs_req`. The state carries:
   - a random 31-character request ID, as in MIT;
   - the client address and port;
   - the status string;
   - the S4U2Self user;
+  - the request fields `kdc_j_encode.c` reads: client, server, KDC options,
+    times, enctypes, padata types, addresses and the second ticket's client
+    and session enctype;
+  - for an issued ticket, the reply fields it reads: the ticket server and
+    enctype, the ticket's client, flags, session enctype, times and transited
+    contents, the reply enctype and padata types;
+  - the referral realm for an AS client referral;
+  - the stage reached (`SRVC_PRINC`, `VALIDATE_POL`, `ISSUE_TKT`,
+    `ENCR_REP`), set where `do_as_req.c` and `do_tgs_req.c` set it;
   - MIT's ticket IDs (upper-case hex SHA-256 of the ticket ciphertext) for the
     header, evidence and issued tickets;
   - `LOCAL_POLICY` as the violation for a policy refusal.
 
   Callback results are ignored, as in MIT.
+- **`simple` (MIT `plugins/audit/simple`):** built in. A module named
+  `simple` whose path ends in `.so` (MIT's `k5audit.so`) is not reached over
+  RPC; each event is encoded as JSON exactly as `kdc_j_encode.c` does
+  (`krb5_rs::kdc::plugins::jenc`) and sent to the Linux audit subsystem as
+  libaudit's `audit_log_user_message` sends it: `AUDIT_USER_START` for
+  `kdc_start`, `AUDIT_USER_END` for `kdc_stop`, `AUDIT_USER_AUTH` otherwise,
+  with ` exe=... hostname=? addr=? terminal=? res=success|failed` appended.
+  If the audit netlink socket cannot be opened (no kernel audit support, or
+  not Linux), `open` fails with `KRB5_PLUGIN_NO_HANDLE` and the KDC stops, as
+  MIT's does. Sending needs `CAP_AUDIT_WRITE`; failed sends are ignored.
+
+  ```ini
+  [plugins]
+      audit = {
+          module = simple:/usr/lib/krb5/plugins/audit/k5audit.so
+      }
+  ```
 - **Concurrency and failures:** each module gets one connection, and calls on
   it run one at a time. A broken connection is opened again (and the module
   initialized again) on the next call. A kdcpolicy call that fails or times
@@ -1223,14 +1250,17 @@ in MIT, with a socket in place of the shared library:
 Deviations:
 - Modules are processes reached over RPC, not MIT shared libraries, so modules
   built for MIT do not load. Static (musl) builds run modules the same way.
-- Principals are unparsed strings, and the audit state replaces MIT's
-  `krb5_kdc_req`/`krb5_kdc_rep` pointers with strings and the reply error
-  code.
-- Audit events are reported once per request, from the request and reply,
-  rather than at each of MIT's intermediate stages. Requests that do not
-  decode are not reported.
+- The audit state carries copies of the request and reply fields that
+  `kdc_j_encode.c` reads instead of MIT's `krb5_kdc_req`/`krb5_kdc_rep`
+  pointers, plus unparsed principals and the reply error code.
+- Requests that do not decode are not reported.
 - Unix sockets only; on other platforms a configured module is skipped as
   unreachable.
+
+`examples/audit_json.rs` writes the events to a file as `au_test.c` does.
+For kinit (needing and failing preauth) and kvno (found and unknown services)
+from MIT 1.22.2's clients, its output matched MIT 1.22.2's `au_test` byte for
+byte apart from request IDs, ports, ticket IDs and times.
 
 The tests port MIT's `plugins/kdcpolicy/test/main.c` and
 `plugins/audit/test/au_test.c` and run the `t_kdcpolicy.py` and `t_audit.py`

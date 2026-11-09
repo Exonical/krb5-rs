@@ -7,6 +7,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 pub mod greet;
+pub mod jenc;
 pub mod rpc;
 
 /// `KRB5KDC_ERR_POLICY`.
@@ -123,9 +124,88 @@ pub const PROT_CONSTRAINT: i32 = 1;
 /// `krb5_audit_state.violation`: `LOCAL_POLICY`.
 pub const LOCAL_POLICY: i32 = 2;
 
+/// A `krb5_principal` as `kdc_j_encode.c` records it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditPrincipal {
+    /// `type`.
+    pub name_type: i32,
+    /// `components`.
+    pub components: Vec<Vec<u8>>,
+    /// `realm`.
+    pub realm: Vec<u8>,
+}
+
+/// A `krb5_address`: `addrtype` and `contents`.
+pub type AuditAddress = (i32, Vec<u8>);
+
+/// The parts of `krb5_kdc_req` that `kdc_j_encode.c` records.
+#[derive(Debug, Clone, Default)]
+pub struct AuditRequest {
+    /// `client`.
+    pub client: Option<AuditPrincipal>,
+    /// `server`.
+    pub server: Option<AuditPrincipal>,
+    /// `kdc_options`.
+    pub kdc_options: i32,
+    /// `from`.
+    pub from: i32,
+    /// `till`.
+    pub till: i32,
+    /// `rtime`.
+    pub rtime: i32,
+    /// `ktype`.
+    pub etypes: Vec<i32>,
+    /// The `padata` types, if there is a `padata` list.
+    pub pa_types: Option<Vec<i32>>,
+    /// `addresses`.
+    pub addresses: Option<Vec<AuditAddress>>,
+    /// `second_ticket[0]->enc_part2`: its client and session key enctype.
+    pub second_ticket: Option<(AuditPrincipal, i32)>,
+}
+
+/// `enc_part2` of the issued ticket.
+#[derive(Debug, Clone, Default)]
+pub struct AuditTicketPart {
+    /// `client`.
+    pub client: AuditPrincipal,
+    /// `flags`.
+    pub flags: i32,
+    /// `session->enctype`.
+    pub session_etype: i32,
+    /// `times.starttime`.
+    pub start: i32,
+    /// `times.endtime`.
+    pub end: i32,
+    /// `times.renew_till`.
+    pub renew_till: i32,
+    /// `times.authtime`.
+    pub authtime: i32,
+    /// `transited.tr_contents`.
+    pub tr_contents: Vec<u8>,
+}
+
+/// The parts of `krb5_kdc_rep` that `kdc_j_encode.c` records.
+#[derive(Debug, Clone, Default)]
+pub struct AuditReply {
+    /// `ticket->server`, if the reply has a ticket.
+    pub ticket_server: Option<AuditPrincipal>,
+    /// `ticket->enc_part.enctype`.
+    pub ticket_etype: i32,
+    /// `ticket->enc_part2`.
+    pub ticket_part: Option<AuditTicketPart>,
+    /// `enc_part.enctype`.
+    pub etype: i32,
+    /// The `padata` types, if there is a `padata` list.
+    pub pa_types: Option<Vec<i32>>,
+}
+
 /// `krb5_audit_state`, with principals unparsed.
 #[derive(Debug, Clone, Default)]
 pub struct AuditState {
+    /// `request`.
+    pub request: Option<AuditRequest>,
+    /// `reply`.
+    pub reply: Option<AuditReply>,
     /// `req_id`: 32 random alphanumeric characters.
     pub req_id: String,
     /// `cl_addr`, or `None` when unknown.
@@ -152,6 +232,8 @@ pub struct AuditState {
     pub cl_realm: Option<String>,
     /// `s4u2self_user`.
     pub s4u2self_user: Option<String>,
+    /// `s4u2self_user` as a principal.
+    pub s4u2self_principal: Option<AuditPrincipal>,
     /// `violation`.
     pub violation: i32,
 }

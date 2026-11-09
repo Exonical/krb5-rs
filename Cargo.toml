@@ -122,6 +122,10 @@ required-features = ["test-pki"]
 name = "kdcauthdata_greet"
 required-features = ["kdc"]
 
+[[example]]
+name = "audit_json"
+required-features = ["kdc"]
+
 [workspace]
 members = [
     ".",

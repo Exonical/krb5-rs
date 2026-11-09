@@ -401,6 +401,7 @@ impl<S: PrincipalStore> Kdc<S> {
         let header_pac =
             self.verify_header_pac(&header, &ap.ticket.sname, &header_key, &local_tgt)?;
 
+        ctx.audit_stage = crate::kdc::plugins::AuditStage::SrvcPrinc;
         let (mut server, is_referral) = self.search_sprinc(opts, sname, realm).await?;
 
         // The request is cross-realm if the header ticket server is not from
@@ -423,6 +424,9 @@ impl<S: PrincipalStore> Kdc<S> {
             String::from_utf8_lossy(&super::kdb::mit::unparse_name(&s.user, &s.user_realm))
                 .into_owned()
         });
+        ctx.audit_s4u_user = s4u2self
+            .as_ref()
+            .map(|s| (s.user.clone(), s.user_realm.to_string()));
         if s4u2self.is_some() {
             // Authorization data stays enabled for S4U2Self (:712-717).
             server
@@ -444,6 +448,13 @@ impl<S: PrincipalStore> Kdc<S> {
             Some(t) if u2u => Some(self.decrypt_2ndtkt(t, &local_tgt).await?),
             _ => None,
         };
+        ctx.audit_second = stkt.as_ref().or(u2u_tkt.as_ref()).map(|e| {
+            (
+                e.part.cname.clone(),
+                realm_string(&e.part.crealm),
+                e.part.key.keytype,
+            )
+        });
         // A cross-realm S4U2Proxy evidence ticket is a cross-realm TGT naming
         // the requested client in its PAC (do_tgs_req.c:734-746).
         let stkt_pac_client = match &stkt {
@@ -489,6 +500,7 @@ impl<S: PrincipalStore> Kdc<S> {
                 .flatten()
         };
 
+        ctx.audit_stage = crate::kdc::plugins::AuditStage::ValidatePol;
         // check_tgs_constraints (tgs_policy.c:668-730).
         // check_anon (tgs_policy.c:762-765).
         if self.config.restrict_anonymous_to_tgt
@@ -789,6 +801,7 @@ impl<S: PrincipalStore> Kdc<S> {
             .as_ref()
             .map(|e| e.part.key.keytype)
             .filter(|e| body.etype.contains(e));
+        ctx.audit_stage = crate::kdc::plugins::AuditStage::IssueTkt;
         let session_etype = u2u_etype
             .or_else(|| select_session_keytype(&server, &body.etype, &permitted))
             .ok_or_else(|| KdcError::new(KDC_ERR_ETYPE_NOSUPP, "BAD_ENCRYPTION_TYPE"))?;
@@ -907,8 +920,10 @@ impl<S: PrincipalStore> Kdc<S> {
             Some(e) => (&e.part.key, None),
             None => (&server_key.key, Some(kvno)),
         };
+        ctx.audit_tkt = Some(part.clone());
         let ticket =
             encrypt_ticket_part(ticket_key, ticket_kvno, realm, ticket_sname.clone(), &part)?;
+        ctx.audit_stage = crate::kdc::plugins::AuditStage::EncrRep;
 
         // kdc_fast_response_handle_padata / kdc_fast_handle_reply_key
         // (do_tgs_req.c:1090-1097).

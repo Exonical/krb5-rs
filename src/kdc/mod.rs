@@ -535,13 +535,14 @@ impl<S: PrincipalStore> Kdc<S> {
             ));
         }
 
+        let audit_seed = (!self.audit.is_empty()).then(|| self.kau_seed(is_as, &decoded, peer));
         let result = if is_as {
             self.process_as_req(&decoded, request, now, &mut ctx).await
         } else {
             self.process_tgs_req(&decoded, request, now, &mut ctx).await
         };
-        if !self.audit.is_empty() {
-            self.kau_request(is_as, &decoded, &ctx, peer, &result);
+        if let Some(st) = audit_seed {
+            self.kau_request(is_as, &decoded, &ctx, st, &result);
         }
         result.map_err(|err| Box::new(Failure { err, ctx }))
     }
@@ -553,7 +554,7 @@ impl<S: PrincipalStore> Kdc<S> {
         is_as: bool,
         outer: &KdcReq,
         ctx: &ErrorContext,
-        peer: Option<std::net::SocketAddr>,
+        mut st: plugins::AuditState,
         result: &Result<Vec<u8>, KdcError>,
     ) {
         // After FAST, the inner request is the one processed (kdc_find_fast).
@@ -563,23 +564,43 @@ impl<S: PrincipalStore> Kdc<S> {
             String::from_utf8_lossy(&kdb::mit::unparse_name(p, realm)).into_owned()
         };
         let tkt_id = |t: &Ticket| plugins::ticket_id(t.enc_part.cipher.as_ref());
-        let mut st = plugins::AuditState::new(peer);
         st.client = req.req_body.cname.as_ref().map(unparse);
         st.server = req.req_body.sname.as_ref().map(unparse);
-        st.cl_realm = Some(String::from_utf8_lossy(req.req_body.realm.as_bytes()).into_owned());
+        let mut areq = audit_request(req);
+        areq.second_ticket = ctx
+            .audit_second
+            .as_ref()
+            .map(|(n, r, e)| (audit_principal(n, r.as_bytes()), *e));
+        st.request = Some(areq);
+        st.s4u2self_principal = ctx
+            .audit_s4u_user
+            .as_ref()
+            .map(|(n, r)| audit_principal(n, r.as_bytes()));
         let success = result.is_ok();
         match result {
             Ok(reply) => {
                 st.stage = plugins::AuditStage::EncrRep;
-                st.status = Some("ISSUE".into());
-                let ticket = if is_as {
-                    rasn::der::decode::<AsRep>(reply).ok().map(|r| r.0.ticket)
+                // do_as_req.c leaves the status unset on success.
+                if !is_as {
+                    st.status = Some("ISSUE".into());
+                }
+                let rep = if is_as {
+                    rasn::der::decode::<AsRep>(reply).ok().map(|r| r.0)
                 } else {
-                    rasn::der::decode::<TgsRep>(reply).ok().map(|r| r.0.ticket)
+                    rasn::der::decode::<TgsRep>(reply).ok().map(|r| r.0)
                 };
-                st.tkt_out_id = ticket.as_ref().map(tkt_id);
+                st.tkt_out_id = rep.as_ref().map(|r| tkt_id(&r.ticket));
+                st.reply = rep.map(|r| audit_reply(&r, ctx.audit_tkt.as_ref()));
             }
             Err(e) => {
+                // do_as_req.c always passes its (empty) reply; TGS passes none.
+                if is_as {
+                    st.reply = Some(plugins::AuditReply::default());
+                }
+                if e.e_text.as_deref() == Some("REFERRAL") {
+                    st.cl_realm = ctx.crealm.clone();
+                }
+                st.stage = ctx.audit_stage;
                 st.error_code = e.code;
                 st.status = e.e_text.clone();
                 if e.code == plugins::KDC_ERR_POLICY {
@@ -634,6 +655,28 @@ impl<S: PrincipalStore> Kdc<S> {
         }
     }
 
+    /// `kau_init_kdc_req` and the first `kau_as_req` / `kau_tgs_req`
+    /// (do_as_req.c:520, do_tgs_req.c:1184), before the request is
+    /// processed.
+    fn kau_seed(
+        &self,
+        is_as: bool,
+        outer: &KdcReq,
+        peer: Option<std::net::SocketAddr>,
+    ) -> plugins::AuditState {
+        let mut st = plugins::AuditState::new(peer);
+        st.request = Some(audit_request(outer));
+        for m in &self.audit {
+            if is_as {
+                m.as_req(true, &st);
+            } else {
+                m.tgs_req(true, &st);
+            }
+        }
+        st.request = None;
+        st
+    }
+
     /// `check_kdcpolicy_as` / `check_kdcpolicy_tgs` (`kdc/policy.c`).
     #[allow(clippy::too_many_arguments)]
     fn check_kdcpolicy(
@@ -681,6 +724,10 @@ impl<S: PrincipalStore> Kdc<S> {
             fast: None,
             audit_req: None,
             s4u2self_user: None,
+            audit_tkt: None,
+            audit_second: None,
+            audit_s4u_user: None,
+            audit_stage: plugins::AuditStage::AuthnReqCl,
         }
     }
 
@@ -707,6 +754,10 @@ impl<S: PrincipalStore> Kdc<S> {
             fast: None,
             audit_req: None,
             s4u2self_user: None,
+            audit_tkt: None,
+            audit_second: None,
+            audit_s4u_user: None,
+            audit_stage: plugins::AuditStage::AuthnReqCl,
         }
     }
 
@@ -855,6 +906,84 @@ fn is_tgs_principal(name: &PrincipalName) -> bool {
 /// Name comparison ignoring the name type (MIT princ_comp.c).
 fn names_equal(a: &PrincipalName, b: &PrincipalName) -> bool {
     a.name_string == b.name_string
+}
+
+/// A principal as `kdc_j_encode.c` records it.
+fn audit_principal(p: &PrincipalName, realm: &[u8]) -> plugins::AuditPrincipal {
+    plugins::AuditPrincipal {
+        name_type: p.name_type,
+        components: p
+            .name_string
+            .iter()
+            .map(|c| c.as_bytes().to_vec())
+            .collect(),
+        realm: realm.to_vec(),
+    }
+}
+
+/// `krb5_flags` from a KerberosFlags BIT STRING (bit 0 is the high bit).
+fn audit_flags(bytes: &[u8]) -> i32 {
+    let mut b = [0u8; 4];
+    for (d, s) in b.iter_mut().zip(bytes) {
+        *d = *s;
+    }
+    i32::from_be_bytes(b)
+}
+
+fn audit_time(t: Option<&crate::types::KerberosTime>) -> i32 {
+    t.map_or(0, |t| policy::ts(t) as i32)
+}
+
+/// The parts of a request `kdc_j_encode.c` records.
+fn audit_request(req: &KdcReq) -> plugins::AuditRequest {
+    let b = &req.req_body;
+    let realm = b.realm.as_bytes();
+    plugins::AuditRequest {
+        client: b.cname.as_ref().map(|p| audit_principal(p, realm)),
+        server: b.sname.as_ref().map(|p| audit_principal(p, realm)),
+        kdc_options: audit_flags(&crate::types::Flags::to_bytes(&*b.kdc_options)),
+        from: audit_time(b.from.as_ref()),
+        till: audit_time(Some(&b.till)),
+        rtime: audit_time(b.rtime.as_ref()),
+        etypes: b.etype.clone(),
+        pa_types: req
+            .padata
+            .as_ref()
+            .map(|p| p.iter().map(|p| p.padata_type).collect()),
+        addresses: b.addresses.as_ref().map(|a| {
+            a.iter()
+                .map(|a| (a.addr_type, a.address.to_vec()))
+                .collect()
+        }),
+        second_ticket: None,
+    }
+}
+
+/// The parts of a reply `kdc_j_encode.c` records.
+fn audit_reply(
+    rep: &crate::types::KdcRep,
+    part: Option<&crate::types::EncTicketPart>,
+) -> plugins::AuditReply {
+    let t = &rep.ticket;
+    plugins::AuditReply {
+        ticket_server: Some(audit_principal(&t.sname, t.realm.as_bytes())),
+        ticket_etype: t.enc_part.etype,
+        ticket_part: part.map(|p| plugins::AuditTicketPart {
+            client: audit_principal(&p.cname, p.crealm.as_bytes()),
+            flags: audit_flags(&crate::types::Flags::to_bytes(&*p.flags)),
+            session_etype: p.key.keytype,
+            start: audit_time(p.starttime.as_ref()),
+            end: audit_time(Some(&p.endtime)),
+            renew_till: audit_time(p.renew_till.as_ref()),
+            authtime: audit_time(Some(&p.authtime)),
+            tr_contents: p.transited.contents.to_vec(),
+        }),
+        etype: rep.enc_part.etype,
+        pa_types: rep
+            .padata
+            .as_ref()
+            .map(|p| p.iter().map(|p| p.padata_type).collect()),
+    }
 }
 
 #[cfg(test)]

@@ -100,6 +100,15 @@ pub(crate) struct ErrorContext {
     pub audit_req: Option<Box<crate::types::KdcReq>>,
     /// The S4U2Self user, for `krb5_audit_state.s4u2self_user`.
     pub s4u2self_user: Option<String>,
+    /// The issued ticket's `enc_part2`, for audit modules.
+    pub audit_tkt: Option<crate::types::EncTicketPart>,
+    /// The decrypted second ticket's client, client realm and session
+    /// enctype, for audit modules.
+    pub audit_second: Option<(PrincipalName, String, i32)>,
+    /// The S4U2Self user and realm, for audit modules.
+    pub audit_s4u_user: Option<(PrincipalName, String)>,
+    /// The stage `kdc_audit.c` reports a failure at.
+    pub audit_stage: crate::kdc::plugins::AuditStage,
 }
 
 /// A failure bundled with the context for its KRB-ERROR.
@@ -223,6 +232,10 @@ mod tests {
             fast: None,
             audit_req: None,
             s4u2self_user: None,
+            audit_tkt: None,
+            audit_second: None,
+            audit_s4u_user: None,
+            audit_stage: crate::kdc::plugins::AuditStage::AuthnReqCl,
         };
         let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 731_854_900).expect("time");
         let der = build_krb_error(&KdcError::new(6, "X"), &ctx, now);
@@ -245,6 +258,10 @@ mod tests {
             fast: None,
             audit_req: None,
             s4u2self_user: None,
+            audit_tkt: None,
+            audit_second: None,
+            audit_s4u_user: None,
+            audit_stage: crate::kdc::plugins::AuditStage::AuthnReqCl,
         };
         let der = build_krb_error(&KdcError::new(6, "CLIENT_NOT_FOUND"), &ctx, Utc::now());
         let got: KrbErrorMsg = rasn::der::decode(&der).expect("decode");
