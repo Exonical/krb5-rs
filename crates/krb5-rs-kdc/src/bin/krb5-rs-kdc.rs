@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
+use krb5_rs::kdc::kdb::test::TestStore;
 use krb5_rs::kdc::kdb::{master_key_from_password_named, read_stash_named, FileStore};
 #[cfg(feature = "cockroach")]
 use krb5_rs::kdc::GateSubject;
@@ -139,6 +140,7 @@ enum DaemonStore {
     Turso(krb5_rs_kdb_turso::TursoReplica, Arc<metrics::Metrics>),
     #[cfg(feature = "kldap")]
     Ldap(krb5_rs_kdb_ldap::LdapStore, Arc<metrics::Metrics>),
+    Test(Arc<TestStore>, Arc<metrics::Metrics>),
 }
 
 impl PrincipalStore for DaemonStore {
@@ -181,6 +183,46 @@ impl PrincipalStore for DaemonStore {
                 metrics.observe_principal_lookup(start.elapsed(), result.is_ok());
                 result
             }
+            DaemonStore::Test(s, metrics) => {
+                let start = std::time::Instant::now();
+                let result = s.lookup(name, realm).await;
+                metrics.observe_principal_lookup(start.elapsed(), result.is_ok());
+                result
+            }
+        }
+    }
+
+    async fn lookup_s4u_x509(
+        &self,
+        cert: &[u8],
+        name: &PrincipalName,
+        realm: &str,
+        referral_ok: bool,
+    ) -> Result<Option<PrincipalEntry>, StoreError> {
+        match self {
+            DaemonStore::Memory(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
+            DaemonStore::File(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
+            #[cfg(feature = "klmdb")]
+            DaemonStore::Lmdb(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
+            #[cfg(feature = "turso")]
+            DaemonStore::Turso(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
+            #[cfg(feature = "kldap")]
+            DaemonStore::Ldap(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
+            DaemonStore::Test(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
+        }
+    }
+
+    fn issue_pac(&self, req: krb5_rs::kdc::IssuePac<'_>) -> Result<(), StoreError> {
+        match self {
+            DaemonStore::Memory(s, _) => s.issue_pac(req),
+            DaemonStore::File(s, _) => s.issue_pac(req),
+            #[cfg(feature = "klmdb")]
+            DaemonStore::Lmdb(s, _) => s.issue_pac(req),
+            #[cfg(feature = "turso")]
+            DaemonStore::Turso(s, _) => s.issue_pac(req),
+            #[cfg(feature = "kldap")]
+            DaemonStore::Ldap(s, _) => s.issue_pac(req),
+            DaemonStore::Test(s, _) => s.issue_pac(req),
         }
     }
 }
@@ -521,6 +563,39 @@ async fn klmdb_mode(
     ))
 }
 
+/// `db_library = test`: MIT's read-only test module (kdb_test.c).
+fn test_mode(
+    cli: &Cli,
+    kdc_conf: &Profile,
+    cfg: RealmConfig,
+    metrics: Arc<metrics::Metrics>,
+) -> std::io::Result<(DynKdc, Listen, ModeParts)> {
+    let store = Arc::new(TestStore::new(
+        kdc_conf.clone(),
+        &cfg.db_module.section,
+        &cfg.kdc.realm,
+    ));
+    let (udp, tcp) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen)
+    } else {
+        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
+        (addrs.clone(), addrs)
+    };
+    let parts = ModeParts {
+        metrics_listen: metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?,
+        ..ModeParts::default()
+    };
+    Ok((
+        Kdc::builder(cfg.kdc, DaemonStore::Test(store, metrics)).build(),
+        Listen {
+            udp,
+            tcp,
+            backlog: cfg.tcp_listen_backlog,
+        },
+        parts,
+    ))
+}
+
 #[cfg(feature = "cockroach")]
 async fn cockroach_mode(
     cli: &Cli,
@@ -743,6 +818,11 @@ async fn config_mode(
     let cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm).map_err(io_err)?;
     if let Some(e) = krb5_rs::kdc::otp_config_error(&kdc_conf, krb5.as_ref()) {
         error!("preauth otp failed to initialize: {e}");
+    }
+    if cfg.db_module.library.as_deref() == Some("test") {
+        // MIT's test module has no master key (kdb_test.c
+        // test_fetch_master_key).
+        return test_mode(cli, &kdc_conf, cfg, metrics).map(Some);
     }
     let master = match &cli.master_password_file {
         Some(path) => {

@@ -75,10 +75,10 @@ pub use db::{
 pub use policy::kerberos_time;
 pub use store::{
     AdminStore, AlwaysAllow, AuthState, AuthStateStore, AuthStateUpdate, AuthoritativeDenial,
-    AuthoritativeState, ConsistencyGate, GateDecision, GateSubject, HealthCheck, LockoutReport,
-    LockoutReporter, MemoryAuthState, NoPolicies, NoopLockoutReporter, Policy, PolicyStore,
-    PolicyTlData, PrincipalRecord, PrincipalRole, PrincipalStore, SecurityState, SharedAuthState,
-    StoreError, StoreErrorKind,
+    AuthoritativeState, ConsistencyGate, GateDecision, GateSubject, HealthCheck, IssuePac,
+    LockoutReport, LockoutReporter, MemoryAuthState, NoPolicies, NoopLockoutReporter, Policy,
+    PolicyStore, PolicyTlData, PrincipalRecord, PrincipalRole, PrincipalStore, SecurityState,
+    SharedAuthState, StoreError, StoreErrorKind,
 };
 
 use std::sync::Arc;

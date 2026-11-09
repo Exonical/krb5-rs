@@ -266,6 +266,39 @@ for resource-based delegation. klmdb is the default `db_library`;
   (`krb5_context`, `krb5_db_entry`), which krb5-rs doesn't provide. This is
   the one difference from MIT.
 
+### MIT test module (`db_library = test`)
+
+`db_library = test` selects `krb5_rs::kdc::kdb::test::TestStore`, a native
+port of MIT's read-only `plugins/kdb/test/kdb_test.c`. It is built in, so it
+needs no `.so`. Principals come from the module's `[dbmodules]` subsection:
+
+- **`princs`:** each entry has MIT's `flags` (one flagspec, parsed once,
+  as `krb5_flagspec_to_mask`), `maxlife`, `maxrenewlife`, `expiration`,
+  `pwexpiration`, `keys` (`[kvno] keysalt...`, repeatable) and `strings`
+  (`key:value`, repeatable). Keys are derived as MIT does: SHA-1 of
+  `"kvno etype salttype name realm"`, repeated to the key length, through
+  the enctype's random-to-key. They are byte-for-byte MIT's, including
+  `arcfour-hmac` keys, which krb5-rs keeps although it has no RC4.
+- **`alias`:** `alias = canon` returns the canonical entry; an alias to
+  `@REALM` is a client referral (an entry with only the principal), a
+  server referral to `krbtgt/REALM` when referrals are allowed, and no entry
+  otherwise (`test_get_principal`).
+- **`delegation`** and **`rbcd`:** constrained and resource-based
+  delegation lists.
+- **S4U X.509:** the "certificate" is a principal name
+  (`test_get_s4u_x509_principal`).
+- **`issue_pac`:** an initial PAC gets a `"fake"` logon-info buffer, plus a
+  `"fake credinfo"` credentials-info buffer when PKINIT or OTP replaced the
+  reply key. Later PACs copy the subject's buffers except the ones the KDC
+  makes, and an indicator `dbincrX` replaces the indicator list with
+  `dbincr{X+1}` (`test_issue_pac`, `change_auth_indicators`).
+  `PrincipalStore::issue_pac` is the general hook (`krb5_db_issue_pac`);
+  other stores return `Unsupported`, which the KDC ignores, as MIT ignores
+  `KRB5_PLUGIN_OP_NOTSUPP`.
+
+The test module has no master key, so the KDC doesn't read a stash for it
+(`test_fetch_master_key`). It is served only by `krb5-rs-kdc`.
+
 ### MIT master-key rotation
 
 `krb5_rs::kdc::kdb::mit::mkey` mirrors `lib/kdb/kdb5.c`,

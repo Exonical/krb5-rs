@@ -88,6 +88,9 @@ pub struct DbModuleConfig {
     /// `db_library` that is not built in, before the default one
     /// (kdb5.c:409-443).
     pub module_dirs: Vec<std::path::PathBuf>,
+    /// The `[dbmodules]` subsection name (`database_module`, default the
+    /// realm name).
+    pub section: String,
 }
 
 impl DbModuleConfig {
@@ -497,6 +500,7 @@ impl RealmConfig {
         };
         reject_removed_kprop_keys(kdc_conf, realm)?;
         let db_module = DbModuleConfig {
+            section: module.clone(),
             library: module_value("db_library").or_else(|| Some("klmdb".to_string())),
             options: DBMODULE_OPTION_KEYS
                 .iter()

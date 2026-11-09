@@ -403,6 +403,18 @@ pub trait PrincipalStore: Send + Sync {
             "get_s4u_x509_principal is not supported",
         )))
     }
+
+    /// `issue_pac` (kdb.h): add buffers to the PAC being issued and change
+    /// the ticket's authentication indicators. Stores without it, like MIT
+    /// db2 and LMDB, return [`StoreErrorKind::Unsupported`], which the KDC
+    /// ignores.
+    fn issue_pac(&self, req: IssuePac<'_>) -> Result<(), StoreError> {
+        let _ = req;
+        Err(StoreError::new(
+            StoreErrorKind::Unsupported,
+            "issue_pac is not supported",
+        ))
+    }
 }
 
 /// Read access to policies (MIT `krb5_db_get_policy`).
@@ -566,6 +578,24 @@ pub trait ConsistencyGate: Send + Sync {
 
 // ----------------------------------------------------------- Arc forwarding
 
+/// Arguments of [`PrincipalStore::issue_pac`] (`krb5_db_issue_pac`).
+#[derive(Debug)]
+pub struct IssuePac<'a> {
+    /// The client's entry, when it is in this realm.
+    pub client: Option<&'a PrincipalEntry>,
+    /// `KRB5_KDB_FLAG_PROTOCOL_TRANSITION`: an S4U2Self request.
+    pub protocol_transition: bool,
+    /// The AS reply key was replaced by pre-authentication (PKINIT, OTP).
+    pub replaced_reply_key: bool,
+    /// The subject ticket's PAC, for a TGS request.
+    pub old_pac: Option<&'a crate::pac::Pac>,
+    /// The PAC being issued; the KDC adds the checksums, client and
+    /// delegation info afterwards.
+    pub new_pac: &'a mut crate::pac::Pac,
+    /// The indicators the KDC will put in the ticket.
+    pub auth_indicators: &'a mut Vec<String>,
+}
+
 impl<T: PrincipalStore + ?Sized> PrincipalStore for Arc<T> {
     fn lookup(
         &self,
@@ -583,6 +613,10 @@ impl<T: PrincipalStore + ?Sized> PrincipalStore for Arc<T> {
         referral_ok: bool,
     ) -> impl Future<Output = Result<Option<PrincipalEntry>, StoreError>> + Send {
         (**self).lookup_s4u_x509(cert, name, realm, referral_ok)
+    }
+
+    fn issue_pac(&self, req: IssuePac<'_>) -> Result<(), StoreError> {
+        (**self).issue_pac(req)
     }
 }
 

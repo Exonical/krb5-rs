@@ -219,6 +219,7 @@ mod tests {
         DbModuleConfig {
             library: Some("kldap".into()),
             module_dirs: Vec::new(),
+            section: String::new(),
             options: pairs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

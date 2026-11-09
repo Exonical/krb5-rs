@@ -21,6 +21,7 @@ pub mod master;
 pub mod mit;
 pub mod pwqual;
 pub mod restrictions;
+pub mod test;
 
 pub use crate::kdc::store::PrincipalRecord;
 pub use file::{FileCaller, FileStore};
