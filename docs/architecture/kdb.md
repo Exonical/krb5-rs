@@ -1302,7 +1302,9 @@ its `sam2` client module (`lib/krb5/krb/preauth_sam2.c`):
   and the KDC sends no reply. When the ACE/Server asks for the next code or
   a new PIN, MIT builds a further challenge but passes no e-data to
   `respond`, so the client gets KDC_ERR_PREAUTH_REQUIRED alone; this is
-  kept.
+  kept. Difference from MIT: the ACE/Server session is then closed, as it
+  is after an unexpected `SD_Check` result; MIT leaves both open, so
+  repeated attempts could exhaust the ACE/Server's sessions.
 - **GRAIL:** MIT's test mechanism ("Enter <n>", answered with n), compiled
   in by MIT only with `GRAIL_PREAUTH`; here it is on only with
   `SecuridSam2::with_grail`.

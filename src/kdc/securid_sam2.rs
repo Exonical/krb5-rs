@@ -524,9 +524,17 @@ impl<S: PrincipalStore> Kdc<S> {
                         let sam_key = self.sam_key(client, TYPE_SECURID).await?;
                         b.track_id = Some(encrypt_track(&sam_key, &next.encode())?);
                         let _ = make_challenge(&b, &client_key);
+                        // Deviation from MIT: the challenge never reaches
+                        // the client, so nothing can resume this session;
+                        // MIT leaves it open.
+                        ace.close(h);
                         Err(required())
                     }
-                    _ => Err(failed("PREAUTH_FAILED")),
+                    _ => {
+                        // MIT leaves the session open here too.
+                        ace.close(h);
+                        Err(failed("PREAUTH_FAILED"))
+                    }
                 }
             }
         }

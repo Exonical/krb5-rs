@@ -81,6 +81,7 @@ impl AceServer for FakeAce {
             "123456" => acm::OK,
             "next" => acm::NEXT_CODE_REQUIRED,
             "newpin" => acm::NEW_PIN_REQUIRED,
+            "odd" => 99,
             _ => acm::ACCESS_DENIED,
         }
     }
@@ -243,12 +244,36 @@ async fn securid_access_denied() {
 async fn securid_next_code_is_preauth_required_without_a_challenge() {
     // MIT builds a next-code challenge but passes no e-data to respond, so
     // the client sees KDC_ERR_PREAUTH_REQUIRED alone.
-    let kdc = securid_kdc(Arc::new(FakeAce::default()));
+    let ace = Arc::new(FakeAce::default());
+    let kdc = securid_kdc(ace.clone());
     let prompts = Prompts::default();
     let e = run(&kdc, Some(responder(&prompts, |_| Some("next".into()))))
         .await
         .expect_err("next code");
     assert_eq!(kdc_code(&e), Some(25), "{e:?}");
+    // The session can't be resumed, so it is closed (MIT leaks it).
+    assert_eq!(
+        ace.log.lock().unwrap().last().map(String::as_str),
+        Some("close 7")
+    );
+}
+
+#[tokio::test]
+async fn securid_sessions_are_closed_on_every_outcome() {
+    for (passcode, code) in [("newpin", 25), ("odd", 24), ("000000", 24)] {
+        let ace = Arc::new(FakeAce::default());
+        let kdc = securid_kdc(ace.clone());
+        let prompts = Prompts::default();
+        let pc = passcode.to_string();
+        let e = run(&kdc, Some(responder(&prompts, move |_| Some(pc.clone()))))
+            .await
+            .expect_err(passcode);
+        assert_eq!(kdc_code(&e), Some(code), "{passcode}: {e:?}");
+        let log = ace.log.lock().unwrap();
+        let opened = log.iter().filter(|l| *l == "init").count();
+        let closed = log.iter().filter(|l| l.starts_with("close")).count();
+        assert_eq!(opened, closed, "{passcode}: {log:?}");
+    }
 }
 
 #[tokio::test]
