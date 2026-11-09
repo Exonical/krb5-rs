@@ -261,9 +261,10 @@ for resource-based delegation. klmdb is the default `db_library`;
   krb5-rs's database modules are built in, so the built-in names never look
   there. For any other `db_library` the directories are searched the same
   way: a missing module fails with MIT's "Unable to find requested database
-  type", and a shared library that is found is refused, because loading a C
-  KDB module would need `unsafe` code, which the crate forbids. This is the
-  one difference from MIT.
+  type", and a shared library that is found is refused. A C KDB module calls
+  into MIT's `libkdb5` and `libkrb5` and passes MIT's own structures
+  (`krb5_context`, `krb5_db_entry`), which krb5-rs doesn't provide. This is
+  the one difference from MIT.
 
 ### MIT master-key rotation
 
