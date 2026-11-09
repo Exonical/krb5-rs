@@ -124,6 +124,9 @@ the stash the kadmin pod's init container writes, and MIT's kadmind
 relations. */}}
 {{- define "krb5-rs-kdc.cockroachKadmindConf" -}}
 {{- $v := .Values }}
+[logging]
+ default = STDERR
+
 [realms]
  {{ required "realm is required" $v.realm }} = {
   database_module = crdb
@@ -175,6 +178,9 @@ relations. */}}
 
 {{- define "krb5-rs-kdc.cockroachKdcConf" -}}
 {{- $v := .Values }}
+[logging]
+ default = STDERR
+
 [kdcdefaults]
  kdc_ports = {{ $v.kdc.containerPort }}
  kdc_tcp_ports = {{ $v.kdc.containerPort }}
@@ -242,6 +248,9 @@ priorityClassName: {{ . }}
 {{- $ctx := .ctx }}
 {{- $v := $ctx.Values }}
 {{- $realm := required "realm is required" $v.realm }}
+[logging]
+ default = STDERR
+
 [kdcdefaults]
  kdc_ports = {{ $v.kdc.containerPort }}
  kdc_tcp_ports = {{ $v.kdc.containerPort }}

@@ -114,6 +114,8 @@ write_profile() {
   printf '%s\n' "$MASTER" > "$dir/master"
   chmod 0600 "$dir/master"
   cat > "$dir/kdc.conf" <<EOF
+[logging]
+ kdc = STDERR
 [kdcdefaults]
     kdc_ports = $port
     kdc_tcp_ports = $port

@@ -119,6 +119,8 @@ write_profile() {
   mkdir -p "$dir"
   printf '%s\n' "$MASTER" > "$dir/master"
   cat > "$dir/kdc.conf" <<EOF
+[logging]
+ kdc = STDERR
 [realms]
     $REALM = {
         database_module = lmdb

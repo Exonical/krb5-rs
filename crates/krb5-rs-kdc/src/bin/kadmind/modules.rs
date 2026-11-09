@@ -531,6 +531,7 @@ fn load_hook(name: &str, path: &Path, log: &Logger) -> Result<Option<DynHook>, S
 }
 
 /// A [`Logger`] writing `prog: message` to standard error.
+#[allow(dead_code)]
 pub fn logger(prog: &'static str) -> Logger {
     Arc::new(move |m| eprintln!("{prog}: {m}"))
 }

@@ -16,7 +16,6 @@
 //! for open TCP connections, and exit 0. One log line per request goes to
 //! stdout in the style of MIT's `log_as_req` / `log_tgs_req`.
 
-use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,8 +40,9 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 
+#[path = "../klog.rs"]
+mod klog;
 #[path = "../daemon_metrics.rs"]
 mod metrics;
 #[path = "kdc/plugins.rs"]
@@ -1024,14 +1024,49 @@ async fn main() {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let from_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_ansi(std::io::stdout().is_terminal())
-        .with_target(false)
-        .with_writer(std::io::stdout)
-        .init();
+    // krb5_klog_init(kcontext, "kdc", argv[0], 1) (kdc/main.c), from the
+    // KDC profile: kdc.conf, then krb5.conf.
+    let whoami = std::env::args()
+        .next()
+        .unwrap_or_else(|| "krb5-rs-kdc".into());
+    let mut profiles = Vec::new();
+    let conf = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_KDC_PROFILE));
+    if cli.keytab.is_some() {
+        profiles.extend(Profile::load(&conf).ok());
+    } else {
+        match Profile::load(&conf) {
+            Ok(p) => profiles.push(p),
+            // As a profile MIT can't read fails krb5_init_context, before
+            // logging is set up.
+            Err(e) => {
+                eprintln!("{whoami}: reading {}: {e}", conf.display());
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(p) = cli.krb5_config.as_ref().filter(|p| p.exists()) {
+        match Profile::load(p) {
+            Ok(p) => profiles.push(p),
+            Err(e) => {
+                eprintln!("{whoami}: reading {}: {e}", p.display());
+                std::process::exit(1);
+            }
+        }
+    }
+    let refs: Vec<&Profile> = profiles.iter().collect();
+    klog::install(klog::Klog::init(&refs, "kdc", &whoami));
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut hup) = signal(SignalKind::hangup()) {
+            while hup.recv().await.is_some() {
+                klog::reopen();
+            }
+        }
+    });
 
     if let Err(e) = run(cli, from_cli("krb5_config"), from_cli("config")).await {
         error!("{e}");

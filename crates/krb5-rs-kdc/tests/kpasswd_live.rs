@@ -81,6 +81,9 @@ trap stop EXIT
 rm -rf "$B/db" "$B"/*.conf "$B"/*.log "$B"/*.acl "$B/stash" "$B"/cc* "$B/setpw"*
 mkdir -p "$B/db"
 cat > "$B/kdc.conf" <<EOF
+[logging]
+ kdc = STDERR
+ admin_server = FILE:$B/kadmind.log
 [kdcdefaults]
  kdc_ports = 18890
  kdc_tcp_ports = 18890

@@ -47,6 +47,8 @@ mod auth;
 mod daemonize;
 #[path = "kadmind/db.rs"]
 mod db;
+#[path = "../klog.rs"]
+mod klog;
 #[path = "kadmind/modules.rs"]
 mod modules;
 use db::{CallerDb, Db};
@@ -61,7 +63,11 @@ const IPROP_FULL_RESYNC: u32 = 2;
 const IPROP_FULL_RESYNC_EXT: u32 = 3;
 
 fn die(msg: impl std::fmt::Display) -> ! {
+    // fail_to_start (ovsec_kadmd.c): standard error and the log.
     eprintln!("krb5-rs-kadmind: {msg}");
+    if klog::installed() {
+        tracing::error!("{msg}");
+    }
     std::process::exit(1);
 }
 
@@ -218,7 +224,7 @@ fn parse_acl_line(line: &str, realm: &str) -> Option<AclEntry> {
     for op in op_str.chars() {
         let lower = op.to_ascii_lowercase();
         let Some((_, mask)) = ACL_OPS.iter().find(|(c, _)| *c == lower) else {
-            eprintln!("krb5-rs-kadmind: Unrecognized ACL operation '{op}' in {line}");
+            tracing::error!("Unrecognized ACL operation '{op}' in {line}");
             return None;
         };
         if lower == op {
@@ -230,7 +236,7 @@ fn parse_acl_line(line: &str, realm: &str) -> Option<AclEntry> {
     let parse = |name: &str, what: &str| match parse_name_with_default(name, realm) {
         Ok(p) => Some(p),
         Err(_) => {
-            eprintln!("krb5-rs-kadmind: Cannot parse {what} principal '{name}'");
+            tracing::error!("Cannot parse {what} principal '{name}'");
             None
         }
     };
@@ -245,7 +251,7 @@ fn parse_acl_line(line: &str, realm: &str) -> Option<AclEntry> {
     let restrictions = match rs {
         "" => None,
         rs => Some(AclRestrictions::parse(rs).or_else(|| {
-            eprintln!("krb5-rs-kadmind: invalid restrictions: {rs}");
+            tracing::error!("invalid restrictions: {rs}");
             None
         })?),
     };
@@ -409,8 +415,9 @@ impl State {
             .authorize(auth_princ(client, crealm), &Request::Iprop)
             .is_some()
         {
-            eprintln!(
-                "krb5-rs-kadmind: Unauthorized request: iprop_get_updates_1, client={}",
+            tracing::info!(
+                target: "notice",
+                "Unauthorized request: iprop_get_updates_1, client={}",
                 unparse(client, crealm)
             );
             w.last(Last::default());
@@ -432,7 +439,7 @@ impl State {
                 Ok(w.0)
             });
         res.unwrap_or_else(|e| {
-            eprintln!("krb5-rs-kadmind: iprop_get_updates_1: {e}");
+            tracing::error!("iprop_get_updates_1: {e}");
             w.last(Last::default());
             w.u32(0);
             w.u32(UpdateStatus::Error as u32);
@@ -450,8 +457,9 @@ impl State {
             .authorize(auth_princ(client, crealm), &Request::Iprop)
             .is_some()
         {
-            eprintln!(
-                "krb5-rs-kadmind: Unauthorized request: iprop_full_resync_1, client={}",
+            tracing::info!(
+                target: "notice",
+                "Unauthorized request: iprop_full_resync_1, client={}",
                 unparse(client, crealm)
             );
             UpdateStatus::PermDenied
@@ -491,8 +499,8 @@ impl State {
                 .status();
             match dumped {
                 Ok(s) if s.success() => {}
-                Ok(s) => return eprintln!("krb5-rs-kadmind: full resync dump failed: {s}"),
-                Err(e) => return eprintln!("krb5-rs-kadmind: {}: {e}", kdb_util.display()),
+                Ok(s) => return tracing::error!("full resync dump failed: {s}"),
+                Err(e) => return tracing::error!("{}: {e}", kdb_util.display()),
             }
             let mut cmd = Command::new(&kprop);
             cmd.args(["-r", &realm, "-f"]).arg(&dump);
@@ -500,9 +508,9 @@ impl State {
                 cmd.args(["-P", port]);
             }
             match cmd.arg(&host).status() {
-                Ok(s) if s.success() => eprintln!("krb5-rs-kadmind: full resync sent to {host}"),
-                Ok(s) => eprintln!("krb5-rs-kadmind: kprop to {host} failed: {s}"),
-                Err(e) => eprintln!("krb5-rs-kadmind: {}: {e}", kprop.display()),
+                Ok(s) if s.success() => tracing::info!("full resync sent to {host}"),
+                Ok(s) => tracing::error!("kprop to {host} failed: {s}"),
+                Err(e) => tracing::error!("{}: {e}", kprop.display()),
             }
         });
     }
@@ -530,8 +538,9 @@ impl State {
         };
         let service = ctx.acceptor();
         if !matches!(service.name_string.as_slice(), [s, _] if s.as_slice() == b"kiprop") {
-            eprintln!(
-                "krb5-rs-kadmind: Unauthorized request: iprop, service={}",
+            tracing::info!(
+                target: "notice",
+                "Unauthorized request: iprop, service={}",
                 unparse(service, &self.realm)
             );
             return Ok(Reply::AuthError(AuthStat::TooWeak).encode(xid));
@@ -640,8 +649,9 @@ struct Caller<'a> {
 
 impl Caller<'_> {
     fn log_unauth(&self, op: &str, target: &str) {
-        eprintln!(
-            "krb5-rs-kadmind: Unauthorized request: {op}, {target}, client={}, service={}, addr={}",
+        tracing::info!(
+            target: "notice",
+            "Unauthorized request: {op}, {target}, client={}, service={}, addr={}",
             self.client_name,
             self.service_name,
             self.from.ip()
@@ -654,8 +664,9 @@ impl Caller<'_> {
         } else {
             code::message(code)
         };
-        eprintln!(
-            "krb5-rs-kadmind: Request: {op}, {target}, {msg}, client={}, service={}, addr={}",
+        tracing::info!(
+            target: "notice",
+            "Request: {op}, {target}, {msg}, client={}, service={}, addr={}",
             self.client_name,
             self.service_name,
             self.from.ip()
@@ -716,7 +727,7 @@ impl Kadm5 {
             Ok(Some(e)) => Ok((api, name, realm, e)),
             Ok(None) => Err((api, code::UNK_PRINC)),
             Err(e) => {
-                eprintln!("krb5-rs-kadmind: reading {}: {e}", unparse(&name, &realm));
+                tracing::error!("reading {}: {e}", unparse(&name, &realm));
                 Err((api, code::FAILURE))
             }
         }
@@ -826,7 +837,7 @@ impl Kadm5 {
         let (c, names) = match (kadm5::Glob::new(exp, princs), names) {
             (None, _) => (code::EINVAL, Vec::new()),
             (Some(_), Err(e)) => {
-                eprintln!("krb5-rs-kadmind: {op}: {e}");
+                tracing::error!("{op}: {e}");
                 (code::FAILURE, Vec::new())
             }
             (Some(g), Ok(ns)) => (code::OK, ns.into_iter().filter(|n| g.matches(n)).collect()),
@@ -867,7 +878,7 @@ impl Kadm5 {
                 Ok(Some(p)) => (code::OK, Some(p)),
                 Ok(None) => (code::UNK_POLICY, None),
                 Err(e) => {
-                    eprintln!("krb5-rs-kadmind: {op}: {e}");
+                    tracing::error!("{op}: {e}");
                     (code::FAILURE, None)
                 }
             },
@@ -1024,7 +1035,7 @@ fn store_code(e: &StoreError, unknown: u32) -> u32 {
         _ => code::FAILURE,
     };
     if c == code::FAILURE {
-        eprintln!("krb5-rs-kadmind: {e}");
+        tracing::error!("{e}");
     }
     c
 }
@@ -2240,9 +2251,9 @@ impl Program for Kadm5 {
         let ok = matches!(service.name_string.as_slice(),
             [k, h] if k.as_slice() == b"kadmin" && h.as_slice() != b"history");
         if !ok {
-            eprintln!("krb5-rs-kadmind: bad service principal {service_name}");
-            eprintln!(
-                "krb5-rs-kadmind: Authentication attempt failed: {}, RPC authentication flavor 6",
+            tracing::error!("bad service principal {service_name}");
+            tracing::error!(
+                "Authentication attempt failed: {}, RPC authentication flavor 6",
                 from.ip()
             );
             return Ok(Reply::AuthError(AuthStat::TooWeak).encode(xid));
@@ -2277,10 +2288,7 @@ impl Program for Kadm5 {
             return gss.reply(xid, seq, &results).map_err(|e| e.to_string());
         }
         let Some(parsed) = ReadArgs::decode(proc_, args) else {
-            eprintln!(
-                "krb5-rs-kadmind: Invalid KADM5 procedure number: {}, {proc_}",
-                from.ip()
-            );
+            tracing::error!("Invalid KADM5 procedure number: {}, {proc_}", from.ip());
             return err(gss, AcceptStat::ProcUnavail);
         };
         let Ok(parsed) = parsed else {
@@ -2304,8 +2312,9 @@ impl Program for Kadm5 {
                 if c != code::OK {
                     kadm5::generic_ret(0, c)
                 } else {
-                    eprintln!(
-                        "krb5-rs-kadmind: Request: kadm5_init, {0}, success, client={0}, service={1}, addr={2}, vers={3}, flavor=6",
+                    tracing::info!(
+                        target: "notice",
+                        "Request: kadm5_init, {0}, success, client={0}, service={1}, addr={2}, vers={3}, flavor=6",
                         caller.client_name,
                         caller.service_name,
                         from.ip(),
@@ -2499,13 +2508,36 @@ async fn kadmind(args: Args) {
     let r = |key: &str| kdc_conf.get_string(&["realms", &realm, key]);
     let acl_file =
         r("acl_file").map_or_else(|| Path::new(KDC_DIR).join("kadm5.acl"), PathBuf::from);
+    // krb5_klog_init(context, "admin_server", progname, 1) (ovsec_kadmd.c).
+    let log_profiles: Vec<&Profile> = [&kdc_conf].into_iter().chain(krb5.iter()).collect();
+    let progname = std::env::args()
+        .next()
+        .map(|a| a.rsplit('/').next().unwrap_or(&a).to_string())
+        .unwrap_or_else(|| "krb5-rs-kadmind".into());
+    klog::install(klog::Klog::init(&log_profiles, "admin_server", &progname));
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut hup) = signal(SignalKind::hangup()) {
+            while hup.recv().await.is_some() {
+                klog::reopen();
+            }
+        }
+    });
     let profiles: Vec<&Profile> = krb5.iter().chain([&kdc_conf]).collect();
     let acl = Arc::new(auth::load(&profiles, &realm, &acl_file).unwrap_or_else(|e| die(e)));
     let dict_file = r("dict_file").map(PathBuf::from);
     let modules = modules::load(
         &profiles,
         dict_file.as_deref(),
-        modules::logger("krb5-rs-kadmind"),
+        std::sync::Arc::new(|m: &str| {
+            // pwqual_dict.c logs this one at LOG_INFO; module errors are LOG_ERR.
+            if m.starts_with("No dictionary file") {
+                tracing::info!("{m}")
+            } else {
+                tracing::error!("{m}")
+            }
+        }),
     )
     .unwrap_or_else(|e| die(e));
     let iprop_port = cfg.iprop.enabled.then(|| match r("iprop_port") {
@@ -2680,9 +2712,12 @@ async fn kadmind(args: Args) {
         tasks.spawn_local_on(serve_kpasswd_tcp(kpasswd.clone(), listener), &local);
     }
     if args.proponly {
-        eprintln!("krb5-rs-kadmind: starting, iprop service only");
+        tracing::info!("starting, iprop service only");
     } else {
-        eprintln!("krb5-rs-kadmind: starting");
+        tracing::info!("starting");
+    }
+    if args.nofork {
+        eprintln!("{}: starting...", klog::whoami());
     }
     local
         .run_until(async { while tasks.join_next().await.is_some() {} })
@@ -2706,11 +2741,11 @@ fn spawn_rpc<P: Program>(
                             let state = state.clone();
                             tokio::task::spawn_local(async move {
                                 if let Err(e) = serve(state, stream, from).await {
-                                    eprintln!("krb5-rs-kadmind: {from}: {e}");
+                                    tracing::error!("{from}: {e}");
                                 }
                             });
                         }
-                        Err(e) => eprintln!("krb5-rs-kadmind: accept: {e}"),
+                        Err(e) => tracing::error!("accept: {e}"),
                     }
                 }
             },
@@ -2726,7 +2761,7 @@ async fn bind_tcp(addrs: Vec<SocketAddr>, out: &mut Vec<TcpListener>) {
         match TcpListener::bind(addr).await {
             Ok(l) => out.push(l),
             Err(e) if addr.ip().is_unspecified() && addr.is_ipv6() && !out.is_empty() => {
-                eprintln!("krb5-rs-kadmind: not listening on {addr}: {e}");
+                tracing::error!("not listening on {addr}: {e}");
             }
             Err(e) => die(format!("{e} while binding {addr}")),
         }
@@ -2738,7 +2773,7 @@ async fn bind_udp(addrs: Vec<SocketAddr>, out: &mut Vec<UdpSocket>) {
         match UdpSocket::bind(addr).await {
             Ok(l) => out.push(l),
             Err(e) if addr.ip().is_unspecified() && addr.is_ipv6() && !out.is_empty() => {
-                eprintln!("krb5-rs-kadmind: not listening on {addr}: {e}");
+                tracing::error!("not listening on {addr}: {e}");
             }
             Err(e) => die(format!("{e} while binding {addr}")),
         }
@@ -2777,7 +2812,7 @@ impl Kpasswd {
             authorize: &authorize,
         };
         let done = process_request(&self.admin, &svc, local, remote, req).await;
-        eprintln!("krb5-rs-kadmind: {}", done.log);
+        tracing::info!(target: "notice", "{}", done.log);
         done.reply
     }
 }
@@ -2795,7 +2830,7 @@ async fn serve_kpasswd_udp(kpasswd: Rc<Kpasswd>, socket: UdpSocket) {
         let (n, from) = match socket.recv_from(&mut buf).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("krb5-rs-kadmind: kpasswd recvfrom: {e}");
+                tracing::error!("kpasswd recvfrom: {e}");
                 continue;
             }
         };
@@ -2804,7 +2839,7 @@ async fn serve_kpasswd_udp(kpasswd: Rc<Kpasswd>, socket: UdpSocket) {
         tokio::task::spawn_local(async move {
             if let Some(reply) = kpasswd.handle(&local, &from, &buf).await {
                 if let Err(e) = socket.send_to(&reply, from).await {
-                    eprintln!("krb5-rs-kadmind: kpasswd sendto {from}: {e}");
+                    tracing::error!("kpasswd sendto {from}: {e}");
                 }
             }
         });
@@ -2816,7 +2851,7 @@ async fn serve_kpasswd_tcp(kpasswd: Rc<Kpasswd>, listener: TcpListener) {
         let (mut stream, from) = match listener.accept().await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("krb5-rs-kadmind: accept: {e}");
+                tracing::error!("accept: {e}");
                 continue;
             }
         };

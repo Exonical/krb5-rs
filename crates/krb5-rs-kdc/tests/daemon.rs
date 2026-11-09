@@ -58,7 +58,7 @@ fn make_realm(dir: &TempDir) -> PathBuf {
     std::fs::write(
         &conf_path,
         format!(
-            "[realms]\n {REALM} = {{\n  database_name = {}\n  key_stash_file = {}\n  \
+            "[logging]\n kdc = STDERR\n[realms]\n {REALM} = {{\n  database_name = {}\n  key_stash_file = {}\n  \
              max_life = 24h\n  max_renewable_life = 7d\n  \
              supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal\n }}\n\
              [dbmodules]\n {REALM} = {{\n  db_library = krb5-rs-file\n }}\n",
@@ -377,7 +377,7 @@ async fn master_password_file_replaces_the_stash() {
     std::fs::write(
         &conf,
         format!(
-            "[realms]\n {REALM} = {{\n  database_name = {}\n  key_stash_file = {}\n  \
+            "[logging]\n kdc = STDERR\n[realms]\n {REALM} = {{\n  database_name = {}\n  key_stash_file = {}\n  \
              supported_enctypes = aes256-cts-hmac-sha1-96:normal\n }}\n",
             slash(&dir.path("principal")),
             slash(&dir.path("stash")),
