@@ -6,6 +6,7 @@
 //! (`lib/kdb/encrypt_key.c`); the master key stash is MIT keytab format
 //! (`lib/kdb/kdb_default.c`).
 
+pub mod acl;
 pub mod admin;
 mod file;
 mod format;
