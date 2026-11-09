@@ -108,7 +108,8 @@ fn get_i64_opt(m: &mut Message) -> io::Result<Option<i64>> {
 }
 
 fn put_opt_bytes(m: &mut Message, v: Option<&[u8]>) {
-    m.put_i32(i32::from(v.is_some())).put_bytes(v.unwrap_or_default());
+    m.put_i32(i32::from(v.is_some()))
+        .put_bytes(v.unwrap_or_default());
 }
 
 fn get_opt_bytes(m: &mut Message) -> io::Result<Option<Vec<u8>>> {
@@ -134,8 +135,7 @@ fn put_entry(m: &mut Message, e: Option<&PrincipalEntry>) -> io::Result<()> {
     put_i64_opt(m, ts(e.last_admin_unlock.as_ref()));
     m.put_i32(i32::try_from(e.keys.len()).map_err(|_| bad("too many keys"))?);
     for k in &e.keys {
-        m.put_i32(k.kvno as i32)
-            .put_bytes(&der_opt(Some(&k.key))?);
+        m.put_i32(k.kvno as i32).put_bytes(&der_opt(Some(&k.key))?);
         put_opt_bytes(m, k.salt.as_deref());
         put_opt_bytes(m, k.s2kparams.as_deref());
     }

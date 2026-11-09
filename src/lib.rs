@@ -23,6 +23,7 @@
 #![deny(clippy::unwrap_used)]
 #![warn(missing_docs)]
 
+pub mod authdata;
 pub mod ccache;
 pub mod crypto;
 pub mod error;
