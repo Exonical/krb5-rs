@@ -2528,7 +2528,12 @@ async fn kadmind(args: Args) {
             let config = krb5_rs_kdb_cockroach::CockroachConfig::from_db_module(&cfg.db_module)
                 .unwrap_or_else(|e| die(format!("{e} while initializing database")));
             Db::Cockroach(
-                krb5_rs_kdb_cockroach::CockroachStore::open(config, master, &realm)
+                krb5_rs_kdb_cockroach::CockroachStore::open_named(
+                    config,
+                    master,
+                    &realm,
+                    &cfg.master_key_name,
+                )
                     .await
                     .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
             )

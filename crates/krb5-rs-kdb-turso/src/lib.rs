@@ -75,6 +75,8 @@ pub struct TursoOptions {
     pub retry_base_delay: Duration,
     /// Upper bound of the retry delay.
     pub retry_max_delay: Duration,
+    /// `master_key_name`, the master key principal (default `K/M`).
+    pub master_key_name: String,
     /// Failure injection for tests.
     #[doc(hidden)]
     pub fail_point: FailPoint,
@@ -90,6 +92,7 @@ impl Default for TursoOptions {
             max_retries: 12,
             retry_base_delay: Duration::from_millis(2),
             retry_max_delay: Duration::from_millis(200),
+            master_key_name: "K/M".to_string(),
             fail_point: FailPoint::default(),
         }
     }

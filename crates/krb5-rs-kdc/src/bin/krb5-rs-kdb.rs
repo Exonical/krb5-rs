@@ -1828,7 +1828,11 @@ fn cockroach_command(
                 .or(global_master_password_file)
                 .unwrap_or_else(|| fail("init requires --master-password-file"));
             let key = master_key(cfg, realm, Some(master_file));
-            let store = ok(rt.block_on(CockroachStore::connect(config, key.clone(), realm)));
+            let store = ok(rt.block_on(async {
+                CockroachStore::connect(config, key.clone(), realm)
+                    .await?
+                    .with_master_key_name(&cfg.master_key_name)
+            }));
             let created = match rt.block_on(store.verify_master()) {
                 Ok(()) => false,
                 Err(error) if error.kind() == StoreErrorKind::NotFound => {
@@ -1927,7 +1931,11 @@ fn cockroach_command(
                 cfg.master_key_type,
             ));
             let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
-            let store = ok(rt.block_on(CockroachStore::connect(config, key.clone(), realm)));
+            let store = ok(rt.block_on(async {
+                CockroachStore::connect(config, key.clone(), realm)
+                    .await?
+                    .with_master_key_name(&cfg.master_key_name)
+            }));
             ok(rt.block_on(store.create_realm(&etypes)));
             if stash {
                 ok(write_stash_named(
@@ -1941,7 +1949,12 @@ fn cockroach_command(
         "stash" => {
             let (keyfile, key) =
                 stash_source(&args, cfg, realm, global_master_password_file, |k| {
-                    rt.block_on(CockroachStore::open(config.clone(), k.clone(), realm))
+                    rt.block_on(CockroachStore::open_named(
+                        config.clone(),
+                        k.clone(),
+                        realm,
+                        &cfg.master_key_name,
+                    ))
                 });
             ok(write_stash_list_named(
                 &keyfile,
@@ -1952,13 +1965,23 @@ fn cockroach_command(
         }
         "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
             mkey_command(cmd, args, cfg, realm, global_master_password_file, |k| {
-                let store = rt.block_on(CockroachStore::open(config.clone(), k.clone(), realm))?;
+                let store = rt.block_on(CockroachStore::open_named(
+                    config.clone(),
+                    k.clone(),
+                    realm,
+                    &cfg.master_key_name,
+                ))?;
                 Ok(CockroachMkey { rt: &rt, store })
             });
         }
         "replication" => {
             let master = master_key(cfg, realm, global_master_password_file);
-            let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
+            let store = ok(rt.block_on(CockroachStore::open_named(
+                config,
+                master,
+                realm,
+                &cfg.master_key_name,
+            )));
             let sub = if args.is_empty() {
                 usage()
             } else {
@@ -2020,7 +2043,12 @@ fn cockroach_command(
         }
         _ => {
             let master = master_key(cfg, realm, global_master_password_file);
-            let store = ok(rt.block_on(CockroachStore::open(config, master, realm)));
+            let store = ok(rt.block_on(CockroachStore::open_named(
+                config,
+                master,
+                realm,
+                &cfg.master_key_name,
+            )));
             let admin = Blocking::new(
                 rt,
                 store,

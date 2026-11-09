@@ -123,6 +123,8 @@ pub struct CockroachStore {
     supplied_master: EncryptionKey,
     master: Arc<RwLock<MasterKeys>>,
     realm: String,
+    /// The `K/M` row's name (`master_key_name`, default `K/M`).
+    km_key: String,
     caller: Option<Arc<Caller>>,
 }
 
@@ -333,12 +335,13 @@ async fn log(tx: &Tx, entity: &str, realm: &str, key: &str, op: &str) -> Result<
 async fn masters_in_tx(
     tx: &Tx,
     realm: &str,
+    km_key: &str,
     supplied: &EncryptionKey,
 ) -> Result<MasterKeys, TxError> {
     let rows = tx
         .query(
             &principal_sql("WHERE p.realm = $1 AND p.name = $2 AND p.deleted = false"),
-            &[&realm, &"K/M"],
+            &[&realm, &km_key],
         )
         .await?;
     let (km, _, _) = stored_principals(&rows)?
@@ -599,6 +602,7 @@ impl CockroachStore {
             master: Arc::new(RwLock::new(MasterKeys::single(master_key.clone()))),
             supplied_master: master_key,
             realm: realm.to_string(),
+            km_key: "K/M".to_string(),
             caller: None,
         })
     }
@@ -611,6 +615,30 @@ impl CockroachStore {
         realm: &str,
     ) -> Result<Self, StoreError> {
         let store = Self::connect(config, master_key, realm).await?;
+        store.verify_master().await?;
+        Ok(store)
+    }
+
+    /// This store with the master key principal `master_key_name`
+    /// (default `K/M`).
+    pub fn with_master_key_name(mut self, master_key_name: &str) -> Result<Self, StoreError> {
+        self.km_key = encode_principal_key(&krb5_rs::kdc::kdb::master::master_principal_named(
+            master_key_name,
+        )?)?;
+        Ok(self)
+    }
+
+    /// [`CockroachStore::open`] for the master key principal
+    /// `master_key_name`.
+    pub async fn open_named(
+        config: CockroachConfig,
+        master_key: EncryptionKey,
+        realm: &str,
+        master_key_name: &str,
+    ) -> Result<Self, StoreError> {
+        let store = Self::connect(config, master_key, realm)
+            .await?
+            .with_master_key_name(master_key_name)?;
         store.verify_master().await?;
         Ok(store)
     }
@@ -654,8 +682,8 @@ impl CockroachStore {
         &self.db.config
     }
 
-    fn km_name() -> Result<PrincipalName, StoreError> {
-        decode_principal_key("K/M", 1)
+    fn km_name(&self) -> Result<PrincipalName, StoreError> {
+        decode_principal_key(&self.km_key, 1)
     }
 
     /// Check that the master key opens the realm's `K/M` entry and load
@@ -675,7 +703,7 @@ impl CockroachStore {
             .db
             .rows(
                 &principal_sql("WHERE p.realm = $1 AND p.name = $2 AND p.deleted = false"),
-                &[&self.realm, &"K/M"],
+                &[&self.realm, &self.km_key],
             )
             .await?;
         stored_principals(&rows)?
@@ -764,14 +792,14 @@ impl CockroachStore {
         let key = encode_principal_key(name)?;
         let f = Arc::new(Mutex::new(f));
         let (key_ref, realm_s, what) = (&key, realm.to_string(), format!("{name}@{realm}"));
-        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let (km_realm, km_key, supplied) = (&self.realm, &self.km_key, &self.supplied_master);
         let (changed, keys) =
             self.db
                 .run_tx(|tx| {
                     let f = Arc::clone(&f);
                     let (realm_s, what) = (realm_s.clone(), what.clone());
                     Box::pin(async move {
-                        let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                        let keys = masters_in_tx(&tx, km_realm, km_key, supplied).await?;
                         let rows = tx
                             .query(
                                 &principal_sql(
@@ -858,12 +886,12 @@ impl CockroachStore {
         &self,
         raw: &krb5_rs::kdc::kdb::mit::MitEntry,
     ) -> Result<(), StoreError> {
-        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let (km_realm, km_key, supplied) = (&self.realm, &self.km_key, &self.supplied_master);
         let keys = self
             .db
             .run_tx(|tx| {
                 Box::pin(async move {
-                    let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                    let keys = masters_in_tx(&tx, km_realm, km_key, supplied).await?;
                     let sp = StoredPrincipal::from_mit(raw, None)?;
                     insert_principal(&tx, &sp).await?;
                     let state = raw.auth_state();
@@ -898,14 +926,14 @@ impl CockroachStore {
         let key = encode_principal_key(name)?;
         let f = Arc::new(Mutex::new(f));
         let (key_ref, realm_s, what) = (&key, realm.to_string(), format!("{name}@{realm}"));
-        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let (km_realm, km_key, supplied) = (&self.realm, &self.km_key, &self.supplied_master);
         let keys = self
             .db
             .run_tx(|tx| {
                 let f = Arc::clone(&f);
                 let (realm_s, what) = (realm_s.clone(), what.clone());
                 Box::pin(async move {
-                    let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                    let keys = masters_in_tx(&tx, km_realm, km_key, supplied).await?;
                     let rows = tx
                         .query(
                             &principal_sql(
@@ -963,7 +991,7 @@ impl CockroachStore {
         let realm = self.realm.clone();
         let now = now_unix();
         let km = PrincipalEntry {
-            name: Self::km_name()?,
+            name: self.km_name()?,
             realm: realm.clone(),
             attributes: PrincipalAttributes::DISALLOW_ALL_TIX
                 | PrincipalAttributes::REQUIRES_PRE_AUTH
@@ -1354,12 +1382,12 @@ impl AdminStore for CockroachStore {
     ) -> Result<(), StoreError> {
         let (entry, pwd) = (&entry, last_pwd_change.map(|t| t.timestamp()));
         let caller = self.caller.as_deref();
-        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let (km_realm, km_key, supplied) = (&self.realm, &self.km_key, &self.supplied_master);
         let keys = self
             .db
             .run_tx(|tx| {
                 Box::pin(async move {
-                    let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                    let keys = masters_in_tx(&tx, km_realm, km_key, supplied).await?;
                     let now = now_unix();
                     let sp = &stamp(
                         StoredPrincipal::from_entry(entry, pwd, Some(now), &keys)?,
@@ -1404,7 +1432,7 @@ impl AdminStore for CockroachStore {
         let (key_ref, realm_s) = (&key, realm.to_string());
         let what = format!("{name}@{realm}");
         let caller = self.caller.as_deref();
-        let (km_realm, supplied) = (&self.realm, &self.supplied_master);
+        let (km_realm, km_key, supplied) = (&self.realm, &self.km_key, &self.supplied_master);
         let (stored, keys) = self
             .db
             .run_tx(|tx| {
@@ -1412,7 +1440,7 @@ impl AdminStore for CockroachStore {
                 let realm_s = realm_s.clone();
                 let what = what.clone();
                 Box::pin(async move {
-                    let keys = masters_in_tx(&tx, km_realm, supplied).await?;
+                    let keys = masters_in_tx(&tx, km_realm, km_key, supplied).await?;
                     let master = &keys;
                     let rows = tx
                         .query(

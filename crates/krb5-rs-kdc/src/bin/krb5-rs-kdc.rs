@@ -330,6 +330,7 @@ async fn turso_mode(
         options.passive_checkpoint =
             matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1");
     }
+    options.master_key_name = cfg.master_key_name.clone();
     let replica = TursoReplica::open(path, options, master)
         .await
         .map_err(io_err)?;
@@ -561,12 +562,18 @@ async fn cockroach_mode(
             .map_err(|_| io_err("turso_max_retries: not a number"))?;
     }
 
+    turso_options.master_key_name = cfg.master_key_name.clone();
     let replica = TursoReplica::open(replica_path, turso_options, master.clone())
         .await
         .map_err(io_err)?;
-    let authority = CockroachStore::open(authority_config, master, &cfg.kdc.realm)
-        .await
-        .map_err(io_err)?;
+    let authority = CockroachStore::open_named(
+        authority_config,
+        master,
+        &cfg.kdc.realm,
+        &cfg.master_key_name,
+    )
+    .await
+    .map_err(io_err)?;
 
     let kdc_id = cfg
         .db_module
