@@ -169,6 +169,7 @@ impl LdapStore {
             .clone()
             .ok_or_else(|| StoreError::rejected("Kerberos Container information is missing"))?;
         let realm = config.kdc.realm.to_string();
+        krb5_rs::kdc::kdb::master::master_principal_named(&config.master_key_name)?;
         {
             let pool = Pool::open(&cfg).await?;
             let mut h = pool.get().await?;
