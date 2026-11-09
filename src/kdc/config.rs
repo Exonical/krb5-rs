@@ -186,6 +186,9 @@ pub struct RealmConfig {
     /// TCP listen addresses (`kdc_tcp_listen` / `kdc_tcp_ports`, defaulting
     /// to the UDP list as in kdc/main.c:969-971).
     pub tcp_listen: Vec<SocketAddr>,
+    /// `[kdcdefaults] kdc_tcp_listen_backlog`, default 5
+    /// (`DEFAULT_TCP_LISTEN_BACKLOG`, kdc/main.c:639-644).
+    pub tcp_listen_backlog: u32,
     /// The database module (`[dbmodules]`).
     pub db_module: DbModuleConfig,
     /// Incremental propagation settings.
@@ -364,6 +367,8 @@ impl RealmConfig {
             &["kdcdefaults", "kdc_max_dgram_reply_size"],
             MAX_DGRAM_SIZE as i64,
         )?;
+        let tcp_listen_backlog =
+            kdc_conf.get_integer(&["kdcdefaults", "kdc_tcp_listen_backlog"], 5)?;
 
         let default_etypes = [18, 17, 20, 19];
         let supported_enctypes =
@@ -516,6 +521,8 @@ impl RealmConfig {
             ),
             udp_listen: parse_listen_addresses(&udp_str, DEFAULT_PORT)?,
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
+            tcp_listen_backlog: u32::try_from(tcp_listen_backlog.clamp(0, i64::from(i32::MAX)))
+                .unwrap_or(5),
             db_module,
             iprop,
         })

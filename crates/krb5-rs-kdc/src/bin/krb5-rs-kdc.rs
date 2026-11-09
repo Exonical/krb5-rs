@@ -106,6 +106,25 @@ struct Cli {
 struct Listen {
     udp: Vec<SocketAddr>,
     tcp: Vec<SocketAddr>,
+    /// `kdc_tcp_listen_backlog`.
+    backlog: u32,
+}
+
+/// MIT `DEFAULT_TCP_LISTEN_BACKLOG`.
+const DEFAULT_TCP_LISTEN_BACKLOG: u32 = 5;
+
+/// Bind a TCP listener with `backlog` (net-server.c `setup_tcp_listener`:
+/// SO_REUSEADDR, then `listen(sock, tcp_listen_backlog)`).
+fn bind_tcp(addr: SocketAddr, backlog: u32) -> std::io::Result<TcpListener> {
+    let sock = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    #[cfg(unix)]
+    sock.set_reuseaddr(true)?;
+    sock.bind(addr)?;
+    sock.listen(backlog)
 }
 
 /// The store this process serves: the bootstrap keytab or the database file.
@@ -234,6 +253,7 @@ async fn keytab_mode(
         Listen {
             udp: addrs.clone(),
             tcp: addrs,
+            backlog: DEFAULT_TCP_LISTEN_BACKLOG,
         },
     ))
 }
@@ -326,7 +346,11 @@ async fn turso_mode(
         .build();
     Ok((
         kdc,
-        Listen { udp, tcp },
+        Listen {
+            udp,
+            tcp,
+            backlog: cfg.tcp_listen_backlog,
+        },
         ModeParts {
             metrics_listen,
             ..ModeParts::default()
@@ -416,7 +440,11 @@ async fn klmdb_mode(
         .build();
     Ok((
         kdc,
-        Listen { udp, tcp },
+        Listen {
+            udp,
+            tcp,
+            backlog: cfg.tcp_listen_backlog,
+        },
         ModeParts {
             metrics_listen,
             ..ModeParts::default()
@@ -456,7 +484,11 @@ async fn kldap_mode(
         .build();
     Ok((
         kdc,
-        Listen { udp, tcp },
+        Listen {
+            udp,
+            tcp,
+            backlog: cfg.tcp_listen_backlog,
+        },
         ModeParts {
             metrics_listen,
             ..ModeParts::default()
@@ -652,7 +684,15 @@ async fn cockroach_mode(
             max_staleness,
         }),
     };
-    Ok(Some((kdc, Listen { udp, tcp }, parts)))
+    Ok(Some((
+        kdc,
+        Listen {
+            udp,
+            tcp,
+            backlog: cfg.tcp_listen_backlog,
+        },
+        parts,
+    )))
 }
 
 #[cfg(not(feature = "cockroach"))]
@@ -748,7 +788,11 @@ async fn config_mode(
             .policies(Arc::clone(&store))
             .auth_state(Arc::clone(&store))
             .build(),
-        Listen { udp, tcp },
+        Listen {
+            udp,
+            tcp,
+            backlog: cfg.tcp_listen_backlog,
+        },
         parts,
     )))
 }
@@ -864,7 +908,7 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
         }
     }
     for addr in &addrs.tcp {
-        match TcpListener::bind(addr).await {
+        match bind_tcp(*addr, addrs.backlog) {
             Ok(l) => {
                 info!("listening on {} (tcp)", l.local_addr()?);
                 tasks.spawn(serve_tcp_with(Arc::clone(&kdc), l, options.clone()));
