@@ -34,13 +34,13 @@ pub mod krad;
 pub mod localauth;
 pub mod locate;
 pub mod otp;
-pub mod sam2;
 pub mod pac;
 #[cfg(feature = "pkinit")]
 pub mod pkinit;
 pub mod plugin;
 pub mod profile;
 pub mod protocol;
+pub mod sam2;
 pub mod spake;
 pub mod trace;
 pub mod types;

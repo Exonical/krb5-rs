@@ -925,11 +925,11 @@ fn duration_secs_i64(dur: Duration) -> i64 {
 pub(crate) use crate::protocol::validate::now_kerberos;
 
 mod otp;
-mod sam2;
 #[cfg(feature = "pkinit")]
 mod pkinit;
 mod reply;
 mod request;
+mod sam2;
 mod spake;
 
 #[cfg(test)]

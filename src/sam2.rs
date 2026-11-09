@@ -232,7 +232,10 @@ mod tests {
              74 20 69 70 73 65 A8 05 02 03 54 32 10 A9 03 02 01 14",
         );
         assert_eq!(rasn::der::encode(&body).expect("enc"), want);
-        assert_eq!(rasn::der::decode::<SamChallenge2Body>(&want).expect("dec"), body);
+        assert_eq!(
+            rasn::der::decode::<SamChallenge2Body>(&want).expect("dec"),
+            body
+        );
 
         let sr2 = SamResponse2 {
             sam_type: 43,
@@ -264,6 +267,9 @@ mod tests {
              65 6E 63 5F 32",
         );
         assert_eq!(rasn::der::encode(&esre).expect("enc"), want);
-        assert_eq!(rasn::der::decode::<EncSamResponseEnc2>(&want).expect("dec"), esre);
+        assert_eq!(
+            rasn::der::decode::<EncSamResponseEnc2>(&want).expect("dec"),
+            esre
+        );
     }
 }

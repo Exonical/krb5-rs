@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use krb5_rs::kdc::plugins::rpc::{self, InitError, PLUGIN_NO_HANDLE, PLUGIN_VER_NOTSUPP};
 use krb5_rs::kdc::plugins::{Audit, AuthdataRequest, KdcAuthdata, KdcPolicy};
+use krb5_rs::kdc::securid_sam2::SecuridSam2;
 use krb5_rs::plugin;
 use krb5_rs::profile::Profile;
 use krb5_rs::types::EncTicketPart;
@@ -33,6 +34,7 @@ pub type Modules = (
     Vec<Arc<dyn KdcPolicy>>,
     Vec<Arc<dyn Audit>>,
     Vec<Arc<dyn KdcAuthdata>>,
+    Option<SecuridSam2>,
 );
 
 /// An authdata module whose errors are logged, as `handle_authdata` logs
@@ -97,7 +99,26 @@ pub fn load(profiles: &[&Profile]) -> Result<Modules, String> {
             }
         }
     }
-    Ok((policy, audit, authdata))
+    // `[plugins] kdcpreauth { module = securid_sam2:<ACE bridge socket> }`:
+    // MIT loads securid_sam2 only when configured; a module that does not
+    // load is logged and skipped (kdc_preauth.c load_preauth_plugins).
+    let mut securid = None;
+    for (name, path) in configured(profiles, "kdcpreauth")? {
+        if name != "securid_sam2" {
+            tracing::error!("unknown kdcpreauth module {name} ({})", path.display());
+            continue;
+        }
+        match rpc::securid_ace(&name, connector(path.clone())) {
+            Ok(m) => securid = Some(SecuridSam2::new(Some(Arc::new(m)))),
+            Err(InitError::Unavailable(e)) => {
+                tracing::error!("kdcpreauth module {name} ({}): {e}", path.display());
+            }
+            Err(InitError::Refused((e, _))) => {
+                tracing::error!("{e} while initializing kdcpreauth module {name}");
+            }
+        }
+    }
+    Ok((policy, audit, authdata, securid))
 }
 
 #[cfg(all(test, unix))]
@@ -153,7 +174,7 @@ mod tests {
         ));
         let lib = Profile::parse(&format!("[libdefaults]\n plugin_base_dir = {base}\n"))
             .expect("profile");
-        let (policy, audit, _) = load(&[&p, &lib]).expect("load");
+        let (policy, audit, _, _) = load(&[&p, &lib]).expect("load");
         assert!(audit.is_empty());
         let names: Vec<&str> = policy.iter().map(|m| m.name()).collect();
         assert_eq!(names, ["a", "b"]);
@@ -216,7 +237,7 @@ mod tests {
             greet.display()
         ))
         .expect("profile");
-        let (policy, audit, authdata) = load(&[&p]).expect("load");
+        let (policy, audit, authdata, _) = load(&[&p]).expect("load");
         assert!(policy.is_empty() && audit.is_empty());
         let names: Vec<&str> = authdata.iter().map(|m| m.name()).collect();
         assert_eq!(names, ["greet"]);

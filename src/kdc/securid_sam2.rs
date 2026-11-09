@@ -132,8 +132,9 @@ fn host_id() -> u32 {
         }
     }
     let name = std::fs::read("/proc/sys/kernel/hostname").unwrap_or_default();
-    name.iter()
-        .fold(0x811c_9dc5u32, |h, &c| (h ^ u32::from(c)).wrapping_mul(0x0100_0193))
+    name.iter().fold(0x811c_9dc5u32, |h, &c| {
+        (h ^ u32::from(c)).wrapping_mul(0x0100_0193)
+    })
 }
 
 const STATE_NEW_PIN: u8 = 1;
@@ -389,7 +390,11 @@ impl<S: PrincipalStore> Kdc<S> {
     }
 
     /// `verify_grail_data`.
-    async fn grail_verify(&self, client: &PrincipalEntry, sr2: &SamResponse2) -> Result<(), KdcError> {
+    async fn grail_verify(
+        &self,
+        client: &PrincipalEntry,
+        sr2: &SamResponse2,
+    ) -> Result<(), KdcError> {
         let (_, sad) = open_response(client, sr2)?;
         let sam_key = self.sam_key(client, TYPE_GRAIL).await?;
         let mut track = decrypt_track(&sam_key, sr2.track_id.as_deref().unwrap_or_default())?;
@@ -507,7 +512,11 @@ impl<S: PrincipalStore> Kdc<S> {
                             });
                         }
                         let next = Track {
-                            state: if new_pin { STATE_NEW_PIN } else { STATE_NEXT_CODE },
+                            state: if new_pin {
+                                STATE_NEW_PIN
+                            } else {
+                                STATE_NEXT_CODE
+                            },
                             hostid: m.hostid,
                             handle: h,
                             passcode: Vec::new(),

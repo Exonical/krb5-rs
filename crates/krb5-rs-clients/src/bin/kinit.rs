@@ -664,6 +664,15 @@ fn as_config(k5: &K5, o: &Opts) -> Result<AsExchangeConfig, String> {
     let p = &k5.profile;
     let r = &k5.realm;
     let mut c = AsExchangeConfig::new(k5.me.clone(), r.clone());
+    // krb5_prompter_posix (prompter.c): name and banner lines, then the
+    // hidden prompt.
+    c.sam2 = Some(krb5_rs::sam2::Sam2Responder(std::sync::Arc::new(
+        |p: &krb5_rs::sam2::Sam2Prompt| {
+            println!("{}", p.name);
+            println!("{}", p.banner);
+            krb5_rs_clients::prompt_password(&p.prompt).ok()
+        },
+    )));
     // get_in_tkt.c:896-1005.
     let mut kopt = KdcOptions::empty();
     let forwardable = if o.forwardable || o.not_forwardable {
@@ -918,7 +927,8 @@ fn k5_kinit(o: &Opts, k5: &mut K5) -> bool {
     let cred = match result {
         Ok(c) => c,
         Err(e) => {
-            let bad_integrity = matches!(e, Krb5Error::DecryptionFailed);
+            let bad_integrity = matches!(e, Krb5Error::DecryptionFailed)
+                || matches!(e, Krb5Error::Mit(c, _) if c == krb5_rs::sam2::AP_ERR_BAD_INTEGRITY);
             let preauth_failed = matches!(e, Krb5Error::PreauthFailed)
                 || matches!(&e, Krb5Error::KdcError(m) if m.error_code == 24);
             if bad_integrity || (pwprompt && preauth_failed) {

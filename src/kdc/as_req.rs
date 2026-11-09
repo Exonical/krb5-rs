@@ -434,7 +434,9 @@ impl<S: PrincipalStore> Kdc<S> {
                 err = err.with_e_data(rasn::der::encode(&list)?);
             }
             if err.code == KDC_ERR_PREAUTH_FAILED {
-                let extras = self.hint_extras(&pk_extras, &client, client_key.as_ref(), kdc_time).await;
+                let extras = self
+                    .hint_extras(&pk_extras, &client, client_key.as_ref(), kdc_time)
+                    .await;
                 err = err.with_e_data(hint_list_with(
                     &client,
                     client_key.as_ref(),
@@ -462,7 +464,9 @@ impl<S: PrincipalStore> Kdc<S> {
             None
         };
         if let Some(status) = missing {
-            let extras = self.hint_extras(&pk_extras, &client, client_key.as_ref(), kdc_time).await;
+            let extras = self
+                .hint_extras(&pk_extras, &client, client_key.as_ref(), kdc_time)
+                .await;
             return Err(KdcError::new(KDC_ERR_PREAUTH_REQUIRED, status).with_e_data(
                 hint_list_with(
                     &client,
