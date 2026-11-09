@@ -878,7 +878,7 @@ impl<S: PrincipalStore> Kdc<S> {
                             .map_or(&server_key.key, |e| &e.part.key)
                             .clone(),
                     ),
-                    header_key: stkt.is_none().then(|| header_key.clone()),
+                    header_key: Some(stkt.as_ref().map_or(&header_key, |e| &e.key).clone()),
                     req_pkt: raw.to_vec(),
                     for_user: s4u2self
                         .as_ref()
