@@ -352,6 +352,14 @@ impl<S: PrincipalStore> Kdc<S> {
                     otp_indicators = Some(ind);
                     None
                 })
+            } else if pa.padata_type == crate::sam2::PA_SAM_RESPONSE_2
+                && self.securid_sam2.is_some()
+            {
+                // verify_*_data_2 set TKT_FLG_HW_AUTH on success.
+                self.sam2_verify(pa, &client).await.map(|()| {
+                    flags |= TicketFlags::HW_AUTHENT;
+                    None
+                })
             } else {
                 match self.pkinit_verify(
                     pa,
@@ -426,12 +434,13 @@ impl<S: PrincipalStore> Kdc<S> {
                 err = err.with_e_data(rasn::der::encode(&list)?);
             }
             if err.code == KDC_ERR_PREAUTH_FAILED {
+                let extras = self.hint_extras(&pk_extras, &client, client_key.as_ref(), kdc_time).await;
                 err = err.with_e_data(hint_list_with(
                     &client,
                     client_key.as_ref(),
                     hw_only,
                     is_armored,
-                    &pk_extras,
+                    &extras,
                     otp_hint.clone(),
                     spake_hint(&mut cookies),
                     cookies.make(&local_tgt, &cookie_client, kdc_time)?,
@@ -453,13 +462,14 @@ impl<S: PrincipalStore> Kdc<S> {
             None
         };
         if let Some(status) = missing {
+            let extras = self.hint_extras(&pk_extras, &client, client_key.as_ref(), kdc_time).await;
             return Err(KdcError::new(KDC_ERR_PREAUTH_REQUIRED, status).with_e_data(
                 hint_list_with(
                     &client,
                     client_key.as_ref(),
                     hw_only,
                     is_armored,
-                    &pk_extras,
+                    &extras,
                     otp_hint.clone(),
                     spake_hint(&mut cookies),
                     cookies.make(&local_tgt, &cookie_client, kdc_time)?,

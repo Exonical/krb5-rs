@@ -41,6 +41,7 @@ bitflags::bitflags! {
     pub struct SamFlags: u32 {
         /// `KRB5_SAM_USE_SAD_AS_KEY`.
         const USE_SAD_AS_KEY      = 0x8000_0000;
+        /// `KRB5_SAM_SEND_ENCRYPTED_SAD`.
         const SEND_ENCRYPTED_SAD  = 0x4000_0000;
         /// `KRB5_SAM_MUST_PK_ENCRYPT_SAD`.
         const MUST_PK_ENCRYPT_SAD = 0x2000_0000;

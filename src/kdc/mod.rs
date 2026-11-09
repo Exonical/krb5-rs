@@ -37,6 +37,7 @@ mod preauth;
 pub mod replication;
 mod reqbody;
 mod s4u;
+pub mod securid_sam2;
 #[cfg(feature = "tokio")]
 mod server;
 mod spake;
@@ -213,6 +214,7 @@ pub struct Kdc<S: PrincipalStore> {
     kdcpolicy: Vec<Arc<dyn plugins::KdcPolicy>>,
     audit: Vec<Arc<dyn plugins::Audit>>,
     kdcauthdata: Vec<Arc<dyn plugins::KdcAuthdata>>,
+    securid_sam2: Option<securid_sam2::SecuridSam2>,
     lookaside: lookaside::Lookaside,
 }
 
@@ -234,6 +236,7 @@ pub struct KdcBuilder<S: PrincipalStore> {
     kdcpolicy: Vec<Arc<dyn plugins::KdcPolicy>>,
     audit: Vec<Arc<dyn plugins::Audit>>,
     kdcauthdata: Vec<Arc<dyn plugins::KdcAuthdata>>,
+    securid_sam2: Option<securid_sam2::SecuridSam2>,
 }
 
 impl<S: PrincipalStore> KdcBuilder<S> {
@@ -281,6 +284,12 @@ impl<S: PrincipalStore> KdcBuilder<S> {
         self
     }
 
+    /// Enable MIT's `securid_sam2` pre-authentication module.
+    pub fn securid_sam2(mut self, module: securid_sam2::SecuridSam2) -> Self {
+        self.securid_sam2 = Some(module);
+        self
+    }
+
     /// Finish.
     pub fn build(self) -> Kdc<S> {
         Kdc {
@@ -293,6 +302,7 @@ impl<S: PrincipalStore> KdcBuilder<S> {
             kdcpolicy: self.kdcpolicy,
             audit: self.audit,
             kdcauthdata: self.kdcauthdata,
+            securid_sam2: self.securid_sam2,
             lookaside: lookaside::Lookaside::default(),
         }
     }
@@ -325,6 +335,13 @@ impl<S: PrincipalStore> Kdc<S> {
         self
     }
 
+    /// Replace the `securid_sam2` module (see [`KdcBuilder::securid_sam2`]).
+    #[must_use]
+    pub fn with_securid_sam2(mut self, module: Option<securid_sam2::SecuridSam2>) -> Self {
+        self.securid_sam2 = module;
+        self
+    }
+
     /// Start a [`KdcBuilder`].
     pub fn builder(config: KdcConfig, store: S) -> KdcBuilder<S> {
         KdcBuilder {
@@ -337,6 +354,7 @@ impl<S: PrincipalStore> Kdc<S> {
             kdcpolicy: Vec::new(),
             audit: Vec::new(),
             kdcauthdata: Vec::new(),
+            securid_sam2: None,
         }
     }
 
@@ -361,6 +379,8 @@ impl<S: PrincipalStore> Kdc<S> {
     ) -> Vec<u8> {
         match self.dispatch(request, now, peer).await {
             Ok(reply) => reply,
+            // A discarded request gets no reply (do_as_req.c:372).
+            Err(f) if f.err.code == securid_sam2::KDC_ERR_DISCARD => Vec::new(),
             Err(f) => build_krb_error(&f.err, &f.ctx, now),
         }
     }
@@ -441,7 +461,13 @@ impl<S: PrincipalStore> Kdc<S> {
             .await;
         #[cfg(not(feature = "tokio"))]
         let reply = self.handle_from_at(request, now, peer).await;
-        pending.finish(&reply, Utc::now().timestamp());
+        if reply.is_empty() {
+            // finish_dispatch_cache (dispatch.c:76-79) keeps the null entry
+            // of a discarded request, so its retransmits are dropped too.
+            pending.discard(Utc::now().timestamp());
+        } else {
+            pending.finish(&reply, Utc::now().timestamp());
+        }
         let reply = datagram(reply);
         let summary = RequestSummary::new(request, &reply, transport);
         #[cfg(feature = "tokio")]
