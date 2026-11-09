@@ -35,6 +35,9 @@ metadata:
   name: krb5-rs-kdc-cockroach-config
 data:
   kdc.conf: |
+    [logging]
+     default = STDERR
+
     [kdcdefaults]
      kdc_ports = 8888
      kdc_tcp_ports = 8888
@@ -74,6 +77,9 @@ data:
       replication_heartbeat_interval = 5s
      }
   kadmind-kdc.conf: |
+    [logging]
+     default = STDERR
+
     [realms]
      CHANGE-ME-REALM = {
       database_module = crdb

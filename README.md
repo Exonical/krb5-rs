@@ -68,7 +68,7 @@ The core library is pure Rust and cross-compiles to musl.
 The `crates/krb5-rs-kdc` workspace member builds two binaries (not published to crates.io):
 
 - `krb5-rs-kdb` administers the persistent database (`create -s`, `addprinc`, `ktadd`, ...; passwords come from stdin).
-- `krb5-rs-kdc` serves it over UDP and TCP, driven by `kdc.conf` (`--config` / `KRB5_KDC_PROFILE`, `--krb5-config` / `KRB5_CONFIG`, optional `--listen` overrides), logs one MIT-style line per request to stdout (`RUST_LOG` controls verbosity) and shuts down gracefully on SIGTERM/SIGINT (`--shutdown-timeout`).
+- `krb5-rs-kdc` serves it over UDP and TCP, driven by `kdc.conf` (`--config` / `KRB5_KDC_PROFILE`, `--krb5-config` / `KRB5_CONFIG`, optional `--listen` overrides), logs one MIT-style line per request to the `[logging]` destinations (see below) and shuts down gracefully on SIGTERM/SIGINT (`--shutdown-timeout`).
 
 ```sh
 krb5-rs-kdb --config kdc.conf create -s
@@ -77,6 +77,18 @@ krb5-rs-kdc --config kdc.conf
 ```
 
 `deploy/docker/Dockerfile` builds a distroless, nonroot image with dynamically linked glibc binaries, so krb5-rs-kadmind can load kadm5_auth modules (`podman build -f deploy/docker/Dockerfile .`). The container user cannot bind port 88: configure `kdc_ports = 8888` and map 88 to 8888 outside.
+
+### Logging
+
+`krb5-rs-kdc` and `krb5-rs-kadmind` read MIT's `[logging]` section from kdc.conf, then krb5.conf, as `krb5_klog_init` does. The KDC uses `kdc` and kadmind uses `admin_server`; either falls back to `default`, and with no usable entry both log to syslog with facility `AUTH`. Each value is one destination, and a relation may be repeated:
+
+- `FILE:path` appends to `path`; `FILE=path` writes it from the start.
+- `STDERR`, `CONSOLE` (`/dev/console`) and `DEVICE=path`.
+- `SYSLOG[:severity[:facility]]`; the severity is ignored, as in MIT.
+
+Lines use MIT's format (`Mon dd hh:mm:ss host prog[pid](severity): message`). Debug messages go to files, devices and standard error only with `[logging] debug = true`; syslog always receives them. SIGHUP reopens `FILE` destinations for log rotation, as MIT's `krb5_klog_reopen`. The container manifests and Helm chart set `default = STDERR`.
+
+`RUST_LOG`, when set, still chooses which events are logged. Without it, info and above are logged, plus krb5-rs's own debug events when a destination takes them. The messages are krb5-rs's: the per-request lines follow MIT's, while other messages are worded differently. On non-Unix systems `SYSLOG` destinations drop messages.
 
 ### Store interfaces, policies and lockout
 

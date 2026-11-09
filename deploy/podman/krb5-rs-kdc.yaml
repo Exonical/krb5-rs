@@ -21,6 +21,9 @@ metadata:
   name: krb5-rs-kdc-config
 data:
   kdc.conf: |
+    [logging]
+     default = STDERR
+
     [kdcdefaults]
      kdc_ports = 8888
      kdc_tcp_ports = 8888

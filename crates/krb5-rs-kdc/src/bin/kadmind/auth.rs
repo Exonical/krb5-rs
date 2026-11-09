@@ -397,7 +397,7 @@ fn load_dyn(name: &str, path: &Path, acl_file: &Path) -> Result<Option<DynModule
     let lib = match unsafe { libloading::Library::new(path) } {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("krb5-rs-kadmind: kadm5_auth module {name}: {e}");
+            tracing::error!("kadm5_auth module {name}: {e}");
             return Ok(None);
         }
     };
@@ -406,7 +406,7 @@ fn load_dyn(name: &str, path: &Path, acl_file: &Path) -> Result<Option<DynModule
     let initvt: InitVt = match unsafe { lib.get::<InitVt>(sym.as_bytes()) } {
         Ok(f) => *f,
         Err(e) => {
-            eprintln!("krb5-rs-kadmind: kadm5_auth module {name}: {e}");
+            tracing::error!("kadm5_auth module {name}: {e}");
             return Ok(None);
         }
     };

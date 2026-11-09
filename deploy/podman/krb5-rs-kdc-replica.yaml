@@ -16,6 +16,9 @@ metadata:
   name: krb5-rs-kdc-replica-config
 data:
   kdc.conf: |
+    [logging]
+     default = STDERR
+
     [kdcdefaults]
      kdc_ports = 8888
      kdc_tcp_ports = 8888
@@ -34,6 +37,9 @@ data:
      dns_lookup_kdc = false
      dns_lookup_realm = false
   keytab-kdc.conf: |
+    [logging]
+     default = STDERR
+
     [realms]
      EXAMPLE.COM = {
       database_name = /var/lib/krb5-rs/keytab-principal

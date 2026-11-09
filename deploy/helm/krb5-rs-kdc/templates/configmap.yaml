@@ -11,6 +11,8 @@ data:
   replica-kdc.conf: |
     {{- include "krb5-rs-kdc.kdcConf" (dict "ctx" . "role" "replica") | nindent 4 }}
   keytab-kdc.conf: |
+    [logging]
+     default = STDERR
     [realms]
      {{ .Values.realm }} = {
       database_name = /keytab/principal
@@ -19,6 +21,8 @@ data:
      }
   {{- if .Values.propagation.iprop.enabled }}
   replica-stash.conf: |
+    [logging]
+     default = STDERR
     [realms]
      {{ .Values.realm }} = {
       database_name = /keytab/principal
