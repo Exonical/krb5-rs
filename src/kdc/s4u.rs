@@ -76,6 +76,7 @@ pub(super) struct EvidenceTicket {
     pub pac: Option<Pac>,
     pub sname: PrincipalName,
     pub realm: String,
+    pub key: EncryptionKey,
 }
 
 fn raw_checksum(cksum_type: i32, key: &EncryptionKey, usage: i32, data: &[u8]) -> Option<Vec<u8>> {
@@ -518,6 +519,7 @@ impl<S: PrincipalStore> Kdc<S> {
             pac,
             sname: ticket.sname.clone(),
             realm,
+            key,
         })
     }
 

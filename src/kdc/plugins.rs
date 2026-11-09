@@ -1,10 +1,12 @@
 //! KDC policy (`kdc/policy.c`, `kdcpolicy_plugin.h`) and audit
-//! (`kdc/kdc_audit.c`, `audit_plugin.h`) modules.
+//! (`kdc/kdc_audit.c`, `audit_plugin.h`) modules, and authdata modules
+//! (`kdc/kdc_authdata.c`, `kdcauthdata_plugin.h`).
 
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
+pub mod greet;
 pub mod rpc;
 
 /// `KRB5KDC_ERR_POLICY`.
@@ -204,6 +206,82 @@ pub trait Audit: Send + Sync {
     fn s4u2proxy(&self, _success: bool, _state: &AuditState) {}
     /// `tgs_u2u`.
     fn u2u(&self, _success: bool, _state: &AuditState) {}
+}
+
+/// `KRB5_KDB_FLAG_*` values (kdb.h) in [`AuthdataRequest::flags`].
+pub mod kdb_flags {
+    /// `KRB5_KDB_FLAG_REFERRAL_OK`.
+    pub const REFERRAL_OK: i32 = 0x10;
+    /// `KRB5_KDB_FLAG_CLIENT`.
+    pub const CLIENT: i32 = 0x40;
+    /// `KRB5_KDB_FLAG_PROTOCOL_TRANSITION`.
+    pub const PROTOCOL_TRANSITION: i32 = 0x100;
+    /// `KRB5_KDB_FLAG_CONSTRAINED_DELEGATION`.
+    pub const CONSTRAINED_DELEGATION: i32 = 0x200;
+    /// `KRB5_KDB_FLAG_USER_TO_USER`.
+    pub const USER_TO_USER: i32 = 0x800;
+    /// `KRB5_KDB_FLAG_CROSS_REALM`.
+    pub const CROSS_REALM: i32 = 0x1000;
+    /// `KRB5_KDB_FLAG_ISSUING_REFERRAL`.
+    pub const ISSUING_REFERRAL: i32 = 0x4000;
+}
+
+/// `KRB5_AS_REQ`.
+pub const MSG_AS_REQ: i32 = 10;
+/// `KRB5_TGS_REQ`.
+pub const MSG_TGS_REQ: i32 = 12;
+
+/// A principal and its realm.
+pub type Principal = (crate::types::PrincipalName, String);
+
+/// The arguments of `krb5_kdcauthdata_handle_fn` other than the reply
+/// ticket.
+#[derive(Debug, Clone, Default)]
+pub struct AuthdataRequest {
+    /// `flags`: [`kdb_flags`].
+    pub flags: i32,
+    /// [`MSG_AS_REQ`] or [`MSG_TGS_REQ`] (`req->msg_type`).
+    pub msg_type: i32,
+    /// `client`: the client's database entry, if it has one.
+    pub client: Option<Principal>,
+    /// `server`.
+    pub server: Option<Principal>,
+    /// `header_server`: for TGS, the server of the header or evidence
+    /// ticket.
+    pub header_server: Option<Principal>,
+    /// `client_key`: the client's long-term key (AS) or the TGS reply key
+    /// (subkey or header ticket session key).
+    pub client_key: Option<crate::types::EncryptionKey>,
+    /// `server_key`: the key the new ticket is encrypted in.
+    pub server_key: Option<crate::types::EncryptionKey>,
+    /// `header_key`: for TGS, the key of the header or evidence ticket.
+    pub header_key: Option<crate::types::EncryptionKey>,
+    /// `req_pkt`: the DER request.
+    pub req_pkt: Vec<u8>,
+    /// `for_user_princ`: the S4U client.
+    pub for_user: Option<Principal>,
+    /// `enc_tkt_req`: for TGS, the header or evidence ticket.
+    pub enc_tkt_req: Option<crate::types::EncTicketPart>,
+}
+
+/// A KDC authdata module (`krb5_kdcauthdata_vtable`).
+pub trait KdcAuthdata: Send + Sync {
+    /// The module name.
+    fn name(&self) -> &str;
+    /// `init`: an error skips the module, as in MIT.
+    fn init(&self) -> Result<(), i32> {
+        Ok(())
+    }
+    /// `fini`.
+    fn fini(&self) {}
+    /// `handle`: may add authorization data to `reply`. An error is
+    /// logged by the KDC and the ticket is issued anyway, as in MIT
+    /// (kdc_authdata.c:601-612).
+    fn handle(
+        &self,
+        req: &AuthdataRequest,
+        reply: &mut crate::types::EncTicketPart,
+    ) -> Result<(), i32>;
 }
 
 #[cfg(test)]

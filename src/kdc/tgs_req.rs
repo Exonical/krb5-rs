@@ -856,6 +856,36 @@ impl<S: PrincipalStore> Kdc<S> {
                 (None, None) => S4uPac::None,
             },
             &indicators,
+            || {
+                use super::plugins::{kdb_flags, AuthdataRequest, MSG_TGS_REQ};
+                let flag = |on: bool, f: i32| if on { f } else { 0 };
+                AuthdataRequest {
+                    flags: flag(is_referral, kdb_flags::ISSUING_REFERRAL)
+                        | flag(is_crossrealm, kdb_flags::CROSS_REALM)
+                        | flag(s4u2self.is_some(), kdb_flags::PROTOCOL_TRANSITION)
+                        | flag(stkt.is_some(), kdb_flags::CONSTRAINED_DELEGATION),
+                    msg_type: MSG_TGS_REQ,
+                    client: client.as_ref().map(|c| (c.name.clone(), c.realm.clone())),
+                    server: Some((server.name.clone(), server.realm.clone())),
+                    header_server: Some(stkt.as_ref().map_or_else(
+                        || (header_server.name.clone(), header_server.realm.clone()),
+                        |e| (e.server.name.clone(), e.server.realm.clone()),
+                    )),
+                    client_key: Some(initial_reply_key.clone()),
+                    server_key: Some(
+                        u2u_tkt
+                            .as_ref()
+                            .map_or(&server_key.key, |e| &e.part.key)
+                            .clone(),
+                    ),
+                    header_key: Some(stkt.as_ref().map_or(&header_key, |e| &e.key).clone()),
+                    req_pkt: raw.to_vec(),
+                    for_user: s4u2self
+                        .as_ref()
+                        .map(|s| (s.user.clone(), s.user_realm.clone())),
+                    enc_tkt_req: Some(subject_tkt.clone()),
+                }
+            },
         )?;
         let kvno =
             i32::try_from(server_key.kvno).map_err(|_| KdcError::generic("FINDING_SERVER_KEY"))?;

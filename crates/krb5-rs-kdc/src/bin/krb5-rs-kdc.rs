@@ -780,7 +780,8 @@ async fn termination_signal() -> std::io::Result<&'static str> {
     Ok("ctrl-c")
 }
 
-/// The `[plugins] kdcpolicy` and `audit` modules from krb5.conf, then
+/// The `[plugins] kdcpolicy`, `audit` and `kdcauthdata` modules from
+/// krb5.conf, then
 /// kdc.conf, the order MIT's KDC profile and kadmind search them in.
 fn load_plugins(cli: &Cli, krb5_conf_explicit: bool) -> std::io::Result<plugins::Modules> {
     let mut profiles = Vec::new();
@@ -829,7 +830,10 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
     };
     let modules = load_plugins(&cli, krb5_conf_explicit)?;
     let audit = modules.1.clone();
-    let kdc = Arc::new(kdc.with_plugins(modules.0, modules.1));
+    let kdc = Arc::new(
+        kdc.with_plugins(modules.0, modules.1)
+            .with_kdcauthdata(modules.2),
+    );
     // kau_kdc_start (main.c:1028).
     for m in &audit {
         m.kdc_start(true);

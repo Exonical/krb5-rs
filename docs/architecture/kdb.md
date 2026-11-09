@@ -1216,6 +1216,38 @@ The tests port MIT's `plugins/kdcpolicy/test/main.c` and
 `plugins/audit/test/au_test.c` and run the `t_kdcpolicy.py` and `t_audit.py`
 cases against the daemon.
 
+### KDC authdata modules
+
+MIT's `kdcauthdata` interface (`kdcauthdata_plugin.h`, `kdc/kdc_authdata.c`)
+is `krb5_rs::kdc::plugins::KdcAuthdata`. Modules run in another process and
+are reached over the same socket RPC as kdcpolicy (`KRB5RS-KDCAUTHDATA-V-1`,
+`plugins::rpc::serve_kdcauthdata`), configured the same way:
+
+```text
+[plugins]
+    kdcauthdata = {
+        module = greet:unix:path=/run/krb5-rs/greet.sock
+    }
+```
+
+- **Loading:** as `load_authdata_plugins`, a module that cannot be reached,
+  refuses the version, or fails `init` is logged and skipped.
+- **Arguments:** `handle` gets MIT's `flags` (`KRB5_KDB_FLAG_*`), the client,
+  server and header/evidence server, the client (or TGS reply), server and
+  header keys, the DER request, the S4U client and the header ticket, and
+  may change the reply ticket's authorization data.
+- **Order:** as `handle_authdata`: for TGS after the request's authdata is
+  copied and before the header ticket's; for AS and TGS before the PAC is
+  added; never for an anonymous ticket. A module error is logged as
+  `... from authdata module NAME` and the ticket is still issued.
+- **`greet`:** `plugins::greet::Greet`, served by
+  `cargo run --example kdcauthdata_greet -- SOCKET`, adds to TGS tickets an
+  AD-IF-RELEVANT holding an AD-KDC-ISSUED type -42 greeting
+  (`Hello, KDC issued acceptor world!`), checksummed with the ticket session
+  key (key usage 19) and naming the header ticket's server.
+  `make_authdata_kdc_issued` and `verify_authdata_kdc_issued` are MIT's
+  `krb5_make_authdata_kdc_issued` and `krb5_verify_authdata_kdc_issued`.
+
 ### OTP pre-authentication
 
 As in MIT (`plugins/preauth/otp/main.c`, `otp_state.c`, `lib/krad`,
