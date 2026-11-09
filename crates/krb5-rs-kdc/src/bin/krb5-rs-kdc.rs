@@ -1,4 +1,9 @@
-//! KDC daemon for a single realm.
+//! KDC daemon, MIT's `krb5kdc`.
+//!
+//! MIT's options (`-r REALM`, repeatable, and `-d`, `-x`, `-m`, `-M`, `-k`,
+//! `-p`, `-P`, `-n`, `-w`, `-T`) work as in `krb5kdc`; one process serves
+//! every realm named, each on all the listen addresses. Unless `-n` is given
+//! the KDC detaches from the terminal once its sockets are bound.
 //!
 //! Two modes:
 //!
@@ -29,8 +34,8 @@ use krb5_rs::kdc::kdb::{master_key_from_password_named, read_stash_named, FileSt
 use krb5_rs::kdc::GateSubject;
 use krb5_rs::kdc::{
     default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
-    MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig, RequestLogger,
-    ServeOptions, StoreError,
+    KdcRealms, MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig,
+    RequestLogger, ServeOptions, StoreError,
 };
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
@@ -41,6 +46,15 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
+
+#[cfg(unix)]
+#[path = "../daemonize.rs"]
+mod daemonize;
+#[path = "../kdc_args.rs"]
+mod kdc_args;
+#[cfg(unix)]
+#[path = "../kdc_workers.rs"]
+mod kdc_workers;
 
 #[path = "../klog.rs"]
 mod klog;
@@ -53,7 +67,11 @@ mod plugins;
 const DEFAULT_KDC_PROFILE: &str = "/usr/local/var/krb5kdc/kdc.conf";
 
 #[derive(Parser)]
-#[command(name = "krb5-rs-kdc", version, about = "Kerberos V5 KDC for one realm")]
+#[command(
+    name = "krb5-rs-kdc",
+    version,
+    about = "Kerberos V5 KDC (MIT krb5kdc options are also accepted)"
+)]
 struct Cli {
     /// kdc.conf to read (config mode).
     #[arg(long, env = "KRB5_KDC_PROFILE", value_name = "PATH")]
@@ -63,7 +81,8 @@ struct Cli {
     #[arg(long, env = "KRB5_CONFIG", value_name = "PATH")]
     krb5_config: Option<PathBuf>,
 
-    /// Realm to serve (default: the sole realm in kdc.conf, else krb5.conf).
+    /// Realm to serve, after any given with -r (default: the sole realm in
+    /// kdc.conf, else krb5.conf).
     #[arg(long, value_name = "REALM")]
     realm: Option<String>,
 
@@ -792,8 +811,30 @@ async fn cockroach_mode(
 
 /// Load kdc.conf and open the database; `None` means shutdown arrived
 /// before the KDC could start.
+/// `krb5_db_fetch_mkey` with `manual` set (kdb_default.c): MIT's
+/// `KRB5_KDC_MKEY_1` prompt, without echo on a terminal.
+fn read_master_password() -> std::io::Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    print!("Enter KDC database master key: ");
+    std::io::stdout().flush()?;
+    let password = if std::io::stdin().is_terminal() {
+        let p = rpassword::read_password()?;
+        println!();
+        p
+    } else {
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        line.trim_end_matches(['\r', '\n']).to_string()
+    };
+    if password.is_empty() {
+        return Err(io_err("empty master password"));
+    }
+    Ok(password)
+}
+
 async fn config_mode(
     cli: &Cli,
+    ra: &kdc_args::RealmArgs,
     krb5_conf_explicit: bool,
     shutdown_rx: &watch::Receiver<bool>,
     metrics: Arc<metrics::Metrics>,
@@ -810,12 +851,35 @@ async fn config_mode(
         }
         _ => None,
     };
-    let realm = cli
+    let realm = ra
         .realm
         .clone()
         .or_else(|| default_realm(&kdc_conf, krb5.as_ref()))
         .ok_or_else(|| io_err("no realm given and no default realm found"))?;
-    let cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm).map_err(io_err)?;
+    let mut cfg = RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), &realm).map_err(io_err)?;
+    // init_realm (main.c:196-330): kdc.conf's [realms] settings win over
+    // the command line's.
+    let in_realm = |key: &str| kdc_conf.get_string(&["realms", &realm, key]).is_some();
+    if let Some(name) = ra
+        .mkey_name
+        .as_ref()
+        .filter(|_| !in_realm("master_key_name"))
+    {
+        cfg.master_key_name = name.clone();
+    }
+    let manual = ra.manual && !in_realm("key_stash_file");
+    if manual && !in_realm("master_key_type") {
+        cfg.master_key_type = ra.menctype.unwrap_or(18);
+    }
+    if let Some(ports) = &ra.ports {
+        if !in_realm("kdc_listen") && !in_realm("kdc_ports") {
+            cfg.udp_listen = parse_listen_addresses(ports, 88).map_err(io_err)?;
+        }
+        if !in_realm("kdc_tcp_listen") && !in_realm("kdc_tcp_ports") {
+            cfg.tcp_listen = parse_listen_addresses(ports, 88).map_err(io_err)?;
+        }
+    }
+    cfg.kdc.time_offset = chrono::Duration::seconds(ra.time_offset);
     if let Some(e) = krb5_rs::kdc::otp_config_error(&kdc_conf, krb5.as_ref()) {
         error!("preauth otp failed to initialize: {e}");
     }
@@ -824,6 +888,7 @@ async fn config_mode(
         // test_fetch_master_key).
         return test_mode(cli, &kdc_conf, cfg, metrics).map(Some);
     }
+    cfg.apply_db_args(&ra.db_args).map_err(io_err)?;
     let master = match &cli.master_password_file {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -836,6 +901,16 @@ async fn config_mode(
                 &realm,
                 &cfg.master_key_name,
                 password,
+                cfg.master_key_type,
+            )
+            .map_err(io_err)?
+        }
+        None if manual => {
+            let password = read_master_password()?;
+            master_key_from_password_named(
+                &realm,
+                &cfg.master_key_name,
+                &password,
                 cfg.master_key_type,
             )
             .map_err(io_err)?
@@ -944,16 +1019,74 @@ fn load_plugins(cli: &Cli, krb5_conf_explicit: bool) -> std::io::Result<plugins:
     plugins::load(&refs).map_err(io_err)
 }
 
-async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::io::Result<()> {
+/// What `main` took from MIT's options.
+struct Startup {
+    realms: Vec<kdc_args::RealmArgs>,
+    nofork: bool,
+    /// `-n` was given: print "starting..." (main.c:1026-1027).
+    announce: bool,
+    workers: usize,
+    pid_file: Option<PathBuf>,
+    /// The sockets inherited from a `-w` supervisor.
+    worker_fds: Option<String>,
+    progname: String,
+    /// Where relative paths on the command line are resolved; workers
+    /// start here, since the supervisor has moved to `/`.
+    start_dir: Option<PathBuf>,
+}
+
+/// Bind every UDP and TCP listen address.
+async fn bind_listeners(addrs: &Listen) -> std::io::Result<(Vec<UdpSocket>, Vec<TcpListener>)> {
+    let (mut udp, mut tcp) = (Vec::new(), Vec::new());
+    for addr in &addrs.udp {
+        match UdpSocket::bind(addr).await {
+            Ok(sock) => {
+                info!("listening on {} (udp)", sock.local_addr()?);
+                udp.push(sock);
+            }
+            Err(e) if tolerable(addr, &e) => info!("skipping udp {addr}: {e}"),
+            Err(e) => return Err(io_err(format!("bind udp {addr}: {e}"))),
+        }
+    }
+    for addr in &addrs.tcp {
+        match bind_tcp(*addr, addrs.backlog) {
+            Ok(l) => {
+                info!("listening on {} (tcp)", l.local_addr()?);
+                tcp.push(l);
+            }
+            Err(e) if tolerable(addr, &e) => info!("skipping tcp {addr}: {e}"),
+            Err(e) => return Err(io_err(format!("bind tcp {addr}: {e}"))),
+        }
+    }
+    Ok((udp, tcp))
+}
+
+async fn run(
+    cli: Cli,
+    st: Startup,
+    krb5_conf_explicit: bool,
+    config_explicit: bool,
+) -> std::io::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let metrics = Arc::new(metrics::Metrics::new());
-    let (kdc, addrs, prop) = match &cli.keytab {
+    let mut kdcs = Vec::new();
+    let mut addrs = Listen {
+        udp: Vec::new(),
+        tcp: Vec::new(),
+        backlog: DEFAULT_TCP_LISTEN_BACKLOG,
+    };
+    let mut prop = ModeParts::default();
+    match &cli.keytab {
         Some(kt) => {
             if config_explicit {
                 return Err(io_err("--keytab and --config are mutually exclusive"));
             }
-            let (kdc, addrs) = keytab_mode(&cli, kt, Arc::clone(&metrics)).await?;
-            (kdc, addrs, ModeParts::default())
+            if st.realms.len() > 1 {
+                return Err(io_err("--keytab serves one realm"));
+            }
+            let (kdc, a) = keytab_mode(&cli, kt, Arc::clone(&metrics)).await?;
+            kdcs.push(kdc);
+            addrs = a;
         }
         None => {
             if cli.max_life.is_some() || cli.max_renewable_life.is_some() {
@@ -961,23 +1094,71 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
                     "--max-life/--max-renewable-life come from kdc.conf in config mode",
                 ));
             }
-            match config_mode(&cli, krb5_conf_explicit, &shutdown_rx, Arc::clone(&metrics)).await? {
-                Some(parts) => parts,
-                None => return Ok(()),
+            // Every realm is answered on every realm's addresses
+            // (main.c:976-990, dispatch.c setup_server_realm).
+            for (i, ra) in st.realms.iter().enumerate() {
+                let (kdc, a, parts) = match config_mode(
+                    &cli,
+                    ra,
+                    krb5_conf_explicit,
+                    &shutdown_rx,
+                    Arc::clone(&metrics),
+                )
+                .await
+                {
+                    Ok(Some(parts)) => parts,
+                    Ok(None) => return Ok(()),
+                    Err(e) => {
+                        // main.c:694-698, 805-809.
+                        error!("{e}");
+                        let name = ra.realm.as_deref().unwrap_or("(default)");
+                        eprintln!(
+                            "{}: cannot initialize realm {name} - see log file for details",
+                            st.progname
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                kdcs.push(kdc);
+                if i == 0 {
+                    addrs.backlog = a.backlog;
+                }
+                for x in a.udp {
+                    if !addrs.udp.contains(&x) {
+                        addrs.udp.push(x);
+                    }
+                }
+                for x in a.tcp {
+                    if !addrs.tcp.contains(&x) {
+                        addrs.tcp.push(x);
+                    }
+                }
+                prop.metrics_listen = prop.metrics_listen.or(parts.metrics_listen);
+                #[cfg(feature = "cockroach")]
+                if let Some(r) = parts.replication {
+                    if prop.replication.is_some() {
+                        return Err(io_err(
+                            "only one realm can use krb5-rs-cockroach replication",
+                        ));
+                    }
+                    prop.replication = Some(r);
+                }
             }
         }
-    };
+    }
     let modules = load_plugins(&cli, krb5_conf_explicit)?;
     let audit = modules.1.clone();
-    let kdc = Arc::new(
-        kdc.with_plugins(modules.0, modules.1)
-            .with_kdcauthdata(modules.2)
-            .with_securid_sam2(modules.3),
-    );
-    // kau_kdc_start (main.c:1028).
-    for m in &audit {
-        m.kdc_start(true);
-    }
+    let kdcs = kdcs
+        .into_iter()
+        .map(|kdc| {
+            Arc::new(
+                kdc.with_plugins(modules.0.clone(), modules.1.clone())
+                    .with_kdcauthdata(modules.2.clone())
+                    .with_securid_sam2(modules.3.clone()),
+            )
+        })
+        .collect();
+    let kdc = Arc::new(KdcRealms::new(kdcs));
 
     let request_metrics = Arc::clone(&metrics);
     let logger: RequestLogger = Arc::new(move |summary, peer| {
@@ -989,36 +1170,40 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
         shutdown: Some(shutdown_rx.clone()),
     };
 
-    let mut tasks = JoinSet::new();
-    let mut bound_kdc_listeners = 0usize;
-    for addr in &addrs.udp {
-        match UdpSocket::bind(addr).await {
-            Ok(sock) => {
-                info!("listening on {} (udp)", sock.local_addr()?);
-                tasks.spawn(serve_udp_with(Arc::clone(&kdc), sock, options.clone()));
-                bound_kdc_listeners += 1;
+    let (udp_socks, tcp_socks) = match &st.worker_fds {
+        #[cfg(unix)]
+        Some(spec) => {
+            let socks = kdc_workers::adopt(spec)?;
+            // A forked MIT worker shares the detached supervisor's `/`.
+            if !st.announce {
+                std::env::set_current_dir("/")?;
             }
-            Err(e) if tolerable(addr, &e) => info!("skipping udp {addr}: {e}"),
-            Err(e) => return Err(io_err(format!("bind udp {addr}: {e}"))),
+            socks
         }
-    }
-    for addr in &addrs.tcp {
-        match bind_tcp(*addr, addrs.backlog) {
-            Ok(l) => {
-                info!("listening on {} (tcp)", l.local_addr()?);
-                tasks.spawn(serve_tcp_with(Arc::clone(&kdc), l, options.clone()));
-                bound_kdc_listeners += 1;
-            }
-            Err(e) if tolerable(addr, &e) => info!("skipping tcp {addr}: {e}"),
-            Err(e) => return Err(io_err(format!("bind tcp {addr}: {e}"))),
-        }
-    }
-    let metrics_listen = cli.metrics_listen.or(prop.metrics_listen);
-    #[cfg(feature = "cockroach")]
-    let replication = prop.replication;
-    if bound_kdc_listeners == 0 {
+        _ => bind_listeners(&addrs).await?,
+    };
+    if udp_socks.is_empty() && tcp_socks.is_empty() {
         return Err(io_err("no KDC listen address could be bound"));
     }
+    // daemon(0, 0), then the PID file (main.c:996-1006).
+    #[cfg(unix)]
+    if !st.nofork {
+        daemonize::detach().map_err(|e| io_err(format!("{e} while detaching from tty")))?;
+    }
+    if let Some(path) = &st.pid_file {
+        std::fs::write(path, format!("{}\n", std::process::id()))
+            .map_err(|e| io_err(format!("{e} while creating PID file")))?;
+    }
+    let supervisor = st.workers > 0;
+    let mut tasks = JoinSet::new();
+    // Each worker would bind the metrics address again; the supervisor
+    // serves it.
+    let metrics_listen = match st.worker_fds {
+        Some(_) => None,
+        None => cli.metrics_listen.or(prop.metrics_listen),
+    };
+    #[cfg(feature = "cockroach")]
+    let replication = if supervisor { None } else { prop.replication };
     #[cfg(feature = "cockroach")]
     let (replica_status, lockout_counters, max_staleness) = match replication {
         Some(replication) => {
@@ -1052,6 +1237,28 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
             max_staleness,
             shutdown_rx.clone(),
         ));
+    }
+
+    #[cfg(unix)]
+    if supervisor {
+        let (spec, fds) = kdc_workers::encode(&udp_socks, &tcp_socks);
+        let result = kdc_workers::supervise(st.workers, &spec, &fds, st.start_dir.as_deref()).await;
+        let _ = shutdown_tx.send(true);
+        return result;
+    }
+    for sock in udp_socks {
+        tasks.spawn(serve_udp_with(Arc::clone(&kdc), sock, options.clone()));
+    }
+    for listener in tcp_socks {
+        tasks.spawn(serve_tcp_with(Arc::clone(&kdc), listener, options.clone()));
+    }
+    // kau_kdc_start (main.c:1028), in each worker.
+    for m in &audit {
+        m.kdc_start(true);
+    }
+    info!("commencing operation");
+    if st.announce {
+        eprintln!("{}: starting...", st.progname);
     }
 
     tokio::select! {
@@ -1098,12 +1305,61 @@ async fn run(cli: Cli, krb5_conf_explicit: bool, config_explicit: bool) -> std::
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
-    let matches = Cli::command().get_matches();
+fn main() {
+    let progname = std::env::args()
+        .next()
+        .unwrap_or_else(|| "krb5-rs-kdc".into());
+    let (long_args, mit) = match kdc_args::parse(std::env::args_os()) {
+        Ok(parsed) => parsed,
+        Err(()) => {
+            eprint!("{}", kdc_args::usage(&progname));
+            std::process::exit(1);
+        }
+    };
+    for w in &mit.warnings {
+        eprintln!("{w}");
+    }
+    let matches = Cli::command().get_matches_from(long_args);
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let from_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+    let (krb5_conf_explicit, config_explicit) = (from_cli("krb5_config"), from_cli("config"));
+    #[cfg(unix)]
+    let worker_fds = std::env::var(kdc_workers::ENV).ok();
+    #[cfg(not(unix))]
+    let worker_fds: Option<String> = None;
+    if cfg!(not(unix)) && mit.workers > 0 {
+        eprintln!("{progname}: worker processes need a Unix system");
+        std::process::exit(1);
+    }
+    let worker = worker_fds.is_some();
+    let st = Startup {
+        realms: kdc_args::realms(&mit, cli.realm.as_deref()),
+        nofork: mit.nofork || worker || cfg!(not(unix)),
+        announce: mit.nofork,
+        workers: if worker { 0 } else { mit.workers },
+        pid_file: if worker { None } else { mit.pid_file.clone() },
+        worker_fds,
+        progname: progname.clone(),
+        start_dir: std::env::current_dir().ok(),
+    };
+    #[cfg(unix)]
+    if !st.nofork {
+        if let Err(e) = daemonize::fork() {
+            eprintln!("{progname}: {e} while detaching from tty");
+            std::process::exit(1);
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("{progname}: {e} while creating main loop");
+            std::process::exit(1);
+        });
+    runtime.block_on(daemon_main(cli, st, krb5_conf_explicit, config_explicit));
+}
 
+async fn daemon_main(cli: Cli, st: Startup, krb5_conf_explicit: bool, config_explicit: bool) {
     // krb5_klog_init(kcontext, "kdc", argv[0], 1) (kdc/main.c), from the
     // KDC profile: kdc.conf, then krb5.conf.
     let whoami = std::env::args()
@@ -1148,7 +1404,7 @@ async fn main() {
         }
     });
 
-    if let Err(e) = run(cli, from_cli("krb5_config"), from_cli("config")).await {
+    if let Err(e) = run(cli, st, krb5_conf_explicit, config_explicit).await {
         error!("{e}");
         std::process::exit(1);
     }

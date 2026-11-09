@@ -142,7 +142,7 @@ for cmd in "${CMDS[@]}"; do
   i=$((i+1))
 done
 
-$BIN/krb5-rs-kdc --realm $R >> "$B/kdc.log" 2>&1 &
+$BIN/krb5-rs-kdc -n --realm $R >> "$B/kdc.log" 2>&1 &
 $BIN/krb5-rs-kadmind -r $R -nofork >> "$B/kadmind.log" 2>&1 &
 wait_port 18891 || fail "kdc did not start"
 wait_port 18749 || fail "kadmind did not start"

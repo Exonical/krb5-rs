@@ -59,7 +59,8 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "tokio")]
 pub use otp::TokenType as OtpTokenType;
 pub use server::{
-    serve_tcp, serve_tcp_with, serve_udp, serve_udp_with, RequestLogger, ServeOptions,
+    serve_tcp, serve_tcp_with, serve_udp, serve_udp_with, KdcRealms, KdcService, RequestLogger,
+    ServeOptions,
 };
 
 pub use summary::{Outcome, RequestKind, RequestSummary, Transport};
@@ -122,6 +123,9 @@ pub struct KdcConfig {
     /// Largest reply sent over UDP; larger replies are replaced by
     /// `KRB_ERR_RESPONSE_TOO_BIG` (MIT `kdc_max_dgram_reply_size`).
     pub max_dgram_reply_size: usize,
+    /// Added to the system clock (MIT `krb5kdc -T`, `krb5_set_time_offsets`,
+    /// kdc/main.c:243-244); for testing only.
+    pub time_offset: chrono::Duration,
     /// The KDC's krb5.conf, for `[domain_realm]` (referrals) and `[capaths]`
     /// (transit checking and alternate TGTs). Without it only hierarchical
     /// realm relationships are known and no host-to-realm mapping exists.
@@ -183,6 +187,7 @@ impl KdcConfig {
             supported_enctypes: vec![18, 17, 20, 19],
             clockskew: Duration::from_secs(300),
             max_dgram_reply_size: 65536,
+            time_offset: chrono::Duration::zero(),
             realm_profile: None,
             host_based_services: Vec::new(),
             no_host_referral: Vec::new(),
@@ -358,10 +363,15 @@ impl<S: PrincipalStore> Kdc<S> {
         }
     }
 
+    /// The KDC's clock: the system time plus [`KdcConfig::time_offset`].
+    pub fn now(&self) -> DateTime<Utc> {
+        Utc::now() + self.config.time_offset
+    }
+
     /// Process one DER request at the current time; always returns DER
     /// (AS-REP, TGS-REP or KRB-ERROR).
     pub async fn handle(&self, request: &[u8]) -> Vec<u8> {
-        self.handle_at(request, Utc::now()).await
+        self.handle_at(request, self.now()).await
     }
 
     /// [`Kdc::handle`] with an injectable clock.
@@ -389,7 +399,7 @@ impl<S: PrincipalStore> Kdc<S> {
     /// `max_dgram_reply_size` is replaced by `KRB_ERR_RESPONSE_TOO_BIG`
     /// (MIT `finish_dispatch`, dispatch.c:54-63).
     pub async fn handle_udp(&self, request: &[u8]) -> Vec<u8> {
-        self.handle_udp_at(request, Utc::now()).await
+        self.handle_udp_at(request, self.now()).await
     }
 
     /// [`Kdc::handle_udp`] with an injectable clock.
@@ -432,11 +442,11 @@ impl<S: PrincipalStore> Kdc<S> {
         transport: Transport,
         peer: Option<std::net::SocketAddr>,
     ) -> (Vec<u8>, RequestSummary) {
-        let now = Utc::now();
+        let now = self.now();
         // finish_dispatch (dispatch.c:54-63) applies to cached replies too.
         let datagram = |reply: Vec<u8>| match transport {
             Transport::Udp if reply.len() > self.config.max_dgram_reply_size => {
-                self.bare_error(KRB_ERR_RESPONSE_TOO_BIG, Utc::now())
+                self.bare_error(KRB_ERR_RESPONSE_TOO_BIG, self.now())
             }
             _ => reply,
         };
@@ -464,9 +474,9 @@ impl<S: PrincipalStore> Kdc<S> {
         if reply.is_empty() {
             // finish_dispatch_cache (dispatch.c:76-79) keeps the null entry
             // of a discarded request, so its retransmits are dropped too.
-            pending.discard(Utc::now().timestamp());
+            pending.discard(self.now().timestamp());
         } else {
-            pending.finish(&reply, Utc::now().timestamp());
+            pending.finish(&reply, self.now().timestamp());
         }
         let reply = datagram(reply);
         let summary = RequestSummary::new(request, &reply, transport);

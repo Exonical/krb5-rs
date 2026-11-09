@@ -104,6 +104,7 @@ impl Daemon {
 
     fn start_with_env(conf: &Path, extra: &[&str], envs: &[(&str, &Path)]) -> Daemon {
         let mut child = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+            .arg("-n")
             .args([
                 "--config",
                 &conf.to_string_lossy(),
@@ -299,6 +300,7 @@ async fn failed_requests_are_logged_with_mits_status() {
 fn bad_configuration_exits_non_zero_with_a_message() {
     let dir = TempDir::new("bad");
     let out = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+        .arg("-n")
         .args(["--config", &dir.path("missing.conf").to_string_lossy()])
         .output()
         .expect("run");
@@ -409,6 +411,7 @@ async fn master_password_file_replaces_the_stash() {
 
     // Without the stash or the flag the daemon cannot start.
     let out = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+        .arg("-n")
         .args([
             "--config",
             &conf.to_string_lossy(),
@@ -430,6 +433,7 @@ async fn master_password_file_replaces_the_stash() {
     // The wrong master password is refused at startup.
     std::fs::write(&master, "wrong\n").expect("master");
     let out = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+        .arg("-n")
         .args([
             "--config",
             &conf.to_string_lossy(),
@@ -845,4 +849,124 @@ async fn kdcpolicy_and_audit_modules_like_mit() {
         )),
         "{lines:?}"
     );
+}
+
+/// Two realms in one kdc.conf, each with its own database and stash.
+fn make_two_realms(dir: &TempDir, realms: [&str; 2]) -> PathBuf {
+    let conf_path = dir.path("kdc.conf");
+    let mut text = String::from("[logging]\n kdc = STDERR\n[realms]\n");
+    let mut dbmodules = String::from("[dbmodules]\n");
+    for realm in realms {
+        text.push_str(&format!(
+            " {realm} = {{\n  database_name = {}\n  key_stash_file = {}\n  \
+             supported_enctypes = aes256-cts-hmac-sha1-96:normal\n }}\n",
+            slash(&dir.path(&format!("{realm}.db"))),
+            slash(&dir.path(&format!("{realm}.stash"))),
+        ));
+        dbmodules.push_str(&format!(
+            " {realm} = {{\n  db_library = krb5-rs-file\n }}\n"
+        ));
+    }
+    std::fs::write(&conf_path, text + &dbmodules).expect("write kdc.conf");
+    let kdc_conf = Profile::load(&conf_path).expect("kdc.conf");
+    for realm in realms {
+        let cfg = RealmConfig::from_profiles(&kdc_conf, None, realm).expect("realm config");
+        let key = master_key_from_password(realm, "master", cfg.master_key_type).expect("key");
+        let etypes: Vec<i32> = cfg.supported_keysalts.iter().map(|(e, _)| *e).collect();
+        let store = FileStore::create_with(&cfg.database_name, realm, &key, &etypes).expect("db");
+        write_stash(&cfg.key_stash_file, realm, &key).expect("stash");
+        Admin::new(&store, cfg.supported_keysalts.clone())
+            .add_principal(
+                &PrincipalName::new_principal("alice"),
+                realm,
+                Some(PASSWORD),
+                &PrincipalOptions::default(),
+            )
+            .expect("alice");
+    }
+    conf_path
+}
+
+async fn as_in<T: KdcTransport>(t: &T, realm: &str) -> Result<Credential, Krb5Error> {
+    let config = AsExchangeConfig::new(PrincipalName::new_principal("alice"), realm);
+    let mut exchange = AsExchange::new(config, PASSWORD);
+    let mut reply = Vec::new();
+    loop {
+        match exchange.step(&reply)? {
+            StepResult::SendToKdc { data, realm } | StepResult::RetryTcp { data, realm } => {
+                reply = t.send_recv(&realm, &data).await?;
+            }
+            StepResult::Complete => return exchange.credential().cloned(),
+        }
+    }
+}
+
+/// MIT `krb5kdc -r A -r B`: one process answers both realms on the same
+/// sockets, and a request for a realm it doesn't serve gets no reply
+/// (dispatch.c:154-158).
+#[tokio::test]
+async fn several_realms_are_served_from_one_process_like_mit() {
+    let realms = ["MULTI-A.TEST", "MULTI-B.TEST"];
+    let dir = TempDir::new("multi");
+    let conf = make_two_realms(&dir, realms);
+    let daemon = Daemon::start(&conf, &["-r", realms[0], "-r", realms[1]]);
+    for realm in realms {
+        let tcp = TcpTransport::new(daemon.tcp);
+        let tgt = as_in(&tcp, realm).await.expect("AS over TCP");
+        assert_eq!(tgt.crealm, realm);
+        let udp = UdpTransport::new(daemon.udp);
+        as_in(&udp, realm).await.expect("AS over UDP");
+    }
+    let tcp = TcpTransport::new(daemon.tcp);
+    let other = tokio::time::timeout(Duration::from_secs(5), as_in(&tcp, "OTHER.TEST")).await;
+    assert!(
+        matches!(other, Err(_) | Ok(Err(_))),
+        "a realm not served must not be answered: {other:?}"
+    );
+}
+
+#[test]
+fn mit_usage_for_a_bad_option() {
+    let out = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+        .args(["-w", "0"])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("[-x db_args]* [-d dbpathname] [-r dbrealmname]"),
+        "{err}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pid_file_and_detaching_like_mit() {
+    let dir = TempDir::new("pidfile");
+    let conf = make_realm(&dir);
+    let pid_path = dir.path("kdc.pid");
+    let status = Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+        .args([
+            "--config",
+            &conf.to_string_lossy(),
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .args(["-P", &pid_path.to_string_lossy()])
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run");
+    // Without -n the parent returns once the daemon is serving.
+    assert!(status.success());
+    let pid = std::fs::read_to_string(&pid_path).expect("pid file");
+    assert!(pid.ends_with('\n'));
+    let pid = pid.trim().to_string();
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "daemon {pid} is running"
+    );
+    let _ = Command::new("kill").arg(&pid).status();
 }

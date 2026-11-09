@@ -136,6 +136,7 @@ fn realm(tag: &str) -> Realm {
     let port = free_port();
     let kdc = Proc(
         Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+            .arg("-n")
             .args(["--config", &primary.to_string_lossy()])
             .args(["--listen", &format!("127.0.0.1:{port}")])
             .env_remove("RUST_LOG")

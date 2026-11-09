@@ -244,7 +244,7 @@ mit_kdc_start() {
 
 rs_kdc_start() {
   local dir=$1
-  "$RS_KDC" --config "$dir/kdc.conf" --krb5-config "$dir/krb5.conf" \
+  "$RS_KDC" -n --config "$dir/kdc.conf" --krb5-config "$dir/krb5.conf" \
     --realm "$REALM" --listen "127.0.0.1:$RS_PORT" \
     > "$dir/rs-kdc.log" 2>&1 &
   ACTIVE_PID=$!
