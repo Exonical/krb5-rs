@@ -1759,7 +1759,7 @@ fn auto_convert_legacy(
         )));
     }
 
-    let legacy = FileStore::open(database_name, master)?;
+    let legacy = FileStore::open_named(database_name, master, &options.master_key_name)?;
     if legacy.realm() != realm {
         return Err(StoreError::backend(format!(
             "legacy file database is for realm {}, expected {realm}",
