@@ -76,6 +76,10 @@ impl<T: KdcTransport> KerberosClient<T> {
         for kt in [&store.client_keytab, &store.keytab].into_iter().flatten() {
             resolve_keytab(kt).map_err(|_| gss(GssError::NoCred))?;
         }
+        // acquire_accept_cred (acquire_cred.c:172-178).
+        if let (Some(rc), true) = (&store.rcache, usage != CredUsage::Initiate) {
+            crate::protocol::ap::Rcache::resolve(rc).map_err(|_| fail())?;
+        }
         if store.password.is_some() {
             if name.is_none() {
                 return Err(gss(GssError::BadName));
@@ -495,5 +499,19 @@ mod tests {
             .expect("accept cred");
         assert_eq!(cred.keytab.as_deref(), Some("MEMORY:acf"));
         assert_eq!(cred.rcache.as_deref(), Some("none:"));
+        assert_eq!(
+            cred.acceptor_rcache(None).expect("rcache").rc_type(),
+            "none"
+        );
+        let bad = CredStore {
+            keytab: Some("MEMORY:acf".into()),
+            rcache: Some("bogus:x".into()),
+            ..Default::default()
+        };
+        let err = client
+            .acquire_cred_from(&ctx, None, Some(&user), CredUsage::Accept, &bad, false)
+            .await
+            .expect_err("bad rcache");
+        assert_eq!(major(err), Some(GssError::Failure));
     }
 }

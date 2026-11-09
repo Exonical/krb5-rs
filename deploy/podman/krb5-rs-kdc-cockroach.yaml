@@ -209,6 +209,8 @@ spec:
         - name: stash
           mountPath: /stash
           readOnly: true
+        - name: rcache
+          mountPath: /var/tmp
     - name: kdc
       image: ghcr.io/exonical/krb5-rs-kdc:CHANGE-ME-tag-cockroach
       imagePullPolicy: IfNotPresent
@@ -273,6 +275,9 @@ spec:
         - name: tmp
           mountPath: /tmp
   volumes:
+    # Replay cache for kadmind (MIT dfl: $KRB5RCACHEDIR, default /var/tmp).
+    - name: rcache
+      emptyDir: {}
     - name: data
       persistentVolumeClaim:
         claimName: krb5-rs-kdc-cockroach-data

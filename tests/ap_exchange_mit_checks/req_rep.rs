@@ -99,12 +99,14 @@ fn mk_req_rfc4537_etype_list() {
     // preference; the first permitted etype that the client desires wins.
     // Default permitted order is [18, 17, 20, 19], so 18 is negotiated.
     let mut server = AuthContext::new();
+    server.set_rcache(Some(krb5_rs::protocol::ap::Rcache::resolve("none:").expect("none")));
     server
         .rd_req(&req, Some(&service()), &OneKey(skey.clone()))
         .expect("rd_req");
     assert_eq!(server.negotiated_etype(), 18);
 
     let mut server_sha2 = AuthContext::new();
+    server_sha2.set_rcache(Some(krb5_rs::protocol::ap::Rcache::resolve("none:").expect("none")));
     server_sha2.set_permitted_etypes(Some(vec![20, 19, 18, 17]));
     server_sha2
         .rd_req(&req, Some(&service()), &OneKey(skey.clone()))
@@ -112,6 +114,7 @@ fn mk_req_rfc4537_etype_list() {
     assert_eq!(server_sha2.negotiated_etype(), 20);
 
     let mut server2 = AuthContext::new();
+    server2.set_rcache(Some(krb5_rs::protocol::ap::Rcache::resolve("none:").expect("none")));
     server2.set_permitted_etypes(Some(vec![18]));
     server2
         .rd_req(&req, Some(&service()), &OneKey(skey))

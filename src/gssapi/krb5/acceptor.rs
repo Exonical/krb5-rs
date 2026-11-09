@@ -14,6 +14,7 @@ pub struct Krb5Acceptor {
     iakerb_conv: Option<Vec<u8>>,
     /// The accepted service ticket as a credential (for S4U2Proxy).
     accepted: Option<crate::ccache::CcCredential>,
+    rcache: Option<crate::protocol::ap::Rcache>,
 }
 
 impl Krb5Acceptor {
@@ -34,7 +35,16 @@ impl Krb5Acceptor {
             done: false,
             iakerb_conv: None,
             accepted: None,
+            rcache: None,
         }
+    }
+
+    /// Use `rcache` for the AP-REQ instead of the default replay cache
+    /// (the credential's rcache, accept_sec_context.c:808-813).
+    #[must_use]
+    pub fn with_rcache(mut self, rcache: Option<crate::protocol::ap::Rcache>) -> Self {
+        self.rcache = rcache;
+        self
     }
 
     /// The constrained-delegation credential gss_accept_sec_context makes
@@ -89,6 +99,7 @@ impl Krb5Acceptor {
         }
 
         let mut ac = AuthContext::new();
+        ac.set_rcache(self.rcache.clone());
         let ap_ticket = rasn::der::decode::<ApReq>(&body[2..])
             .ok()
             .map(|r| r.ticket);

@@ -149,6 +149,24 @@ fn now() -> i64 {
 }
 
 impl GssCred {
+    /// The acceptor's replay cache: the `rcache` name if one was given,
+    /// else the default (`krb5_get_server_rcache`, acquire_cred.c:172-224);
+    /// pass it to [`super::krb5::Krb5Acceptor::with_rcache`].
+    pub fn acceptor_rcache(
+        &self,
+        profile: Option<&crate::profile::Profile>,
+    ) -> Result<crate::protocol::ap::Rcache, Krb5Error> {
+        Ok(match &self.rcache {
+            Some(name) => crate::protocol::ap::Rcache::resolve(name)?,
+            None => crate::protocol::ap::Rcache::default(profile)?,
+        })
+    }
+
+    /// `gss_krb5_set_cred_rcache`: replace the acceptor replay cache name.
+    pub fn set_cred_rcache(&mut self, rcache: &crate::protocol::ap::Rcache) {
+        self.rcache = Some(rcache.name().to_string());
+    }
+
     pub(crate) fn empty(usage: CredUsage) -> Self {
         GssCred {
             usage,
