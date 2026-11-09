@@ -326,7 +326,21 @@ fn host_name() -> String {
 /// then ask each configured token's RADIUS server in turn. An
 /// Access-Accept returns the indicators to assert; a reject moves to the
 /// next token; a transport failure ends the attempt.
+/// Validates OTP values in place of the RADIUS token types, for example
+/// against an identity provider.
+pub trait OtpVerifier: Send + Sync {
+    /// Check `value` for `principal` (unparsed, with realm). Returns the
+    /// authentication indicators to assert, or `None` to reject.
+    fn verify<'a>(
+        &'a self,
+        principal: &'a str,
+        value: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<String>>> + Send + 'a>>;
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn verify(
+    verifier: Option<&dyn OtpVerifier>,
     types: &[TokenType],
     pa_value: &[u8],
     armor: Option<&EncryptionKey>,
@@ -350,13 +364,16 @@ pub(crate) async fn verify(
         )
         .map_err(|_| failed())?;
     verify_nonce(&plain, armor, now, clockskew)?;
-    let config = config.ok_or_else(failed)?;
-    let tokens = tokens(types, config, principal).map_err(|_| failed())?;
     let value = req
         .otp_value
         .as_ref()
         .map(|v| v.to_vec())
         .unwrap_or_default();
+    if let Some(verifier) = verifier {
+        return verifier.verify(principal, &value).await.ok_or_else(failed);
+    }
+    let config = config.ok_or_else(failed)?;
+    let tokens = tokens(types, config, principal).map_err(|_| failed())?;
     let base = vec![
         (crate::krad::attr::NAS_IDENTIFIER, host_name().into_bytes()),
         (

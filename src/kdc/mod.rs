@@ -57,7 +57,7 @@ use crate::profile::Profile;
 use chrono::{DateTime, Utc};
 
 #[cfg(feature = "tokio")]
-pub use otp::TokenType as OtpTokenType;
+pub use otp::{OtpVerifier, TokenType as OtpTokenType};
 pub use server::{
     serve_tcp, serve_tcp_with, serve_udp, serve_udp_with, KdcRealms, KdcService, RequestLogger,
     ServeOptions,
@@ -220,6 +220,7 @@ pub struct Kdc<S: PrincipalStore> {
     audit: Vec<Arc<dyn plugins::Audit>>,
     kdcauthdata: Vec<Arc<dyn plugins::KdcAuthdata>>,
     securid_sam2: Option<securid_sam2::SecuridSam2>,
+    otp_verifier: Option<Arc<dyn otp::OtpVerifier>>,
     lookaside: lookaside::Lookaside,
 }
 
@@ -242,6 +243,7 @@ pub struct KdcBuilder<S: PrincipalStore> {
     audit: Vec<Arc<dyn plugins::Audit>>,
     kdcauthdata: Vec<Arc<dyn plugins::KdcAuthdata>>,
     securid_sam2: Option<securid_sam2::SecuridSam2>,
+    otp_verifier: Option<Arc<dyn otp::OtpVerifier>>,
 }
 
 impl<S: PrincipalStore> KdcBuilder<S> {
@@ -295,6 +297,13 @@ impl<S: PrincipalStore> KdcBuilder<S> {
         self
     }
 
+    /// Validate `PA-OTP-REQUEST` values with `verifier` instead of RADIUS.
+    /// OTP still requires `otp_token_types`; their indicators are not used.
+    pub fn otp_verifier(mut self, verifier: Arc<dyn otp::OtpVerifier>) -> Self {
+        self.otp_verifier = Some(verifier);
+        self
+    }
+
     /// Finish.
     pub fn build(self) -> Kdc<S> {
         Kdc {
@@ -308,6 +317,7 @@ impl<S: PrincipalStore> KdcBuilder<S> {
             audit: self.audit,
             kdcauthdata: self.kdcauthdata,
             securid_sam2: self.securid_sam2,
+            otp_verifier: self.otp_verifier,
             lookaside: lookaside::Lookaside::default(),
         }
     }
@@ -360,6 +370,7 @@ impl<S: PrincipalStore> Kdc<S> {
             audit: Vec::new(),
             kdcauthdata: Vec::new(),
             securid_sam2: None,
+            otp_verifier: None,
         }
     }
 

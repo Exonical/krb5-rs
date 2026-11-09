@@ -345,6 +345,7 @@ impl<S: PrincipalStore> Kdc<S> {
                 self.config.otp_token_types.as_deref(),
             ) {
                 super::otp::verify(
+                    self.otp_verifier.as_deref(),
                     types,
                     pa.padata_value.as_ref(),
                     armored.as_ref(),
