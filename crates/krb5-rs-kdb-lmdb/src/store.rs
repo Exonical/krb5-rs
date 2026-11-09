@@ -37,6 +37,8 @@ pub struct LmdbOptions {
     pub disable_lockout: bool,
     /// Disable last-success updates.
     pub disable_last_success: bool,
+    /// `master_key_name`, default `K/M`.
+    pub master_key_name: String,
 }
 
 impl Default for LmdbOptions {
@@ -47,6 +49,7 @@ impl Default for LmdbOptions {
             nosync: false,
             disable_lockout: false,
             disable_last_success: false,
+            master_key_name: "K/M".to_string(),
         }
     }
 }
@@ -75,6 +78,7 @@ impl LmdbOptions {
             nosync: false,
             disable_lockout,
             disable_last_success,
+            master_key_name: "K/M".to_string(),
         };
         if let Some(value) = module.get("nosync") {
             options.nosync = match value.to_ascii_lowercase().as_str() {
@@ -258,6 +262,10 @@ impl LmdbStore {
             config.kdc.disable_lockout,
             config.kdc.disable_last_success,
         )?;
+        let options = LmdbOptions {
+            master_key_name: config.master_key_name.clone(),
+            ..options
+        };
         let database_name = &config.database_name;
         let realm = config.kdc.realm.as_str();
         let keysalts = &config.supported_keysalts;
@@ -280,13 +288,8 @@ impl LmdbStore {
         let life = (max_life != Duration::ZERO).then_some(max_life);
         let renewable = (max_renewable_life != Duration::ZERO).then_some(max_renewable_life);
 
-        let master_principal = PrincipalName {
-            name_type: 1,
-            name_string: vec![
-                KerberosString::from_bytes(b"K").map_err(|e| StoreError::backend(e.to_string()))?,
-                KerberosString::from_bytes(b"M").map_err(|e| StoreError::backend(e.to_string()))?,
-            ],
-        };
+        let master_principal =
+            krb5_rs::kdc::kdb::master::master_principal_named(&options.master_key_name)?;
         let creator = PrincipalName {
             name_type: 2,
             name_string: vec![KerberosString::from_bytes(b"db_creation")
@@ -493,6 +496,10 @@ impl LmdbStore {
             config.kdc.disable_lockout,
             config.kdc.disable_last_success,
         )?;
+        let options = LmdbOptions {
+            master_key_name: config.master_key_name.clone(),
+            ..options
+        };
         let database_name = &config.database_name;
         let realm = config.kdc.realm.as_str();
         let main = main_path(database_name);
@@ -524,6 +531,10 @@ impl LmdbStore {
             config.kdc.disable_lockout,
             config.kdc.disable_last_success,
         )?;
+        let options = LmdbOptions {
+            master_key_name: config.master_key_name.clone(),
+            ..options
+        };
         let database_name = &config.database_name;
         let main = main_path(database_name);
         if !main.exists() {
@@ -609,13 +620,8 @@ impl LmdbStore {
     /// `krb5_db_fetch_mkey_list`: reread `K/M` and decrypt its master keys
     /// with the supplied (stashed) key.
     fn refresh_master(&self) -> Result<(), StoreError> {
-        let name = PrincipalName {
-            name_type: 1,
-            name_string: vec![
-                KerberosString::from_bytes(b"K").map_err(|e| StoreError::backend(e.to_string()))?,
-                KerberosString::from_bytes(b"M").map_err(|e| StoreError::backend(e.to_string()))?,
-            ],
-        };
+        let name =
+            krb5_rs::kdc::kdb::master::master_principal_named(&self.inner.options.master_key_name)?;
         let raw = self
             .get_raw(&name, &self.inner.realm)?
             .ok_or_else(|| StoreError::backend("klmdb database has no K/M principal"))?;
@@ -1434,6 +1440,10 @@ impl LmdbStore {
             config.kdc.disable_lockout,
             config.kdc.disable_last_success,
         )?;
+        let options = LmdbOptions {
+            master_key_name: config.master_key_name.clone(),
+            ..options
+        };
         let database_name = &config.database_name;
         let main = main_path(database_name);
         if update && !main.exists() {
@@ -1690,10 +1700,8 @@ fn rename_env_file(from: &Path, to: &Path) -> Result<(), StoreError> {
 
 /// Ensure migrated K/M entries have MIT's initially-active master-key tuple
 /// (`kadmin/dbutil/kdb5_create.c:423-434`).
-fn ensure_master_actkvno(entry: &mut MitEntry) -> Result<(), StoreError> {
-    if entry.principal.name_string.len() != 2
-        || entry.principal.name_string[0].as_slice() != b"K"
-        || entry.principal.name_string[1].as_slice() != b"M"
+fn ensure_master_actkvno(entry: &mut MitEntry, master_key_name: &str) -> Result<(), StoreError> {
+    if entry.principal != krb5_rs::kdc::kdb::master::master_principal_named(master_key_name)?
         || entry.tl_data.iter().any(|tl| tl.kind == ACTKVNO)
     {
         return Ok(());
@@ -1773,7 +1781,7 @@ fn auto_convert_legacy(
         let mut raw_entries = Vec::with_capacity(records.len());
         for record in &records {
             let mut entry = new_entry(record, &MasterKeys::single(master.clone()), &creator)?;
-            ensure_master_actkvno(&mut entry)?;
+            ensure_master_actkvno(&mut entry, &options.master_key_name)?;
             raw_entries.push(entry);
         }
         temp.insert_initial(raw_entries)?;
