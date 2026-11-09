@@ -41,6 +41,30 @@ path = "src/bin/kdestroy.rs"
 name = "krb5-rs-kswitch"
 path = "src/bin/kswitch.rs"
 
+[[bin]]
+name = "krb5-rs-sclient"
+path = "src/bin/sclient.rs"
+
+[[bin]]
+name = "krb5-rs-sserver"
+path = "src/bin/sserver.rs"
+
+[[bin]]
+name = "krb5-rs-uu-client"
+path = "src/bin/uu-client.rs"
+
+[[bin]]
+name = "krb5-rs-uu-server"
+path = "src/bin/uu-server.rs"
+
+[[bin]]
+name = "krb5-rs-gss-client"
+path = "src/bin/gss-client.rs"
+
+[[bin]]
+name = "krb5-rs-gss-server"
+path = "src/bin/gss-server.rs"
+
 [dependencies]
 krb5-rs = { path = "../..", features = ["client", "gssapi", "pkinit", "dns", "kdc"] }
 base64 = "0.22"
@@ -48,7 +72,7 @@ chrono = { version = "0.4.38", default-features = false, features = ["clock", "u
 rasn = "0.28"
 dns-lookup = "4"
 rpassword = "7"
-tokio = { version = "1.53.2", features = ["rt", "net", "time"] }
+tokio = { version = "1.53.2", features = ["rt", "net", "time", "io-util"] }
 
 [dev-dependencies]
 tempfile = "3.27"
