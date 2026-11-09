@@ -63,9 +63,22 @@ pub fn master_key_from_password(
     password: &str,
     etype: i32,
 ) -> Result<EncryptionKey, StoreError> {
+    master_key_from_password_named(realm, MASTER_NAME, password, etype)
+}
+
+/// [`master_key_from_password`] for the master key principal
+/// `master_key_name`, whose components make the salt.
+pub fn master_key_from_password_named(
+    realm: &str,
+    master_key_name: &str,
+    password: &str,
+    etype: i32,
+) -> Result<EncryptionKey, StoreError> {
     let profile =
         find_etype(etype).map_err(|_| err(format!("unsupported master key enctype {etype}")))?;
-    let salt = default_salt(realm, &[b"K".as_slice(), b"M".as_slice()]);
+    let name = master_principal_named(master_key_name)?;
+    let comps: Vec<&[u8]> = name.name_string.iter().map(|c| c.as_bytes()).collect();
+    let salt = default_salt(realm, &comps);
     let key = profile
         .string_to_key(password.as_bytes(), &salt, None)
         .map_err(|e| err(e.to_string()))?;
