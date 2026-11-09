@@ -167,6 +167,10 @@ pub struct RealmConfig {
     pub database_name: PathBuf,
     /// Path of the master key stash (`key_stash_file`).
     pub key_stash_file: PathBuf,
+    /// `[realms] master_key_name`: the master key principal's name without
+    /// the realm, default `K/M` (`KRB5_KDB_M_NAME`, kdc/main.c:246-252,
+    /// alt_prof.c:538).
+    pub master_key_name: String,
     /// Master key enctype (`master_key_type`).
     pub master_key_type: i32,
     /// Key/salt combinations generated for new keys (`supported_enctypes`).
@@ -507,6 +511,7 @@ impl RealmConfig {
         Ok(Self {
             kdc,
             database_name,
+            master_key_name: r("master_key_name").unwrap_or_else(|| "K/M".to_string()),
             key_stash_file: r("key_stash_file")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(format!("{KDC_DIR}/.k5.{realm}"))),

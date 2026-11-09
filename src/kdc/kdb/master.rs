@@ -20,10 +20,38 @@ fn err(msg: impl Into<String>) -> StoreError {
 
 /// The master principal `K/M@REALM` name components.
 pub(super) fn master_principal() -> Result<PrincipalName, StoreError> {
-    let part = |s: &str| GeneralString::from_bytes(s.as_bytes()).map_err(|_| err("bad name"));
+    master_principal_named(MASTER_NAME)
+}
+
+/// The master principal named `name` (`master_key_name`, without the
+/// realm), as `krb5_db_setup_mkey_name` parses `name@REALM` (kdb5.c:1479).
+pub fn master_principal_named(name: &str) -> Result<PrincipalName, StoreError> {
+    let bad = || err(format!("bad master key name {name:?}"));
+    let mut comps = vec![Vec::new()];
+    let mut chars = name.bytes();
+    while let Some(c) = chars.next() {
+        match c {
+            b'\\' => {
+                let e = chars.next().ok_or_else(bad)?;
+                comps.last_mut().ok_or_else(bad)?.push(match e {
+                    b'n' => b'\n',
+                    b't' => b'\t',
+                    b'b' => 8,
+                    b'0' => 0,
+                    other => other,
+                });
+            }
+            b'/' => comps.push(Vec::new()),
+            b'@' => return Err(bad()),
+            other => comps.last_mut().ok_or_else(bad)?.push(other),
+        }
+    }
     Ok(PrincipalName {
         name_type: 1,
-        name_string: MASTER_NAME.split('/').map(part).collect::<Result<_, _>>()?,
+        name_string: comps
+            .iter()
+            .map(|c| GeneralString::from_bytes(c).map_err(|_| bad()))
+            .collect::<Result<_, _>>()?,
     })
 }
 
