@@ -276,13 +276,6 @@ pub(crate) fn main() {
     if help {
         usage();
     }
-    if let Some(name) = &g.mkey_name {
-        if name != "K/M" {
-            fail(format!(
-                "master key name '{name}' is not supported; kldap uses K/M"
-            ));
-        }
-    }
 
     let config = g
         .config
@@ -317,8 +310,12 @@ pub(crate) fn main() {
     if let Some(sf) = &g.stash_file {
         cfg.key_stash_file = sf.clone();
     }
+    if let Some(name) = &g.mkey_name {
+        cfg.master_key_name = name.clone();
+    }
     let mut lcfg = LdapConfig::new(&cfg.db_module, &[], ServerType::Admin)
         .unwrap_or_else(|e| fail(format!("{e} while reading ldap configuration")));
+    lcfg.master_key_name = cfg.master_key_name.clone();
     if let Some(dn) = &g.bind_dn {
         let pwd = match g.bind_pwd.take() {
             Some(p) => p,
