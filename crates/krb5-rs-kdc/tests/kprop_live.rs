@@ -66,6 +66,8 @@ mkdir -p "$B/mit" "$B/mitrep" "$B/rsrep"
 H=$(hostname | tr 'A-Z' 'a-z')
 realm_conf() { # file dbdir db_library
   cat > "$1" <<EOF
+[logging]
+ default = STDERR
 [kdcdefaults]
  kdc_ports = 18888
  kdc_tcp_ports = 18888

@@ -81,6 +81,8 @@ trap stop EXIT
 rm -rf "$B/db" "$B"/*.conf "$B"/*.log "$B"/*.acl "$B/stash" "$B"/*.out "$B"/*.exp "$B/cpw"*
 mkdir -p "$B/db"
 cat > "$B/kdc.conf" <<EOF
+[logging]
+ default = STDERR
 [kdcdefaults]
  kdc_ports = 18891
  kdc_tcp_ports = 18891

@@ -76,7 +76,7 @@ fn write_conf(dir: &Path, name: &str, user: &str, db: &str, realm: &str, module:
     std::fs::write(
         &path,
         format!(
-            "[realms]\n {REALM} = {{\n  database_module = crdb\n  key_stash_file = {}\n  \
+            "[logging]\n default = STDERR\n[realms]\n {REALM} = {{\n  database_module = crdb\n  key_stash_file = {}\n  \
              supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal\n\
              {realm} }}\n\
              [dbmodules]\n crdb = {{\n  db_library = krb5-rs-cockroach\n  \

@@ -93,6 +93,8 @@ setup() {
   local D=$B/$1
   mkdir -p "$D/db"
   cat > "$D/kdc.conf" <<EOF
+[logging]
+ default = STDERR
 [kdcdefaults]
  kdc_ports = $2
  kdc_tcp_ports = $2
