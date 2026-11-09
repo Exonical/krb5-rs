@@ -376,45 +376,6 @@ pub fn runtime() -> tokio::runtime::Runtime {
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    fn opts(args: &[&str], spec: &'static str) -> (Vec<(char, Option<String>)>, Vec<String>) {
-        let mut g = Getopt::from_args(args.iter().map(|s| s.to_string()).collect(), spec);
-        let v: Vec<_> = g.by_ref().collect();
-        (v, g.rest().to_vec())
-    }
-
-    #[test]
-    fn getopt_like_posix() {
-        let (v, rest) = opts(&["-ef", "-cFILE:x", "-p", "a@R", "name", "-q"], "efc:p:q");
-        assert_eq!(
-            v,
-            [
-                ('e', None),
-                ('f', None),
-                ('c', Some("FILE:x".into())),
-                ('p', Some("a@R".into()))
-            ]
-        );
-        assert_eq!(rest, ["name", "-q"]);
-        let (v, rest) = opts(&["-x", "--", "-q"], "q");
-        assert_eq!(v, [('?', None)]);
-        assert_eq!(rest, ["-q"]);
-        let (v, _) = opts(&["-c"], "c:");
-        assert_eq!(v, [('?', None)]);
-    }
-
-    #[test]
-    fn etype_strings() {
-        assert_eq!(etype_string(18), "aes256-cts-hmac-sha1-96");
-        assert_eq!(etype_string(23), "DEPRECATED:arcfour-hmac");
-        assert_eq!(etype_string(999), "etype 999");
-    }
-}
-
 /// `krb5_sname_to_principal(host, sname, KRB5_NT_SRV_HST)`: this host when
 /// `host` is `None`; the realm is empty when it is left to referrals.
 pub fn sname_to_principal(
@@ -477,4 +438,43 @@ pub fn syslog(ident: &str, pri: u8, msg: &str) {
     }
     #[cfg(not(unix))]
     let _ = (ident, pri, msg);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn opts(args: &[&str], spec: &'static str) -> (Vec<(char, Option<String>)>, Vec<String>) {
+        let mut g = Getopt::from_args(args.iter().map(|s| s.to_string()).collect(), spec);
+        let v: Vec<_> = g.by_ref().collect();
+        (v, g.rest().to_vec())
+    }
+
+    #[test]
+    fn getopt_like_posix() {
+        let (v, rest) = opts(&["-ef", "-cFILE:x", "-p", "a@R", "name", "-q"], "efc:p:q");
+        assert_eq!(
+            v,
+            [
+                ('e', None),
+                ('f', None),
+                ('c', Some("FILE:x".into())),
+                ('p', Some("a@R".into()))
+            ]
+        );
+        assert_eq!(rest, ["name", "-q"]);
+        let (v, rest) = opts(&["-x", "--", "-q"], "q");
+        assert_eq!(v, [('?', None)]);
+        assert_eq!(rest, ["-q"]);
+        let (v, _) = opts(&["-c"], "c:");
+        assert_eq!(v, [('?', None)]);
+    }
+
+    #[test]
+    fn etype_strings() {
+        assert_eq!(etype_string(18), "aes256-cts-hmac-sha1-96");
+        assert_eq!(etype_string(23), "DEPRECATED:arcfour-hmac");
+        assert_eq!(etype_string(999), "etype 999");
+    }
 }

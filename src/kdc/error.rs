@@ -201,6 +201,7 @@ fn typed_data_from_method_data(method_data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ap::ApError;
 
     #[test]
     fn ap_error_code_maps_protocol_codes() {
