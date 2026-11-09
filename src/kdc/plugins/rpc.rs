@@ -561,6 +561,159 @@ pub fn audit(name: &str, connect: Connect) -> Result<RemoteAudit, InitError> {
     Conn::open(name, AUDIT_HANDSHAKE, connect).map(RemoteAudit)
 }
 
+/// [`call::INITIALIZE`]'s string for the ACE/Server bridge the
+/// `securid_sam2` module uses.
+pub const SECURID_ACE_HANDSHAKE: &str = "KRB5RS-SECURID-ACE-V-1";
+
+/// Call numbers of the ACE/Server bridge.
+pub mod ace_call {
+    pub use crate::plugin::rpc::call::{ERROR, FINALIZE, INITIALIZE};
+    /// `SD_Init`: answered with `i` handle.
+    pub const SD_INIT: u32 = 3;
+    /// `SD_Lock`: `is` handle, user; answered with `i` ACM code.
+    pub const SD_LOCK: u32 = 4;
+    /// `SD_Check`: `iss` handle, passcode, user; answered with `i`.
+    pub const SD_CHECK: u32 = 5;
+    /// `SD_Next`: `is` handle, passcode; answered with `i`.
+    pub const SD_NEXT: u32 = 6;
+    /// `SD_Pin`: `is` handle, PIN; answered with `i`.
+    pub const SD_PIN: u32 = 7;
+    /// `SD_Close`: `i` handle.
+    pub const SD_CLOSE: u32 = 8;
+    /// `AceGetMinPinLen`, `AceGetMaxPinLen`, `AceGetAlphanumeric`: `i`
+    /// handle; answered with `iii` min, max, alphanumeric, or an error.
+    pub const PIN_PARAMS: u32 = 9;
+}
+
+/// Run the ACE/Server bridge side for `ace` on `stream`.
+pub fn serve_securid_ace<S: Read + Write>(
+    stream: S,
+    ace: &dyn crate::kdc::securid_sam2::AceServer,
+) -> io::Result<()> {
+    serve(stream, SECURID_ACE_HANDSHAKE, |req| {
+        let mut answer = Message::new(req.call);
+        let handle = |req: &mut Message| req.get_i32().map(|h| h as u32);
+        Ok(match req.call {
+            ace_call::INITIALIZE | ace_call::FINALIZE => Ok(answer),
+            ace_call::SD_INIT => {
+                req.finish()?;
+                ace.init()
+                    .map(|h| {
+                        answer.put_i32(h as i32);
+                        answer
+                    })
+                    .map_err(|c| (c, None))
+            }
+            ace_call::SD_LOCK | ace_call::SD_NEXT | ace_call::SD_PIN => {
+                let h = handle(req)?;
+                let s = req.get_str()?.unwrap_or_default();
+                req.finish()?;
+                let code = match req.call {
+                    ace_call::SD_LOCK => ace.lock(h, &s),
+                    ace_call::SD_NEXT => ace.next(h, &s),
+                    _ => ace.pin(h, &s),
+                };
+                answer.put_i32(code);
+                Ok(answer)
+            }
+            ace_call::SD_CHECK => {
+                let h = handle(req)?;
+                let passcode = req.get_str()?.unwrap_or_default();
+                let user = req.get_str()?.unwrap_or_default();
+                req.finish()?;
+                answer.put_i32(ace.check(h, &passcode, &user));
+                Ok(answer)
+            }
+            ace_call::SD_CLOSE => {
+                let h = handle(req)?;
+                req.finish()?;
+                ace.close(h);
+                Ok(answer)
+            }
+            ace_call::PIN_PARAMS => {
+                let h = handle(req)?;
+                req.finish()?;
+                match ace.pin_params(h) {
+                    Some(p) => {
+                        answer
+                            .put_i32(p.min)
+                            .put_i32(p.max)
+                            .put_i32(i32::from(p.alphanumeric));
+                        Ok(answer)
+                    }
+                    None => Err((ERROR_TABLE_BASE_KRB5 + KRB_ERR_GENERIC, None)),
+                }
+            }
+            _ => Err((ERROR_TABLE_BASE_KRB5 + KRB_ERR_GENERIC, None)),
+        })
+    })
+}
+
+/// The ACE/Server reached over RPC. A call that fails in transport
+/// answers as a refusal.
+pub struct RemoteAce(Conn);
+
+impl RemoteAce {
+    fn code(&self, m: &Message) -> i32 {
+        match self.0.call(m) {
+            Ok(Ok(mut r)) => r.get_i32().unwrap_or(-1),
+            Ok(Err(_)) | Err(_) => -1,
+        }
+    }
+}
+
+impl crate::kdc::securid_sam2::AceServer for RemoteAce {
+    fn init(&self) -> Result<u32, i32> {
+        match self.0.call(&Message::new(ace_call::SD_INIT)) {
+            Ok(Ok(mut r)) => r.get_i32().map(|h| h as u32).map_err(|_| -1),
+            Ok(Err((c, _))) => Err(c),
+            Err(_) => Err(-1),
+        }
+    }
+    fn lock(&self, handle: u32, user: &str) -> i32 {
+        let mut m = Message::new(ace_call::SD_LOCK);
+        m.put_i32(handle as i32).put_str(Some(user));
+        self.code(&m)
+    }
+    fn check(&self, handle: u32, passcode: &str, user: &str) -> i32 {
+        let mut m = Message::new(ace_call::SD_CHECK);
+        m.put_i32(handle as i32)
+            .put_str(Some(passcode))
+            .put_str(Some(user));
+        self.code(&m)
+    }
+    fn next(&self, handle: u32, passcode: &str) -> i32 {
+        let mut m = Message::new(ace_call::SD_NEXT);
+        m.put_i32(handle as i32).put_str(Some(passcode));
+        self.code(&m)
+    }
+    fn pin(&self, handle: u32, pin: &str) -> i32 {
+        let mut m = Message::new(ace_call::SD_PIN);
+        m.put_i32(handle as i32).put_str(Some(pin));
+        self.code(&m)
+    }
+    fn close(&self, handle: u32) {
+        let mut m = Message::new(ace_call::SD_CLOSE);
+        m.put_i32(handle as i32);
+        let _ = self.0.call(&m);
+    }
+    fn pin_params(&self, handle: u32) -> Option<crate::kdc::securid_sam2::PinParams> {
+        let mut m = Message::new(ace_call::PIN_PARAMS);
+        m.put_i32(handle as i32);
+        let mut r = self.0.call(&m).ok()?.ok()?;
+        Some(crate::kdc::securid_sam2::PinParams {
+            min: r.get_i32().ok()?,
+            max: r.get_i32().ok()?,
+            alphanumeric: r.get_i32().ok()? != 0,
+        })
+    }
+}
+
+/// Connect the `securid_sam2` module to the ACE/Server bridge `name`.
+pub fn securid_ace(name: &str, connect: Connect) -> Result<RemoteAce, InitError> {
+    Conn::open(name, SECURID_ACE_HANDSHAKE, connect).map(RemoteAce)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -123,6 +123,15 @@ impl<'a> InProgress<'a> {
     }
 }
 
+impl InProgress<'_> {
+    /// Keep the null entry: the request was discarded.
+    pub(crate) fn discard(self, now: i64) {
+        self.cache.remove(self.req);
+        self.cache.insert(self.req, None, now);
+        std::mem::forget(self);
+    }
+}
+
 impl Drop for InProgress<'_> {
     fn drop(&mut self) {
         self.cache.remove(self.req);

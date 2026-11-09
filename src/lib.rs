@@ -41,6 +41,7 @@ pub mod pkinit;
 pub mod plugin;
 pub mod profile;
 pub mod protocol;
+pub mod sam2;
 pub mod spake;
 pub mod trace;
 pub mod types;

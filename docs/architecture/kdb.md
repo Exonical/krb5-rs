@@ -1316,6 +1316,61 @@ host name sent as NAS-Identifier is `uname`'s node name.
 The tests (`tests/kdc_otp.rs`) port MIT's `tests/t_otp.py` cases against
 fake UDP and Unix-socket RADIUS servers.
 
+### SecurID SAM-2 pre-authentication
+
+MIT's `securid_sam2` kdcpreauth module (`plugins/preauth/securid_sam2`) and
+its `sam2` client module (`lib/krb5/krb/preauth_sam2.c`):
+- **When offered:** the KDC sends PA-SAM-CHALLENGE-2 (30) for a client with
+  a `<client>/SECURID` principal, else a `<client>/GRAIL` one, and a client
+  key. The challenge body carries the client key's mandatory checksum (key
+  usage 25), and its track ID is encrypted with the SAM principal's newest
+  key (key usage 26). The module is PA_HARDWARE, so the challenge is also
+  offered to `requires_hwauth` principals.
+- **Verification:** PA-SAM-RESPONSE-2 (31) is decrypted with the client key
+  it names (key usage 27); its nonce must match and its SAD must not be
+  empty. Success sets HW-AUTHENT and PRE-AUTHENT on the ticket.
+- **SecurID:** the passcode goes to the ACE/Server as MIT's `securid2.c`
+  sends it: `SD_Init`, `SD_Lock` and `SD_Check` with the client name before
+  the `@`; next-code and new-PIN states travel in the track data, which
+  holds a host ID. Track data from another host is `KRB5KDC_ERR_DISCARD`,
+  and the KDC sends no reply. When the ACE/Server asks for the next code or
+  a new PIN, MIT builds a further challenge but passes no e-data to
+  `respond`, so the client gets KDC_ERR_PREAUTH_REQUIRED alone; this is
+  kept. Difference from MIT: the ACE/Server session is then closed, as it
+  is after an unexpected `SD_Check` result; MIT leaves both open, so
+  repeated attempts could exhaust the ACE/Server's sessions.
+- **GRAIL:** MIT's test mechanism ("Enter <n>", answered with n), compiled
+  in by MIT only with `GRAIL_PREAUTH`; here it is on only with
+  `SecuridSam2::with_grail`.
+- **Client:** checks the challenge as MIT does (`KRB5_SAM_NO_CHECKSUM`,
+  `KRB5_SAM_UNSUPPORTED` for `MUST_PK_ENCRYPT_SAD` or neither SAD flag,
+  `KRB5_SAM_INVALID_ETYPE`), prompts with MIT's name, banner and prompt,
+  verifies the keyed checksums with the password key (or the SAD-derived
+  key for `USE_SAD_AS_KEY`, which then becomes the reply key) and answers
+  with the encrypted nonce and SAD.
+
+The ACE/Server calls go through `kdc::securid_sam2::AceServer`. The
+`krb5-rs-kdc` binary loads it like MIT loads the module, from
+`[plugins] kdcpreauth`, as a bridge process reached over the module RPC
+(`plugins::rpc::serve_securid_ace`):
+
+    [plugins]
+        kdcpreauth = {
+            module = securid_sam2:unix:path=/run/krb5kdc/securid.sock
+        }
+
+Differences: RSA's ACE/Server SDK is proprietary, so it is not linked in;
+a deployment runs a bridge that calls it. The host ID is glibc's
+`gethostid()` source (`/etc/hostid`, else derived from the host name), and
+the track data layout is our own, so a response is only accepted by a
+krb5-rs KDC. The client's answer comes from `AsExchangeConfig::sam2`
+(`Sam2Responder`); `krb5-rs-kinit` prompts as MIT's `krb5_prompter_posix`
+does.
+
+The tests (`tests/kdc_sam2.rs`) run GRAIL and a fake ACE/Server, in
+process and over the RPC. Nothing was tested against RSA's ACE/Server or
+MIT binaries.
+
 ### Authentication indicators
 
 As in MIT (`kdc/authind.c`, `kdc/cammac.c`, `kdc_authdata.c`):

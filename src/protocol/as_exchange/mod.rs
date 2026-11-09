@@ -94,6 +94,9 @@ pub struct AsExchangeConfig {
     /// Answer to a KDC's PA-OTP-CHALLENGE (MIT responder question
     /// `otp`); `None` skips OTP. Requires FAST armor.
     pub otp: Option<crate::otp::OtpAnswer>,
+    /// Answers a KDC's PA-SAM-CHALLENGE-2 (MIT's prompter for the `sam2`
+    /// module); `None` skips SAM-2.
+    pub sam2: Option<crate::sam2::Sam2Responder>,
     /// Seconds from now until the ticket becomes valid (MIT `start_time`);
     /// non-zero requests a postdated ticket (get_in_tkt.c:928-929).
     /// Default: 0.
@@ -157,6 +160,7 @@ impl Default for AsExchangeConfig {
             subject_cert: None,
             spake_groups: vec![crate::spake::Group::Edwards25519],
             otp: None,
+            sam2: None,
             start_time: 0,
             addresses: None,
             in_ccache: None,
@@ -309,6 +313,8 @@ pub struct AsExchange {
     cc_config_out: std::collections::BTreeMap<String, Vec<u8>>,
     /// FAST armor key set as the AS key by OTP (preauth_otp.c:1118-1120).
     otp_key: Option<EncryptionKey>,
+    /// The SAD-derived AS key (preauth_sam2.c, `KRB5_SAM_USE_SAD_AS_KEY`).
+    sam_key: Option<EncryptionKey>,
     /// Real preauth types that already failed this exchange
     /// (MIT `k5_preauth_note_failed`).
     preauth_failed: Vec<i32>,
@@ -383,6 +389,7 @@ impl AsExchange {
             cc_config_in: Default::default(),
             cc_config_out: Default::default(),
             otp_key: None,
+            sam_key: None,
             preauth_failed: Vec::new(),
             method_padata: None,
             pa_offset: None,
@@ -808,6 +815,9 @@ impl AsExchange {
         // pa_type_allowed (preauth2.c:625-631, :667).
         let only = self.allowed_preauth_type;
         let allowed = move |t: i32| only.is_none_or(|a| a == t);
+        // preauth2.c:704-724: a failed real mechanism's error is returned if
+        // nothing else succeeds.
+        let mut saved: Option<Krb5Error> = None;
         #[cfg(feature = "pkinit")]
         if allowed(crate::pkinit::server::PA_PK_AS_REQ) && self.pkinit_offered(method) {
             self.selected_preauth_type = Some(crate::pkinit::server::PA_PK_AS_REQ);
@@ -853,6 +863,21 @@ impl AsExchange {
                         None => self.preauth_failed.push(t),
                     }
                 }
+                t if t == crate::sam2::PA_SAM_CHALLENGE_2 => {
+                    if self.preauth_failed.contains(&t) {
+                        continue;
+                    }
+                    match self.sam2_process(pa.padata_value.as_ref()) {
+                        Ok(out) => {
+                            self.selected_preauth_type = Some(t);
+                            return Ok(out);
+                        }
+                        Err(e) => {
+                            self.preauth_failed.push(t);
+                            saved.get_or_insert(e);
+                        }
+                    }
+                }
                 t if t == PaDataType::Spake as i32 => {
                     if self.preauth_failed.contains(&t) {
                         continue;
@@ -883,7 +908,7 @@ impl AsExchange {
         }
         // MIT preauth2.c:715-724 — must_preauth and no real mechanism
         // succeeded → KRB5_PREAUTH_FAILED.
-        Err(Krb5Error::PreauthFailed)
+        Err(saved.unwrap_or(Krb5Error::PreauthFailed))
     }
 }
 
@@ -904,6 +929,7 @@ mod otp;
 mod pkinit;
 mod reply;
 mod request;
+mod sam2;
 mod spake;
 
 #[cfg(test)]
