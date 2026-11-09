@@ -911,7 +911,7 @@ mod db_module_tests {
         ))
         .expect("kdc.conf");
         let c = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
-        assert_eq!(c.db_module.module_dirs, [dir.clone()]);
+        assert_eq!(c.db_module.module_dirs, std::slice::from_ref(&dir));
         let found = c.db_module.unknown_library_error("mymod");
         assert!(
             found.contains("mymod.so") && found.contains("only built-in"),
