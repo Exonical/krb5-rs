@@ -11,7 +11,8 @@
 //! carry an MS-PAC with client info and signatures, issued, verified and
 //! re-signed as MIT's `handle_pac` does (see [`crate::pac`]); there is no
 //! logon-information source. No user-to-user, postdating, validation, proxy
-//! tickets or lookaside cache. Principal lockout follows MIT's db2 module
+//! tickets. Repeated request packets are answered from MIT's lookaside cache
+//! (see [`LookasideHit`]). Principal lockout follows MIT's db2 module
 //! (see [`lockout`]).
 //! FAST (RFC 6113) armor, encrypted challenge and armored replies/errors are
 //! handled in the `fast` module.
@@ -24,6 +25,8 @@ mod cookie;
 mod db;
 mod error;
 mod fast;
+mod lookaside;
+pub use lookaside::LookasideHit;
 pub mod kdb;
 pub mod lockout;
 mod otp;
@@ -209,6 +212,7 @@ pub struct Kdc<S: PrincipalStore> {
     reporter: Arc<dyn LockoutReporter>,
     kdcpolicy: Vec<Arc<dyn plugins::KdcPolicy>>,
     audit: Vec<Arc<dyn plugins::Audit>>,
+    lookaside: lookaside::Lookaside,
 }
 
 /// Builds a [`Kdc`] with injected services (docs/architecture/kdb.md §3).
@@ -280,6 +284,7 @@ impl<S: PrincipalStore> KdcBuilder<S> {
             reporter: self.reporter,
             kdcpolicy: self.kdcpolicy,
             audit: self.audit,
+            lookaside: lookaside::Lookaside::default(),
         }
     }
 }
@@ -370,7 +375,11 @@ impl<S: PrincipalStore> Kdc<S> {
     }
 
     /// Process one request like [`Kdc::handle`] (or [`Kdc::handle_udp`] for
-    /// [`Transport::Udp`]) and summarise it for logging.
+    /// [`Transport::Udp`]) and summarise it for logging. A packet repeating
+    /// one seen in the last two minutes gets the same reply without being
+    /// processed again, or no reply (an empty one) while the first copy is
+    /// still being processed (MIT `dispatch`, dispatch.c:113-141); see
+    /// [`RequestSummary::lookaside`].
     pub async fn handle_summarized(
         &self,
         request: &[u8],
@@ -386,22 +395,37 @@ impl<S: PrincipalStore> Kdc<S> {
         transport: Transport,
         peer: Option<std::net::SocketAddr>,
     ) -> (Vec<u8>, RequestSummary) {
+        let now = Utc::now();
+        // finish_dispatch (dispatch.c:54-63) applies to cached replies too.
+        let datagram = |reply: Vec<u8>| match transport {
+            Transport::Udp if reply.len() > self.config.max_dgram_reply_size => {
+                self.bare_error(KRB_ERR_RESPONSE_TOO_BIG, Utc::now())
+            }
+            _ => reply,
+        };
+        if let Some(hit) = self.lookaside.check(request) {
+            let (reply, hit) = match hit {
+                Some(reply) => (datagram(reply), LookasideHit::Resent),
+                None => (Vec::new(), LookasideHit::Dropped),
+            };
+            let mut summary = RequestSummary::new(request, &reply, transport);
+            summary.lookaside = Some(hit);
+            return (reply, summary);
+        }
+        let pending = lookaside::InProgress::start(&self.lookaside, request, now.timestamp());
         #[cfg(feature = "tokio")]
         let timer = std::sync::Arc::new(AtomicU64::new(0));
         #[cfg(feature = "tokio")]
         let reply = STORE_TIME_NANOS
-            .scope(std::sync::Arc::clone(&timer), async {
-                match transport {
-                    Transport::Udp => self.handle_udp_from_at(request, Utc::now(), peer).await,
-                    Transport::Tcp => self.handle_from_at(request, Utc::now(), peer).await,
-                }
-            })
+            .scope(
+                std::sync::Arc::clone(&timer),
+                self.handle_from_at(request, now, peer),
+            )
             .await;
         #[cfg(not(feature = "tokio"))]
-        let reply = match transport {
-            Transport::Udp => self.handle_udp_from_at(request, Utc::now(), peer).await,
-            Transport::Tcp => self.handle_from_at(request, Utc::now(), peer).await,
-        };
+        let reply = self.handle_from_at(request, now, peer).await;
+        pending.finish(&reply, Utc::now().timestamp());
+        let reply = datagram(reply);
         let summary = RequestSummary::new(request, &reply, transport);
         #[cfg(feature = "tokio")]
         let summary = {
