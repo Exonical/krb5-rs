@@ -24,12 +24,12 @@ pub enum SeqStatus {
 /// Sequence-number state for received per-message tokens.
 #[derive(Debug)]
 pub struct SeqState {
-    do_replay: bool,
-    do_sequence: bool,
-    seqmask: u64,
-    base: u64,
-    next: u64,
-    recvmap: u64,
+    pub(crate) do_replay: bool,
+    pub(crate) do_sequence: bool,
+    pub(crate) seqmask: u64,
+    pub(crate) base: u64,
+    pub(crate) next: u64,
+    pub(crate) recvmap: u64,
 }
 
 impl SeqState {

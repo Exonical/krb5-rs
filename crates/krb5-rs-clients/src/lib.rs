@@ -24,6 +24,7 @@ pub fn progname() -> &'static str {
     })
 }
 
+pub mod gss_sample;
 pub mod kadm5;
 pub mod ss;
 

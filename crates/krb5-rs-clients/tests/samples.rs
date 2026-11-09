@@ -14,6 +14,8 @@ use krb5_rs::types::PrincipalName;
 const REALM: &str = "SAMPLE.REALM";
 const KINIT: &str = env!("CARGO_BIN_EXE_krb5-rs-kinit");
 const KTUTIL: &str = env!("CARGO_BIN_EXE_krb5-rs-ktutil");
+const GSSCLIENT: &str = env!("CARGO_BIN_EXE_krb5-rs-gss-client");
+const GSSSERVER: &str = env!("CARGO_BIN_EXE_krb5-rs-gss-server");
 const SCLIENT: &str = env!("CARGO_BIN_EXE_krb5-rs-sclient");
 const SSERVER: &str = env!("CARGO_BIN_EXE_krb5-rs-sserver");
 const UUCLIENT: &str = env!("CARGO_BIN_EXE_krb5-rs-uu-client");
@@ -61,6 +63,16 @@ impl Realm {
                 PrincipalAttributes::empty(),
             )
             .expect("sample service");
+        store
+            .add_with_password(
+                PrincipalName::new_srv_hst("host", &host),
+                REALM,
+                "hostpw",
+                1,
+                &[18],
+                PrincipalAttributes::empty(),
+            )
+            .expect("host service");
         let kdc = Arc::new(Kdc::new(KdcConfig::new(REALM), store));
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -102,7 +114,7 @@ impl Realm {
         }
         let ktutil = format!(
             "addent -password -p sample/{}@{REALM} -k 1 -e aes256-cts-hmac-sha1-96\n\
-             samplepw\nwkt {}\nquit\n",
+             samplepw\naddent -password -p host/{0}@{REALM} -k 1 -e aes256-cts-hmac-sha1-96\nhostpw\nwkt {}\nquit\n",
             realm.host,
             realm.keytab().display()
         );
@@ -167,6 +179,157 @@ impl Realm {
         assert_eq!(line.trim_end(), ready);
         child
     }
+}
+
+impl Realm {
+    /// Start gss-server and wait for "starting..." on its stderr.
+    fn gss_server(&self, port: &str) -> Child {
+        let mut child = self
+            .cmd(GSSSERVER, &["-export", "-port", port, "host"], "server")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn gss-server");
+        let mut line = String::new();
+        BufReader::new(child.stderr.as_mut().expect("stderr"))
+            .read_line(&mut line)
+            .expect("ready line");
+        assert_eq!(line.trim_end(), "starting...");
+        child
+    }
+
+    /// t_gss_sample.py server_client_test: one exchange with gss-client.
+    fn gss_client(&self, port: &str, args: &[&str], user: &str) -> std::process::Output {
+        let mut a = vec!["-port", port];
+        a.extend_from_slice(args);
+        a.extend_from_slice(&[&self.host, "host", "testmsg"]);
+        self.run(GSSCLIENT, &a, user, None).expect("gss-client")
+    }
+}
+
+fn gss_ok(out: &std::process::Output) {
+    let text = stdout(out);
+    assert!(out.status.success(), "gss-client: {text}{}", stderr(out));
+    assert!(text.contains("Signature verified."), "{text}");
+}
+
+fn stop_gss_server(mut server: Child, messages: usize) {
+    let _ = server.kill();
+    let out = server.wait_with_output().expect("gss-server");
+    let text = stdout(&out);
+    assert_eq!(
+        text.matches("Received message: \"testmsg\"").count(),
+        messages,
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("Accepted connection: \"alice@{REALM}\"")),
+        "{text}"
+    );
+}
+
+const GSS_MECHS: &[&[&str]] = &[&["-krb5"], &["-spnego"], &["-iakerb"], &["-krb5", "-dce"]];
+
+/// t_gss_sample.py tgs_test and ap_test: a cached TGT, then the cached
+/// service ticket.
+#[test]
+fn gss_sample_tgs_and_ap() {
+    let realm = Realm::start();
+    let port = free_port().to_string();
+    let server = realm.gss_server(&port);
+    for mech in GSS_MECHS {
+        gss_ok(&realm.gss_client(&port, mech, "alice"));
+        gss_ok(&realm.gss_client(&port, mech, "alice"));
+    }
+    stop_gss_server(server, GSS_MECHS.len() * 2);
+}
+
+/// t_gss_sample.py pw_test and wrong_pw_test.
+#[test]
+fn gss_sample_password() {
+    let realm = Realm::start();
+    let port = free_port().to_string();
+    let server = realm.gss_server(&port);
+    for mech in GSS_MECHS {
+        let mut args = mech.to_vec();
+        args.extend_from_slice(&["-user", "alice", "-pass", "alicepw"]);
+        gss_ok(&realm.gss_client(&port, &args, "nocache"));
+        let mut args = mech.to_vec();
+        args.extend_from_slice(&["-user", "alice", "-pass", "wrongpw"]);
+        let out = realm.gss_client(&port, &args, "nocache");
+        assert!(!out.status.success());
+        let op = if mech[0] == "-iakerb" {
+            "initializing context"
+        } else {
+            "acquiring creds"
+        };
+        assert!(
+            stdout(&out).contains(&format!("GSS-API error {op}")),
+            "{}",
+            stdout(&out)
+        );
+    }
+    let _ = std::fs::remove_file(realm.path("nocache"));
+    stop_gss_server(server, GSS_MECHS.len());
+}
+
+/// t_gss_sample.py: credentials from the default client keytab.
+#[test]
+fn gss_sample_client_keytab() {
+    let realm = Realm::start();
+    let ckt = realm.path("client.keytab");
+    let script = format!(
+        "addent -password -p alice@{REALM} -k 1 -e aes256-cts-hmac-sha1-96\nalicepw\nwkt {}\nquit\n",
+        ckt.display()
+    );
+    let out = realm
+        .run(KTUTIL, &[], "alice", Some(&script))
+        .expect("ktutil");
+    assert!(out.status.success(), "ktutil: {}", stderr(&out));
+    let port = free_port().to_string();
+    let server = realm.gss_server(&port);
+    for mech in [&["-krb5"][..], &["-spnego"]] {
+        let mut a = vec!["-port", &port];
+        a.extend_from_slice(mech);
+        a.extend_from_slice(&["-user", "alice", &realm.host, "host", "testmsg"]);
+        let out = realm
+            .cmd(GSSCLIENT, &a, "kt")
+            .env("KRB5_CLIENT_KTNAME", format!("FILE:{}", ckt.display()))
+            .output()
+            .expect("gss-client");
+        gss_ok(&out);
+        let _ = std::fs::remove_file(realm.path("kt"));
+    }
+    stop_gss_server(server, 2);
+}
+
+/// Message counts, unwrapped and unsigned messages, and an
+/// unauthenticated connection.
+#[test]
+fn gss_sample_message_options() {
+    let realm = Realm::start();
+    let port = free_port().to_string();
+    let mut server = realm.gss_server(&port);
+    let out = realm.gss_client(&port, &["-mcount", "3", "-ccount", "2"], "alice");
+    gss_ok(&out);
+    assert_eq!(stdout(&out).matches("Signature verified.").count(), 6);
+    let out = realm.gss_client(&port, &["-nw", "-nm"], "alice");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("Response received."));
+    let out = realm.gss_client(&port, &["-na"], "alice");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let _ = server.kill();
+    let srv = server.wait_with_output().expect("gss-server");
+    let text = stdout(&srv);
+    assert_eq!(
+        text.matches("Received message: \"testmsg\"").count(),
+        8,
+        "{text}"
+    );
+    assert!(
+        text.contains("Accepted unauthenticated connection."),
+        "{text}"
+    );
 }
 
 fn stdout(o: &std::process::Output) -> String {

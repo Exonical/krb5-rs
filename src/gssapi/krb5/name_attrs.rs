@@ -44,9 +44,9 @@ pub struct NameAttrValue {
 /// The authdata context of a name (`krb5_authdata_context`).
 #[derive(Debug, Clone, Default)]
 pub(super) struct NameAttrs {
-    pac: Option<Pac>,
-    pac_verified: bool,
-    indicators: Vec<String>,
+    pub(super) pac: Option<Pac>,
+    pub(super) pac_verified: bool,
+    pub(super) indicators: Vec<String>,
 }
 
 /// mspac_attr2type: `Some(None)` is the whole PAC.
