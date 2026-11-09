@@ -641,7 +641,7 @@ fn run() {
             cockroach_command(&cmd, args, &cfg, &realm, master_password_file.as_deref());
             return;
         }
-        Some(other) => fail(format!("unknown db_library {other:?}")),
+        Some(other) => fail(cfg.db_module.unknown_library_error(other)),
     }
     if matches!(cmd.as_str(), "database" | "replication") {
         fail(format!("`{cmd}` needs db_library = krb5-rs-cockroach"));

@@ -695,7 +695,10 @@ fn replay(
         )?
         .with_iprop(&cfg.iprop)?
         .replay_updates(updates),
-        _ => LmdbStore::open(cfg, master)?.replay_updates(updates),
+        None | Some("klmdb") => LmdbStore::open(cfg, master)?.replay_updates(updates),
+        Some(other) => Err(StoreError::backend(
+            cfg.db_module.unknown_library_error(other),
+        )),
     }
 }
 

@@ -84,6 +84,10 @@ pub struct DbModuleConfig {
     /// Every other key of the section, for the plug-in to interpret
     /// (`replica_path`, `turso_pool_size`, ...).
     pub options: std::collections::BTreeMap<String, String>,
+    /// `[dbmodules] db_module_dir`: directories searched for a
+    /// `db_library` that is not built in, before the default one
+    /// (kdb5.c:409-443).
+    pub module_dirs: Vec<std::path::PathBuf>,
 }
 
 impl DbModuleConfig {
@@ -91,7 +95,33 @@ impl DbModuleConfig {
     pub fn get(&self, key: &str) -> Option<&str> {
         self.options.get(key).map(String::as_str)
     }
+
+    /// The error for a `db_library` that is not built in. MIT's
+    /// `load_library` looks for `<name>.so` in `db_module_dir`, then in
+    /// the default directory; a shared library found there can't be
+    /// loaded here, since KDB modules are built in.
+    pub fn unknown_library_error(&self, name: &str) -> String {
+        let found = self
+            .module_dirs
+            .iter()
+            .chain(std::iter::once(&std::path::PathBuf::from(
+                DEFAULT_KDB_LIB_PATH,
+            )))
+            .flat_map(|d| [d.join(format!("{name}.so")), d.join(name)])
+            .find(|p| p.is_file());
+        match found {
+            Some(path) => format!(
+                "Unable to load requested database module '{name}': {} is a shared \
+                 library, and only built-in database modules can be loaded",
+                path.display()
+            ),
+            None => format!("Unable to find requested database type: {name}"),
+        }
+    }
 }
+
+/// MIT's default KDB module directory (`DEFAULT_KDB_LIB_PATH`).
+const DEFAULT_KDB_LIB_PATH: &str = "/usr/local/lib/krb5/plugins/kdb";
 
 /// Keys of a `[dbmodules]` section that plug-ins may read.
 const DBMODULE_OPTION_KEYS: &[&str] = &[
@@ -471,6 +501,15 @@ impl RealmConfig {
             options: DBMODULE_OPTION_KEYS
                 .iter()
                 .filter_map(|k| module_value(k).map(|v| ((*k).to_string(), v)))
+                .collect(),
+            module_dirs: kdc_conf
+                .get_values(&["dbmodules", "db_module_dir"])
+                .into_iter()
+                .chain(
+                    krb5_conf
+                        .map_or_else(Vec::new, |p| p.get_values(&["dbmodules", "db_module_dir"])),
+                )
+                .map(std::path::PathBuf::from)
                 .collect(),
         };
         #[cfg(feature = "pkinit")]

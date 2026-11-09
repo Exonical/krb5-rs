@@ -2107,6 +2107,7 @@ mod tests {
     fn module_options_use_mit_defaults_and_profile_values() {
         let module = krb5_rs::kdc::DbModuleConfig {
             library: Some("klmdb".into()),
+            module_dirs: Vec::new(),
             options: [
                 ("mapsize".into(), "256".into()),
                 ("max_readers".into(), "80".into()),

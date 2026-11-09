@@ -779,7 +779,7 @@ async fn config_mode(
         Some("krb5-rs-cockroach") => {
             return cockroach_mode(cli, cfg, master, shutdown_rx, metrics).await;
         }
-        Some(other) => return Err(io_err(format!("unknown db_library {other:?}"))),
+        Some(other) => return Err(io_err(cfg.db_module.unknown_library_error(other))),
     }
 
     let mut parts = ModeParts::default();

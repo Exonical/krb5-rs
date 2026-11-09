@@ -2568,9 +2568,13 @@ async fn kadmind(args: Args) {
                 .and_then(|store| store.with_iprop(&cfg.iprop))
                 .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
         )),
-        _ => Db::Lmdb(Arc::new(
+        None | Some("klmdb") => Db::Lmdb(Arc::new(
             LmdbStore::open(&cfg, &master)
                 .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+        )),
+        Some(other) => die(format!(
+            "{} while initializing database",
+            cfg.db_module.unknown_library_error(other)
         )),
     };
 

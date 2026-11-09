@@ -218,6 +218,7 @@ mod tests {
     fn module(pairs: &[(&str, &str)]) -> DbModuleConfig {
         DbModuleConfig {
             library: Some("kldap".into()),
+            module_dirs: Vec::new(),
             options: pairs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
