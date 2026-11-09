@@ -92,7 +92,7 @@ fn kdb5_ldap_util_against_openldap() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let port = 20000 + ((std::process::id() + 7) % 20000) as u16;
+    let port = free_port();
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../krb5-rs-kdb-ldap/tests/slapd.sh");
     let out = Command::new("sh")
         .arg(&script)
@@ -316,4 +316,13 @@ fn kdb5_ldap_util_against_openldap() {
         "",
     );
     assert!(!left.contains("dn:"), "{left}");
+}
+
+/// A port that was free a moment ago (the kernel picks it), so slapd
+/// doesn't collide with another listener.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("free port")
+        .port()
 }

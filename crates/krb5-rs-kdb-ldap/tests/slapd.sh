@@ -77,7 +77,10 @@ slapadd -n1 -F "$dir/slapd.d" -l "$dir/base.ldif"
 # Ubuntu's AppArmor profile for /usr/sbin/slapd denies paths outside
 # /etc/ldap and /var/lib/ldap; a copy of the binary is not confined.
 cp "$(command -v slapd)" "$dir/slapd"
-"$dir/slapd" -F "$dir/slapd.d" -h "ldap://127.0.0.1:$port/" >/dev/null 2>&1
+if ! "$dir/slapd" -F "$dir/slapd.d" -h "ldap://127.0.0.1:$port/" >"$dir/slapd.log" 2>&1; then
+    cat "$dir/slapd.log" >&2
+    exit 1
+fi
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ -s "$dir/slapd.pid" ] && break
     sleep 0.3
