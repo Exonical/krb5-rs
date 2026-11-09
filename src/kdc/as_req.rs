@@ -152,6 +152,9 @@ impl<S: PrincipalStore> Kdc<S> {
         let server = self
             .lookup(sname, realm, "LOOKING_UP_SERVER")
             .await?
+            // An alias to another realm is no entry without
+            // KRB5_KDB_FLAG_REFERRAL_OK (do_as_req.c:596).
+            .filter(|e| e.realm == *realm)
             .ok_or_else(|| KdcError::new(KDC_ERR_S_PRINCIPAL_UNKNOWN, "SERVER_NOT_FOUND"))?;
         // The store returned a client from another realm (a KDB alias): a
         // client referral if KRB5_KDB_FLAG_REFERRAL_OK (do_as_req.c:575-577,
@@ -599,7 +602,10 @@ impl<S: PrincipalStore> Kdc<S> {
             &server_key.key,
             &local_tgt,
             include_pac_p(request.padata.as_deref()),
-            &indicators,
+            &mut indicators,
+            &client,
+            // rock->replaced_reply_key (do_as_req.c:267-268).
+            replaced.is_some() || otp_key.is_some(),
             || {
                 use super::plugins::{kdb_flags, AuthdataRequest, MSG_AS_REQ};
                 // KRB5_NT_ENTERPRISE_PRINCIPAL.

@@ -165,6 +165,16 @@ impl<S: PrincipalStore> super::Kdc<S> {
         }
     }
 
+    /// `krb5_db_issue_pac` (kdc_authdata.c:507-515): a store without
+    /// `issue_pac` leaves the PAC and indicators alone.
+    fn db_issue_pac(&self, req: super::IssuePac<'_>) -> Result<(), KdcError> {
+        match self.store.issue_pac(req) {
+            Ok(()) => Ok(()),
+            Err(e) if matches!(e.kind(), super::StoreErrorKind::Unsupported) => Ok(()),
+            Err(_) => Err(KdcError::generic("HANDLE_AUTHDATA")),
+        }
+    }
+
     /// `handle_pac` for an AS request (kdc_authdata.c:462-575).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn issue_as_pac(
@@ -174,7 +184,9 @@ impl<S: PrincipalStore> super::Kdc<S> {
         server_key: &EncryptionKey,
         local_tgt: &PrincipalEntry,
         include_pac: bool,
-        indicators: &[String],
+        indicators: &mut Vec<String>,
+        client: &PrincipalEntry,
+        replaced_reply_key: bool,
         ad: impl FnOnce() -> AuthdataRequest,
     ) -> Result<(), KdcError> {
         self.run_authdata_modules(part, ad);
@@ -186,16 +198,25 @@ impl<S: PrincipalStore> super::Kdc<S> {
         {
             return Ok(());
         }
-        add_auth_indicators(part, indicators, server_key, local_tgt)?;
         if self.config.disable_pac || part.flags.contains(TicketFlags::ANONYMOUS) || !include_pac {
-            return Ok(());
+            return add_auth_indicators(part, indicators, server_key, local_tgt);
         }
+        let mut pac = Pac::new();
+        self.db_issue_pac(super::IssuePac {
+            client: Some(client),
+            protocol_transition: false,
+            replaced_reply_key,
+            old_pac: None,
+            new_pac: &mut pac,
+            auth_indicators: indicators,
+        })?;
+        add_auth_indicators(part, indicators, server_key, local_tgt)?;
         let privsvr = self.privsvr_key(local_tgt)?;
         let crealm = String::from_utf8_lossy(part.crealm.as_bytes()).to_string();
         let cname = part.cname.clone();
         kdc_sign_ticket(
             part,
-            &mut Pac::new(),
+            &mut pac,
             &server.name,
             Some((&cname, &crealm)),
             server_key,
@@ -220,7 +241,8 @@ impl<S: PrincipalStore> super::Kdc<S> {
         subject_tkt: &EncTicketPart,
         subject_pac: Option<&Pac>,
         s4u: S4uPac<'_>,
-        indicators: &[String],
+        indicators: &mut Vec<String>,
+        client: Option<&PrincipalEntry>,
         ad: impl FnOnce() -> AuthdataRequest,
     ) -> Result<(), KdcError> {
         let mut list: Vec<AuthorizationDataElement> = Vec::new();
@@ -248,14 +270,22 @@ impl<S: PrincipalStore> super::Kdc<S> {
         {
             return Ok(());
         }
-        add_auth_indicators(part, indicators, server_key, local_tgt)?;
-        let Some(subject) = subject_pac else {
-            return Ok(());
+        let subject = match subject_pac {
+            Some(s) if !self.config.disable_pac && !part.flags.contains(TicketFlags::ANONYMOUS) => {
+                s
+            }
+            _ => return add_auth_indicators(part, indicators, server_key, local_tgt),
         };
-        if self.config.disable_pac || part.flags.contains(TicketFlags::ANONYMOUS) {
-            return Ok(());
-        }
         let mut pac = Pac::new();
+        self.db_issue_pac(super::IssuePac {
+            client,
+            protocol_transition: matches!(s4u, S4uPac::SelfReq { .. }),
+            replaced_reply_key: false,
+            old_pac: Some(subject),
+            new_pac: &mut pac,
+            auth_indicators: indicators,
+        })?;
+        add_auth_indicators(part, indicators, server_key, local_tgt)?;
         if let S4uPac::Proxy {
             target,
             impersonator,

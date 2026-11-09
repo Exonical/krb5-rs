@@ -2108,6 +2108,7 @@ mod tests {
         let module = krb5_rs::kdc::DbModuleConfig {
             library: Some("klmdb".into()),
             module_dirs: Vec::new(),
+            section: String::new(),
             options: [
                 ("mapsize".into(), "256".into()),
                 ("max_readers".into(), "80".into()),

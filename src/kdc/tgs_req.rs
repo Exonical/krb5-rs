@@ -232,6 +232,24 @@ impl<S: PrincipalStore> Kdc<S> {
             .ok()
             .flatten()
         {
+            // An alias to another realm: the TGT for that realm, which MIT's
+            // modules look up under KRB5_KDB_FLAG_REFERRAL_OK (kdb_test.c).
+            if found.realm != realm {
+                let tgt = PrincipalName {
+                    name_type: 2,
+                    name_string: vec![
+                        rasn::types::GeneralString::from_bytes(b"krbtgt").map_err(|_| unknown())?,
+                        rasn::types::GeneralString::from_bytes(found.realm.as_bytes())
+                            .map_err(|_| unknown())?,
+                    ],
+                };
+                let found = self
+                    .lookup(&tgt, realm, "LOOKING_UP_SERVER")
+                    .await?
+                    .filter(|e| e.realm == realm)
+                    .ok_or_else(unknown)?;
+                return Ok((found, true));
+            }
             // A cross-realm TGT found for another name (a KDB alias) is a
             // referral too (do_tgs_req.c:674-677).
             let referral =
@@ -728,7 +746,7 @@ impl<S: PrincipalStore> Kdc<S> {
         }
         // Indicators from the subject ticket, not for S4U2Self, where the
         // client didn't authenticate (do_tgs_req.c:761-769, 894-902).
-        let indicators = if s4u2self.is_none() {
+        let mut indicators = if s4u2self.is_none() {
             let inds = super::cammac::get_auth_indicators(subject_tkt, &local_tgt);
             super::cammac::check_indicators(server.require_auth.as_deref(), &inds)?;
             inds
@@ -868,7 +886,8 @@ impl<S: PrincipalStore> Kdc<S> {
                 },
                 (None, None) => S4uPac::None,
             },
-            &indicators,
+            &mut indicators,
+            client.as_ref(),
             || {
                 use super::plugins::{kdb_flags, AuthdataRequest, MSG_TGS_REQ};
                 let flag = |on: bool, f: i32| if on { f } else { 0 };
