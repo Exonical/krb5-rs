@@ -159,7 +159,7 @@ else
 fi
 echo "kiprop/$H@$R p" > "$B/kadm5.acl"
 echo "host/$H@$R" > "$B/kpropd.acl"
-p $BIN/krb5-rs-kdc --realm $R > "$B/kdc.log" 2>&1 &
+p $BIN/krb5-rs-kdc -n --realm $R > "$B/kdc.log" 2>&1 &
 echo $! > $B/kdc.pid
 wait_port 18889 || fail "kdc did not start"
 
@@ -198,7 +198,7 @@ if [ "$PLIB" = krb5-rs-file ]; then
   set -- $(lockout)
   [ "$3" = 1 ] && [ "$2" != 0 ] || fail "lockout after one failure: $*"
   kill "$(cat $B/kdc.pid)"; sleep 0.5
-  p $BIN/krb5-rs-kdc --realm $R >> "$B/kdc.log" 2>&1 &
+  p $BIN/krb5-rs-kdc -n --realm $R >> "$B/kdc.log" 2>&1 &
   echo $! > $B/kdc.pid
   wait_port 18889 || fail "kdc did not restart"
   bad_kinit
