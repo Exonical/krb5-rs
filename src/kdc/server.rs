@@ -93,7 +93,9 @@ pub async fn serve_udp_with<S: PrincipalStore + 'static>(
         if let Some(log) = &options.logger {
             log(&summary, peer);
         }
-        if summary.lookaside == Some(super::LookasideHit::Dropped) {
+        // A dropped repeat or a discarded request gets no reply
+        // (net-server.c process_packet_response).
+        if summary.lookaside == Some(super::LookasideHit::Dropped) || reply.is_empty() {
             continue;
         }
         // MIT logs and drops on send failure (net-server.c:1112-1124).
@@ -227,7 +229,9 @@ async fn serve_connection<S: PrincipalStore>(
     if let Some(log) = logger {
         log(&summary, peer);
     }
-    if summary.lookaside == Some(super::LookasideHit::Dropped) {
+    // A dropped repeat or a discarded request closes the connection
+    // unanswered (net-server.c process_tcp_response).
+    if summary.lookaside == Some(super::LookasideHit::Dropped) || reply.is_empty() {
         return Ok(());
     }
     write_framed(&mut stream, &reply).await
