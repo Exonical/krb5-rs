@@ -81,12 +81,14 @@ pub(crate) fn validate_as_reply(
         ));
     }
 
-    // 6. A postdated reply starts when requested (get_in_tkt.c:243-245).
+    // 6. A postdated reply starts when requested (get_in_tkt.c:243-245);
+    //    an absent starttime is the authtime (get_in_tkt.c:218-220).
+    let starttime = enc_part.starttime.as_ref().unwrap_or(&enc_part.authtime);
     if let Some(from) = &request_body.from {
         if request_body
             .kdc_options
             .contains(crate::types::KdcOptions::POSTDATED)
-            && enc_part.starttime.as_ref() != Some(from)
+            && starttime != from
         {
             return Err(Krb5Error::ReplyValidation(
                 "KDC reply did not match expectations",
@@ -96,7 +98,6 @@ pub(crate) fn validate_as_reply(
 
     // 7. Start time within acceptable clock skew, unless postdated
     //    (get_in_tkt.c:266-269).
-    let starttime = enc_part.starttime.as_ref().unwrap_or(&enc_part.authtime);
     let skew = time_diff(starttime, &now);
     if request_body.from.is_none() && skew > max_clock_skew {
         return Err(Krb5Error::ClockSkew {
@@ -245,6 +246,41 @@ mod tests {
             now,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn postdated_reply_without_starttime_starts_at_authtime() {
+        let now = make_time(1_700_000_000);
+        let (mut req_body, reply, mut enc_part) = make_valid_set(12345, now);
+        req_body.kdc_options = KerberosFlags::new(KdcOptions::POSTDATED);
+        req_body.from = Some(now);
+        enc_part.starttime = None;
+        let ok = validate_as_reply(
+            12345,
+            &req_body,
+            &reply,
+            &enc_part,
+            true,
+            DEFAULT_MAX_CLOCK_SKEW,
+            now,
+        );
+        assert!(ok.is_ok());
+        req_body.from = Some(make_time(1_700_000_100));
+        let late = validate_as_reply(
+            12345,
+            &req_body,
+            &reply,
+            &enc_part,
+            true,
+            DEFAULT_MAX_CLOCK_SKEW,
+            now,
+        );
+        assert!(matches!(
+            late,
+            Err(Krb5Error::ReplyValidation(
+                "KDC reply did not match expectations"
+            ))
+        ));
     }
 
     #[test]

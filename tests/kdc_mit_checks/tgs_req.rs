@@ -344,20 +344,19 @@ async fn tgs_req_unsupported_options_return_badoption() {
         at(3600),
         Some(at(86400)),
     );
-    for opt in [
-        KdcOptions::POSTDATED,
-        KdcOptions::ALLOW_POSTDATE,
-        KdcOptions::VALIDATE,
-        KdcOptions::ENC_TKT_IN_SKEY,
-        KdcOptions::PROXY,
+    // VALIDATE of a valid ticket, user-to-user without a second ticket,
+    // and PROXY of a TGT (tgs_policy.c:72-73, 639-644).
+    for (sname, opt) in [
+        (krbtgt(), KdcOptions::VALIDATE),
+        (service(), KdcOptions::ENC_TKT_IN_SKEY),
+        (krbtgt(), KdcOptions::PROXY),
     ] {
-        let mut spec = TgsReqSpec::new(service(), opt);
-        if opt == KdcOptions::POSTDATED {
-            spec.from = Some(at(600));
-        }
-        let (req, _) = build_tgs_req(&tgt, spec);
+        let (req, _) = build_tgs_req(&tgt, TgsReqSpec::new(sname, opt));
         assert_eq!(tgs_error_code(&f, &req).await, 13, "{opt:?}");
     }
+    // PROXY for another server than the ticket's (tgs_policy.c:635-638).
+    let (req, _) = build_tgs_req(&tgt, TgsReqSpec::new(service(), KdcOptions::PROXY));
+    assert_eq!(tgs_error_code(&f, &req).await, 26);
 }
 
 #[tokio::test]
@@ -718,4 +717,107 @@ async fn authoritative_tgs_header_client_disable_returns_client_revoked() {
         error.e_text.as_ref().map(|text| text.as_bytes()),
         Some(b"AUTHORITATIVE_CLIENT_DISABLED".as_slice())
     );
+}
+
+/// do_tgs_req.c:829-830, kdc_util.c:825-826.
+#[tokio::test]
+async fn tgs_req_postdated_service_ticket_starts_at_from_and_is_invalid() {
+    let f = fixture().await;
+    let tgt = mint_tgt(
+        &f,
+        RENEWABLE_TGT | TicketFlags::MAY_POSTDATE,
+        at(-60),
+        at(-60),
+        at(7200),
+        Some(at(86400)),
+    );
+    let mut spec = TgsReqSpec::new(service(), KdcOptions::POSTDATED);
+    spec.from = Some(at(600));
+    let (req, subkey) = build_tgs_req(&tgt, spec);
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
+    assert_eq!(enc.starttime, Some(at(600)));
+    let part = decrypt_ticket(&f.service_key, &rep.ticket).expect("decrypt");
+    let flags: TicketFlags = *part.flags;
+    assert!(flags.contains(TicketFlags::POSTDATED | TicketFlags::INVALID));
+    assert_eq!(part.starttime, Some(at(600)));
+
+    // tgs_policy.c:70-71: the TGT must be MAY-POSTDATE.
+    let plain = mint_tgt(&f, RENEWABLE_TGT, at(-60), at(-60), at(7200), None);
+    for opt in [KdcOptions::POSTDATED, KdcOptions::ALLOW_POSTDATE] {
+        let mut spec = TgsReqSpec::new(service(), opt);
+        spec.from = Some(at(600));
+        let (req, _) = build_tgs_req(&plain, spec);
+        assert_eq!(tgs_error_code(&f, &req).await, 13, "{opt:?}");
+    }
+}
+
+/// do_tgs_req.c:820-824, 1012-1017, kdc_util.c:819-820: validating a
+/// postdated ticket whose start has passed keeps its times and flags but
+/// clears INVALID; validating early fails with KRB_AP_ERR_TKT_NYV.
+#[tokio::test]
+async fn tgs_req_validate_postdated_ticket() {
+    let f = fixture().await;
+    let postdated = RENEWABLE_TGT | TicketFlags::POSTDATED | TicketFlags::INVALID;
+    let tgt = mint_tgt(&f, postdated, at(-120), at(-60), at(3600), Some(at(86400)));
+    let (req, subkey) = build_tgs_req(&tgt, TgsReqSpec::new(krbtgt(), KdcOptions::VALIDATE));
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
+    let flags: TicketFlags = *enc.flags;
+    assert!(!flags.contains(TicketFlags::INVALID));
+    assert!(flags.contains(TicketFlags::POSTDATED | TicketFlags::RENEWABLE));
+    assert_eq!(enc.sname, krbtgt());
+    let part = decrypt_ticket(&f.tgs_key, &rep.ticket).expect("decrypt");
+    assert_eq!(part.authtime, at(-120));
+    assert_eq!(part.starttime, Some(at(-60)));
+    assert_eq!(part.endtime, at(3600));
+    assert_eq!(part.renew_till, Some(at(86400)));
+
+    // An INVALID ticket can't be used for anything else.
+    let (req, _) = build_tgs_req(&tgt, TgsReqSpec::new(service(), KdcOptions::empty()));
+    assert_eq!(tgs_error_code(&f, &req).await, 33);
+
+    let early = mint_tgt(&f, postdated, at(-60), at(600), at(3600), None);
+    let (req, _) = build_tgs_req(&early, TgsReqSpec::new(krbtgt(), KdcOptions::VALIDATE));
+    assert_eq!(tgs_error_code(&f, &req).await, 33);
+}
+
+/// tgs_policy.c:68-69, do_tgs_req.c:1019-1022: a proxy ticket comes from a
+/// PROXIABLE ticket for the same (non-TGS) server and carries the requested
+/// addresses.
+#[tokio::test]
+async fn tgs_req_proxy_ticket_from_proxiable_service_ticket() {
+    let f = fixture().await;
+    let tkt = mint_ticket(
+        &f.service_key,
+        service(),
+        TicketFlags::PROXIABLE | TicketFlags::PRE_AUTHENT,
+        at(-60),
+        at(-60),
+        at(3600),
+        None,
+    );
+    let addr = HostAddress {
+        addr_type: 2,
+        address: OctetString::from(vec![192, 0, 2, 9]),
+    };
+    let mut spec = TgsReqSpec::new(service(), KdcOptions::PROXY);
+    spec.addresses = Some(vec![addr.clone()]);
+    let (req, subkey) = build_tgs_req(&tkt, spec);
+    let (rep, enc) = open_tgs_rep(&f.kdc.handle(&req).await, &subkey);
+    let flags: TicketFlags = *enc.flags;
+    assert!(flags.contains(TicketFlags::PROXY));
+    assert_eq!(enc.caddr.as_deref(), Some(&[addr.clone()][..]));
+    let part = decrypt_ticket(&f.service_key, &rep.ticket).expect("decrypt");
+    assert_eq!(part.caddr.as_deref(), Some(&[addr][..]));
+
+    let plain = mint_ticket(
+        &f.service_key,
+        service(),
+        TicketFlags::PRE_AUTHENT,
+        at(-60),
+        at(-60),
+        at(3600),
+        None,
+    );
+    let (req, _) = build_tgs_req(&plain, TgsReqSpec::new(service(), KdcOptions::PROXY));
+    assert_eq!(tgs_error_code(&f, &req).await, 13);
 }

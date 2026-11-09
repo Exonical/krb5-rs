@@ -332,11 +332,9 @@ async fn as_exchange_wrong_realm_returns_wrong_realm() {
 }
 
 #[tokio::test]
-async fn as_req_unsupported_options_return_badoption() {
+async fn as_req_invalid_options_return_badoption() {
     let f = fixture().await;
     for opt in [
-        KdcOptions::POSTDATED,
-        KdcOptions::ALLOW_POSTDATE,
         KdcOptions::VALIDATE,
         KdcOptions::ENC_TKT_IN_SKEY,
         KdcOptions::PROXY,
@@ -363,4 +361,25 @@ async fn as_req_unknown_service_returns_s_principal_unknown() {
     req.0.req_body.sname = Some(PrincipalName::new_srv_hst("nosuch", "host.test.realm"));
     let der = rasn::der::encode(&req).expect("encode");
     assert_eq!(krb_error(&f.kdc.handle(&der).await).error_code, 7);
+}
+
+/// do_as_req.c:692-695, kdc_util.c:825-826: a postdated AS ticket starts at
+/// the requested `from` and is marked INVALID until validated.
+#[tokio::test]
+async fn as_req_postdated_ticket_starts_at_from_and_is_invalid() {
+    let f = fixture().await;
+    let mut config = AsExchangeConfig::new(PrincipalName::new_principal(USER), REALM);
+    config.start_time = 600;
+    let cred = run_as(&f.kdc, config, PASSWORD)
+        .await
+        .result
+        .expect("postdated AS");
+    let part = decrypt_ticket(&f.tgs_key, &cred.ticket).expect("decrypt TGT");
+    let flags: TicketFlags = *part.flags;
+    assert!(
+        flags.contains(TicketFlags::POSTDATED | TicketFlags::INVALID | TicketFlags::MAY_POSTDATE)
+    );
+    let start = part.starttime.expect("starttime").timestamp();
+    assert!((start - (Utc::now().timestamp() + 600)).abs() <= 5);
+    assert!(part.endtime.timestamp() > start);
 }

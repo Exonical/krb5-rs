@@ -28,13 +28,6 @@ pub(crate) const AS_INVALID_OPTIONS: KdcOptions = KdcOptions::FORWARDED
     .union(KdcOptions::ENC_TKT_IN_SKEY)
     .union(KdcOptions::CNAME_IN_ADDL_TKT);
 
-/// Options this KDC milestone does not implement; rejected with
-/// `KDC_ERR_BADOPTION` instead of being silently ignored.
-pub(crate) const UNSUPPORTED_OPTIONS: KdcOptions = KdcOptions::ALLOW_POSTDATE
-    .union(KdcOptions::POSTDATED)
-    .union(KdcOptions::VALIDATE)
-    .union(KdcOptions::PROXY);
-
 /// Realm-wide lifetime limits (MIT `realm_maxlife` / `realm_maxrlife`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RealmLimits {
@@ -199,7 +192,7 @@ pub(crate) fn validate_as_request(
     server: &PrincipalEntry,
     now: i64,
 ) -> Result<(), KdcError> {
-    if opts.intersects(AS_INVALID_OPTIONS | UNSUPPORTED_OPTIONS) {
+    if opts.intersects(AS_INVALID_OPTIONS) {
         return Err(KdcError::new(KDC_ERR_BADOPTION, "INVALID AS OPTIONS"));
     }
     if expired(&client.expiration, now) {
@@ -223,6 +216,20 @@ pub(crate) fn validate_as_request(
             .contains(PrincipalAttributes::PWCHANGE_SERVICE)
     {
         return Err(KdcError::new(KDC_ERR_KEY_EXPIRED, "REQUIRED PWCHANGE"));
+    }
+    // kdc_util.c:768-775.
+    if opts.intersects(KdcOptions::ALLOW_POSTDATE | KdcOptions::POSTDATED)
+        && (client
+            .attributes
+            .contains(PrincipalAttributes::DISALLOW_POSTDATED)
+            || server
+                .attributes
+                .contains(PrincipalAttributes::DISALLOW_POSTDATED))
+    {
+        return Err(KdcError::new(
+            KDC_ERR_CANNOT_POSTDATE,
+            "POSTDATE NOT ALLOWED",
+        ));
     }
     if client
         .attributes
@@ -280,6 +287,9 @@ pub(crate) fn get_ticket_flags(
         if opts.contains(opt) {
             flags |= flag;
         }
+    }
+    if opts.contains(KdcOptions::POSTDATED) {
+        flags |= TicketFlags::INVALID;
     }
     match header {
         Some(h) => {
@@ -379,12 +389,17 @@ pub(crate) fn check_tgs_opts(opts: KdcOptions, header_flags: TicketFlags) -> Res
     Ok(())
 }
 
-/// `check_tgs_times` renew_till check (MIT tgs_policy.c:220-245).
+/// `check_tgs_times` (MIT tgs_policy.c:220-245). `header_start` is the
+/// header ticket's starttime, or its authtime when absent.
 pub(crate) fn check_tgs_times(
     opts: KdcOptions,
+    header_start: i64,
     header_renew_till: i64,
     now: i64,
 ) -> Result<(), KdcError> {
+    if opts.contains(KdcOptions::VALIDATE) && header_start > now {
+        return Err(KdcError::new(KRB_AP_ERR_TKT_NYV, "NOT_YET_VALID"));
+    }
     if opts.contains(KdcOptions::RENEW) && now > header_renew_till {
         return Err(KdcError::new(KRB_AP_ERR_TKT_EXPIRED, "TKT_EXPIRED"));
     }
@@ -404,6 +419,14 @@ pub(crate) fn check_tgs_svc_policy(
         && attrs.contains(PrincipalAttributes::DISALLOW_RENEWABLE)
     {
         return Err(KdcError::new(KDC_ERR_POLICY, "NON-RENEWABLE TICKET"));
+    }
+    if opts.contains(KdcOptions::ALLOW_POSTDATE)
+        && attrs.contains(PrincipalAttributes::DISALLOW_POSTDATED)
+    {
+        return Err(KdcError::new(
+            KDC_ERR_CANNOT_POSTDATE,
+            "NON-POSTDATABLE TICKET",
+        ));
     }
     if opts.contains(KdcOptions::ENC_TKT_IN_SKEY)
         && attrs.contains(PrincipalAttributes::DISALLOW_DUP_SKEY)
@@ -738,10 +761,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_as_request_unsupported_option_is_badoption() {
+    fn validate_as_request_postdate_needs_client_and_server_permission() {
+        assert!(validate_as_request(KdcOptions::POSTDATED, &entry(), &entry(), START).is_ok());
+        let mut denied = entry();
+        denied.attributes |= PrincipalAttributes::DISALLOW_POSTDATED;
+        for (client, server) in [(&denied, &entry()), (&entry(), &denied)] {
+            for opt in [KdcOptions::POSTDATED, KdcOptions::ALLOW_POSTDATE] {
+                let err = validate_as_request(opt, client, server, START).expect_err("reject");
+                assert_eq!(err.code, KDC_ERR_CANNOT_POSTDATE);
+            }
+        }
+    }
+
+    #[test]
+    fn validate_as_request_invalid_option_is_badoption() {
         for opt in [
-            KdcOptions::POSTDATED,
-            KdcOptions::ALLOW_POSTDATE,
             KdcOptions::VALIDATE,
             KdcOptions::ENC_TKT_IN_SKEY,
             KdcOptions::PROXY,
@@ -827,8 +861,8 @@ mod tests {
 
     #[test]
     fn check_tgs_times_renew_after_renew_till_is_expired() {
-        let err = check_tgs_times(KdcOptions::RENEW, START, START + 1).expect_err("expired");
+        let err = check_tgs_times(KdcOptions::RENEW, 0, START, START + 1).expect_err("expired");
         assert_eq!(err.code, KRB_AP_ERR_TKT_EXPIRED);
-        assert!(check_tgs_times(KdcOptions::RENEW, START, START).is_ok());
+        assert!(check_tgs_times(KdcOptions::RENEW, 0, START, START).is_ok());
     }
 }
