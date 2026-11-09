@@ -1220,7 +1220,7 @@ cases against the daemon.
 
 MIT's `kdcauthdata` interface (`kdcauthdata_plugin.h`, `kdc/kdc_authdata.c`)
 is `krb5_rs::kdc::plugins::KdcAuthdata`. Modules run in another process and
-are reached over the same socket RPC as kdcpolicy (`KRB5RS-KDCAUTHDATA-V-1`,
+are reached over the same socket RPC as kdcpolicy (`KRB5RS-KDCAUTHDATA-V-2`,
 `plugins::rpc::serve_kdcauthdata`), configured the same way:
 
 ```text
@@ -1233,9 +1233,13 @@ are reached over the same socket RPC as kdcpolicy (`KRB5RS-KDCAUTHDATA-V-1`,
 - **Loading:** as `load_authdata_plugins`, a module that cannot be reached,
   refuses the version, or fails `init` is logged and skipped.
 - **Arguments:** `handle` gets MIT's `flags` (`KRB5_KDB_FLAG_*`), the client,
-  server and header/evidence server, the client (or TGS reply), server and
+  server and header/evidence server with their database entries (MIT's
+  `krb5_db_entry`: attributes, lifetimes, expirations, keys, delegation
+  lists, string attributes, policy), the client (or TGS reply), server and
   header keys, the DER request, the S4U client and the header ticket, and
-  may change the reply ticket's authorization data.
+  may change the reply ticket's authorization data. The module gets the
+  entries as values, since it runs in another process; as in MIT, changes
+  it makes to them are not written to the database.
 - **Order:** as `handle_authdata`: for TGS after the request's authdata is
   copied and before the header ticket's; for AS and TGS before the PAC is
   added; never for an anonymous ticket. A module error is logged as

@@ -207,6 +207,10 @@ async fn modules_get_mit_arguments_in_order_and_errors_do_not_stop_tickets() {
     assert_eq!(key(&as_req.server_key), key_of(&f.tgs_key));
     assert!(as_req.client_key.is_some());
     assert!(as_req.header_server.is_none() && as_req.enc_tkt_req.is_none());
+    let name = |e: &Option<krb5_rs::kdc::PrincipalEntry>| e.as_ref().map(|e| e.name.clone());
+    assert_eq!(name(&as_req.client_entry), Some(alice()));
+    assert_eq!(name(&as_req.server_entry), Some(tgs_name()));
+    assert!(as_req.header_server_entry.is_none());
     assert!(!as_req.req_pkt.is_empty());
 
     let cred = f.tgs(&tgt, svc()).await;
@@ -225,6 +229,9 @@ async fn modules_get_mit_arguments_in_order_and_errors_do_not_stop_tickets() {
     assert_eq!(tgs_req.header_server, Some((tgs_name(), REALM.into())));
     assert_eq!(key(&tgs_req.header_key), key_of(&f.tgs_key));
     assert_eq!(key(&tgs_req.server_key), key_of(&f.svc_key));
+    assert_eq!(name(&tgs_req.client_entry), Some(alice()));
+    assert_eq!(name(&tgs_req.server_entry), Some(svc()));
+    assert_eq!(name(&tgs_req.header_server_entry), Some(tgs_name()));
     // The TGS reply key: the client's subkey here.
     assert!(tgs_req.client_key.is_some());
     assert_eq!(

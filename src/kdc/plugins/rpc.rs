@@ -17,6 +17,7 @@ use super::{
     Audit, AuditStage, AuditState, AuthdataRequest, KdcAuthdata, KdcPolicy, PolicyLimits,
     PolicyRefusal, PolicyRequest,
 };
+use crate::kdc::{KeyEntry, PrincipalAttributes, PrincipalEntry};
 use crate::types::{AuthorizationDataElement, EncTicketPart, EncryptionKey, PrincipalName};
 
 /// [`call::INITIALIZE`]'s string for a kdcpolicy module.
@@ -24,7 +25,7 @@ pub const KDCPOLICY_HANDSHAKE: &str = "KRB5RS-KDCPOLICY-V-1";
 /// [`call::INITIALIZE`]'s string for an audit module.
 pub const AUDIT_HANDSHAKE: &str = "KRB5RS-AUDIT-V-1";
 /// [`call::INITIALIZE`]'s string for a KDC authdata module.
-pub const KDCAUTHDATA_HANDSHAKE: &str = "KRB5RS-KDCAUTHDATA-V-1";
+pub const KDCAUTHDATA_HANDSHAKE: &str = "KRB5RS-KDCAUTHDATA-V-2";
 
 /// Call numbers.
 pub mod call {
@@ -52,8 +53,17 @@ pub mod call {
     /// header server and S4U client each as `ay` DER PrincipalName (empty
     /// for none) and `s` realm; `ay ay ay` client, server and header keys
     /// (DER EncryptionKey, empty for none); `ay` request; `ay ay` request
-    /// and reply tickets (DER EncTicketPart, empty for none). Answered with
-    /// `ay` the reply ticket's authorization data (DER, empty for none).
+    /// and reply tickets (DER EncTicketPart, empty for none); then the
+    /// client, server and header server database entries (`krb5_db_entry`),
+    /// each `i` present (0 or 1) followed, when present, by the entry:
+    /// `ay s` name and realm, `i` attributes, `ay ay ay ay ay` max life, max
+    /// renewable life, expiration, password expiration and last admin unlock
+    /// (8-byte big-endian seconds, empty for none), `i` key count and per key
+    /// `i ay` kvno and DER EncryptionKey and `i ay i ay` salt and s2kparams
+    /// (present flag and value), `as as` allowed to delegate to and from,
+    /// `s s s s` require_auth, otp, pkinit_cert_match and policy, `ay`
+    /// security epoch (8-byte big-endian). Answered with `ay` the reply
+    /// ticket's authorization data (DER, empty for none).
     pub const HANDLE: u32 = 12;
 }
 
@@ -84,6 +94,118 @@ fn get_principal(m: &mut Message) -> io::Result<Option<super::Principal>> {
     Ok(name.map(|n| (n, realm.unwrap_or_default())))
 }
 
+fn put_i64_opt(m: &mut Message, v: Option<i64>) {
+    m.put_bytes(&v.map_or(Vec::new(), |v| v.to_be_bytes().to_vec()));
+}
+
+fn get_i64_opt(m: &mut Message) -> io::Result<Option<i64>> {
+    let b = m.get_bytes()?;
+    if b.is_empty() {
+        return Ok(None);
+    }
+    let b: [u8; 8] = b.try_into().map_err(|_| bad("bad integer"))?;
+    Ok(Some(i64::from_be_bytes(b)))
+}
+
+fn put_opt_bytes(m: &mut Message, v: Option<&[u8]>) {
+    m.put_i32(i32::from(v.is_some())).put_bytes(v.unwrap_or_default());
+}
+
+fn get_opt_bytes(m: &mut Message) -> io::Result<Option<Vec<u8>>> {
+    let present = m.get_i32()? != 0;
+    let v = m.get_bytes()?;
+    Ok(present.then_some(v))
+}
+
+fn put_entry(m: &mut Message, e: Option<&PrincipalEntry>) -> io::Result<()> {
+    let Some(e) = e else {
+        m.put_i32(0);
+        return Ok(());
+    };
+    m.put_i32(1);
+    put_principal(m, Some(&(e.name.clone(), e.realm.clone())))?;
+    m.put_i32(e.attributes.bits() as i32);
+    let secs = |d: Option<std::time::Duration>| d.map(|d| d.as_secs() as i64);
+    let ts = |t: Option<&crate::types::KerberosTime>| t.map(|t| t.timestamp());
+    put_i64_opt(m, secs(e.max_life));
+    put_i64_opt(m, secs(e.max_renewable_life));
+    put_i64_opt(m, ts(e.expiration.as_ref()));
+    put_i64_opt(m, ts(e.pw_expiration.as_ref()));
+    put_i64_opt(m, ts(e.last_admin_unlock.as_ref()));
+    m.put_i32(i32::try_from(e.keys.len()).map_err(|_| bad("too many keys"))?);
+    for k in &e.keys {
+        m.put_i32(k.kvno as i32)
+            .put_bytes(&der_opt(Some(&k.key))?);
+        put_opt_bytes(m, k.salt.as_deref());
+        put_opt_bytes(m, k.s2kparams.as_deref());
+    }
+    m.put_strs(&e.allowed_to_delegate_to)
+        .put_strs(&e.allowed_to_delegate_from)
+        .put_str(e.require_auth.as_deref())
+        .put_str(e.otp.as_deref())
+        .put_str(e.pkinit_cert_match.as_deref())
+        .put_str(e.policy.as_deref())
+        .put_bytes(&e.security_epoch.to_be_bytes());
+    Ok(())
+}
+
+fn get_entry(m: &mut Message) -> io::Result<Option<PrincipalEntry>> {
+    if m.get_i32()? == 0 {
+        return Ok(None);
+    }
+    let (name, realm) = get_principal(m)?.ok_or_else(|| bad("missing entry name"))?;
+    let attributes = PrincipalAttributes::from_bits_retain(m.get_i32()? as u32);
+    let dur = |v: Option<i64>| v.map(|v| std::time::Duration::from_secs(v.max(0) as u64));
+    let time = |v: Option<i64>| v.map(crate::kdc::policy::kerberos_time);
+    let max_life = dur(get_i64_opt(m)?);
+    let max_renewable_life = dur(get_i64_opt(m)?);
+    let expiration = time(get_i64_opt(m)?);
+    let pw_expiration = time(get_i64_opt(m)?);
+    let last_admin_unlock = time(get_i64_opt(m)?);
+    let n = usize::try_from(m.get_i32()?).map_err(|_| bad("bad key count"))?;
+    let mut keys = Vec::new();
+    for _ in 0..n {
+        let kvno = m.get_i32()? as u32;
+        let key: EncryptionKey = opt_der(&m.get_bytes()?)?.ok_or_else(|| bad("missing key"))?;
+        let salt = get_opt_bytes(m)?;
+        let s2kparams = get_opt_bytes(m)?;
+        keys.push(KeyEntry {
+            kvno,
+            key,
+            salt,
+            s2kparams,
+        });
+    }
+    let allowed_to_delegate_to = m.get_strs()?;
+    let allowed_to_delegate_from = m.get_strs()?;
+    let require_auth = m.get_str()?;
+    let otp = m.get_str()?;
+    let pkinit_cert_match = m.get_str()?;
+    let policy = m.get_str()?;
+    let epoch: [u8; 8] = m
+        .get_bytes()?
+        .try_into()
+        .map_err(|_| bad("bad security epoch"))?;
+    Ok(Some(PrincipalEntry {
+        name,
+        realm,
+        attributes,
+        max_life,
+        max_renewable_life,
+        expiration,
+        pw_expiration,
+        keys,
+        allowed_to_delegate_to,
+        allowed_to_delegate_from,
+        require_auth,
+        otp,
+        pkinit_cert_match,
+        policy,
+        security_epoch: u64::from_be_bytes(epoch),
+        last_admin_unlock,
+    }))
+}
+
 fn put_authdata(m: &mut Message, r: &AuthdataRequest, reply: &EncTicketPart) -> io::Result<()> {
     m.put_i32(r.flags).put_i32(r.msg_type);
     for p in [&r.client, &r.server, &r.header_server, &r.for_user] {
@@ -95,6 +217,9 @@ fn put_authdata(m: &mut Message, r: &AuthdataRequest, reply: &EncTicketPart) -> 
     m.put_bytes(&r.req_pkt)
         .put_bytes(&der_opt(r.enc_tkt_req.as_ref())?)
         .put_bytes(&der_opt(Some(reply))?);
+    for e in [&r.client_entry, &r.server_entry, &r.header_server_entry] {
+        put_entry(m, e.as_ref())?;
+    }
     Ok(())
 }
 
@@ -111,6 +236,9 @@ fn get_authdata(m: &mut Message) -> io::Result<(AuthdataRequest, EncTicketPart)>
     let req_pkt = m.get_bytes()?;
     let enc_tkt_req: Option<EncTicketPart> = opt_der(&m.get_bytes()?)?;
     let reply: EncTicketPart = opt_der(&m.get_bytes()?)?.ok_or_else(|| bad("missing ticket"))?;
+    let client_entry = get_entry(m)?;
+    let server_entry = get_entry(m)?;
+    let header_server_entry = get_entry(m)?;
     m.finish()?;
     let r = AuthdataRequest {
         flags,
@@ -124,6 +252,9 @@ fn get_authdata(m: &mut Message) -> io::Result<(AuthdataRequest, EncTicketPart)>
         req_pkt,
         for_user,
         enc_tkt_req,
+        client_entry,
+        server_entry,
+        header_server_entry,
     };
     Ok((r, reply))
 }
@@ -710,5 +841,93 @@ mod tests {
         write_message(&mut a, 10, &Message::new(call::FINALIZE)).expect("write");
         assert_eq!(read_message(&mut a).expect("read").1.call, call::FINALIZE);
         t.join().expect("join").expect("serve");
+    }
+
+    struct Capture(Arc<Mutex<Vec<AuthdataRequest>>>);
+
+    impl KdcAuthdata for Capture {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn handle(&self, req: &AuthdataRequest, _reply: &mut EncTicketPart) -> Result<(), i32> {
+            self.0.lock().expect("lock").push(req.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn authdata_entries_round_trip() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let g = Arc::clone(&got);
+        let m = kdcauthdata(
+            "capture",
+            connector(move |s| {
+                let _ = serve_kdcauthdata(s, &Capture(Arc::clone(&g)));
+            }),
+        )
+        .expect("connect");
+        let t = crate::kdc::policy::kerberos_time;
+        let entry = PrincipalEntry {
+            name: PrincipalName::new_principal("alice"),
+            realm: "R".into(),
+            attributes: PrincipalAttributes::REQUIRES_PRE_AUTH
+                | PrincipalAttributes::REQUIRES_HW_AUTH,
+            max_life: Some(std::time::Duration::from_secs(3600)),
+            max_renewable_life: None,
+            expiration: Some(t(1_900_000_000)),
+            pw_expiration: None,
+            keys: vec![
+                KeyEntry {
+                    kvno: 3,
+                    key: EncryptionKey::new(18, vec![7; 32]),
+                    salt: Some(Vec::new()),
+                    s2kparams: None,
+                },
+                KeyEntry {
+                    kvno: 3,
+                    key: EncryptionKey::new(17, vec![8; 16]),
+                    salt: None,
+                    s2kparams: Some(vec![0, 0, 16, 0]),
+                },
+            ],
+            allowed_to_delegate_to: vec!["svc@R".into()],
+            allowed_to_delegate_from: Vec::new(),
+            require_auth: Some("otp".into()),
+            otp: None,
+            pkinit_cert_match: Some("<SAN>alice".into()),
+            policy: Some("default".into()),
+            security_epoch: u64::MAX - 1,
+            last_admin_unlock: Some(t(1_700_000_000)),
+        };
+        let req = AuthdataRequest {
+            msg_type: super::super::MSG_AS_REQ,
+            client_entry: Some(entry.clone()),
+            header_server_entry: Some(entry),
+            ..AuthdataRequest::default()
+        };
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("time")
+            .fixed_offset();
+        let mut reply = EncTicketPart {
+            flags: crate::types::KerberosFlags::new(crate::types::TicketFlags::empty()),
+            key: EncryptionKey::new(18, vec![1; 32]),
+            crealm: crate::kdc::error::general_string("R").expect("realm"),
+            cname: PrincipalName::new_principal("alice"),
+            transited: crate::types::TransitedEncoding {
+                tr_type: 1,
+                contents: Vec::new().into(),
+            },
+            authtime: at,
+            starttime: None,
+            endtime: at,
+            renew_till: None,
+            caddr: None,
+            authorization_data: None,
+        };
+        m.handle(&req, &mut reply).expect("handle");
+        drop(m);
+        let got = got.lock().expect("lock").clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(format!("{:?}", got[0]), format!("{req:?}"));
     }
 }

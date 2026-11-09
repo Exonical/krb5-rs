@@ -600,6 +600,8 @@ impl<S: PrincipalStore> Kdc<S> {
                     client_key: client_key.as_ref().map(|k| k.entry.key.clone()),
                     server_key: Some(server_key.key.clone()),
                     req_pkt: raw.to_vec(),
+                    client_entry: Some(client.clone()),
+                    server_entry: Some(server.clone()),
                     ..AuthdataRequest::default()
                 }
             },
