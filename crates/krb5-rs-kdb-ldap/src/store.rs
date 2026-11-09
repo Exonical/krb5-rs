@@ -9,7 +9,7 @@ use krb5_rs::kdc::kdb::mit::{record_from_entry, MitEntry};
 use krb5_rs::kdc::{
     PrincipalEntry, PrincipalRecord, PrincipalStore, RealmConfig, StoreError, StoreErrorKind,
 };
-use krb5_rs::types::{EncryptionKey, KerberosString, PrincipalName};
+use krb5_rs::types::{EncryptionKey, PrincipalName};
 use ldap3::{Scope, SearchEntry};
 
 use crate::attr::{filter_correct, ldap_parse_name, ldap_unparse_name};
@@ -114,7 +114,8 @@ impl LdapStore {
         srv: ServerType,
         master: &EncryptionKey,
     ) -> Result<Self, StoreError> {
-        let cfg = LdapConfig::new(&config.db_module, db_args, srv)?;
+        let mut cfg = LdapConfig::new(&config.db_module, db_args, srv)?;
+        cfg.master_key_name = config.master_key_name.clone();
         Self::open_with_config(cfg, &config.kdc.realm.to_string(), master).await
     }
 
@@ -197,13 +198,7 @@ impl LdapStore {
 
     /// `krb5_db_fetch_mkey_list`: reread `K/M` with the supplied key.
     pub async fn refresh_master(&self) -> Result<(), StoreError> {
-        let km = PrincipalName {
-            name_type: 1,
-            name_string: vec![
-                KerberosString::from_bytes(b"K").map_err(|e| StoreError::backend(e.to_string()))?,
-                KerberosString::from_bytes(b"M").map_err(|e| StoreError::backend(e.to_string()))?,
-            ],
-        };
+        let km = self.inner.cfg.master_principal()?;
         let raw = self
             .search_raw(&km, &self.inner.realm.clone())
             .await?

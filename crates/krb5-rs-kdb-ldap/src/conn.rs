@@ -234,6 +234,7 @@ mod tests {
     fn cfg() -> LdapConfig {
         LdapConfig {
             servers: vec!["ldapi://".into()],
+            master_key_name: String::new(),
             container_dn: None,
             bind_dn: None,
             bind_pwd: None,
