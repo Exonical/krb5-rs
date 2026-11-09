@@ -21,6 +21,7 @@ const MAX_LINE: usize = 2047;
 
 const LOG_ERR: u8 = 3;
 const LOG_WARNING: u8 = 4;
+const LOG_NOTICE: u8 = 5;
 const LOG_INFO: u8 = 6;
 const LOG_DEBUG: u8 = 7;
 const LOG_AUTH: u8 = 4 << 3;
@@ -290,7 +291,7 @@ impl Klog {
             2 => "CRITICAL",
             LOG_ERR => "Error",
             LOG_WARNING => "Warning",
-            5 => "Notice",
+            LOG_NOTICE => "Notice",
             LOG_INFO => "info",
             LOG_DEBUG => "debug",
             _ => "???",
@@ -467,6 +468,7 @@ struct KlogLayer(Arc<Klog>);
 impl<S: Subscriber> Layer<S> for KlogLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let priority = match *event.metadata().level() {
+            _ if event.metadata().target() == "notice" => LOG_NOTICE,
             Level::ERROR => LOG_ERR,
             Level::WARN => LOG_WARNING,
             Level::INFO => LOG_INFO,

@@ -94,7 +94,8 @@ setup() {
   mkdir -p "$D/db"
   cat > "$D/kdc.conf" <<EOF
 [logging]
- default = STDERR
+ kdc = STDERR
+ admin_server = FILE:$D/kadmind.log
 [kdcdefaults]
  kdc_ports = $2
  kdc_tcp_ports = $2
@@ -145,12 +146,12 @@ setup rs 18893 18751 18466 18753
 (
   export KRB5_CONFIG=$B/mit/krb5.conf KRB5_KDC_PROFILE=$B/mit/kdc.conf
   krb5kdc -r $R -n > "$B/mit/kdc.log" 2>&1 &
-  kadmind -r $R -nofork > "$B/mit/kadmind.log" 2>&1 &
+  kadmind -r $R -nofork >> "$B/mit/kadmind.log" 2>&1 &
 )
 (
   export KRB5_CONFIG=$B/rs/krb5.conf KRB5_KDC_PROFILE=$B/rs/kdc.conf
   $BIN/krb5-rs-kdc --realm $R > "$B/rs/kdc.log" 2>&1 &
-  $BIN/krb5-rs-kadmind -r $R -nofork > "$B/rs/kadmind.log" 2>&1 &
+  $BIN/krb5-rs-kadmind -r $R -nofork >> "$B/rs/kadmind.log" 2>&1 &
 )
 for p in 18894 18752 18893 18751; do wait_port $p || fail "port $p did not open"; done
 

@@ -82,7 +82,8 @@ rm -rf "$B/db" "$B"/*.conf "$B"/*.log "$B"/*.acl "$B/stash" "$B"/*.out "$B"/*.ex
 mkdir -p "$B/db"
 cat > "$B/kdc.conf" <<EOF
 [logging]
- default = STDERR
+ kdc = STDERR
+ admin_server = FILE:$B/kadmind.log
 [kdcdefaults]
  kdc_ports = 18891
  kdc_tcp_ports = 18891

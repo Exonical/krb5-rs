@@ -120,7 +120,7 @@ write_profile() {
   printf '%s\n' "$MASTER" > "$dir/master"
   cat > "$dir/kdc.conf" <<EOF
 [logging]
- default = STDERR
+ kdc = STDERR
 [realms]
     $REALM = {
         database_module = lmdb

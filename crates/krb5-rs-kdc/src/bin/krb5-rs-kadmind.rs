@@ -415,7 +415,8 @@ impl State {
             .authorize(auth_princ(client, crealm), &Request::Iprop)
             .is_some()
         {
-            tracing::error!(
+            tracing::info!(
+                target: "notice",
                 "Unauthorized request: iprop_get_updates_1, client={}",
                 unparse(client, crealm)
             );
@@ -456,7 +457,8 @@ impl State {
             .authorize(auth_princ(client, crealm), &Request::Iprop)
             .is_some()
         {
-            tracing::error!(
+            tracing::info!(
+                target: "notice",
                 "Unauthorized request: iprop_full_resync_1, client={}",
                 unparse(client, crealm)
             );
@@ -536,7 +538,8 @@ impl State {
         };
         let service = ctx.acceptor();
         if !matches!(service.name_string.as_slice(), [s, _] if s.as_slice() == b"kiprop") {
-            tracing::error!(
+            tracing::info!(
+                target: "notice",
                 "Unauthorized request: iprop, service={}",
                 unparse(service, &self.realm)
             );
@@ -646,7 +649,8 @@ struct Caller<'a> {
 
 impl Caller<'_> {
     fn log_unauth(&self, op: &str, target: &str) {
-        tracing::error!(
+        tracing::info!(
+            target: "notice",
             "Unauthorized request: {op}, {target}, client={}, service={}, addr={}",
             self.client_name,
             self.service_name,
@@ -660,7 +664,8 @@ impl Caller<'_> {
         } else {
             code::message(code)
         };
-        tracing::error!(
+        tracing::info!(
+            target: "notice",
             "Request: {op}, {target}, {msg}, client={}, service={}, addr={}",
             self.client_name,
             self.service_name,
@@ -2307,7 +2312,8 @@ impl Program for Kadm5 {
                 if c != code::OK {
                     kadm5::generic_ret(0, c)
                 } else {
-                    tracing::error!(
+                    tracing::info!(
+                        target: "notice",
                         "Request: kadm5_init, {0}, success, client={0}, service={1}, addr={2}, vers={3}, flavor=6",
                         caller.client_name,
                         caller.service_name,
@@ -2524,7 +2530,14 @@ async fn kadmind(args: Args) {
     let modules = modules::load(
         &profiles,
         dict_file.as_deref(),
-        std::sync::Arc::new(|m: &str| tracing::error!("{m}")),
+        std::sync::Arc::new(|m: &str| {
+            // pwqual_dict.c logs this one at LOG_INFO; module errors are LOG_ERR.
+            if m.starts_with("No dictionary file") {
+                tracing::info!("{m}")
+            } else {
+                tracing::error!("{m}")
+            }
+        }),
     )
     .unwrap_or_else(|e| die(e));
     let iprop_port = cfg.iprop.enabled.then(|| match r("iprop_port") {
@@ -2799,7 +2812,7 @@ impl Kpasswd {
             authorize: &authorize,
         };
         let done = process_request(&self.admin, &svc, local, remote, req).await;
-        tracing::info!("{}", done.log);
+        tracing::info!(target: "notice", "{}", done.log);
         done.reply
     }
 }

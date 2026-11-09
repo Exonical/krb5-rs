@@ -98,7 +98,7 @@ run_all() {
   printf 'wrong-master\n' > "$db/wrong"
   cat > "$db/kdc.conf" <<EOF
 [logging]
- default = STDERR
+ kdc = STDERR
 [realms]
     $REALM = {
         database_module = lmdb

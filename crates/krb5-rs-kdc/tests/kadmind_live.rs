@@ -104,7 +104,8 @@ H=$(hostname | tr 'A-Z' 'a-z')
 realm_conf() { # file dbdir db_library
   cat > "$1" <<EOF
 [logging]
- default = STDERR
+ kdc = STDERR
+ admin_server = FILE:$B/kadmind.log
 [kdcdefaults]
  kdc_ports = 18889
  kdc_tcp_ports = 18889
@@ -163,7 +164,7 @@ echo $! > $B/kdc.pid
 wait_port 18889 || fail "kdc did not start"
 
 p env KRB5_KTNAME=FILE:$B/kt $BIN/krb5-rs-kadmind -proponly -nofork -r $R -P $B/kadmind.pid \
-  -p $BIN/krb5-rs-kdb -K $BIN/krb5-rs-kprop -k 17560 -F $B/p/replica_datatrans > "$B/kadmind.log" 2>&1 &
+  -p $BIN/krb5-rs-kdb -K $BIN/krb5-rs-kprop -k 17560 -F $B/p/replica_datatrans >> "$B/kadmind.log" 2>&1 &
 wait_port 18755 || fail "kadmind did not start"
 
 r kpropd -D -d -P 17560 -r $R -s $B/kt -a "$B/kpropd.acl" -f "$B/r/from_master" \
