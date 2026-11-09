@@ -55,7 +55,10 @@ pub struct Sam2Prompt {
 /// Answers a [`Sam2Prompt`] with the single-use authentication data, as
 /// MIT's prompter does; `None` fails the mechanism.
 #[derive(Clone)]
-pub struct Sam2Responder(pub std::sync::Arc<dyn Fn(&Sam2Prompt) -> Option<String> + Send + Sync>);
+pub struct Sam2Responder(pub std::sync::Arc<Sam2Answer>);
+
+/// The function behind a [`Sam2Responder`].
+pub type Sam2Answer = dyn Fn(&Sam2Prompt) -> Option<String> + Send + Sync;
 
 impl std::fmt::Debug for Sam2Responder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
