@@ -233,18 +233,26 @@ impl Clone for AuthdataContext {
     }
 }
 
+/// How deep AD-IF-RELEVANT containers may nest, so that a peer cannot
+/// exhaust the stack.
+const MAX_CONTAINER_DEPTH: usize = 32;
+
 fn find_authdata_1(
     list: &[AuthorizationDataElement],
     ad_type: i32,
     from_ap_req: bool,
+    depth: usize,
     out: &mut Vec<AuthorizationDataElement>,
 ) -> Result<(), i32> {
+    if depth > MAX_CONTAINER_DEPTH {
+        return Err(ASN1_BAD_FORMAT);
+    }
     for ad in list {
         match ad.ad_type {
             AD_IF_RELEVANT => {
                 let inner: Vec<AuthorizationDataElement> =
                     rasn::der::decode(ad.ad_data.as_ref()).map_err(|_| ASN1_BAD_FORMAT)?;
-                find_authdata_1(&inner, ad_type, from_ap_req, out)?;
+                find_authdata_1(&inner, ad_type, from_ap_req, depth + 1, out)?;
             }
             AD_SIGNTICKET | AD_KDC_ISSUED | AD_WIN2K_PAC | AD_CAMMAC | AD_AUTH_INDICATOR
                 if from_ap_req => {}
@@ -265,10 +273,10 @@ pub fn find_authdata(
 ) -> Result<Vec<AuthorizationDataElement>, i32> {
     let mut out = Vec::new();
     if let Some(t) = ticket {
-        find_authdata_1(t, ad_type, false, &mut out)?;
+        find_authdata_1(t, ad_type, false, 0, &mut out)?;
     }
     if let Some(a) = ap_req {
-        find_authdata_1(a, ad_type, true, &mut out)?;
+        find_authdata_1(a, ad_type, true, 0, &mut out)?;
     }
     Ok(out)
 }
@@ -528,5 +536,34 @@ impl AuthdataContext {
         };
         self.reqs[i.req].internalize(buf)?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deeply_nested_containers_are_refused() {
+        let mut ad = vec![AuthorizationDataElement {
+            ad_type: greet::AD_GREET,
+            ad_data: b"x".to_vec().into(),
+        }];
+        for _ in 0..=MAX_CONTAINER_DEPTH {
+            ad = vec![AuthorizationDataElement {
+                ad_type: AD_IF_RELEVANT,
+                ad_data: rasn::der::encode(&ad).expect("enc").into(),
+            }];
+        }
+        assert_eq!(
+            find_authdata(None, Some(&ad), greet::AD_GREET).err(),
+            Some(ASN1_BAD_FORMAT)
+        );
+        let inner: Vec<AuthorizationDataElement> =
+            rasn::der::decode(ad[0].ad_data.as_ref()).expect("dec");
+        assert_eq!(
+            find_authdata(None, Some(&inner), greet::AD_GREET).map(|v| v.len()),
+            Ok(1)
+        );
     }
 }
