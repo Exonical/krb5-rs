@@ -1146,6 +1146,12 @@ async fn run(
             }
         }
     }
+    #[cfg(feature = "cockroach")]
+    if (st.workers > 0 || st.worker_fds.is_some()) && prop.replication.is_some() {
+        return Err(io_err(
+            "-w can't be used with krb5-rs-cockroach replication",
+        ));
+    }
     let modules = load_plugins(&cli, krb5_conf_explicit)?;
     let audit = modules.1.clone();
     let kdcs = kdcs
