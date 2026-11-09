@@ -246,6 +246,25 @@ loaded principals and policies use epoch zero. MIT key-data has no
 for resource-based delegation. klmdb is the default `db_library`;
 `db_library = krb5-rs-file` selects `FileStore`. MIT dump/load is described below.
 
+### kdc.conf master key name, module directory and TCP backlog
+
+- **`master_key_name`** (`[realms]`, default `K/M`) names the master key
+  principal without the realm, as MIT (`kdc/main.c:246-252`,
+  `alt_prof.c:538`). It is used for the master key's salt, the stash entry,
+  and the database's master key entry in every store (file, klmdb, kldap,
+  CockroachDB and Turso), by the KDC, kadmind, kpropd and `krb5-rs-kdb`,
+  whose `-M` sets it as `kdb5_util -M` does.
+- **`kdc_tcp_listen_backlog`** (`[kdcdefaults]`, default 5, MIT's
+  `DEFAULT_TCP_LISTEN_BACKLOG`) is the KDC's TCP `listen()` backlog.
+- **`db_module_dir`** (`[dbmodules]`) lists directories MIT searches for a
+  `db_library` shared library before its default one (`kdb5.c:409-443`).
+  krb5-rs's database modules are built in, so the built-in names never look
+  there. For any other `db_library` the directories are searched the same
+  way: a missing module fails with MIT's "Unable to find requested database
+  type", and a shared library that is found is refused, because loading a C
+  KDB module would need `unsafe` code, which the crate forbids. This is the
+  one difference from MIT.
+
 ### MIT master-key rotation
 
 `krb5_rs::kdc::kdb::mit::mkey` mirrors `lib/kdb/kdb5.c`,

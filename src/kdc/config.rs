@@ -883,6 +883,48 @@ mod db_module_tests {
     use super::*;
 
     #[test]
+    fn tcp_listen_backlog_and_master_key_name() {
+        let kdc = Profile::parse("[realms]\n R = {\n }\n").expect("kdc.conf");
+        let c = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
+        assert_eq!(c.tcp_listen_backlog, 5);
+        assert_eq!(c.master_key_name, "K/M");
+        let kdc = Profile::parse(
+            "[kdcdefaults]\n kdc_tcp_listen_backlog = 64\n[realms]\n R = {\n  \
+             master_key_name = kdc/master\n }\n",
+        )
+        .expect("kdc.conf");
+        let c = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
+        assert_eq!(c.tcp_listen_backlog, 64);
+        assert_eq!(c.master_key_name, "kdc/master");
+    }
+
+    #[test]
+    fn db_module_dir_is_searched_for_unknown_db_library() {
+        let dir =
+            std::env::temp_dir().join(format!("krb5-rs-db-module-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("mymod.so"), b"").expect("so");
+        let kdc = Profile::parse(&format!(
+            "[realms]\n R = {{\n }}\n[dbmodules]\n db_module_dir = {}\n R = {{\n  \
+             db_library = mymod\n }}\n",
+            dir.display()
+        ))
+        .expect("kdc.conf");
+        let c = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
+        assert_eq!(c.db_module.module_dirs, [dir.clone()]);
+        let found = c.db_module.unknown_library_error("mymod");
+        assert!(
+            found.contains("mymod.so") && found.contains("only built-in"),
+            "{found}"
+        );
+        assert_eq!(
+            c.db_module.unknown_library_error("other"),
+            "Unable to find requested database type: other"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn db_library_and_plugin_options_come_from_dbmodules() {
         let kdc = Profile::parse(
             "[realms]\n R = {\n  database_module = replica\n }\n[dbmodules]\n replica = {\n  \

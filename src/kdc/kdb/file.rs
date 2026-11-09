@@ -1815,6 +1815,19 @@ impl AdminStore for FileCaller {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn create_and_open_with_a_named_master_key() {
+        let path = std::env::temp_dir().join(format!("krb5-rs-named-km-{}", std::process::id()));
+        let master =
+            super::super::master_key_from_password_named("R", "kdc/master", "pw", 18).expect("key");
+        FileStore::create_named(&path, "R", &master, &[18], "kdc/master").expect("create");
+        FileStore::open_named(&path, &master, "kdc/master").expect("open named");
+        assert!(FileStore::open(&path, &master).is_err());
+        for f in [path.clone(), path.with_extension("lock")] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
     use super::*;
     use crate::kdc::kdb::master_key_from_password;
 

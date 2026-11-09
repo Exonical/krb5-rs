@@ -202,7 +202,7 @@ pub fn read_stash_kvno_named(
         let kt = FileKeytab::new(path);
         let entry = kt
             .get_entry(&principal, realm, None, None)
-            .map_err(|e| err(format!("stash has no K/M@{realm}: {e}")))?;
+            .map_err(|e| err(format!("stash has no {master_key_name}@{realm}: {e}")))?;
         return Ok((entry.kvno, entry.key));
     }
     Ok((1, read_stash_named(path, realm, master_key_name)?))
@@ -229,7 +229,7 @@ pub fn read_stash_named(
         let kt = FileKeytab::new(path);
         let entry = kt
             .get_entry(&principal, realm, None, None)
-            .map_err(|e| err(format!("stash has no K/M@{realm}: {e}")))?;
+            .map_err(|e| err(format!("stash has no {master_key_name}@{realm}: {e}")))?;
         return Ok(entry.key);
     }
     if bytes.len() < 6 {
@@ -245,6 +245,34 @@ pub fn read_stash_named(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn named_master_key_principal_salt_and_stash() {
+        let name = master_principal_named("kdc/mas\\/ter").expect("name");
+        let comps: Vec<&[u8]> = name.name_string.iter().map(|c| c.as_bytes()).collect();
+        assert_eq!(comps, [b"kdc".as_slice(), b"mas/ter".as_slice()]);
+        assert!(master_principal_named("K/M@R").is_err());
+
+        let default = master_key_from_password("R", "pw", 18).expect("default");
+        let km = master_key_from_password_named("R", "K/M", "pw", 18).expect("K/M");
+        assert_eq!(default.key_bytes(), km.key_bytes());
+        let custom = master_key_from_password_named("R", "kdc/master", "pw", 18).expect("custom");
+        let expected = find_etype(18)
+            .expect("aes256")
+            .string_to_key(b"pw", b"Rkdcmaster", None)
+            .expect("s2k");
+        assert_eq!(custom.key_bytes(), expected.as_slice());
+        assert_ne!(custom.key_bytes(), default.key_bytes());
+
+        let path = std::env::temp_dir().join(format!("krb5-rs-named-stash-{}", std::process::id()));
+        write_stash_named(&path, "R", "kdc/master", &custom).expect("write");
+        let read = read_stash_named(&path, "R", "kdc/master").expect("read");
+        assert_eq!(read.key_bytes(), custom.key_bytes());
+        let (_, kvno_key) = read_stash_kvno_named(&path, "R", "kdc/master").expect("kvno");
+        assert_eq!(kvno_key.key_bytes(), custom.key_bytes());
+        assert!(read_stash(&path, "R").is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
     use super::*;
 
     #[test]
