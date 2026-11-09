@@ -275,7 +275,16 @@ pod="${FULL}-kdc-0"
 ip=$("$KUBECTL" get pod "$pod" -n "$NS" -o jsonpath='{.status.podIP}')
 write_krb5_conf "${ip}:8888"
 kinit_alice
-metrics=$("$KUBECTL" get --raw "/api/v1/namespaces/${NS}/pods/${pod}:9100/proxy/metrics")
+# The API server's pod proxy can return NotFound briefly after a pod is recreated.
+metrics=""
+for _ in $(seq 1 30); do
+  metrics=$("$KUBECTL" get --raw "/api/v1/namespaces/${NS}/pods/${pod}:9100/proxy/metrics" 2>/dev/null) && break
+  sleep 2
+done
+[ -n "$metrics" ] || {
+  echo "metrics endpoint of ${pod} unavailable"
+  exit 1
+}
 rebuilds=$(awk '$1 ~ /^krb5_replication_rebuilds_total(_total)?$/ { print $2; exit }' <<<"$metrics")
 [ "$rebuilds" = "0" ] || {
   grep -E 'rebuild|snapshot' <<<"$metrics" || true
