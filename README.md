@@ -73,8 +73,10 @@ The `crates/krb5-rs-kdc` workspace member builds two binaries (not published to 
 ```sh
 krb5-rs-kdb --config kdc.conf create -s
 echo secret | krb5-rs-kdb --config kdc.conf addprinc alice
-krb5-rs-kdc --config kdc.conf
+krb5-rs-kdc -n --config kdc.conf
 ```
+
+`krb5-rs-kdc` also takes MIT `krb5kdc`'s options: `-r REALM` (repeat it to serve several realms from one process, each answered on every realm's listen addresses, chosen by the realm of the requested server), `-d DBPATH`, `-x DBARG`, `-m` (type the master key in), `-M`, `-k`, `-p PORTS`, `-P PIDFILE`, `-T OFFSET`, `-w WORKERS` and `-n`. As in MIT, options before a `-r` apply to that realm and the ones after it, and kdc.conf's `[realms]` settings win over them. Like `krb5kdc`, it detaches from the terminal once its sockets are bound unless `-n` is given; the container image passes `-n`.
 
 `deploy/docker/Dockerfile` builds a distroless, nonroot image with dynamically linked glibc binaries, so krb5-rs-kadmind can load kadm5_auth modules (`podman build -f deploy/docker/Dockerfile .`). The container user cannot bind port 88: configure `kdc_ports = 8888` and map 88 to 8888 outside.
 

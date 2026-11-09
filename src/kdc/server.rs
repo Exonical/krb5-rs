@@ -17,6 +17,7 @@ use tokio::task::AbortHandle;
 
 use super::{Kdc, PrincipalStore, RequestSummary, Transport};
 use crate::types::error_codes::KRB_ERR_FIELD_TOOLONG;
+use crate::types::{AsReq, TgsReq};
 
 /// MIT `MAX_DGRAM_SIZE` (osconf.hin:113): UDP receive buffer size.
 const MAX_DGRAM_SIZE: usize = 65536;
@@ -41,6 +42,107 @@ pub struct ServeOptions {
     pub shutdown: Option<watch::Receiver<bool>>,
 }
 
+/// What [`serve_udp_with`] and [`serve_tcp_with`] hand requests to: one
+/// realm's [`Kdc`], or several realms in one process ([`KdcRealms`]).
+pub trait KdcService: Send + Sync + 'static {
+    /// [`Kdc::handle_summarized_from`].
+    fn handle_summarized_from(
+        &self,
+        request: &[u8],
+        transport: Transport,
+        peer: Option<SocketAddr>,
+    ) -> impl std::future::Future<Output = (Vec<u8>, Option<RequestSummary>)> + Send;
+
+    /// A KRB-ERROR with only `code` set, for transport-level errors.
+    fn bare_error(&self, code: i32, now: chrono::DateTime<chrono::Utc>) -> Vec<u8>;
+}
+
+impl<S: PrincipalStore + 'static> KdcService for Kdc<S> {
+    async fn handle_summarized_from(
+        &self,
+        request: &[u8],
+        transport: Transport,
+        peer: Option<SocketAddr>,
+    ) -> (Vec<u8>, Option<RequestSummary>) {
+        let (reply, summary) = Kdc::handle_summarized_from(self, request, transport, peer).await;
+        (reply, Some(summary))
+    }
+
+    fn bare_error(&self, code: i32, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+        Kdc::bare_error(self, code, now)
+    }
+}
+
+/// Several realms served by one process, as MIT's `krb5kdc -r A -r B`
+/// (`setup_server_realm`, kdc/main.c:117-137): with more than one realm a
+/// request goes to the realm named in its body, and a request for a realm
+/// not served gets no reply (dispatch.c:154-158, net-server.c
+/// `process_packet_response`). With one realm every request goes to it.
+pub struct KdcRealms<S: PrincipalStore> {
+    realms: Vec<Arc<Kdc<S>>>,
+}
+
+impl<S: PrincipalStore + 'static> KdcRealms<S> {
+    /// The realms in command-line order. Panics if `realms` is empty.
+    pub fn new(realms: Vec<Arc<Kdc<S>>>) -> Self {
+        assert!(!realms.is_empty(), "KdcRealms needs at least one realm");
+        Self { realms }
+    }
+
+    /// The served realms.
+    pub fn realms(&self) -> &[Arc<Kdc<S>>] {
+        &self.realms
+    }
+
+    /// The realm a request is for; `Err(())` for a realm not served. A
+    /// request that can't be decoded goes to the first realm, which
+    /// answers it as a single-realm KDC would.
+    fn pick(&self, request: &[u8]) -> Result<&Kdc<S>, ()> {
+        if self.realms.len() == 1 {
+            return Ok(&self.realms[0]);
+        }
+        let realm = match request.first() {
+            Some(0x6A) => rasn::der::decode::<AsReq>(request)
+                .ok()
+                .map(|r| r.0.req_body.realm),
+            Some(0x6C) => rasn::der::decode::<TgsReq>(request)
+                .ok()
+                .map(|r| r.0.req_body.realm),
+            _ => None,
+        };
+        let Some(realm) = realm else {
+            return Ok(&self.realms[0]);
+        };
+        self.realms
+            .iter()
+            .find(|k| k.config.realm.as_bytes() == realm.as_bytes())
+            .map(|k| &**k)
+            .ok_or(())
+    }
+}
+
+impl<S: PrincipalStore + 'static> KdcService for KdcRealms<S> {
+    async fn handle_summarized_from(
+        &self,
+        request: &[u8],
+        transport: Transport,
+        peer: Option<SocketAddr>,
+    ) -> (Vec<u8>, Option<RequestSummary>) {
+        match self.pick(request) {
+            Ok(kdc) => {
+                let (reply, summary) = kdc.handle_summarized_from(request, transport, peer).await;
+                (reply, Some(summary))
+            }
+            // Not processed, so not logged (dispatch.c:154-158).
+            Err(()) => (Vec::new(), None),
+        }
+    }
+
+    fn bare_error(&self, code: i32, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+        self.realms[0].bare_error(code, now)
+    }
+}
+
 /// Resolves once `rx` holds `true`; never resolves without a receiver or if
 /// the sender is dropped without signalling.
 async fn shutdown_requested(rx: &mut Option<watch::Receiver<bool>>) {
@@ -61,16 +163,13 @@ async fn shutdown_requested(rx: &mut Option<watch::Receiver<bool>>) {
 /// (MIT `process_packet`, net-server.c:1130-1190). Replies longer than
 /// `max_dgram_reply_size` become KRB_ERR_RESPONSE_TOO_BIG
 /// (see [`Kdc::handle_udp`]). Per-datagram send errors are ignored.
-pub async fn serve_udp<S: PrincipalStore + 'static>(
-    kdc: Arc<Kdc<S>>,
-    socket: UdpSocket,
-) -> io::Result<()> {
+pub async fn serve_udp<K: KdcService>(kdc: Arc<K>, socket: UdpSocket) -> io::Result<()> {
     serve_udp_with(kdc, socket, ServeOptions::default()).await
 }
 
 /// [`serve_udp`] with a request logger and/or shutdown signal.
-pub async fn serve_udp_with<S: PrincipalStore + 'static>(
-    kdc: Arc<Kdc<S>>,
+pub async fn serve_udp_with<K: KdcService>(
+    kdc: Arc<K>,
     socket: UdpSocket,
     mut options: ServeOptions,
 ) -> io::Result<()> {
@@ -90,12 +189,14 @@ pub async fn serve_udp_with<S: PrincipalStore + 'static>(
         let (reply, summary) = kdc
             .handle_summarized_from(&buf[..n], Transport::Udp, Some(peer))
             .await;
-        if let Some(log) = &options.logger {
-            log(&summary, peer);
+        if let (Some(log), Some(summary)) = (&options.logger, &summary) {
+            log(summary, peer);
         }
         // A dropped repeat or a discarded request gets no reply
         // (net-server.c process_packet_response).
-        if summary.lookaside == Some(super::LookasideHit::Dropped) || reply.is_empty() {
+        if summary.as_ref().and_then(|s| s.lookaside) == Some(super::LookasideHit::Dropped)
+            || reply.is_empty()
+        {
             continue;
         }
         // MIT logs and drops on send failure (net-server.c:1112-1124).
@@ -111,10 +212,7 @@ pub async fn serve_udp_with<S: PrincipalStore + 'static>(
 /// bit set) gets a framed KRB_ERR_FIELD_TOOLONG error and a close
 /// (:1391-1413, :1492-1494). At most 45 connections stay open; the oldest
 /// is dropped when another arrives (:1282, :1571). There is no idle timeout.
-pub async fn serve_tcp<S: PrincipalStore + 'static>(
-    kdc: Arc<Kdc<S>>,
-    listener: TcpListener,
-) -> io::Result<()> {
+pub async fn serve_tcp<K: KdcService>(kdc: Arc<K>, listener: TcpListener) -> io::Result<()> {
     serve_tcp_with(kdc, listener, ServeOptions::default()).await
 }
 
@@ -140,8 +238,8 @@ impl Drop for InFlightGuard {
 /// connection has finished; callers that cannot wait forever (a client that
 /// never sends its request keeps its connection open) should bound it with a
 /// timeout.
-pub async fn serve_tcp_with<S: PrincipalStore + 'static>(
-    kdc: Arc<Kdc<S>>,
+pub async fn serve_tcp_with<K: KdcService>(
+    kdc: Arc<K>,
     listener: TcpListener,
     mut options: ServeOptions,
 ) -> io::Result<()> {
@@ -175,7 +273,7 @@ pub async fn serve_tcp_with<S: PrincipalStore + 'static>(
         let mut open_guard = open.lock().await;
         let handle = tokio::spawn(async move {
             let _guard = guard;
-            let _ = serve_connection(&conn_kdc, stream, peer, logger.as_ref()).await;
+            let _ = serve_connection(&*conn_kdc, stream, peer, logger.as_ref()).await;
             registry.lock().await.retain(|(i, _)| *i != id);
         });
         open_guard.push_back((id, handle.abort_handle()));
@@ -208,8 +306,8 @@ async fn write_framed(stream: &mut TcpStream, reply: &[u8]) -> io::Result<()> {
     stream.shutdown().await
 }
 
-async fn serve_connection<S: PrincipalStore>(
-    kdc: &Kdc<S>,
+async fn serve_connection<K: KdcService>(
+    kdc: &K,
     mut stream: TcpStream,
     peer: SocketAddr,
     logger: Option<&RequestLogger>,
@@ -226,12 +324,14 @@ async fn serve_connection<S: PrincipalStore>(
     let (reply, summary) = kdc
         .handle_summarized_from(&request, Transport::Tcp, Some(peer))
         .await;
-    if let Some(log) = logger {
-        log(&summary, peer);
+    if let (Some(log), Some(summary)) = (logger, &summary) {
+        log(summary, peer);
     }
     // A dropped repeat or a discarded request closes the connection
     // unanswered (net-server.c process_tcp_response).
-    if summary.lookaside == Some(super::LookasideHit::Dropped) || reply.is_empty() {
+    if summary.as_ref().and_then(|s| s.lookaside) == Some(super::LookasideHit::Dropped)
+        || reply.is_empty()
+    {
         return Ok(());
     }
     write_framed(&mut stream, &reply).await

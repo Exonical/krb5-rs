@@ -205,6 +205,7 @@ async fn mit_kadmin_and_kpasswd_administer_a_cockroachdb_realm() {
     let mut daemons = Daemons(Vec::new());
     daemons.0.push(
         Command::new(env!("CARGO_BIN_EXE_krb5-rs-kdc"))
+            .arg("-n")
             .args(["--config", &kdc_conf.to_string_lossy()])
             .args(["--krb5-config", &krb5_conf.to_string_lossy()])
             .args(["--realm", REALM, "--master-password-file", &master])

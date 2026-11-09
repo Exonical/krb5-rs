@@ -132,7 +132,7 @@ kl "addprinc -pw carol-old-pw carol"
 kl "addprinc -pw dave-old-password -policy long dave"
 echo "admin@$R c bob@$R" > "$B/kadm5.acl"
 start() {
-  $BIN/krb5-rs-kdc --realm $R >> "$B/kdc.log" 2>&1 &
+  $BIN/krb5-rs-kdc -n --realm $R >> "$B/kdc.log" 2>&1 &
   $BIN/krb5-rs-kadmind -r $R -nofork >> "$B/kadmind.log" 2>&1 &
   wait_port 18890 || fail "kdc did not start"
   wait_port 18464 || fail "kadmind did not start"

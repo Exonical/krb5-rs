@@ -61,4 +61,4 @@ COPY --from=build --chown=65532:65532 /out/data /var/lib/krb5-rs
 
 USER 65532:65532
 EXPOSE 8888/udp 8888/tcp
-ENTRYPOINT ["/usr/local/bin/krb5-rs-kdc"]
+ENTRYPOINT ["/usr/local/bin/krb5-rs-kdc", "-n"]
