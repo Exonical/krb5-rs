@@ -1313,14 +1313,39 @@ impl FileStore {
         merge_nra: bool,
         log: Option<(&IpropConfig, usize)>,
     ) -> Result<(), StoreError> {
-        let km_name = master_principal()?;
+        Self::load_dump_named(
+            path, realm, master, "K/M", entries, policies, update, merge_nra, log,
+        )
+    }
+
+    /// [`FileStore::load_dump`] for the master key principal
+    /// `master_key_name`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_dump_named(
+        path: &Path,
+        realm: &str,
+        master: &EncryptionKey,
+        master_key_name: &str,
+        entries: &[MitEntry],
+        policies: &[MitPolicy],
+        update: bool,
+        merge_nra: bool,
+        log: Option<(&IpropConfig, usize)>,
+    ) -> Result<(), StoreError> {
+        let km_name = super::master::master_principal_named(master_key_name)?;
         let dumped_km = entries
             .iter()
             .find(|e| e.principal == km_name && e.realm == realm);
         let store = match (update, log) {
-            (true, Some((iprop, _))) => Self::open(path, master)?.with_iprop(iprop)?,
-            (true, None) => Self::open(path, master)?,
-            (false, _) => Self::new(path, realm, master, MasterKeys::single(master.clone())),
+            (true, Some((iprop, _))) => {
+                Self::open_named(path, master, master_key_name)?.with_iprop(iprop)?
+            }
+            (true, None) => Self::open_named(path, master, master_key_name)?,
+            (false, _) => {
+                let mut store = Self::new(path, realm, master, MasterKeys::single(master.clone()));
+                store.master_name = km_name.clone();
+                store
+            }
         };
         if let Some(km) = dumped_km {
             MasterKeys::fetch(km, master)?;

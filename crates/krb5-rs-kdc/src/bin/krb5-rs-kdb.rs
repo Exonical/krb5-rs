@@ -768,10 +768,11 @@ fn run() {
                 iprop,
                 |entries, policies, update, iprop_load, log_from| {
                     let master = master_key(&cfg, &realm, master_password_file.as_deref());
-                    FileStore::load_dump(
+                    FileStore::load_dump_named(
                         &cfg.database_name,
                         &realm,
                         &master,
+                        &cfg.master_key_name,
                         entries,
                         policies,
                         update,
