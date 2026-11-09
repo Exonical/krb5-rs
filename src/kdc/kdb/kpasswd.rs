@@ -84,6 +84,49 @@ pub fn parse_request(req: &[u8]) -> Result<Request<'_>, String> {
 /// realm).
 pub type Authorize<'a> = dyn Fn(&PrincipalName, &str, &PrincipalName, &str) -> bool + 'a;
 
+/// Applies the password change of an authenticated request.
+///
+/// [`process_request`] uses MIT's `schpw_util_wrapper` over an [`AdminOps`];
+/// [`process_request_with`] lets a caller whose passwords live elsewhere
+/// supply its own.
+pub trait PasswordChanger {
+    /// Set `target`'s password to `password` for `client`. `initial` is true
+    /// when the ticket came from an AS exchange. Returns the RFC 3244 result
+    /// code and text.
+    fn change_password(
+        &self,
+        client: (&PrincipalName, &str),
+        target: (&PrincipalName, &str),
+        initial: bool,
+        password: &str,
+    ) -> impl std::future::Future<Output = (u16, String)>;
+}
+
+struct AdminChanger<'a, S: AdminStore> {
+    admin: &'a AdminOps<S>,
+    authorize: &'a Authorize<'a>,
+}
+
+impl<S: AdminStore> PasswordChanger for AdminChanger<'_, S> {
+    async fn change_password(
+        &self,
+        client: (&PrincipalName, &str),
+        target: (&PrincipalName, &str),
+        initial: bool,
+        password: &str,
+    ) -> (u16, String) {
+        schpw_util_wrapper(
+            self.admin,
+            self.authorize,
+            client,
+            target,
+            initial,
+            password,
+        )
+        .await
+    }
+}
+
 /// What the service needs besides the database.
 pub struct Service<'a> {
     /// Our realm.
@@ -409,6 +452,22 @@ pub async fn process_request<S: AdminStore>(
     remote: &SocketAddr,
     req: &[u8],
 ) -> Processed {
+    let changer = AdminChanger {
+        admin,
+        authorize: svc.authorize,
+    };
+    process_request_with(&changer, svc, local, remote, req).await
+}
+
+/// [`process_request`] with the password change done by `changer`.
+/// `svc.authorize` is not consulted; `changer` makes the access decision.
+pub async fn process_request_with<C: PasswordChanger>(
+    changer: &C,
+    svc: &Service<'_>,
+    local: &SocketAddr,
+    remote: &SocketAddr,
+    req: &[u8],
+) -> Processed {
     let from = remote.ip();
     let parsed = match parse_request(req) {
         Ok(p) => p,
@@ -431,7 +490,7 @@ pub async fn process_request<S: AdminStore>(
                 (f.status, f.text, f.code, log)
             }
             Ok(auth) => {
-                let (status, text, log) = change(admin, svc, &parsed, auth, from).await;
+                let (status, text, log) = change(changer, &parsed, auth, from).await;
                 (status, text, 0, log)
             }
         };
@@ -459,9 +518,8 @@ pub async fn process_request<S: AdminStore>(
     }
 }
 
-async fn change<S: AdminStore>(
-    admin: &AdminOps<S>,
-    svc: &Service<'_>,
+async fn change<C: PasswordChanger>(
+    changer: &C,
     req: &Request<'_>,
     auth: Authenticated,
     from: std::net::IpAddr,
@@ -499,15 +557,14 @@ async fn change<S: AdminStore>(
                 .map_or((&auth.client, auth.crealm.as_str()), |(n, r)| {
                     (n, r.as_str())
                 });
-            schpw_util_wrapper(
-                admin,
-                svc.authorize,
-                (&auth.client, &auth.crealm),
-                (tname, trealm),
-                auth.initial,
-                pw,
-            )
-            .await
+            changer
+                .change_password(
+                    (&auth.client, &auth.crealm),
+                    (tname, trealm),
+                    auth.initial,
+                    pw,
+                )
+                .await
         }
         Err(_) => (
             KPASSWD_HARDERROR,
