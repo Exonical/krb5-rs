@@ -54,6 +54,12 @@ fn krb5_rs_kpropd_replays_into_the_file_store() {
     follow_mit_kadmind("krb5-rs-file");
 }
 
+#[test]
+#[ignore = "requires the MIT container of the Compose stack"]
+fn krb5_rs_kpropd_replays_into_db2() {
+    follow_mit_kadmind("db2");
+}
+
 /// The replica's database is `db_library = library`.
 fn follow_mit_kadmind(library: &str) {
     let c = container();
