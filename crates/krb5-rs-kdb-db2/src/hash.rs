@@ -1243,10 +1243,11 @@ impl Hash {
             return Ok(());
         }
         let bs = self.bsize() as u64;
-        for pgno in std::mem::take(&mut self.dirty) {
+        while let Some(pgno) = self.dirty.first().copied() {
             if let Some(p) = self.pages.get(&pgno) {
                 write_at(&self.file, p, pgno as u64 * bs)?;
             }
+            self.dirty.remove(&pgno);
         }
         self.hdr.magic = HASHMAGIC;
         self.hdr.version = HASHVERSION;
