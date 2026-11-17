@@ -7,9 +7,11 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-fs2 = "0.4.3"
 krb5-rs = { path = "../..", features = ["kdc", "tokio"] }
 tokio = { version = "1.53.2", features = ["rt"] }
+
+[target.'cfg(not(unix))'.dependencies]
+fs2 = "0.4.3"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
