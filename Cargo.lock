@@ -1944,6 +1944,7 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "krb5-rs",
+ "rustix 1.1.5",
  "tempfile",
  "tokio",
 ]

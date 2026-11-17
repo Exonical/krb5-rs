@@ -268,7 +268,7 @@ impl Hash {
         hdr.low_mask = nbuckets - 1;
         hdr.high_mask = (nbuckets << 1) - 1;
         let usable = hdr.bsize - HEADER_OVERHEAD;
-        hdr.hdrpages = HDRSIZE as u32 / usable + u32::from(HDRSIZE as u32 % usable != 0);
+        hdr.hdrpages = HDRSIZE as u32 / usable + u32::from(!(HDRSIZE as u32).is_multiple_of(usable));
         file.set_len(0)?;
         let mut h = Hash {
             file,
@@ -759,7 +759,7 @@ impl Hash {
             let free = {
                 let p = self.pgm(pgno)?;
                 o.put_u16(p, 8, 1);
-                (o.u16(p, 12) as usize + 1 - PAGE_OVERHEAD - PAIR_OVERHEAD) as usize
+                o.u16(p, 12) as usize + 1 - PAGE_OVERHEAD - PAIR_OVERHEAD
             };
             let km = free.min(k.len());
             let vm = (free - km).min(v.len());

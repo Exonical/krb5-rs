@@ -518,6 +518,7 @@ impl Btree {
 
     /// `__bt_search`: the leaf for `key`, the index where it is or would
     /// go, whether it was found, and the internal-page path.
+    #[allow(clippy::type_complexity)]
     fn search(&mut self, key: &[u8]) -> io::Result<(u32, usize, bool, Vec<(u32, usize)>)> {
         let mut pgno = P_ROOT;
         let mut path = Vec::new();

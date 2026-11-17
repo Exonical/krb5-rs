@@ -3,4 +3,5 @@
 
 pub mod btree;
 pub mod codec;
+pub mod env;
 pub mod hash;
