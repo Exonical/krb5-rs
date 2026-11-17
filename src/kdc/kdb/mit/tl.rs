@@ -102,12 +102,7 @@ pub fn update_tl_data(entry: &mut MitEntry, tl: &[TlData]) {
 
 fn set_tl(entry: &mut MitEntry, kind: u16, data: Option<Vec<u8>>) {
     let first = entry.tl_data.iter().position(|tl| tl.kind == kind);
-    entry.tl_data.retain(|tl| {
-        if tl.kind != kind {
-            return true;
-        }
-        false
-    });
+    entry.tl_data.retain(|tl| tl.kind != kind);
     if let Some(data) = data {
         let tl = TlData { kind, data };
         if let Some(at) = first {
