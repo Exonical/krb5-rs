@@ -272,6 +272,7 @@ impl Db2Files {
             principal,
             policy: None,
             policy_locked: false,
+            committed: false,
             _serial: serial,
         };
         guard.lock_policy()?;
@@ -286,6 +287,7 @@ pub struct Guard<'a> {
     pub principal: Tree,
     policy: Option<Btree>,
     policy_locked: bool,
+    committed: bool,
     _serial: MutexGuard<'a, ()>,
 }
 
@@ -339,7 +341,9 @@ impl Guard<'_> {
     /// Write changes and update the database age, as each MIT write does
     /// (`ctx_update_age`).
     pub fn commit(mut self) -> io::Result<()> {
-        self.flush()
+        self.flush()?;
+        self.committed = true;
+        Ok(())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -358,7 +362,9 @@ impl Guard<'_> {
 impl Drop for Guard<'_> {
     /// `ctx_unlock`.
     fn drop(&mut self) {
-        let _ = self.flush();
+        if !self.committed {
+            let _ = self.flush();
+        }
         if self.policy_locked {
             let pl = self
                 .files
