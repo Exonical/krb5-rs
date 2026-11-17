@@ -985,8 +985,16 @@ fn promote(temp: &Path, base: &Path) -> Result<(), StoreError> {
     let rename = |from: PathBuf, to: PathBuf| {
         std::fs::rename(&from, &to).map_err(|e| io_err("renaming loaded database", e))
     };
-    let existing = Db2Files::open(base, false).ok();
-    let guard = existing.as_ref().and_then(|f| f.write().ok());
+    // krb5_db2_promote_db: an existing real database must be locked first.
+    let existing = if base.exists() {
+        Some(Db2Files::open(base, false).map_err(|e| io_err("opening DB2 database", e))?)
+    } else {
+        None
+    };
+    let guard = match &existing {
+        Some(f) => Some(f.write().map_err(|e| io_err("locking database", e))?),
+        None => None,
+    };
     rename(temp.to_path_buf(), base.to_path_buf())?;
     rename(suffixed(temp, SUFFIX_POLICY), suffixed(base, SUFFIX_POLICY))?;
     drop(guard);
