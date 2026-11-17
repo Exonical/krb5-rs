@@ -2,4 +2,5 @@
 //! `principal.db` read and written in place.
 
 pub mod btree;
+pub mod codec;
 pub mod hash;
