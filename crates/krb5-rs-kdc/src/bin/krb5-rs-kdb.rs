@@ -1516,20 +1516,26 @@ fn db2_command(
                 Ok((store.dump_entries()?, keys))
             });
         }
-        "load" => load_command(
-            args,
-            iprop,
-            |entries, policies, update, iprop_load, log_from| {
-                Db2Store::load_dump(
-                    cfg,
-                    entries,
-                    policies,
-                    update,
-                    iprop_load || merge_nra,
-                    log_from,
-                )
-            },
-        ),
+        "load" => {
+            // `kdb5_util load -hash` passes `hash=true` to the module.
+            let mut cfg = cfg.clone();
+            cfg.db_module.db2_hash |= args.iter().any(|a| a == "-hash");
+            let cfg = &cfg;
+            load_command(
+                args,
+                iprop,
+                |entries, policies, update, iprop_load, log_from| {
+                    Db2Store::load_dump(
+                        cfg,
+                        entries,
+                        policies,
+                        update,
+                        iprop_load || merge_nra,
+                        log_from,
+                    )
+                },
+            )
+        }
         _ => {
             require_db2(cfg);
             let master = master_key(cfg, realm, global_master_password_file);

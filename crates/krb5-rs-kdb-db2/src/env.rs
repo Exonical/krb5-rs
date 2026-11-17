@@ -118,12 +118,16 @@ impl Tree {
 
 /// `open_db`: try the configured type, then the other one.
 fn open_tree(path: &Path, write: bool, hash_first: &AtomicBool) -> io::Result<Tree> {
-    let file = OpenOptions::new().read(true).write(write).open(path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("Cannot open DB2 database '{}': {e}", path.display()),
-        )
-    })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(write)
+        .open(path)
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Cannot open DB2 database '{}': {e}", path.display()),
+            )
+        })?;
     let first = hash_first.load(Ordering::Relaxed);
     let as_hash = |f: File| Hash::open(f).map(Tree::Hash);
     let as_btree = |f: File| Btree::open(f).map(Tree::Btree);
@@ -288,7 +292,11 @@ pub struct Guard<'a> {
 impl Guard<'_> {
     /// `osa_adb_get_lock`.
     fn lock_policy(&mut self) -> io::Result<()> {
-        let mut pl = self.files.policy_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut pl = self
+            .files
+            .policy_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if pl.is_none() {
             *pl = Db2Files::open_policy_lock(&self.files.base);
         }
@@ -319,7 +327,10 @@ impl Guard<'_> {
     pub fn policy(&mut self) -> io::Result<&mut Btree> {
         if self.policy.is_none() {
             let path = suffixed(&self.files.base, SUFFIX_POLICY);
-            let file = OpenOptions::new().read(true).write(self.writable()).open(&path)?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(self.writable())
+                .open(&path)?;
             self.policy = Some(Btree::open(file)?);
         }
         Ok(self.policy.as_mut().unwrap())
@@ -349,7 +360,11 @@ impl Drop for Guard<'_> {
     fn drop(&mut self) {
         let _ = self.flush();
         if self.policy_locked {
-            let pl = self.files.policy_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let pl = self
+                .files
+                .policy_lock
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             if let Some(f) = pl.as_ref() {
                 let _ = lock_file(f, None);
             }
@@ -364,7 +379,10 @@ fn update_age(lock: &File) {
     let Ok(mtime) = lock.metadata().and_then(|m| m.modified()) else {
         return;
     };
-    let secs = |t: SystemTime| t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let secs = |t: SystemTime| {
+        t.duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
     let t = if secs(mtime) >= secs(now) {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs(mtime) + 1)
     } else {

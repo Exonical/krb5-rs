@@ -252,7 +252,9 @@ impl Page {
         self.set_upper(upper as u16);
     }
     fn items(&self) -> io::Result<Vec<Vec<u8>>> {
-        (0..self.nent()).map(|i| self.item(i).map(<[u8]>::to_vec)).collect()
+        (0..self.nent())
+            .map(|i| self.item(i).map(<[u8]>::to_vec))
+            .collect()
     }
     fn free_space(&self) -> usize {
         self.upper() - self.lower()
@@ -298,13 +300,22 @@ impl Btree {
         }
         let psize = order.u32(&m, 8) as usize;
         let meta_flags = order.u32(&m, 20);
-        if !(512..=65536).contains(&psize) || psize & (psize - 1) != 0 || meta_flags & !SAVEMETA != 0
+        if !(512..=65536).contains(&psize)
+            || psize & (psize - 1) != 0
+            || meta_flags & !SAVEMETA != 0
         {
             return Err(io::Error::other("EFTYPE: bad btree metadata"));
         }
         let len = file.metadata()?.len();
         let npages = u32::try_from(len / psize as u64).map_err(|_| bad("btree file too large"))?;
-        Ok(Self::new(file, order, psize, order.u32(&m, 12), npages, meta_flags))
+        Ok(Self::new(
+            file,
+            order,
+            psize,
+            order.u32(&m, 12),
+            npages,
+            meta_flags,
+        ))
     }
 
     /// Create an empty btree, as `__bt_open` does on an empty file with
@@ -319,7 +330,14 @@ impl Btree {
         Ok(t)
     }
 
-    fn new(file: File, order: Order, psize: usize, free: u32, npages: u32, meta_flags: u32) -> Self {
+    fn new(
+        file: File,
+        order: Order,
+        psize: usize,
+        free: u32,
+        npages: u32,
+        meta_flags: u32,
+    ) -> Self {
         let mut ovflsize = (psize - BTDATAOFF) / DEFMINKEYPAGE - (2 + nbleafdbt(0, 0));
         if ovflsize < nbleafdbt(NOVFLSIZE, NOVFLSIZE) + 2 {
             ovflsize = nbleafdbt(NOVFLSIZE, NOVFLSIZE) + 2;
@@ -798,7 +816,12 @@ impl Btree {
 
     /// `bt_root` and `bt_broot`: the root keeps page 1 and gets two new
     /// children.
-    fn split_root(&mut self, left: Vec<Vec<u8>>, right: Vec<Vec<u8>>, leaf: bool) -> io::Result<()> {
+    fn split_root(
+        &mut self,
+        left: Vec<Vec<u8>>,
+        right: Vec<Vec<u8>>,
+        leaf: bool,
+    ) -> io::Result<()> {
         let flags = if leaf { P_BLEAF } else { P_BINTERNAL };
         let l = self.new_page(flags)?;
         let r = self.new_page(flags)?;
@@ -993,21 +1016,34 @@ mod tests {
         let mut model = std::collections::BTreeMap::new();
         let mut seed = 1u64;
         for i in 0..3000u32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let klen = if i % 97 == 0 { 1500 } else { 5 + (seed >> 59) as usize };
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let klen = if i % 97 == 0 {
+                1500
+            } else {
+                5 + (seed >> 59) as usize
+            };
             let key: Vec<u8> = format!("{:08x}", seed >> 32)
                 .bytes()
                 .cycle()
                 .take(klen)
                 .collect();
-            let dlen = if i % 31 == 0 { 9000 } else { (seed >> 52) as usize % 600 };
+            let dlen = if i % 31 == 0 {
+                9000
+            } else {
+                (seed >> 52) as usize % 600
+            };
             let data = vec![(i % 251) as u8; dlen];
             t.put(&key, &data).unwrap();
             model.insert(key, data);
         }
         t.sync().unwrap();
         let mut t = Btree::open(rw(&p)).unwrap();
-        assert_eq!(t.entries().unwrap(), model.clone().into_iter().collect::<Vec<_>>());
+        assert_eq!(
+            t.entries().unwrap(),
+            model.clone().into_iter().collect::<Vec<_>>()
+        );
         let keys: Vec<_> = model.keys().cloned().collect();
         for (n, k) in keys.iter().enumerate() {
             if n % 3 != 0 {
@@ -1021,7 +1057,10 @@ mod tests {
         }
         t.sync().unwrap();
         let mut t = Btree::open(rw(&p)).unwrap();
-        assert_eq!(t.entries().unwrap(), model.clone().into_iter().collect::<Vec<_>>());
+        assert_eq!(
+            t.entries().unwrap(),
+            model.clone().into_iter().collect::<Vec<_>>()
+        );
         for (k, v) in &model {
             assert_eq!(t.get(k).unwrap().as_ref(), Some(v));
         }

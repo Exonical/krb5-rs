@@ -19,7 +19,9 @@ use krb5_rs::kdc::{
 };
 use krb5_rs::types::{EncryptionKey, KerberosString, KerberosTime, PrincipalName};
 
-use crate::codec::{decode_entry, decode_policy, encode_entry, encode_policy, policy_key, zeroed_keys};
+use crate::codec::{
+    decode_entry, decode_policy, encode_entry, encode_policy, policy_key, zeroed_keys,
+};
 use crate::env::{suffixed, Db2Files, Guard, SUFFIX_LOCK, SUFFIX_POLICY, SUFFIX_POLICY_LOCK};
 
 /// The db2 module's `[dbmodules]` settings (`configure_context`).
@@ -167,7 +169,9 @@ fn all_entries(g: &mut Guard<'_>) -> Result<Vec<MitEntry>, StoreError> {
 }
 
 fn all_policies(g: &mut Guard<'_>) -> Result<Vec<MitPolicy>, StoreError> {
-    let pol = g.policy().map_err(|e| io_err("opening policy database", e))?;
+    let pol = g
+        .policy()
+        .map_err(|e| io_err("opening policy database", e))?;
     pol.entries()
         .map_err(|e| io_err("iterating policies", e))?
         .iter()
@@ -193,7 +197,10 @@ fn mit_policy(policy: Policy) -> MitPolicy {
         tl_data: policy
             .tl_data
             .into_iter()
-            .map(|t| TlData { kind: t.kind, data: t.data })
+            .map(|t| TlData {
+                kind: t.kind,
+                data: t.data,
+            })
             .collect(),
     }
 }
@@ -295,16 +302,20 @@ impl Db2Store {
         actkvno.extend_from_slice(&1u16.to_le_bytes());
         actkvno.extend_from_slice(&1u16.to_le_bytes());
         actkvno.extend_from_slice(&0u32.to_le_bytes());
-        km.tl_data.push(TlData { kind: ACTKVNO, data: actkvno });
+        km.tl_data.push(TlData {
+            kind: ACTKVNO,
+            data: actkvno,
+        });
         km.tl_data.extend(mkvno_tl);
         let mut tgt = new_entry(&tgt_record, &single, &creator_key)?;
         tgt.tl_data.retain(|tl| tl.kind != MKVNO);
 
         if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| io_err("creating database directory", e))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| io_err("creating database directory", e))?;
         }
-        let files = Db2Files::create(base, options.hash)
-            .map_err(|e| io_err("creating DB2 database", e))?;
+        let files =
+            Db2Files::create(base, options.hash).map_err(|e| io_err("creating DB2 database", e))?;
         {
             let mut g = files.write().map_err(|e| io_err("locking database", e))?;
             put_entry(&mut g, &km)?;
@@ -343,10 +354,20 @@ impl Db2Store {
         }
         let files =
             Db2Files::open(base, options.hash).map_err(|e| io_err("opening DB2 database", e))?;
-        Ok(Self::from_files(files, config.kdc.realm.as_str(), master, options))
+        Ok(Self::from_files(
+            files,
+            config.kdc.realm.as_str(),
+            master,
+            options,
+        ))
     }
 
-    fn from_files(files: Db2Files, realm: &str, master: &EncryptionKey, options: Db2Options) -> Self {
+    fn from_files(
+        files: Db2Files,
+        realm: &str,
+        master: &EncryptionKey,
+        options: Db2Options,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 files,
@@ -398,11 +419,17 @@ impl Db2Store {
     }
 
     fn read(&self) -> Result<Guard<'_>, StoreError> {
-        self.inner.files.read().map_err(|e| io_err("locking database", e))
+        self.inner
+            .files
+            .read()
+            .map_err(|e| io_err("locking database", e))
     }
 
     fn write(&self) -> Result<Guard<'_>, StoreError> {
-        self.inner.files.write().map_err(|e| io_err("locking database", e))
+        self.inner
+            .files
+            .write()
+            .map_err(|e| io_err("locking database", e))
     }
 
     fn refresh_master(&self) -> Result<(), StoreError> {
@@ -466,7 +493,9 @@ impl Db2Store {
 
     pub fn raw_policy(&self, name: &str) -> Result<Option<MitPolicy>, StoreError> {
         let mut g = self.read()?;
-        let pol = g.policy().map_err(|e| io_err("opening policy database", e))?;
+        let pol = g
+            .policy()
+            .map_err(|e| io_err("opening policy database", e))?;
         pol.get(&policy_key(name))
             .map_err(|e| io_err("reading policy", e))?
             .map(|v| decode_policy(&v))
@@ -474,7 +503,11 @@ impl Db2Store {
     }
 
     pub fn policy_names_sync(&self) -> Result<Vec<String>, StoreError> {
-        Ok(self.list_policies_sync()?.into_iter().map(|p| p.name).collect())
+        Ok(self
+            .list_policies_sync()?
+            .into_iter()
+            .map(|p| p.name)
+            .collect())
     }
 
     fn get_record_sync(
@@ -492,7 +525,10 @@ impl Db2Store {
         self.refresh_master()?;
         let entries = all_entries(&mut self.read()?)?;
         let keys = self.master_keys();
-        entries.iter().map(|e| record_from_entry(e, &keys)).collect()
+        entries
+            .iter()
+            .map(|e| record_from_entry(e, &keys))
+            .collect()
     }
 
     fn get_policy_sync(&self, name: &str) -> Result<Option<Policy>, StoreError> {
@@ -766,14 +802,21 @@ impl Db2Store {
         let value = encode_policy(&raw)?;
         {
             let mut g = self.write()?;
-            let pol = g.policy().map_err(|e| io_err("opening policy database", e))?;
-            if pol.get(&key).map_err(|e| io_err("reading policy", e))?.is_some() {
+            let pol = g
+                .policy()
+                .map_err(|e| io_err("opening policy database", e))?;
+            if pol
+                .get(&key)
+                .map_err(|e| io_err("reading policy", e))?
+                .is_some()
+            {
                 return Err(StoreError::conflict(format!(
                     "Principal or policy already exists: policy {}",
                     raw.name
                 )));
             }
-            pol.put(&key, &value).map_err(|e| io_err("writing policy", e))?;
+            pol.put(&key, &value)
+                .map_err(|e| io_err("writing policy", e))?;
             g.commit().map_err(|e| io_err("writing policy", e))?;
         }
         self.reset_ulog()
@@ -786,11 +829,15 @@ impl Db2Store {
         let key = policy_key(name);
         let policy = {
             let mut g = self.write()?;
-            let pol = g.policy().map_err(|e| io_err("opening policy database", e))?;
+            let pol = g
+                .policy()
+                .map_err(|e| io_err("opening policy database", e))?;
             let bytes = pol
                 .get(&key)
                 .map_err(|e| io_err("reading policy", e))?
-                .ok_or_else(|| StoreError::not_found(format!("Policy \"{name}\" does not exist")))?;
+                .ok_or_else(|| {
+                    StoreError::not_found(format!("Policy \"{name}\" does not exist"))
+                })?;
             let mut raw = decode_policy(&bytes)?;
             let mut policy = policy_from_entry(&raw);
             f(&mut policy)?;
@@ -807,7 +854,9 @@ impl Db2Store {
     fn delete_policy_sync(&self, name: &str) -> Result<bool, StoreError> {
         let deleted = {
             let mut g = self.write()?;
-            let pol = g.policy().map_err(|e| io_err("opening policy database", e))?;
+            let pol = g
+                .policy()
+                .map_err(|e| io_err("opening policy database", e))?;
             let deleted = pol
                 .delete(&policy_key(name))
                 .map_err(|e| io_err("deleting policy", e))?;
@@ -846,7 +895,8 @@ impl Db2Store {
             )));
         }
         if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| io_err("creating database directory", e))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| io_err("creating database directory", e))?;
         }
         let ulog = match update && config.iprop.enabled {
             true => Some(Ulog::map(&config.iprop.logfile, config.iprop.ulogsize)?),
@@ -855,8 +905,8 @@ impl Db2Store {
         let held = ulog.as_ref().map(Ulog::lock).transpose()?;
         let mut logged = Vec::new();
         if update {
-            let files =
-                Db2Files::open(&base, options.hash).map_err(|e| io_err("opening DB2 database", e))?;
+            let files = Db2Files::open(&base, options.hash)
+                .map_err(|e| io_err("opening DB2 database", e))?;
             let mut g = files.write().map_err(|e| io_err("locking database", e))?;
             for (i, entry) in entries.iter().enumerate() {
                 let (key, _) = encode_entry(entry)?;
@@ -910,7 +960,9 @@ impl Db2Store {
     }
 
     fn put_policies(g: &mut Guard<'_>, policies: &[MitPolicy]) -> Result<(), StoreError> {
-        let pol = g.policy().map_err(|e| io_err("opening policy database", e))?;
+        let pol = g
+            .policy()
+            .map_err(|e| io_err("opening policy database", e))?;
         for p in policies {
             pol.put(&policy_key(&p.name), &encode_policy(p)?)
                 .map_err(|e| io_err("writing policy", e))?;

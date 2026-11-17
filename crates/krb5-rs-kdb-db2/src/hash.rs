@@ -35,8 +35,9 @@ fn bad(msg: &str) -> io::Error {
 
 /// libdb2's default hash function (`hash4`).
 pub fn hash4(key: &[u8]) -> u32 {
-    key.iter()
-        .fold(0u32, |h, &b| (h << 5).wrapping_add(h).wrapping_add(b as u32))
+    key.iter().fold(0u32, |h, &b| {
+        (h << 5).wrapping_add(h).wrapping_add(b as u32)
+    })
 }
 
 fn log2(num: u32) -> u32 {
@@ -146,7 +147,8 @@ fn read_at(file: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
         #[cfg(unix)]
         let n = std::os::unix::fs::FileExt::read_at(file, &mut buf[done..], off + done as u64)?;
         #[cfg(windows)]
-        let n = std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], off + done as u64)?;
+        let n =
+            std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], off + done as u64)?;
         if n == 0 {
             break;
         }
@@ -227,10 +229,9 @@ impl Hash {
         {
             return Err(bad("bad header"));
         }
-        let nmaps = ((hdr.spares[hdr.ovfl_point as usize] as u64
-            + ((hdr.bsize as u64) << BYTE_SHIFT)
-            - 1)
-            >> (hdr.bshift + BYTE_SHIFT)) as u32;
+        let nmaps =
+            ((hdr.spares[hdr.ovfl_point as usize] as u64 + ((hdr.bsize as u64) << BYTE_SHIFT) - 1)
+                >> (hdr.bshift + BYTE_SHIFT)) as u32;
         let max_chain = (file.metadata()?.len() / hdr.bsize as u64) as usize + 2;
         Ok(Hash {
             file,
@@ -250,7 +251,11 @@ impl Hash {
         let mut hdr = Header {
             magic: HASHMAGIC,
             version: HASHVERSION,
-            lorder: if Order::native() == Order::Big { 4321 } else { 1234 },
+            lorder: if Order::native() == Order::Big {
+                4321
+            } else {
+                1234
+            },
             bsize: 1 << bshift,
             bshift,
             ffactor: if ffactor == 0 { DEF_FFACTOR } else { ffactor },
@@ -268,7 +273,8 @@ impl Hash {
         hdr.low_mask = nbuckets - 1;
         hdr.high_mask = (nbuckets << 1) - 1;
         let usable = hdr.bsize - HEADER_OVERHEAD;
-        hdr.hdrpages = HDRSIZE as u32 / usable + u32::from(!(HDRSIZE as u32).is_multiple_of(usable));
+        hdr.hdrpages =
+            HDRSIZE as u32 / usable + u32::from(!(HDRSIZE as u32).is_multiple_of(usable));
         file.set_len(0)?;
         let mut h = Hash {
             file,
@@ -312,7 +318,8 @@ impl Hash {
 
     fn oaddr_to_page(&self, a: u32) -> u32 {
         let s = (a >> SPLITSHIFT).min(31);
-        self.bucket_to_page((1u32 << s) - 1).wrapping_add(a & SPLITMASK)
+        self.bucket_to_page((1u32 << s) - 1)
+            .wrapping_add(a & SPLITMASK)
     }
 
     fn page_to_oaddr(&self, pgno: u32) -> u32 {
@@ -423,7 +430,9 @@ impl Hash {
         self.o.put_u16(p, PAGE_OVERHEAD + i * PAIR_OVERHEAD + 2, v)
     }
     fn freespace(&self, p: &[u8]) -> i64 {
-        self.offset(p) as i64 + 1 - PAGE_OVERHEAD as i64 - self.nent(p) as i64 * PAIR_OVERHEAD as i64
+        self.offset(p) as i64 + 1
+            - PAGE_OVERHEAD as i64
+            - self.nent(p) as i64 * PAIR_OVERHEAD as i64
     }
     fn isbig(&self, n: usize) -> bool {
         n as f64 > self.hdr.bsize as f64 * 0.75
@@ -439,11 +448,19 @@ impl Hash {
     }
 
     /// Key and data ranges of a normal pair, as `__get_item` computes them.
-    fn pair(&self, p: &[u8], i: usize) -> io::Result<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    fn pair(
+        &self,
+        p: &[u8],
+        i: usize,
+    ) -> io::Result<(std::ops::Range<usize>, std::ops::Range<usize>)> {
         let ko = self.key_off(p, i)? as usize;
         let dof = self.data_off(p, i)? as usize;
         let j = self.prev_realkey(p, i)?;
-        let kend = if j == i { self.bsize() } else { self.data_off(p, j)? as usize };
+        let kend = if j == i {
+            self.bsize()
+        } else {
+            self.data_off(p, j)? as usize
+        };
         if dof > ko || ko > kend || kend > p.len() {
             return Err(bad("bad pair offsets"));
         }
@@ -528,7 +545,10 @@ impl Hash {
                 let p = self.pg(pgno)?;
                 let bkl = self.key_off(&p, 0)? as usize;
                 let s = PAGE_OVERHEAD + PAIR_OVERHEAD;
-                let part = p.get(s..s + bkl).ok_or_else(|| bad("bad big page"))?.to_vec();
+                let part = p
+                    .get(s..s + bkl)
+                    .ok_or_else(|| bad("bad big page"))?
+                    .to_vec();
                 (bkl, part, self.next(&p))
             };
             if ks == 0 || bkl == 0 {
@@ -549,7 +569,10 @@ impl Hash {
     /// Walk `bucket` as `hash_access` does.
     fn access(&mut self, key: &[u8], seek_size: i64) -> io::Result<(Option<Found>, u32, ItemInfo)> {
         let bucket = self.call_hash(key);
-        let mut info = ItemInfo { bucket, ..Default::default() };
+        let mut info = ItemInfo {
+            bucket,
+            ..Default::default()
+        };
         let mut cur = self.bucket_to_page(bucket);
         let mut pgndx: usize = 0;
         let mut num_items = 0u32;
@@ -581,7 +604,14 @@ impl Hash {
                 p[kr] == *key
             };
             if hit {
-                return Ok((Some(Found { pgno: cur, ndx: pgndx as u16 }), num_items, info));
+                return Ok((
+                    Some(Found {
+                        pgno: cur,
+                        ndx: pgndx as u16,
+                    }),
+                    num_items,
+                    info,
+                ));
             }
             pgndx += 1;
         }
@@ -603,7 +633,10 @@ impl Hash {
     }
 
     /// Every pair in libdb2's sequential order.
-    pub fn for_each(&mut self, mut f: impl FnMut(Vec<u8>, Vec<u8>) -> io::Result<bool>) -> io::Result<()> {
+    pub fn for_each(
+        &mut self,
+        mut f: impl FnMut(Vec<u8>, Vec<u8>) -> io::Result<bool>,
+    ) -> io::Result<()> {
         for bucket in 0..=self.hdr.max_bucket {
             let mut pgno = self.bucket_to_page(bucket);
             for _ in 0..=self.max_chain {
@@ -694,11 +727,22 @@ impl Hash {
     }
 
     /// `__addel`.
-    fn addel(&mut self, info: &mut ItemInfo, key: &[u8], val: &[u8], num: NumItems, expanding: bool) -> io::Result<()> {
+    fn addel(
+        &mut self,
+        info: &mut ItemInfo,
+        key: &[u8],
+        val: &[u8],
+        num: NumItems,
+        expanding: bool,
+    ) -> io::Result<()> {
         let psize = PAIR_OVERHEAD + key.len() + val.len();
         let big = self.isbig(psize);
         let mut do_expand = false;
-        let mut pgno = if info.seek_found_page != 0 { info.seek_found_page } else { info.pgno };
+        let mut pgno = if info.seek_found_page != 0 {
+            info.seek_found_page
+        } else {
+            info.pgno
+        };
         for _ in 0..=self.max_chain.saturating_add(4096) {
             let p = self.pg(pgno)?;
             if self.nent(&p) == 0 || self.next(&p) == INVALID_PGNO || self.fits(&p, big, psize) {
@@ -706,10 +750,16 @@ impl Hash {
             }
             pgno = self.next(&p);
         }
-        if !{ let p = self.pg(pgno)?; self.fits(&p, big, psize) } {
+        if !{
+            let p = self.pg(pgno)?;
+            self.fits(&p, big, psize)
+        } {
             do_expand = true;
             pgno = self.add_ovflpage(pgno)?;
-            if !{ let p = self.pg(pgno)?; self.fits(&p, big, psize) } {
+            if !{
+                let p = self.pg(pgno)?;
+                self.fits(&p, big, psize)
+            } {
                 return Err(bad("pair does not fit"));
             }
         }
@@ -797,7 +847,10 @@ impl Hash {
     /// `__add_ovflpage`.
     fn add_ovflpage(&mut self, pgno: u32) -> io::Result<u32> {
         if self.hdr.ffactor == DEF_FFACTOR {
-            let n = { let p = self.pg(pgno)?; self.nent(&p) as u32 };
+            let n = {
+                let p = self.pg(pgno)?;
+                self.nent(&p) as u32
+            };
             self.hdr.ffactor = (n >> 1).max(MIN_FFACTOR);
         }
         let ovfl = self.overflow_page()?;
@@ -830,7 +883,11 @@ impl Hash {
                 check -= 1;
             }
             let dof = self.data_off(&p, ndx)? as usize;
-            let top = if check < 0 { bs } else { self.data_off(&p, check as usize)? as usize };
+            let top = if check < 0 {
+                bs
+            } else {
+                self.data_off(&p, check as usize)? as usize
+            };
             let delta = top as i32 - dof as i32;
             if ndx != nent - 1 {
                 let src = self.offset(&p) as usize + 1;
@@ -865,7 +922,10 @@ impl Hash {
         if typ == HASH_OVFLPAGE && now == 0 {
             let mut prev = self.bucket_to_page(info.bucket);
             for _ in 0..=self.max_chain {
-                let next = { let p = self.pg(prev)?; self.next(&p) };
+                let next = {
+                    let p = self.pg(prev)?;
+                    self.next(&p)
+                };
                 if next == pgno {
                     break;
                 }
@@ -877,7 +937,10 @@ impl Hash {
             o.put_u32(self.pgm(prev)?, 4, link);
             if info.pgno == pgno {
                 info.pgno = prev;
-                info.pgndx = { let p = self.pg(prev)?; self.nent(&p) as u32 };
+                info.pgndx = {
+                    let p = self.pg(prev)?;
+                    self.nent(&p) as u32
+                };
                 info.seek_found_page = prev;
             }
             self.delete_page(pgno, true)?;
@@ -917,8 +980,16 @@ impl Hash {
             self.page_init(&mut p, addr, HASH_PAGE);
             self.pages.insert(opg, p);
         }
-        let mut old_ii = ItemInfo { pgno: opg, bucket: ob, ..Default::default() };
-        let mut new_ii = ItemInfo { pgno: self.bucket_to_page(nb), bucket: nb, ..Default::default() };
+        let mut old_ii = ItemInfo {
+            pgno: opg,
+            bucket: ob,
+            ..Default::default()
+        };
+        let mut new_ii = ItemInfo {
+            pgno: self.bucket_to_page(nb),
+            bucket: nb,
+            ..Default::default()
+        };
         let mut base_page = true;
         let mut temp_pgno = opg;
         for _ in 0..=self.max_chain.saturating_add(4096) {
@@ -934,7 +1005,11 @@ impl Hash {
                 } else {
                     let (kr, dr) = self.pair(&temp, n)?;
                     let (k, v) = (temp[kr].to_vec(), temp[dr].to_vec());
-                    let ii = if self.call_hash(&k) == ob { &mut old_ii } else { &mut new_ii };
+                    let ii = if self.call_hash(&k) == ob {
+                        &mut old_ii
+                    } else {
+                        &mut new_ii
+                    };
                     self.addel(ii, &k, &v, NumItems::NoExpand, true)?;
                 }
             }
@@ -957,12 +1032,19 @@ impl Hash {
         let mut pgno = self.bucket_to_page(bucket);
         for _ in 0..=self.max_chain.saturating_add(4096) {
             let p = self.pg(pgno)?;
-            if self.nent(&p) == 0 || self.next(&p) == INVALID_PGNO || self.freespace(&p) >= PAIR_OVERHEAD as i64 {
+            if self.nent(&p) == 0
+                || self.next(&p) == INVALID_PGNO
+                || self.freespace(&p) >= PAIR_OVERHEAD as i64
+            {
                 break;
             }
             pgno = self.next(&p);
         }
-        if { let p = self.pg(pgno)?; self.freespace(&p) } < PAIR_OVERHEAD as i64 {
+        if {
+            let p = self.pg(pgno)?;
+            self.freespace(&p)
+        } < PAIR_OVERHEAD as i64
+        {
             pgno = self.add_ovflpage(pgno)?;
         }
         let mut p = std::mem::take(self.pgm(pgno)?);
@@ -1018,7 +1100,11 @@ impl Hash {
         let clearints = ((nbits - 1) >> 5) + 1;
         let clearbytes = (clearints << 2) as usize;
         p[clearbytes..].fill(0xff);
-        o.put_u32(&mut p, (clearints as usize - 1) * 4, ALL_SET << (nbits & 31));
+        o.put_u32(
+            &mut p,
+            (clearints as usize - 1) * 4,
+            ALL_SET << (nbits & 31),
+        );
         let w = o.u32(&p, 0) | 1;
         o.put_u32(&mut p, 0, w);
         self.pages.insert(pg, p);
@@ -1042,7 +1128,9 @@ impl Hash {
         let mut freep = None;
         let mut i = first_page;
         while i <= free_page {
-            let Some(pg) = self.bitmap_pgno(i)? else { return Err(full()) };
+            let Some(pg) = self.bitmap_pgno(i)? else {
+                return Err(full());
+            };
             freep = Some(pg);
             let in_use_bits = if i == free_page { free_bit } else { bits - 1 };
             let (mut bit, mut j) = if i == first_page {
@@ -1065,7 +1153,11 @@ impl Hash {
                     while s < splitnum && bit > self.hdr.spares[s as usize] {
                         s += 1;
                     }
-                    let offset = if s != 0 { bit - self.hdr.spares[s as usize - 1] } else { bit };
+                    let offset = if s != 0 {
+                        bit - self.hdr.spares[s as usize - 1]
+                    } else {
+                        bit
+                    };
                     if offset >= SPLITMASK {
                         return Err(full());
                     }
@@ -1081,7 +1173,11 @@ impl Hash {
         self.hdr.last_freed = self.hdr.spares[splitnum as usize];
         self.hdr.spares[splitnum as usize] += 1;
         let mut offset = self.hdr.spares[splitnum as usize]
-            - if splitnum != 0 { self.hdr.spares[splitnum as usize - 1] } else { 0 };
+            - if splitnum != 0 {
+                self.hdr.spares[splitnum as usize - 1]
+            } else {
+                0
+            };
         if offset > SPLITMASK {
             splitnum += 1;
             if splitnum as usize >= NCACHED {
@@ -1122,7 +1218,11 @@ impl Hash {
     fn free_ovflpage(&mut self, pgno: u32) -> io::Result<()> {
         let addr = self.page_to_oaddr(pgno);
         let ndx = addr >> SPLITSHIFT;
-        let base = if ndx != 0 { self.hdr.spares[(ndx as usize - 1) % NCACHED] } else { 0 };
+        let base = if ndx != 0 {
+            self.hdr.spares[(ndx as usize - 1) % NCACHED]
+        } else {
+            0
+        };
         let bit_address = (base + (addr & SPLITMASK)).wrapping_sub(1);
         if bit_address < self.hdr.last_freed {
             self.hdr.last_freed = bit_address;
@@ -1172,14 +1272,32 @@ mod tests {
     fn insert_expand_delete_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("h.db");
-        let open = || std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).unwrap();
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap()
+        };
         let mut h = Hash::create(open(), 4096, 40, 1).unwrap();
         let mut model = std::collections::BTreeMap::new();
         let mut seed = 0x1234_5678_9abc_def0u64;
         for i in 0..3000u32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let klen = if i % 97 == 0 { 5000 } else { 5 + (seed >> 59) as usize };
-            let dlen = if i % 89 == 0 { 9000 } else { (seed >> 40) as usize % 400 };
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let klen = if i % 97 == 0 {
+                5000
+            } else {
+                5 + (seed >> 59) as usize
+            };
+            let dlen = if i % 89 == 0 {
+                9000
+            } else {
+                (seed >> 40) as usize % 400
+            };
             let mut k = format!("k{i:05}-").into_bytes();
             k.resize(klen.max(k.len()), b'a' + (i % 26) as u8);
             let d = vec![(i % 251) as u8; dlen];

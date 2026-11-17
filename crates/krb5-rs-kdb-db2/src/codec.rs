@@ -94,14 +94,19 @@ pub fn decode_entry(value: &[u8]) -> Result<MitEntry, StoreError> {
     for _ in 0..n_tl {
         let kind = r.u16()?;
         let n = r.u16()? as usize;
-        tl_data.push(TlData { kind, data: r.take(n)?.to_vec() });
+        tl_data.push(TlData {
+            kind,
+            data: r.take(n)?.to_vec(),
+        });
     }
     let mut key_data = Vec::with_capacity(n_key as usize);
     for _ in 0..n_key {
         let ver = r.u16()?;
         let kvno = r.u16()?;
         if ver as i16 > KEY_DATA_ARRAY as i16 || (ver as i16) < 0 {
-            return Err(StoreError::backend("db2: bad key-data version (KRB5_KDB_BAD_VERSION)"));
+            return Err(StoreError::backend(
+                "db2: bad key-data version (KRB5_KDB_BAD_VERSION)",
+            ));
         }
         let mut fields = Vec::with_capacity(ver as usize);
         for _ in 0..ver {

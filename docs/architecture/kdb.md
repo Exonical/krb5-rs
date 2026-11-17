@@ -135,6 +135,38 @@ write lock (`<database_name>.lock`) from export to backup, so it fails with
 crash leaves that lock file behind, exactly as a crashed file-store writer
 does; remove it once no file-store writer is running.
 
+### MIT db2 (Berkeley DB)
+
+`db_library = db2` selects `krb5-rs-kdb-db2`, which reads and writes an MIT
+db2 database in place, with no dump and load. It has its own Berkeley DB 1.85
+btree and hash engines, compatible with MIT's bundled libdb2
+(`plugins/kdb/db2/libdb2`), and follows `plugins/kdb/db2/kdb_db2.c`:
+
+- `<database_name>` holds the principals, `<database_name>.kadm5` the
+  policies; `<database_name>.ok` and `<database_name>.kadm5.lock` are the
+  lock files. Locks are `fcntl` record locks, shared for reads and exclusive
+  for writes, so the KDC, kadmind and `krb5-rs-kdb` can share a database with
+  MIT's `krb5kdc`, `kadmind`, `kadmin.local` and `kdb5_util`. The database is
+  reopened under each lock, as MIT does, and each write advances the `.ok`
+  file's mtime, which is the database age.
+- Principal keys are the unparsed name plus a NUL. Values are MIT's
+  `krb5_encode_princ_entry` records (`kdb_xdr.c`), with the lockout fields in
+  the entry, as db2 has no separate lockout database. Policies are MIT's XDR
+  `osa_policy_ent_rec` (`pol_xdr.c`), versions 1 to 3.
+- A deleted principal's keys are overwritten with zeros before the record is
+  removed (`krb5_db2_delete_principal`).
+- New databases are btrees. `-x hash=...` (any value, `kdb_db2.c:237-238`)
+  or `krb5-rs-kdb load -hash` creates a hash database. An existing database
+  is opened as whichever type it is.
+- `disable_lockout` and `disable_last_success` come from the module section.
+  `unlockiter` and `lockiter` are accepted; iteration always holds the lock.
+- A full `load` writes `<database_name>~` and its policy file, then renames
+  them into place (`krb5_db2_promote_db`); `merge_nra` keeps the current
+  lockout fields.
+- iprop logs and replays db2 changes as for klmdb.
+
+When `db_library` is unset krb5-rs uses klmdb; MIT uses db2 (`kdb5.c:262`).
+
 ### MIT kldap (LDAP directory)
 
 `db_library = kldap` selects `krb5-rs-kdb-ldap`, which follows MIT 1.22.2's
@@ -496,11 +528,11 @@ klmdb `db_args` (`dbname=PATH`, `temporary`, `merge_nra`; anything else is
 `Unsupported argument "..." for LMDB`) for the database the update log is
 replayed into, as MIT passes them to `ulog_replay` (`kpropd.c:891`).
 `krb5-rs-kadmind -x` and `krb5-rs-kdb -x` take the same arguments. With
-`db_library = krb5-rs-file` they take db2's instead (`kdb_db2.c:222-247`):
-`dbname=PATH`, `temporary`, `merge_nra`, `hash=...`, `unlockiter` and
-`lockiter`; anything else is `Unsupported argument "..." for db2`. The file
-store has no db2 access methods, so `hash` and the iteration locks change
-nothing; `merge_nra` keeps the current lockout fields on a full load, as
+`db_library = db2` or `krb5-rs-file` they take db2's instead
+(`kdb_db2.c:222-247`): `dbname=PATH`, `temporary`, `merge_nra`, `hash=...`,
+`unlockiter` and `lockiter`; anything else is `Unsupported argument "..." for
+db2`. On db2, `hash` creates a hash database. The file store has no db2
+access methods, so there `hash` and the iteration locks change nothing; `merge_nra` keeps the current lockout fields on a full load, as
 db2's `krb5_db2_promote_db` does.
 Deliberate retry deviations from MIT `do_iprop`: a failed
 `IPROP_GET_UPDATES` or `IPROP_FULL_RESYNC[_EXT]` call waits the same

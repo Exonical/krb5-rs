@@ -40,10 +40,10 @@ use krb5_rs::kdc::{
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
 use krb5_rs::types::{EncryptionKey, PrincipalName};
-#[cfg(feature = "klmdb")]
-use krb5_rs_kdb_lmdb::LmdbStore;
 #[cfg(feature = "kdb2")]
 use krb5_rs_kdb_db2::Db2Store;
+#[cfg(feature = "klmdb")]
+use krb5_rs_kdb_lmdb::LmdbStore;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
