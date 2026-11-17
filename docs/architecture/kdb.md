@@ -167,6 +167,11 @@ btree and hash engines, compatible with MIT's bundled libdb2
 
 When `db_library` is unset krb5-rs uses klmdb; MIT uses db2 (`kdb5.c:262`).
 
+Deliberate deviation: libdb2's `__bt_put` searches with the 8-byte overflow
+reference of a key too long for a page, so it misplaces the key and stores a
+duplicate when the entry is replaced. krb5-rs searches with the key itself;
+the file format is unchanged and MIT reads the result.
+
 ### MIT kldap (LDAP directory)
 
 `db_library = kldap` selects `krb5-rs-kdb-ldap`, which follows MIT 1.22.2's

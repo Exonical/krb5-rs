@@ -695,9 +695,10 @@ impl Btree {
                 flags |= P_BIGKEY;
             }
         }
-        // __bt_put searches with the stored key, so a key moved to an
-        // overflow chain is positioned by its 8-byte reference, as in libdb2.
-        let (pgno, idx, found, path) = self.search(&kbuf)?;
+        // libdb2's __bt_put searches with the 8-byte overflow reference of a
+        // big key, which misplaces it and duplicates it on replacement; search
+        // with the key itself so big keys stay ordered and unique.
+        let (pgno, idx, found, path) = self.search(key)?;
         if found {
             let raw = self.page(pgno)?.item(idx)?.to_vec();
             self.free_leaf_item(&raw)?;
@@ -922,10 +923,11 @@ impl Btree {
 
     /// Write dirty pages and the metadata page (`__bt_sync`).
     pub fn sync(&mut self) -> io::Result<()> {
-        for pgno in std::mem::take(&mut self.dirty) {
+        while let Some(pgno) = self.dirty.first().copied() {
             let p = &self.cache[&pgno];
             self.file
                 .write_all_at(&p.b, u64::from(pgno) * self.psize as u64)?;
+            self.dirty.remove(&pgno);
         }
         if self.meta_dirty {
             let mut m = vec![0u8; self.psize];
@@ -1069,5 +1071,31 @@ mod tests {
         }
         t.sync().unwrap();
         assert!(Btree::open(rw(&p)).unwrap().entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn big_keys_replace_in_place() {
+        let (_d, p) = tmp();
+        let mut t = Btree::create(rw(&p), 512).unwrap();
+        let key = |i: u32| -> Vec<u8> {
+            let mut k = format!("{i:05}").into_bytes();
+            k.resize(700, b'x');
+            k
+        };
+        for round in 0..3u8 {
+            for i in (0..120).rev() {
+                t.put(&key(i), &[round; 20]).unwrap();
+            }
+        }
+        t.sync().unwrap();
+        let mut t = Btree::open(rw(&p)).unwrap();
+        let all = t.entries().unwrap();
+        assert_eq!(all.len(), 120);
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+        for i in 0..120 {
+            assert_eq!(t.get(&key(i)).unwrap(), Some(vec![2u8; 20]));
+            assert!(t.delete(&key(i)).unwrap());
+        }
+        assert!(t.entries().unwrap().is_empty());
     }
 }
