@@ -45,7 +45,7 @@ impl Db2Options {
                 .transpose()
         };
         Ok(Self {
-            hash: flag("hash")?.unwrap_or(false),
+            hash: config.db_module.db2_hash,
             disable_lockout: flag("disable_lockout")?.unwrap_or(config.kdc.disable_lockout),
             disable_last_success: flag("disable_last_success")?
                 .unwrap_or(config.kdc.disable_last_success),

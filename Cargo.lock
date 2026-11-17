@@ -2007,6 +2007,7 @@ dependencies = [
  "clap",
  "krb5-rs",
  "krb5-rs-kdb-cockroach",
+ "krb5-rs-kdb-db2",
  "krb5-rs-kdb-ldap",
  "krb5-rs-kdb-lmdb",
  "krb5-rs-kdb-turso",

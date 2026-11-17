@@ -42,6 +42,8 @@ use krb5_rs::profile::Profile;
 use krb5_rs::types::{EncryptionKey, PrincipalName};
 #[cfg(feature = "klmdb")]
 use krb5_rs_kdb_lmdb::LmdbStore;
+#[cfg(feature = "kdb2")]
+use krb5_rs_kdb_db2::Db2Store;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -155,6 +157,8 @@ enum DaemonStore {
     File(Arc<FileStore>, Arc<metrics::Metrics>),
     #[cfg(feature = "klmdb")]
     Lmdb(Arc<LmdbStore>, Arc<metrics::Metrics>),
+    #[cfg(feature = "kdb2")]
+    Db2(Arc<Db2Store>, Arc<metrics::Metrics>),
     #[cfg(feature = "turso")]
     Turso(krb5_rs_kdb_turso::TursoReplica, Arc<metrics::Metrics>),
     #[cfg(feature = "kldap")]
@@ -183,6 +187,13 @@ impl PrincipalStore for DaemonStore {
             }
             #[cfg(feature = "klmdb")]
             DaemonStore::Lmdb(s, metrics) => {
+                let start = std::time::Instant::now();
+                let result = s.lookup(name, realm).await;
+                metrics.observe_principal_lookup(start.elapsed(), result.is_ok());
+                result
+            }
+            #[cfg(feature = "kdb2")]
+            DaemonStore::Db2(s, metrics) => {
                 let start = std::time::Instant::now();
                 let result = s.lookup(name, realm).await;
                 metrics.observe_principal_lookup(start.elapsed(), result.is_ok());
@@ -223,6 +234,8 @@ impl PrincipalStore for DaemonStore {
             DaemonStore::File(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
             #[cfg(feature = "klmdb")]
             DaemonStore::Lmdb(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
+            #[cfg(feature = "kdb2")]
+            DaemonStore::Db2(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
             #[cfg(feature = "turso")]
             DaemonStore::Turso(s, _) => s.lookup_s4u_x509(cert, name, realm, referral_ok).await,
             #[cfg(feature = "kldap")]
@@ -237,6 +250,8 @@ impl PrincipalStore for DaemonStore {
             DaemonStore::File(s, _) => s.issue_pac(req),
             #[cfg(feature = "klmdb")]
             DaemonStore::Lmdb(s, _) => s.issue_pac(req),
+            #[cfg(feature = "kdb2")]
+            DaemonStore::Db2(s, _) => s.issue_pac(req),
             #[cfg(feature = "turso")]
             DaemonStore::Turso(s, _) => s.issue_pac(req),
             #[cfg(feature = "kldap")]
@@ -579,6 +594,67 @@ async fn klmdb_mode(
 ) -> std::io::Result<(DynKdc, Listen, ModeParts)> {
     Err(io_err(
         "db_library klmdb needs a krb5-rs-kdc built with the `klmdb` feature",
+    ))
+}
+
+#[cfg(feature = "kdb2")]
+async fn db2_mode(
+    cli: &Cli,
+    cfg: RealmConfig,
+    master: EncryptionKey,
+    metrics: Arc<metrics::Metrics>,
+) -> std::io::Result<(DynKdc, Listen, ModeParts)> {
+    let mut waiting = false;
+    let store = loop {
+        let config = cfg.clone();
+        let key = master.clone();
+        match tokio::task::spawn_blocking(move || Db2Store::open(&config, &key))
+            .await
+            .map_err(io_err)?
+        {
+            Ok(store) => break store,
+            Err(e) if cli.wait_for_database => {
+                waiting = database_wait(waiting, &e).await;
+            }
+            Err(e) => return Err(io_err(e)),
+        }
+    };
+    let store = Arc::new(store);
+    let (udp, tcp) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen)
+    } else {
+        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
+        (addrs.clone(), addrs)
+    };
+    let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
+    let kdc = Kdc::builder(cfg.kdc, DaemonStore::Db2(Arc::clone(&store), metrics))
+        .policies(Arc::clone(&store))
+        .auth_state(store)
+        .build();
+    Ok((
+        kdc,
+        Listen {
+            udp,
+            tcp,
+            backlog: cfg.tcp_listen_backlog,
+        },
+        ModeParts {
+            metrics_listen,
+            ..ModeParts::default()
+        },
+    ))
+}
+
+/// Serve from an LDAP directory (`db_library = kldap`).
+#[cfg(not(feature = "kdb2"))]
+async fn db2_mode(
+    _cli: &Cli,
+    _cfg: RealmConfig,
+    _master: EncryptionKey,
+    _metrics: Arc<metrics::Metrics>,
+) -> std::io::Result<(DynKdc, Listen, ModeParts)> {
+    Err(io_err(
+        "db_library db2 needs a krb5-rs-kdc built with the `kdb2` feature",
     ))
 }
 
@@ -927,6 +1003,9 @@ async fn config_mode(
         }
         Some("klmdb") => {
             return klmdb_mode(cli, cfg, master, metrics).await.map(Some);
+        }
+        Some("db2") => {
+            return db2_mode(cli, cfg, master, metrics).await.map(Some);
         }
         Some("kldap") => {
             return kldap_mode(cli, cfg, master, metrics).await.map(Some);

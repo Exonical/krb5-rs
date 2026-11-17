@@ -41,8 +41,10 @@ path = "src/bin/krb5-rs-kproplog.rs"
 
 [features]
 # MIT-compatible LMDB backend, selected with `db_library = klmdb`.
-default = ["klmdb", "kldap"]
+default = ["klmdb", "kldap", "kdb2"]
 klmdb = ["dep:krb5-rs-kdb-lmdb"]
+# MIT db2 (Berkeley DB principal.db) read and written in place, `db_library = db2`.
+kdb2 = ["dep:krb5-rs-kdb-db2"]
 # MIT-compatible LDAP backend, selected with `db_library = kldap`.
 kldap = ["dep:krb5-rs-kdb-ldap"]
 # The Turso replica database module (db_library = krb5-rs-turso). Off by
@@ -55,6 +57,7 @@ cockroach = ["dep:krb5-rs-kdb-cockroach", "turso"]
 [dependencies]
 rpassword = "7"
 krb5-rs-kdb-lmdb = { path = "../krb5-rs-kdb-lmdb", optional = true }
+krb5-rs-kdb-db2 = { path = "../krb5-rs-kdb-db2", optional = true }
 krb5-rs-kdb-ldap = { path = "../krb5-rs-kdb-ldap", optional = true }
 libc = "0.2"
 libloading = "0.8"

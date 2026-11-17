@@ -2600,6 +2600,13 @@ async fn kadmind(args: Args) {
                 .and_then(|store| store.with_iprop(&cfg.iprop))
                 .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
         )),
+        #[cfg(feature = "kdb2")]
+        Some("db2") => Db::Db2(Arc::new(
+            krb5_rs_kdb_db2::Db2Store::open(&cfg, &master)
+                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+        )),
+        #[cfg(not(feature = "kdb2"))]
+        Some("db2") => die("db_library db2 needs a krb5-rs-kadmind built with the `kdb2` feature"),
         None | Some("klmdb") => Db::Lmdb(Arc::new(
             LmdbStore::open(&cfg, &master)
                 .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
