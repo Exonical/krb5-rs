@@ -4,4 +4,7 @@
 pub mod btree;
 pub mod codec;
 pub mod env;
+pub mod store;
+
+pub use store::{CallerStore, Db2Options, Db2Store};
 pub mod hash;
