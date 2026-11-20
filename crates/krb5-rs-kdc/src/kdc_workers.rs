@@ -164,9 +164,11 @@ mod tests {
     async fn sockets_round_trip_through_the_spec() {
         let u = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let t = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (spec, fds) = super::encode(&[u], &[t], &[]);
-        assert_eq!(fds.len(), 2);
-        assert!(spec.starts_with('u') && spec.contains(",t"));
-        assert!(super::adopt("x3").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let x = tokio::net::UnixListener::bind(dir.path().join("kdc.sock")).unwrap();
+        let (spec, fds) = super::encode(&[u], &[t], &[x]);
+        assert_eq!(fds.len(), 3);
+        assert!(spec.starts_with('u') && spec.contains(",t") && spec.contains(",x"));
+        assert!(super::adopt("z3").is_err());
     }
 }
