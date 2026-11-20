@@ -9,7 +9,6 @@ pub mod dump;
 pub mod mkey;
 mod name;
 mod tl;
-#[cfg(unix)]
 pub mod ulog;
 mod xdr;
 

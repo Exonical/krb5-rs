@@ -332,6 +332,8 @@ fn cache_type(c: &AnyCcache) -> &'static str {
         AnyCcache::Keyring(_) => "KEYRING",
         #[cfg(unix)]
         AnyCcache::Kcm(_) => "KCM",
+        #[cfg(windows)]
+        AnyCcache::Mslsa(_) => "MSLSA",
     }
 }
 

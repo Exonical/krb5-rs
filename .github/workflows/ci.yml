@@ -36,6 +36,8 @@ jobs:
         shell: pwsh
         run: Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "127.0.0.1 hostsreal.example.test hostsalias"
       - run: cargo test -p krb5-rs --no-default-features --features client,dns --lib -- --include-ignored locate::canon dns_step_runs_without_a_tokio_runtime
+      - name: Client tools build on Windows
+        run: cargo clippy -p krb5-rs-clients --all-targets -- -D warnings
 
   clippy:
     runs-on: ubuntu-latest

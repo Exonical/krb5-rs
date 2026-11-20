@@ -7,10 +7,12 @@
 
 use std::io::{self, Read, Write};
 
+#[cfg(unix)]
+pub use crate::plugin::rpc::unix_connector;
 use crate::plugin::rpc::{bad, Conn, KRB_ERR_GENERIC};
 pub use crate::plugin::rpc::{
-    read_message, serve, unix_connector, write_message, CallError, Client, Connect, InitError,
-    Message, Stream, ERROR_TABLE_BASE_KRB5, PLUGIN_NO_HANDLE, PLUGIN_VER_NOTSUPP, PROTOCOL_VERSION,
+    read_message, serve, write_message, CallError, Client, Connect, InitError, Message, Stream,
+    ERROR_TABLE_BASE_KRB5, PLUGIN_NO_HANDLE, PLUGIN_VER_NOTSUPP, PROTOCOL_VERSION,
 };
 
 use super::{
