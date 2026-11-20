@@ -5,11 +5,96 @@
 //! locking is an `fcntl` lock on the whole file (`lib/krb5/os/lock_file.c`).
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{fcntl_lock, FlockOperation};
+use plat::{fcntl_lock, FlockOperation};
+
+/// File operations MIT's ulog needs (`kdb_log.c`), per platform.
+#[cfg(unix)]
+mod plat {
+    use std::fs::{File, Metadata, OpenOptions};
+    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+    use std::path::Path;
+
+    pub use rustix::fs::FlockOperation;
+
+    /// A POSIX record lock over the whole file, as MIT's `krb5_lock_file`.
+    pub fn fcntl_lock(file: &File, op: FlockOperation) -> std::io::Result<()> {
+        rustix::fs::fcntl_lock(file, op).map_err(Into::into)
+    }
+
+    pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        file.read_at(buf, offset)
+    }
+
+    pub fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
+        file.write_all_at(data, offset)
+    }
+
+    pub fn private(open: &mut OpenOptions) {
+        open.mode(0o600);
+    }
+
+    pub fn file_id(_path: &Path, m: &Metadata) -> (u64, u64) {
+        (m.dev(), m.ino())
+    }
+}
+
+#[cfg(windows)]
+mod plat {
+    use std::fs::{File, Metadata, OpenOptions};
+    use std::os::windows::fs::FileExt;
+    use std::path::Path;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum FlockOperation {
+        LockShared,
+        LockExclusive,
+        Unlock,
+    }
+
+    /// `LockFileEx` over the whole file. A handle's own shared lock blocks
+    /// its exclusive one, so a lock change releases the old lock first.
+    pub fn fcntl_lock(file: &File, op: FlockOperation) -> std::io::Result<()> {
+        let _ = file.unlock();
+        match op {
+            FlockOperation::LockShared => file.lock_shared(),
+            FlockOperation::LockExclusive => file.lock(),
+            FlockOperation::Unlock => Ok(()),
+        }
+    }
+
+    pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        file.seek_read(buf, offset)
+    }
+
+    pub fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+        while !data.is_empty() {
+            match file.seek_write(data, offset) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    data = &data[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn private(_open: &mut OpenOptions) {}
+
+    pub fn file_id(path: &Path, _m: &Metadata) -> (u64, u64) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .hash(&mut h);
+        (0, h.finish())
+    }
+}
 
 use super::codec::{KeyData, MitEntry, TlData};
 use super::name::{parse_name, unparse_name};
@@ -1048,7 +1133,7 @@ fn read_zero_padded(file: &File, buf: &mut [u8], offset: u64) -> Result<(), Stor
     buf.fill(0);
     let mut done = 0;
     while done < buf.len() {
-        match file.read_at(&mut buf[done..], offset + done as u64) {
+        match plat::read_at(file, &mut buf[done..], offset + done as u64) {
             Ok(0) => break,
             Ok(n) => done += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1105,12 +1190,13 @@ impl Ulog {
         if entries == 0 {
             return Err(StoreError::backend("iprop_ulogsize must be positive"));
         }
-        use std::os::unix::fs::MetadataExt;
         let mut open = OPEN_LOGS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         open.retain(|(_, w)| w.strong_count() > 0);
-        let id = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        let id = std::fs::metadata(path)
+            .ok()
+            .map(|m| plat::file_id(path, &m));
         let exists = id.is_some();
         let found = id.and_then(|id| {
             open.iter()
@@ -1120,11 +1206,10 @@ impl Ulog {
         let shared = match found {
             Some(shared) => shared,
             None => {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(!exists)
-                    .mode(0o600)
+                let mut options = OpenOptions::new();
+                options.read(true).write(true).create(!exists);
+                plat::private(&mut options);
+                let file = options
                     .open(path)
                     .map_err(|e| io_error(&format!("opening ulog {}", path.display()), e))?;
                 let m = file
@@ -1135,7 +1220,7 @@ impl Ulog {
                     gate: std::sync::Mutex::new(Gate::default()),
                     freed: std::sync::Condvar::new(),
                 });
-                open.push(((m.dev(), m.ino()), std::sync::Arc::downgrade(&shared)));
+                open.push((plat::file_id(path, &m), std::sync::Arc::downgrade(&shared)));
                 shared
             }
         };
@@ -1200,10 +1285,7 @@ impl Ulog {
     }
 
     fn write_at(&self, data: &[u8], offset: u64) -> Result<(), StoreError> {
-        self.shared
-            .file
-            .write_all_at(data, offset)
-            .map_err(|e| io_error("writing ulog", e))
+        plat::write_all_at(&self.shared.file, data, offset).map_err(|e| io_error("writing ulog", e))
     }
 
     fn sync(&self) -> Result<(), StoreError> {
