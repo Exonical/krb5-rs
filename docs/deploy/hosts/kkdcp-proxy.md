@@ -79,11 +79,12 @@ server terminate TLS. Add this to `/etc/sysconfig/kdcproxy`:
 KDCPROXY_ARGS=--http --listen 127.0.0.1:8088
 ```
 
-Then remove the `--cert` and `--key` options with a drop-in:
+Then remove the `--cert` and `--key` options, and the certificate files the unit loads, with a drop-in:
 
 ```
 # systemctl edit kdcproxy
 [Service]
+LoadCredential=
 ExecStart=
 ExecStart=/usr/sbin/kdcproxy $KDCPROXY_ARGS
 ```
