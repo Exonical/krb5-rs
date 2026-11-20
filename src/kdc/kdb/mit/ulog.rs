@@ -983,11 +983,11 @@ impl<'a> Locked<'a> {
                     .wait(g)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            fcntl_lock(&shared.file, op).map_err(|e| io_error("locking ulog", e.into()))?;
+            fcntl_lock(&shared.file, op).map_err(|e| io_error("locking ulog", e))?;
             g.owner = Some(me);
             g.exclusive = exclusive;
         } else if exclusive && !g.exclusive {
-            fcntl_lock(&shared.file, op).map_err(|e| io_error("locking ulog", e.into()))?;
+            fcntl_lock(&shared.file, op).map_err(|e| io_error("locking ulog", e))?;
             g.exclusive = true;
         }
         if exclusive {

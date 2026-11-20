@@ -1,6 +1,8 @@
 //! MIT's sample-program tests (`appl/sample/t_sample.py`,
 //! `appl/user_user/t_user2user.py`) against an in-process KDC.
 
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::OwnedFd;
