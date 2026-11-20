@@ -530,6 +530,10 @@ impl Server {
                 }
             };
             reinit_cnt = 0;
+            // kpropd.c:326-334: SIGUSR1 cuts the poll sleep short.
+            let mut usr1 =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                    .map_err(|e| format!("{e} while catching SIGUSR1"))?;
             loop {
                 let mylast: Last = ulog
                     .get_last()
@@ -665,6 +669,7 @@ impl Server {
                 tokio::select! {
                     () = tokio::time::sleep(wait) => {}
                     () = self.loaded.notified() => {}
+                    _ = usr1.recv() => {}
                 }
             }
         }
