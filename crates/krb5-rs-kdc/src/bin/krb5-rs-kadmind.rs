@@ -2244,6 +2244,98 @@ impl Kadm5 {
     }
 }
 
+impl Kadm5 {
+    /// `kadm_1` after authentication: run one kadm5 call for `caller` and
+    /// return its XDR results.
+    fn handle(&self, caller: &Caller<'_>, proc_: u32, args: &[u8]) -> Result<Vec<u8>, AcceptStat> {
+        let _serial = auth::serialize_request();
+        let _end = AuthEnd(&self.auth);
+        if let Some(parsed) = kadm5::WriteArgs::decode(proc_, args) {
+            let Ok(parsed) = parsed else {
+                return Err(AcceptStat::GarbageArgs);
+            };
+            // xdr_krb5_principal fails on names krb5_parse_name rejects.
+            if parsed.principals().iter().any(|p| self.parse(p).is_none()) {
+                return Err(AcceptStat::GarbageArgs);
+            }
+            let results = self.write(caller, parsed);
+            return Ok(results);
+        }
+        let Some(parsed) = ReadArgs::decode(proc_, args) else {
+            tracing::error!(
+                "Invalid KADM5 procedure number: {}, {proc_}",
+                caller.from.ip()
+            );
+            return Err(AcceptStat::ProcUnavail);
+        };
+        let Ok(parsed) = parsed else {
+            return Err(AcceptStat::GarbageArgs);
+        };
+        // xdr_krb5_principal fails on names krb5_parse_name rejects.
+        if let ReadArgs::GetPrincipal { princ: Some(p), .. } = &parsed {
+            if self.parse(p).is_none() {
+                return Err(AcceptStat::GarbageArgs);
+            }
+        }
+        if let (kadm5::proc_::GET_STRINGS, ReadArgs::Name { name: Some(p), .. }) = (proc_, &parsed)
+        {
+            if self.parse(p).is_none() {
+                return Err(AcceptStat::GarbageArgs);
+            }
+        }
+        let results = match (proc_, parsed) {
+            (kadm5::proc_::INIT, ReadArgs::Api(api)) => {
+                let c = kadm5::check_api_version(api);
+                if c != code::OK {
+                    kadm5::generic_ret(0, c)
+                } else {
+                    tracing::info!(
+                        target: "notice",
+                        "Request: kadm5_init, {0}, success, client={0}, service={1}, addr={2}, vers={3}, flavor=6",
+                        caller.client_name,
+                        caller.service_name,
+                        caller.from.ip(),
+                        api & !kadm5::API_VERSION_MASK
+                    );
+                    kadm5::generic_ret(api, code::OK)
+                }
+            }
+            (kadm5::proc_::GET_PRIVS, ReadArgs::Api(api)) => {
+                let c = kadm5::check_api_version(api);
+                if c != code::OK {
+                    kadm5::getprivs_ret(0, c, 0)
+                } else {
+                    caller.log_done("kadm5_get_privs", &caller.client_name, code::OK);
+                    // kadm5_get_privs (server_misc.c) reports every privilege.
+                    kadm5::getprivs_ret(api, code::OK, !0)
+                }
+            }
+            (
+                _,
+                ReadArgs::GetPrincipal {
+                    api_version,
+                    princ,
+                    mask,
+                },
+            ) => self.get_principal(caller, api_version, princ.as_deref(), mask),
+            (kadm5::proc_::GET_PRINCS, ReadArgs::Name { api_version, name }) => {
+                self.list(caller, api_version, name.as_deref(), true)
+            }
+            (kadm5::proc_::GET_POLS, ReadArgs::Name { api_version, name }) => {
+                self.list(caller, api_version, name.as_deref(), false)
+            }
+            (kadm5::proc_::GET_POLICY, ReadArgs::Name { api_version, name }) => {
+                self.get_policy(caller, api_version, name.as_deref())
+            }
+            (kadm5::proc_::GET_STRINGS, ReadArgs::Name { api_version, name }) => {
+                self.get_strings(caller, api_version, name.as_deref())
+            }
+            _ => return Err(AcceptStat::GarbageArgs),
+        };
+        Ok(results)
+    }
+}
+
 impl Program for Kadm5 {
     fn keys(&self) -> (Db, String) {
         (self.store.clone(), self.realm.clone())
@@ -2299,88 +2391,10 @@ impl Program for Kadm5 {
         if proc_ == kadm5::proc_::NULL {
             return gss.reply(xid, seq, &[]).map_err(|e| e.to_string());
         }
-        let _serial = auth::serialize_request();
-        let _end = AuthEnd(&self.auth);
-        if let Some(parsed) = kadm5::WriteArgs::decode(proc_, args) {
-            let Ok(parsed) = parsed else {
-                return err(gss, AcceptStat::GarbageArgs);
-            };
-            // xdr_krb5_principal fails on names krb5_parse_name rejects.
-            if parsed.principals().iter().any(|p| self.parse(p).is_none()) {
-                return err(gss, AcceptStat::GarbageArgs);
-            }
-            let results = self.write(&caller, parsed);
-            return gss.reply(xid, seq, &results).map_err(|e| e.to_string());
+        match self.handle(&caller, proc_, args) {
+            Ok(results) => gss.reply(xid, seq, &results).map_err(|e| e.to_string()),
+            Err(stat) => err(gss, stat),
         }
-        let Some(parsed) = ReadArgs::decode(proc_, args) else {
-            tracing::error!("Invalid KADM5 procedure number: {}, {proc_}", from.ip());
-            return err(gss, AcceptStat::ProcUnavail);
-        };
-        let Ok(parsed) = parsed else {
-            return err(gss, AcceptStat::GarbageArgs);
-        };
-        // xdr_krb5_principal fails on names krb5_parse_name rejects.
-        if let ReadArgs::GetPrincipal { princ: Some(p), .. } = &parsed {
-            if self.parse(p).is_none() {
-                return err(gss, AcceptStat::GarbageArgs);
-            }
-        }
-        if let (kadm5::proc_::GET_STRINGS, ReadArgs::Name { name: Some(p), .. }) = (proc_, &parsed)
-        {
-            if self.parse(p).is_none() {
-                return err(gss, AcceptStat::GarbageArgs);
-            }
-        }
-        let results = match (proc_, parsed) {
-            (kadm5::proc_::INIT, ReadArgs::Api(api)) => {
-                let c = kadm5::check_api_version(api);
-                if c != code::OK {
-                    kadm5::generic_ret(0, c)
-                } else {
-                    tracing::info!(
-                        target: "notice",
-                        "Request: kadm5_init, {0}, success, client={0}, service={1}, addr={2}, vers={3}, flavor=6",
-                        caller.client_name,
-                        caller.service_name,
-                        from.ip(),
-                        api & !kadm5::API_VERSION_MASK
-                    );
-                    kadm5::generic_ret(api, code::OK)
-                }
-            }
-            (kadm5::proc_::GET_PRIVS, ReadArgs::Api(api)) => {
-                let c = kadm5::check_api_version(api);
-                if c != code::OK {
-                    kadm5::getprivs_ret(0, c, 0)
-                } else {
-                    caller.log_done("kadm5_get_privs", &caller.client_name, code::OK);
-                    // kadm5_get_privs (server_misc.c) reports every privilege.
-                    kadm5::getprivs_ret(api, code::OK, !0)
-                }
-            }
-            (
-                _,
-                ReadArgs::GetPrincipal {
-                    api_version,
-                    princ,
-                    mask,
-                },
-            ) => self.get_principal(&caller, api_version, princ.as_deref(), mask),
-            (kadm5::proc_::GET_PRINCS, ReadArgs::Name { api_version, name }) => {
-                self.list(&caller, api_version, name.as_deref(), true)
-            }
-            (kadm5::proc_::GET_POLS, ReadArgs::Name { api_version, name }) => {
-                self.list(&caller, api_version, name.as_deref(), false)
-            }
-            (kadm5::proc_::GET_POLICY, ReadArgs::Name { api_version, name }) => {
-                self.get_policy(&caller, api_version, name.as_deref())
-            }
-            (kadm5::proc_::GET_STRINGS, ReadArgs::Name { api_version, name }) => {
-                self.get_strings(&caller, api_version, name.as_deref())
-            }
-            _ => return err(gss, AcceptStat::GarbageArgs),
-        };
-        gss.reply(xid, seq, &results).map_err(|e| e.to_string())
     }
 }
 
@@ -2576,71 +2590,7 @@ async fn kadmind(args: Args) {
     });
     let master = read_stash_named(&cfg.key_stash_file, &realm, &cfg.master_key_name)
         .unwrap_or_else(|e| die(format!("{e} while reading master key")));
-    let db = match cfg.db_module.library.as_deref() {
-        #[cfg(feature = "cockroach")]
-        Some("krb5-rs-cockroach") => {
-            if cfg.iprop.enabled {
-                die("iprop_enable is not supported with db_library krb5-rs-cockroach");
-            }
-            let config = krb5_rs_kdb_cockroach::CockroachConfig::from_db_module(&cfg.db_module)
-                .unwrap_or_else(|e| die(format!("{e} while initializing database")));
-            Db::Cockroach(
-                krb5_rs_kdb_cockroach::CockroachStore::open_named(
-                    config,
-                    master,
-                    &realm,
-                    &cfg.master_key_name,
-                )
-                    .await
-                    .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
-            )
-        }
-        #[cfg(not(feature = "cockroach"))]
-        Some("krb5-rs-cockroach") => die(
-            "db_library krb5-rs-cockroach needs a krb5-rs-kadmind built with the `cockroach` feature",
-        ),
-        #[cfg(feature = "kldap")]
-        Some("kldap") => {
-            // MIT's kldap has no update log: the directory replicates itself.
-            if cfg.iprop.enabled {
-                die("iprop_enable is not supported with db_library kldap");
-            }
-            Db::Ldap(
-                krb5_rs_kdb_ldap::LdapStore::open(
-                    &cfg,
-                    &args.db_args,
-                    krb5_rs_kdb_ldap::config::ServerType::Admin,
-                    &master,
-                )
-                .await
-                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
-            )
-        }
-        #[cfg(not(feature = "kldap"))]
-        Some("kldap") => {
-            die("db_library kldap needs a krb5-rs-kadmind built with the `kldap` feature")
-        }
-        Some("krb5-rs-file") => Db::File(Arc::new(
-            krb5_rs::kdc::kdb::FileStore::open_named(&cfg.database_name, &master, &cfg.master_key_name)
-                .and_then(|store| store.with_iprop(&cfg.iprop))
-                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
-        )),
-        #[cfg(feature = "kdb2")]
-        Some("db2") => Db::Db2(Arc::new(
-            krb5_rs_kdb_db2::Db2Store::open(&cfg, &master)
-                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
-        )),
-        #[cfg(not(feature = "kdb2"))]
-        Some("db2") => die("db_library db2 needs a krb5-rs-kadmind built with the `kdb2` feature"),
-        None | Some("klmdb") => Db::Lmdb(Arc::new(
-            LmdbStore::open(&cfg, &master)
-                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
-        )),
-        Some(other) => die(format!(
-            "{} while initializing database",
-            cfg.db_module.unknown_library_error(other)
-        )),
-    };
+    let db = open_db(&cfg, &realm, &args.db_args, master).await;
 
     let mut iprop_listeners = Vec::new();
     if let Some(port) = iprop_port {
@@ -2804,6 +2754,198 @@ fn spawn_rpc<P: Program>(
 
 /// Bind every address; a failed `[::]` after another socket is only
 /// logged (dual-stack hosts), anything else is fatal.
+/// Open the realm's KDB (`kdb_init` with the stashed master key).
+async fn open_db(cfg: &RealmConfig, realm: &str, db_args: &[String], master: EncryptionKey) -> Db {
+    #[cfg_attr(not(feature = "cockroach"), allow(unused_variables))]
+    let realm = realm.to_string();
+    match cfg.db_module.library.as_deref() {
+        #[cfg(feature = "cockroach")]
+        Some("krb5-rs-cockroach") => {
+            if cfg.iprop.enabled {
+                die("iprop_enable is not supported with db_library krb5-rs-cockroach");
+            }
+            let config = krb5_rs_kdb_cockroach::CockroachConfig::from_db_module(&cfg.db_module)
+                .unwrap_or_else(|e| die(format!("{e} while initializing database")));
+            Db::Cockroach(
+                krb5_rs_kdb_cockroach::CockroachStore::open_named(
+                    config,
+                    master,
+                    &realm,
+                    &cfg.master_key_name,
+                )
+                    .await
+                    .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+            )
+        }
+        #[cfg(not(feature = "cockroach"))]
+        Some("krb5-rs-cockroach") => die(
+            "db_library krb5-rs-cockroach needs a krb5-rs-kadmind built with the `cockroach` feature",
+        ),
+        #[cfg(feature = "kldap")]
+        Some("kldap") => {
+            // MIT's kldap has no update log: the directory replicates itself.
+            if cfg.iprop.enabled {
+                die("iprop_enable is not supported with db_library kldap");
+            }
+            Db::Ldap(
+                krb5_rs_kdb_ldap::LdapStore::open(
+                    &cfg,
+                    db_args,
+                    krb5_rs_kdb_ldap::config::ServerType::Admin,
+                    &master,
+                )
+                .await
+                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+            )
+        }
+        #[cfg(not(feature = "kldap"))]
+        Some("kldap") => {
+            die("db_library kldap needs a krb5-rs-kadmind built with the `kldap` feature")
+        }
+        Some("krb5-rs-file") => Db::File(Arc::new(
+            krb5_rs::kdc::kdb::FileStore::open_named(&cfg.database_name, &master, &cfg.master_key_name)
+                .and_then(|store| store.with_iprop(&cfg.iprop))
+                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+        )),
+        #[cfg(feature = "kdb2")]
+        Some("db2") => Db::Db2(Arc::new(
+            krb5_rs_kdb_db2::Db2Store::open(&cfg, &master)
+                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+        )),
+        #[cfg(not(feature = "kdb2"))]
+        Some("db2") => die("db_library db2 needs a krb5-rs-kadmind built with the `kdb2` feature"),
+        None | Some("klmdb") => Db::Lmdb(Arc::new(
+            LmdbStore::open(&cfg, &master)
+                .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
+        )),
+        Some(other) => die(format!(
+            "{} while initializing database",
+            cfg.db_module.unknown_library_error(other)
+        )),
+    }
+}
+
+/// `kadmin.local`'s server handle: libkadm5srv runs with every privilege
+/// and no ACL check.
+struct LocalAuth;
+
+impl krb5_rs::kdc::kdb::kadm5_auth::Kadm5Auth for LocalAuth {
+    fn name(&self) -> &str {
+        "local"
+    }
+
+    fn authorize(
+        &self,
+        _: Princ<'_>,
+        _: &Request<'_>,
+    ) -> (
+        krb5_rs::kdc::kdb::kadm5_auth::Verdict,
+        Option<AclRestrictions>,
+    ) {
+        (krb5_rs::kdc::kdb::kadm5_auth::Verdict::Pass, None)
+    }
+}
+
+static LOCAL_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::LOCALHOST,
+    0,
+));
+
+/// A kadm5 call run in-process, from procedure and XDR arguments to the
+/// XDR results.
+pub(crate) type LocalCall = Box<dyn FnMut(u32, &[u8]) -> Result<Vec<u8>, String>>;
+
+/// `kadm5_init` in `kadmin.local` (server_init.c): open `realm`'s KDB
+/// with the stashed master key, or the key from `master_password`, and run
+/// each call as `client` with every privilege.
+#[allow(dead_code)]
+pub(crate) fn local_call(
+    realm: &str,
+    db_args: &[String],
+    master_password: Option<&str>,
+    keysalts: Option<&str>,
+    (client, crealm): (&PrincipalName, &str),
+) -> Result<LocalCall, String> {
+    let config = std::env::var_os("KRB5_KDC_PROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(KDC_DIR).join("kdc.conf"));
+    let kdc_conf =
+        Profile::load(&config).map_err(|e| format!("reading {}: {e}", config.display()))?;
+    let krb5 = std::env::var_os("KRB5_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| Some(PathBuf::from("/etc/krb5.conf")))
+        .filter(|p| p.exists())
+        .map(|p| Profile::load(&p).map_err(|e| format!("reading {}: {e}", p.display())))
+        .transpose()?;
+    let mut cfg =
+        RealmConfig::from_profiles(&kdc_conf, krb5.as_ref(), realm).map_err(|e| e.to_string())?;
+    cfg.apply_db_args(db_args).map_err(|e| e.to_string())?;
+    if let Some(ks) = keysalts {
+        cfg.supported_keysalts = krb5_rs::crypto::parse_keysalt_list(ks)
+            .map_err(|e| format!("{e} while parsing keysalts {ks}"))?;
+    }
+    let profiles: Vec<&Profile> = krb5.iter().chain([&kdc_conf]).collect();
+    let dict_file = kdc_conf
+        .get_string(&["realms", realm, "dict_file"])
+        .map(PathBuf::from);
+    let modules = modules::load(
+        &profiles,
+        dict_file.as_deref(),
+        // kadmin.local has no klog: only module errors reach the terminal.
+        Arc::new(|m: &str| {
+            if !m.starts_with("No dictionary file") {
+                eprintln!("{m}")
+            }
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+    let master = match master_password {
+        Some(pw) => krb5_rs::kdc::kdb::master::master_key_from_password_named(
+            realm,
+            &cfg.master_key_name,
+            pw,
+            cfg.master_key_type,
+        ),
+        None => read_stash_named(&cfg.key_stash_file, realm, &cfg.master_key_name),
+    }
+    .map_err(|e| format!("{e} while reading master key"))?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let db = rt.block_on(open_db(&cfg, realm, db_args, master));
+    let kadm5 = Kadm5 {
+        realm: realm.to_string(),
+        store: db,
+        auth: Arc::new(Kadm5AuthModules::new(vec![Box::new(LocalAuth)])),
+        modules,
+        keysalts: cfg.supported_keysalts.clone(),
+        history_enctype: cfg.master_key_type,
+        max_life: cfg.kdc.max_life,
+        max_rlife: cfg.admin_max_renewable_life,
+        expiration: cfg.default_principal_expiration,
+        flags: cfg.default_principal_flags,
+    };
+    let client = client.clone();
+    let crealm = crealm.to_string();
+    let service_name = format!("kadmin/admin@{realm}");
+    Ok(Box::new(move |proc_, args| {
+        let _rt = rt.enter();
+        let caller = Caller {
+            client_name: unparse(&client, &crealm),
+            client: client.clone(),
+            crealm: crealm.clone(),
+            service_name: service_name.clone(),
+            changepw: false,
+            initial: true,
+            from: &LOCAL_ADDR,
+        };
+        kadm5
+            .handle(&caller, proc_, args)
+            .map_err(|_| "RPC error".to_string())
+    }))
+}
+
 async fn bind_tcp(addrs: Vec<SocketAddr>, out: &mut Vec<TcpListener>) {
     for addr in addrs {
         match TcpListener::bind(addr).await {
