@@ -2008,7 +2008,9 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "dns-lookup",
  "krb5-rs",
+ "krb5-rs-clients",
  "krb5-rs-kdb-cockroach",
  "krb5-rs-kdb-db2",
  "krb5-rs-kdb-ldap",
