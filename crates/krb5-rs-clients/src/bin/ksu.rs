@@ -116,6 +116,20 @@ mod sys {
         unsafe { libc::getuid() }
     }
 
+    /// `getauxval(AT_SECURE)`: running setuid or setgid.
+    pub fn at_secure() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: plain libc call.
+            unsafe { libc::getauxval(libc::AT_SECURE) != 0 }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: plain system calls; cannot fail.
+            unsafe { libc::getuid() != libc::geteuid() || libc::getgid() != libc::getegid() }
+        }
+    }
+
     pub fn geteuid() -> u32 {
         // SAFETY: no arguments; cannot fail.
         unsafe { libc::geteuid() }
@@ -188,6 +202,22 @@ const LOG_AUTH_WARNING: u8 = 4 * 8 + 4;
 const LOG_AUTH_NOTICE: u8 = 4 * 8 + 5;
 
 type Princ = (PrincipalName, String);
+
+/// Variables MIT reads with `secure_getenv`, so a setuid ksu ignores
+/// them, plus krb5-rs's `PKI_DUMP_DIR`. They still reach the command.
+const SECURE_ENV: &[&str] = &[
+    "KRB5_KTNAME",
+    "KRB5_CLIENT_KTNAME",
+    "KRB5_TRACE",
+    "KRB5RCACHENAME",
+    "KRB5RCACHETYPE",
+    "KRB5RCACHEDIR",
+    "TMPDIR",
+    "GSS_MECH_CONFIG",
+    "NEGOEX_NO_OPTIMISTIC_TOKEN",
+    "PKI_DUMP_DIR",
+    "HOME",
+];
 
 /// `strerror(errno)`: the OS error text without Rust's "(os error N)".
 fn os_msg(e: &std::io::Error) -> String {
@@ -1005,6 +1035,15 @@ fn main() {
     }
     // init_secure_context: the source user's KRB5_CONFIG is ignored.
     std::env::remove_var("KRB5_CONFIG");
+    let mut hidden_env = Vec::new();
+    if sys::at_secure() {
+        for name in SECURE_ENV {
+            if let Some(v) = std::env::var_os(name) {
+                std::env::remove_var(name);
+                hidden_env.push((*name, v));
+            }
+        }
+    }
     if progname().len() > 50 {
         com_err(
             "program name too long - quitting to avoid triggering system logging bugs",
@@ -1469,6 +1508,9 @@ fn main() {
         (None, _) => shell,
     };
 
+    for (name, v) in hidden_env.iter().filter(|(n, _)| *n != "HOME") {
+        std::env::set_var(name, v);
+    }
     let prog = params[0].clone();
     // execv does no PATH search.
     let path = if prog.contains('/') {
