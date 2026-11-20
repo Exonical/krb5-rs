@@ -74,6 +74,10 @@ name = "krb5-rs-kdeltkt"
 path = "src/bin/kdeltkt.rs"
 
 [[bin]]
+name = "krb5-rs-ksu"
+path = "src/bin/ksu.rs"
+
+[[bin]]
 name = "krb5-rs-k5srvutil"
 path = "src/bin/k5srvutil.rs"
 
@@ -84,6 +88,7 @@ chrono = { version = "0.4.38", default-features = false, features = ["clock", "u
 rasn = "0.28"
 dns-lookup = "4"
 rpassword = "7"
+libc = "0.2"
 tokio = { version = "1.53.2", features = ["rt", "net", "time", "io-util"] }
 
 [dev-dependencies]
