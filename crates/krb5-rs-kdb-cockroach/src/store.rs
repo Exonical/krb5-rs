@@ -1011,6 +1011,7 @@ impl CockroachStore {
             require_auth: None,
             otp: None,
             pkinit_cert_match: None,
+            session_enctypes: None,
             policy: None,
             security_epoch: 1,
             last_admin_unlock: None,

@@ -105,6 +105,9 @@ pub struct PrincipalEntry {
     /// The `pkinit_cert_match` string attribute: a rule the client's
     /// certificate must match (MIT's `dbmatch` certauth module).
     pub pkinit_cert_match: Option<String>,
+    /// The `session_enctypes` string attribute: the session key enctypes
+    /// this service supports (MIT `KRB5_KDB_SK_SESSION_ENCTYPES`).
+    pub session_enctypes: Option<String>,
     /// The policy this principal is under (kadmin `-policy`), by name.
     pub policy: Option<String>,
     /// Bumped by every security-sensitive administrative change: disable,
@@ -275,6 +278,7 @@ impl MemoryStore {
             require_auth: None,
             otp: None,
             pkinit_cert_match: None,
+            session_enctypes: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
@@ -395,6 +399,7 @@ mod tests {
             require_auth: None,
             otp: None,
             pkinit_cert_match: None,
+            session_enctypes: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,

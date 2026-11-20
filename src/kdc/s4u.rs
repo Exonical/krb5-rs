@@ -408,6 +408,7 @@ impl<S: PrincipalStore> Kdc<S> {
             require_auth: None,
             otp: None,
             pkinit_cert_match: None,
+            session_enctypes: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
