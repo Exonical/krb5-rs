@@ -710,8 +710,8 @@ impl<S: AdminStore> AdminOps<S> {
         name: &PrincipalName,
         realm: &str,
     ) -> Result<(), StoreError> {
-        // svr_principal.c:532-546: the hooks run once the entry is found.
-        self.require(name, realm).await?;
+        // svr_principal.c:520-549: no lookup first, so an alias whose
+        // target is gone can still be deleted.
         let hooks = &self.modules.hooks;
         let princ = unparse(name, realm);
         hooks.remove(Stage::Precommit, &princ)?;
