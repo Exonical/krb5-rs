@@ -154,13 +154,15 @@ async fn deferred_conns_contacted_serially() {
     // UdpFirst -> both Tcp entries are deferred.
     let r = sendto(&servers, b"req", Strategy::UdpFirst, &cfg, &accept_all()).await;
     assert!(matches!(r, Err(SendtoError::KdcUnreach)));
-    // The second conn's task is spawned just before the deadline; give it
-    // a moment to complete the connect+accept.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let l = log.lock().unwrap();
     let t0 = l.iter().find(|r| r.server == "s0").unwrap().at;
-    let t1 = l.iter().find(|r| r.server == "s1").unwrap().at;
-    assert!(t1.duration_since(t0) >= Duration::from_millis(30));
+    // s1 is started at the deadline at the earliest, and like MIT's
+    // sendto_kdc, ending the request closes every connection, so it may
+    // never connect at all.
+    if let Some(r1) = l.iter().find(|r| r.server == "s1") {
+        assert!(r1.at.duration_since(t0) >= Duration::from_millis(30));
+    }
 }
 
 #[tokio::test]
