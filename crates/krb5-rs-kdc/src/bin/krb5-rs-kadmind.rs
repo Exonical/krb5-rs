@@ -1774,7 +1774,17 @@ impl Kadm5 {
                 return code::AUTH_MODIFY;
             }
         };
-        if mask & m::ATTRIBUTES != 0 && rec.attributes & LOCKDOWN_KEYS == 0 {
+        // server_stubs.c modify_principal_2_svc: stub_auth_restrict imposes
+        // the ACL restrictions on the record before the lockdown check.
+        let mut attributes = rec.attributes;
+        let mut sets_attributes = mask & m::ATTRIBUTES != 0;
+        for r in &restr {
+            if r.mask & krb5_rs::kdc::kdb::restrictions::KADM5_ATTRIBUTES != 0 {
+                attributes = (attributes | r.require_attrs) & r.forbid_attrs;
+                sets_attributes = true;
+            }
+        }
+        if sets_attributes && attributes & LOCKDOWN_KEYS == 0 {
             match self.lockdown(&name, &realm) {
                 Ok(true) => {
                     caller.log_unauth(op, &target);
