@@ -176,7 +176,7 @@ impl RequestSummary {
     }
 
     /// The MIT-style log line for a request from `peer`, e.g.
-    /// `AS_REQ (2 etypes {18 17}) 10.0.0.1:50000: ISSUE: user@R for krbtgt/R@R, etypes {rep=18 tkt=18}`
+    /// `AS_REQ (2 etypes {18 17}) 10.0.0.1:50000: ISSUE: user@R for krbtgt/R@R, etypes {rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18)}`
     /// or `AS_REQ (1 etypes {18}) 10.0.0.1:50000: NEEDED_PREAUTH: user@R for krbtgt/R@R, Additional pre-authentication required`.
     pub fn log_line(&self, peer: SocketAddr) -> String {
         // dispatch.c:117-133.
@@ -200,7 +200,7 @@ impl RequestSummary {
             RequestKind::Tgs => "TGS_REQ",
             RequestKind::Unknown => "UNKNOWN_REQ",
         };
-        let etypes: Vec<String> = self.etypes.iter().map(i32::to_string).collect();
+        let etypes: Vec<String> = self.etypes.iter().map(|&e| mit_etype_label(e)).collect();
         let who = match (&self.client, &self.server) {
             (Some(c), Some(s)) => format!("{c} for {s}"),
             (Some(c), None) => c.clone(),
@@ -212,7 +212,11 @@ impl RequestSummary {
                 let mut s = "ISSUE".to_string();
                 s.push_str(&format!(": {who}"));
                 if let (Some(rep), Some(tkt)) = (self.reply_etype, self.ticket_etype) {
-                    s.push_str(&format!(", etypes {{rep={rep} tkt={tkt}}}"));
+                    s.push_str(&format!(
+                        ", etypes {{rep={}, tkt={}}}",
+                        mit_etype_label(rep),
+                        mit_etype_label(tkt)
+                    ));
                 }
                 s
             }
@@ -232,11 +236,36 @@ impl RequestSummary {
             }
         };
         format!(
-            "{kind} ({} etypes {{{}}}) {peer}: {tail}",
+            "{kind} ({} etypes {{{}}}) {}: {tail}",
             self.etypes.len(),
-            etypes.join(" ")
+            etypes.join(", "),
+            peer.ip()
         )
     }
+}
+
+/// MIT's KDC `enctype_name` (kdc_util.c:1140-1182) followed by `(n)`, as
+/// `ktypes2str` and `rep_etypes2str` print each enctype.
+fn mit_etype_label(e: i32) -> String {
+    let (prefix, name) = match e {
+        16 => ("DEPRECATED:", "des3-cbc-sha1"),
+        23 => ("DEPRECATED:", "arcfour-hmac"),
+        25 => ("", "camellia128-cts-cmac"),
+        26 => ("", "camellia256-cts-cmac"),
+        9 => ("UNSUPPORTED:", "id-dsa-with-sha1-CmsOID"),
+        10 => ("UNSUPPORTED:", "md5WithRSAEncryption-CmsOID"),
+        11 => ("UNSUPPORTED:", "sha-1WithRSAEncryption-CmsOID"),
+        12 => ("UNSUPPORTED:", "rc2-cbc-EnvOID"),
+        13 => ("UNSUPPORTED:", "rsaEncryption-EnvOID"),
+        14 => ("UNSUPPORTED:", "id-RSAES-OAEP-EnvOID"),
+        15 => ("UNSUPPORTED:", "des-ede3-cbc-EnvOID"),
+        _ => match crate::crypto::enctype_name(e) {
+            Some(n) if crate::crypto::find_etype(e).is_ok() => ("", n),
+            Some(n) => ("UNSUPPORTED:", n),
+            None => ("UNSUPPORTED:", ""),
+        },
+    };
+    format!("{prefix}{name}({e})")
 }
 
 impl fmt::Display for Transport {
@@ -338,7 +367,7 @@ mod tests {
         );
         assert_eq!(
             s.log_line(peer()),
-            "AS_REQ (4 etypes {18 17 20 19}) 192.0.2.7:4000: NEEDED_PREAUTH: \
+            "AS_REQ (4 etypes {aes256-cts-hmac-sha1-96(18), aes128-cts-hmac-sha1-96(17), aes256-cts-hmac-sha384-192(20), aes128-cts-hmac-sha256-128(19)}) 192.0.2.7: NEEDED_PREAUTH: \
              alice@R for krbtgt/R@R, Additional pre-authentication required"
         );
     }
@@ -419,7 +448,7 @@ mod tests {
         assert_eq!((s.reply_etype, s.ticket_etype), (Some(18), Some(18)));
         assert!(s
             .log_line(peer())
-            .contains("ISSUE: alice@R for krbtgt/R@R, etypes {rep=18 tkt=18}"));
+            .contains("ISSUE: alice@R for krbtgt/R@R, etypes {rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18)}"));
 
         let tgt = ex.credential().expect("TGT").clone();
         let mut tgs = TgsExchange::new(
@@ -457,7 +486,7 @@ mod tests {
         );
         assert_eq!(
             s.log_line(peer()),
-            "UNKNOWN_REQ (0 etypes {}) 192.0.2.7:4000: BAD_MESSAGE_TYPE: (unparseable request), error 40"
+            "UNKNOWN_REQ (0 etypes {}) 192.0.2.7: BAD_MESSAGE_TYPE: (unparseable request), error 40"
         );
     }
 }

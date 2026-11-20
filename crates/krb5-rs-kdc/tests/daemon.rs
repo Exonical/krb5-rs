@@ -258,7 +258,7 @@ async fn serves_as_and_tgs_over_udp_and_tcp_and_logs_each_request() {
     assert_eq!(count("TGS_REQ"), 2, "{lines:?}");
     assert!(
         lines.iter().any(|l| l.contains(&format!(
-            "ISSUE: alice@{REALM} for krbtgt/{REALM}@{REALM}, etypes {{rep=18 tkt=18}}"
+            "ISSUE: alice@{REALM} for krbtgt/{REALM}@{REALM}, etypes {{rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18)}}"
         ))),
         "{lines:?}"
     );
