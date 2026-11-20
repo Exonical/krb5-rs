@@ -24,7 +24,7 @@ impl Princ<'_> {
     /// `krb5_principal_compare`.
     #[must_use]
     pub fn same(&self, other: &Princ<'_>) -> bool {
-        self.realm == other.realm && self.name == other.name
+        self.realm == other.realm && self.name.name_string == other.name.name_string
     }
 }
 
@@ -304,6 +304,19 @@ pub use crate::plugin::module_order;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn same_ignores_the_name_type_like_krb5_principal_compare() {
+        let a = PrincipalName::new_srv_hst("host", "h.test");
+        let mut b = a.clone();
+        b.name_type = 1;
+        let p = |name| Princ { name, realm: "R" };
+        assert!(p(&a).same(&p(&b)));
+        assert!(!p(&a).same(&Princ {
+            name: &b,
+            realm: "S"
+        }));
+    }
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {
