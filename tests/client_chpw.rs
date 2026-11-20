@@ -149,7 +149,7 @@ async fn serve_one(
         clockskew: Duration::from_secs(300),
         authorize: &authorize,
     };
-    process_request(&admin, &svc, &local, &remote, req)
+    process_request(&admin, &svc, &local, &krb5_rs::kdc::Peer::Inet(remote), req)
         .await
         .reply
 }

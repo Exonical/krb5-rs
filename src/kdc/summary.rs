@@ -3,7 +3,6 @@
 //! client and server.
 
 use std::fmt;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::types::{AsReq, KdcReq, KrbErrorMsg, TgsReq};
@@ -184,19 +183,20 @@ impl RequestSummary {
     /// The MIT-style log line for a request from `peer`, e.g.
     /// `AS_REQ (2 etypes {aes256-cts-hmac-sha1-96(18), aes128-cts-hmac-sha1-96(17)}) 10.0.0.1: ISSUE: authtime 1700000000, etypes {rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18), ses=aes256-cts-hmac-sha1-96(18)}, user@R for krbtgt/R@R`
     /// or `AS_REQ (1 etypes {aes256-cts-hmac-sha1-96(18)}) 10.0.0.1: NEEDED_PREAUTH: user@R for krbtgt/R@R, Additional pre-authentication required`.
-    pub fn log_line(&self, peer: SocketAddr) -> String {
+    pub fn log_line(&self, peer: impl Into<super::server::Peer>) -> String {
+        let peer = peer.into();
         // dispatch.c:117-133.
         match self.lookaside {
             Some(super::LookasideHit::Resent) => {
                 return format!(
                     "DISPATCH: repeated (retransmitted?) request from {}, resending previous response",
-                    peer.ip()
+                    peer
                 )
             }
             Some(super::LookasideHit::Dropped) => {
                 return format!(
                     "DISPATCH: repeated (retransmitted?) request from {} during request processing, dropping repeated request",
-                    peer.ip()
+                    peer
                 )
             }
             None => {}
@@ -250,7 +250,7 @@ impl RequestSummary {
             "{kind} ({} etypes {{{}}}) {}: {tail}",
             self.etypes.len(),
             etypes.join(", "),
-            peer.ip()
+            peer
         )
     }
 }
@@ -299,6 +299,7 @@ mod tests {
         AsExchange, AsExchangeConfig, StepResult, TgsExchange, TgsOptions, TgsStepResult,
     };
     use crate::types::PrincipalName;
+    use std::net::SocketAddr;
 
     const REALM: &str = "R";
 

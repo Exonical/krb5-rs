@@ -10,8 +10,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{watch, Mutex, Notify};
 use tokio::task::AbortHandle;
 
@@ -30,7 +30,49 @@ const MAX_STREAM_CONNECTIONS: usize = 45;
 
 /// Called with a summary of every request and the peer it came from
 /// (MIT `log_as_req` / `log_tgs_req`).
-pub type RequestLogger = Arc<dyn Fn(&RequestSummary, SocketAddr) + Send + Sync>;
+pub type RequestLogger = Arc<dyn Fn(&RequestSummary, &Peer) + Send + Sync>;
+
+/// Where a request came from, printed like MIT's `k5_print_addr`
+/// (addr.c:78-92): an IP address without the port, or a UNIX socket path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Peer {
+    /// A UDP or TCP client.
+    Inet(SocketAddr),
+    /// A client of the UNIX domain socket at this path; MIT logs the
+    /// listener's own path (net-server.c:1263-1271).
+    Unix(Arc<std::path::Path>),
+}
+
+impl Peer {
+    /// The client's IP address and port, if it has one.
+    pub fn addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Inet(a) => Some(*a),
+            Self::Unix(_) => None,
+        }
+    }
+}
+
+impl From<SocketAddr> for Peer {
+    fn from(addr: SocketAddr) -> Self {
+        Self::Inet(addr)
+    }
+}
+
+impl From<&Peer> for Peer {
+    fn from(peer: &Peer) -> Self {
+        peer.clone()
+    }
+}
+
+impl std::fmt::Display for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inet(a) => write!(f, "{}", a.ip()),
+            Self::Unix(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
 
 /// Optional behaviour for [`serve_udp_with`] and [`serve_tcp_with`].
 #[derive(Clone, Default)]
@@ -190,7 +232,7 @@ pub async fn serve_udp_with<K: KdcService>(
             .handle_summarized_from(&buf[..n], Transport::Udp, Some(peer))
             .await;
         if let (Some(log), Some(summary)) = (&options.logger, &summary) {
-            log(summary, peer);
+            log(summary, &Peer::Inet(peer));
         }
         // A dropped repeat or a discarded request gets no reply
         // (net-server.c process_packet_response).
@@ -241,6 +283,53 @@ impl Drop for InFlightGuard {
 pub async fn serve_tcp_with<K: KdcService>(
     kdc: Arc<K>,
     listener: TcpListener,
+    options: ServeOptions,
+) -> io::Result<()> {
+    serve_stream_with(kdc, StreamListener::Tcp(listener), options).await
+}
+
+/// [`serve_tcp_with`] on a UNIX domain socket bound at `path` (MIT
+/// `loop_add_unix_socket`, net-server.c:470-490): requests are framed as
+/// over TCP and logged as coming from `path`.
+#[cfg(unix)]
+pub async fn serve_unix_with<K: KdcService>(
+    kdc: Arc<K>,
+    listener: tokio::net::UnixListener,
+    path: &std::path::Path,
+    options: ServeOptions,
+) -> io::Result<()> {
+    serve_stream_with(kdc, StreamListener::Unix(listener, path.into()), options).await
+}
+
+/// A connected stream client.
+trait Conn: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Conn for T {}
+
+enum StreamListener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener, Arc<std::path::Path>),
+}
+
+impl StreamListener {
+    async fn accept(&self) -> io::Result<(Box<dyn Conn>, Peer)> {
+        match self {
+            Self::Tcp(l) => {
+                let (s, a) = l.accept().await?;
+                Ok((Box::new(s), Peer::Inet(a)))
+            }
+            #[cfg(unix)]
+            Self::Unix(l, path) => {
+                let (s, _) = l.accept().await?;
+                Ok((Box::new(s), Peer::Unix(Arc::clone(path))))
+            }
+        }
+    }
+}
+
+async fn serve_stream_with<K: KdcService>(
+    kdc: Arc<K>,
+    listener: StreamListener,
     mut options: ServeOptions,
 ) -> io::Result<()> {
     let open: Arc<Mutex<VecDeque<(u64, AbortHandle)>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -297,7 +386,7 @@ pub async fn serve_tcp_with<K: KdcService>(
     }
 }
 
-async fn write_framed(stream: &mut TcpStream, reply: &[u8]) -> io::Result<()> {
+async fn write_framed(stream: &mut (impl AsyncWrite + Unpin), reply: &[u8]) -> io::Result<()> {
     let len = u32::try_from(reply.len()).map_err(|_| io::ErrorKind::InvalidData)?;
     let mut out = Vec::with_capacity(4 + reply.len());
     out.extend_from_slice(&len.to_be_bytes());
@@ -308,8 +397,8 @@ async fn write_framed(stream: &mut TcpStream, reply: &[u8]) -> io::Result<()> {
 
 async fn serve_connection<K: KdcService>(
     kdc: &K,
-    mut stream: TcpStream,
-    peer: SocketAddr,
+    mut stream: Box<dyn Conn>,
+    peer: Peer,
     logger: Option<&RequestLogger>,
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 4];
@@ -322,10 +411,10 @@ async fn serve_connection<K: KdcService>(
     let mut request = vec![0u8; usize::try_from(len).map_err(|_| io::ErrorKind::InvalidData)?];
     stream.read_exact(&mut request).await?;
     let (reply, summary) = kdc
-        .handle_summarized_from(&request, Transport::Tcp, Some(peer))
+        .handle_summarized_from(&request, Transport::Tcp, peer.addr())
         .await;
     if let (Some(log), Some(summary)) = (logger, &summary) {
-        log(summary, peer);
+        log(summary, &peer);
     }
     // A dropped repeat or a discarded request closes the connection
     // unanswered (net-server.c process_tcp_response).

@@ -235,7 +235,9 @@ async fn shutdown_stops_accepting_and_waits_for_open_connections() {
         listener,
         ServeOptions {
             logger: Some(Arc::new(move |s, peer| {
-                log.lock().expect("lock").push((s.clone(), peer));
+                log.lock()
+                    .expect("lock")
+                    .push((s.clone(), peer.addr().expect("tcp peer")));
             })),
             shutdown: Some(rx),
         },
