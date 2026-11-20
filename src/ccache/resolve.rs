@@ -111,6 +111,9 @@ pub enum AnyCcache {
     /// `KCM:name`.
     #[cfg(unix)]
     Kcm(super::KcmCcache),
+    /// `MSLSA:`, the logon session's LSA ticket cache (Windows).
+    #[cfg(windows)]
+    Mslsa(super::MslsaCcache),
 }
 
 /// The type prefix and residual of a cache name (`krb5_cc_resolve`). A
@@ -139,6 +142,8 @@ pub fn resolve(ctx: &CcContext, name: &str) -> Result<AnyCcache, CcError> {
         "KEYRING" => AnyCcache::Keyring(super::KeyringCcache::resolve(residual)?),
         #[cfg(unix)]
         "KCM" => AnyCcache::Kcm(super::KcmCcache::resolve(residual, ctx.kcm_socket())?),
+        #[cfg(windows)]
+        "MSLSA" => AnyCcache::Mslsa(super::MslsaCcache::resolve(residual)?),
         _ => return Err(CcError::UnknownType),
     })
 }
@@ -171,12 +176,14 @@ pub fn new_unique(ctx: &CcContext, ty: &str) -> Result<AnyCcache, CcError> {
         "KEYRING" => AnyCcache::Keyring(super::KeyringCcache::gen_new(Some(&def))?),
         #[cfg(unix)]
         "KCM" => AnyCcache::Kcm(super::KcmCcache::gen_new(ctx.kcm_socket())?),
+        #[cfg(windows)]
+        "MSLSA" => AnyCcache::Mslsa(super::MslsaCcache::gen_new()?),
         _ => return Err(CcError::UnknownType),
     })
 }
 
 /// `krb5_cccol_cursor`: every cache in the collection, by type in MIT's
-/// order (KCM, DIR, KEYRING, FILE, MEMORY). Each type contributes caches
+/// order (KCM, DIR, KEYRING, FILE, MEMORY, MSLSA). Each type contributes caches
 /// only when the default cache name has that type.
 pub fn collection(ctx: &CcContext) -> Result<Vec<AnyCcache>, CcError> {
     let def = ctx.default_ccname()?;
@@ -204,6 +211,10 @@ pub fn collection(ctx: &CcContext) -> Result<Vec<AnyCcache>, CcError> {
     }
     if ty == "MEMORY" {
         out.push(resolve(ctx, &def)?);
+    }
+    #[cfg(windows)]
+    if let Ok(m) = super::MslsaCcache::resolve("") {
+        out.push(AnyCcache::Mslsa(m));
     }
     Ok(out)
 }
@@ -273,6 +284,8 @@ macro_rules! each {
             AnyCcache::Keyring($c) => $e,
             #[cfg(unix)]
             AnyCcache::Kcm($c) => $e,
+            #[cfg(windows)]
+            AnyCcache::Mslsa($c) => $e,
         }
     };
 }
@@ -288,6 +301,8 @@ impl AnyCcache {
             Self::Keyring(k) => k.name(),
             #[cfg(unix)]
             Self::Kcm(k) => k.name(),
+            #[cfg(windows)]
+            Self::Mslsa(m) => m.name(),
         }
     }
 
@@ -308,6 +323,8 @@ impl AnyCcache {
             Self::Keyring(k) => k.destroy(),
             #[cfg(unix)]
             Self::Kcm(k) => k.destroy(),
+            #[cfg(windows)]
+            Self::Mslsa(m) => m.destroy(),
         }
     }
 

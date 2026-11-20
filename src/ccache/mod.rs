@@ -12,6 +12,8 @@ pub mod kcm;
 mod keyring;
 pub mod marshal;
 mod memory;
+#[cfg(any(windows, test))]
+mod mslsa;
 mod resolve;
 mod retrieve;
 mod select;
@@ -32,6 +34,8 @@ pub use kcm::KcmCcache;
 #[cfg(target_os = "linux")]
 pub use keyring::KeyringCcache;
 pub use memory::MemoryCcache;
+#[cfg(windows)]
+pub use mslsa::MslsaCcache;
 pub use resolve::{
     cache_match, collection, default_cache, expand_path_tokens, have_content, new_unique, resolve,
     split_name, AnyCcache, CcContext, DEFAULT_CCNAME,
