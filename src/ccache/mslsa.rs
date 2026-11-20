@@ -181,7 +181,7 @@ mod sys {
         pub domain: String,
         pub target_domain: Vec<u16>,
         pub key_type: i32,
-        pub key: Vec<u8>,
+        pub key: zeroize::Zeroizing<Vec<u8>>,
         pub flags: u32,
         pub start: i64,
         pub end: i64,
@@ -228,6 +228,12 @@ mod sys {
     struct Request {
         buf: Vec<u64>,
         len: usize,
+    }
+
+    impl Drop for Request {
+        fn drop(&mut self) {
+            zeroize::Zeroize::zeroize(&mut self.buf);
+        }
     }
 
     impl Request {
@@ -423,7 +429,7 @@ mod sys {
                 domain: string_of(&t.DomainName),
                 target_domain: utf16_of(&t.TargetDomainName),
                 key_type: t.SessionKey.KeyType,
-                key: bytes_of(t.SessionKey.Value, t.SessionKey.Length),
+                key: zeroize::Zeroizing::new(bytes_of(t.SessionKey.Value, t.SessionKey.Length)),
                 flags: t.TicketFlags,
                 start: t.StartTime,
                 end: t.EndTime,
@@ -615,7 +621,7 @@ mod imp {
             crealm,
             server,
             srealm,
-            keyblock: EncryptionKey::new(t.key_type, t.key.clone()),
+            keyblock: EncryptionKey::new(t.key_type, t.key.to_vec()),
             authtime: 0,
             starttime: filetime_to_unix(t.start),
             endtime: filetime_to_unix(t.end),
@@ -770,12 +776,14 @@ mod imp {
         /// `KerbSubmitTicket`.
         fn submit(&self, cred: &CcCredential) -> Option<()> {
             let profile = find_etype(SUBMIT_ETYPE).ok()?;
-            let key = profile
-                .random_to_key(&generate_random(profile.key_bytes()))
-                .ok()?
-                .to_vec();
+            let key = zeroize::Zeroizing::new(
+                profile
+                    .random_to_key(&generate_random(profile.key_bytes()))
+                    .ok()?
+                    .to_vec(),
+            );
             let mut actx = AuthContext::new();
-            actx.set_session_key(EncryptionKey::new(SUBMIT_ETYPE, key.clone()));
+            actx.set_session_key(EncryptionKey::new(SUBMIT_ETYPE, key.to_vec()));
             let credential = crate::protocol::Credential::try_from(cred).ok()?;
             let (packet, _) = actx.mk_cred(&[credential]).ok()?;
             self.lsa.submit(&packet, SUBMIT_ETYPE, &key).then_some(())
