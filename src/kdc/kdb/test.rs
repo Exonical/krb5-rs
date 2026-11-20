@@ -293,6 +293,7 @@ impl TestStore {
                 "require_auth" => entry.require_auth = Some(v.to_string()),
                 "otp" => entry.otp = Some(v.to_string()),
                 "pkinit_cert_match" => entry.pkinit_cert_match = Some(v.to_string()),
+                "session_enctypes" => entry.session_enctypes = Some(v.to_string()),
                 _ => {}
             }
         }
@@ -331,6 +332,7 @@ fn stub(name: PrincipalName, realm: String) -> PrincipalEntry {
         require_auth: None,
         otp: None,
         pkinit_cert_match: None,
+        session_enctypes: None,
         policy: None,
         security_epoch: 0,
         last_admin_unlock: None,
