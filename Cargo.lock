@@ -1915,10 +1915,12 @@ dependencies = [
  "chrono",
  "dns-lookup",
  "krb5-rs",
+ "libc",
  "rasn",
  "rpassword",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

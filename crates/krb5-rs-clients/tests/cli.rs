@@ -164,3 +164,40 @@ fn k5srvutil_options() {
     );
     assert_eq!(rc, 1);
 }
+
+const KSU: &str = env!("CARGO_BIN_EXE_krb5-rs-ksu");
+
+#[test]
+fn ksu_options() {
+    let usage = " [target user] [-n principal] [-c source cachename] [-k] [-r time] [-p|-P] [-f|-F] [-l lifetime] [-zZ] [-q] [-e command [args... ] ] [-a [args... ] ]\n";
+    let (out, rc) = run(KSU, &["-x"]);
+    assert!(
+        out.starts_with("krb5-rs-ksu: invalid option -- 'x'\nUsage: ") && out.ends_with(usage),
+        "{out}"
+    );
+    assert_eq!(rc, 2);
+    let (out, rc) = run(KSU, &["root", "-z", "-Z"]);
+    assert!(
+        out.starts_with("-Z option is mutually exclusive with -z.\nUsage: "),
+        "{out}"
+    );
+    assert_eq!(rc, 2);
+    let (out, rc) = run(KSU, &["root", "-l", "99999999999999"]);
+    assert!(
+        out.starts_with("Bad lifetime value (bad-time hours?)\nUsage: "),
+        "{out}"
+    );
+    assert_eq!(rc, 2);
+    let (out, rc) = run(KSU, &["root", "extra"]);
+    assert!(out.starts_with("Usage: "), "{out}");
+    assert_eq!(rc, 2);
+    let (out, rc) = run(KSU, &["no-such-user-ksutest"]);
+    assert_eq!(out, "ksu: unknown login no-such-user-ksutest\n");
+    assert_eq!(rc, 1);
+    let (out, rc) = run(KSU, &["root", "-c", "FILE:/nonexistent/ksu-cache"]);
+    assert_eq!(
+        out,
+        "krb5-rs-ksu: No such file or directory while looking for credentials cache FILE:/nonexistent/ksu-cache\r\n"
+    );
+    assert_eq!(rc, 1);
+}

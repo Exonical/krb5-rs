@@ -174,6 +174,16 @@ impl Getopt {
         }
     }
 
+    /// `optind - 1`: the index in `args` of the next element to scan.
+    pub fn optind(&self) -> usize {
+        self.idx
+    }
+
+    /// All of `args`.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
     /// The operands after the options.
     pub fn rest(&self) -> &[String] {
         &self.args[self.idx.min(self.args.len())..]
