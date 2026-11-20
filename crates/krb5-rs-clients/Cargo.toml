@@ -89,6 +89,7 @@ rasn = "0.28"
 dns-lookup = "4"
 rpassword = "7"
 libc = "0.2"
+zeroize = "1"
 tokio = { version = "1.53.2", features = ["rt", "net", "time", "io-util"] }
 
 [dev-dependencies]

@@ -240,15 +240,15 @@ fn exit(code: i32) -> ! {
 }
 
 /// `krb5_prompter_posix` for ksu's prompt, which already ends in ": ".
-fn read_password(prompt: &str) -> std::io::Result<String> {
+fn read_password(prompt: &str) -> std::io::Result<zeroize::Zeroizing<String>> {
     use std::io::{IsTerminal, Write};
     let mut out = std::io::stdout();
     write!(out, "{prompt}: ")?;
     out.flush()?;
     let line = if std::io::stdin().is_terminal() {
-        rpassword::read_password()?
+        zeroize::Zeroizing::new(rpassword::read_password()?)
     } else {
-        let mut line = String::new();
+        let mut line = zeroize::Zeroizing::new(String::new());
         if std::io::stdin().lock().read_line(&mut line)? == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
@@ -816,7 +816,7 @@ impl Ksu {
         let kc = kerberos_client(&self.profile, r);
         let res = self
             .rt
-            .block_on(kc.get_init_creds(AsExchange::new(c, &password)))
+            .block_on(kc.get_init_creds(AsExchange::new(c, password.as_str())))
             .and_then(|x| x.credential().cloned());
         drop(password);
         let cred = match res {

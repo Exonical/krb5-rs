@@ -1920,6 +1920,7 @@ dependencies = [
  "rpassword",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
