@@ -32,11 +32,17 @@ fn atoi(s: &str) -> i32 {
         Some(b'+') => (false, &s[1..]),
         _ => (false, s),
     };
+    // glibc atoi is (int) strtol: strtol saturates at LONG_MIN/LONG_MAX
+    // and the conversion to int keeps the low 32 bits.
+    let limit = i128::from(i64::MAX) + 1;
     let n = digits
         .bytes()
         .take_while(u8::is_ascii_digit)
-        .fold(0i64, |n, d| (n * 10 + i64::from(d - b'0')).min(1 << 32));
-    (if neg { -n } else { n }) as i32
+        .fold(0i128, |n, d| (n * 10 + i128::from(d - b'0')).min(limit));
+    let n = if neg { -n } else { n };
+    let long = i64::try_from(n).unwrap_or(if neg { i64::MIN } else { i64::MAX });
+    let [a, b, c, d, ..] = long.to_le_bytes();
+    i32::from_le_bytes([a, b, c, d])
 }
 
 /// `getopt(argc, argv, "c:e:f:hq")`; fewer than `min` operands is a usage
@@ -177,5 +183,22 @@ pub fn match_of(c: &CcCredential) -> MatchCred {
         ticket_flags: c.ticket_flags,
         authdata: Some(c.authdata.clone()),
         second_ticket: Some(c.second_ticket.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atoi;
+
+    #[test]
+    fn atoi_like_glibc() {
+        assert_eq!(atoi(" 42x"), 42);
+        assert_eq!(atoi("-7"), -7);
+        assert_eq!(atoi("+8"), 8);
+        assert_eq!(atoi("x"), 0);
+        assert_eq!(atoi("4294967297"), 1);
+        assert_eq!(atoi("2147483648"), i32::MIN);
+        assert_eq!(atoi("99999999999999999999"), -1);
+        assert_eq!(atoi("-99999999999999999999"), 0);
     }
 }

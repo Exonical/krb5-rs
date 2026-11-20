@@ -17,7 +17,7 @@ fn xusage() -> ! {
 fn main() {
     let o = parse_args(1, xusage);
     let mut src = open_source(&o, "while opening ccache");
-    let flags = MatchFlags::from_bits_retain(o.flags as u32);
+    let flags = MatchFlags::from_bits_retain(u32::from_ne_bytes(o.flags.to_ne_bytes()));
     let mut errors = 0;
     for name in &o.names {
         let Some((princ, creds)) = src.retrieve(name, o.quiet) else {
