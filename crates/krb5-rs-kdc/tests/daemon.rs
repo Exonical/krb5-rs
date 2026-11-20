@@ -264,7 +264,7 @@ async fn serves_as_and_tgs_over_udp_and_tcp_and_logs_each_request() {
     );
     assert!(
         lines.iter().any(
-            |l| l.contains("TGS_REQ (4 etypes {18 17 20 19}) 127.0.0.1:")
+            |l| l.contains("TGS_REQ (4 etypes {aes256-cts-hmac-sha1-96(18), aes128-cts-hmac-sha1-96(17), aes256-cts-hmac-sha384-192(20), aes128-cts-hmac-sha256-128(19)}) 127.0.0.1: ISSUE: authtime ")
                 && l.contains(&format!(
                     ", alice@{REALM} for HTTP/server.daemon.test@{REALM}"
                 ))
