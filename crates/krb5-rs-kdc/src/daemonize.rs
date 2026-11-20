@@ -3,8 +3,8 @@
 //! The fork has to happen before the Tokio runtime starts threads, but MIT
 //! daemonizes only after startup, so startup errors still reach the
 //! terminal. [`fork`] forks at once and the parent waits: it exits 0 when the
-//! child calls [`detach`] (MIT's `daemon()` call), or with the child's status
-//! if the child exits first.
+//! child calls [`ready`] after [`detach`] (MIT's `daemon()` call) and writing
+//! its PID file, or with the child's status if the child exits first.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -59,12 +59,11 @@ pub fn fork() -> io::Result<()> {
 }
 
 /// Finish daemonizing after [`fork`]: new session, `/` as the working
-/// directory, stdio on `/dev/null`, and let the parent exit. Does nothing
-/// without a prior [`fork`].
+/// directory and stdio on `/dev/null`. Does nothing without a prior [`fork`].
 pub fn detach() -> io::Result<()> {
-    let Some(mut ready) = READY.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+    if READY.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
         return Ok(());
-    };
+    }
     // SAFETY: setsid takes no arguments; the child is not a group leader.
     check(unsafe { libc::setsid() })?;
     std::env::set_current_dir("/")?;
@@ -73,5 +72,14 @@ pub fn detach() -> io::Result<()> {
         // SAFETY: duplicates an owned descriptor onto stdio.
         check(unsafe { libc::dup2(null.as_raw_fd(), fd) })?;
     }
-    ready.write_all(b"1")
+    Ok(())
+}
+
+/// Let the [`fork`] parent exit 0, once the PID file is written so it can be
+/// read as soon as the parent returns. Does nothing without a prior [`fork`].
+pub fn ready() {
+    if let Some(mut ready) = READY.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        // A parent that has gone away cannot be told.
+        let _ = ready.write_all(b"1");
+    }
 }

@@ -828,6 +828,7 @@ async fn run(args: Args, inetd: Option<std::net::TcpStream>) {
     if let Some(pid_file) = &state.args.pid_file {
         write_pid_file(pid_file);
     }
+    daemonize::ready();
     let Some(ip) = &state.iprop else {
         state.do_standalone().await;
         return;

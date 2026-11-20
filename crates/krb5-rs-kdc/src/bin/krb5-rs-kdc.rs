@@ -1279,6 +1279,8 @@ async fn run(
         std::fs::write(path, format!("{}\n", std::process::id()))
             .map_err(|e| io_err(format!("{e} while creating PID file")))?;
     }
+    #[cfg(unix)]
+    daemonize::ready();
     let supervisor = st.workers > 0;
     let mut tasks = JoinSet::new();
     // Each worker would bind the metrics address again; the supervisor
