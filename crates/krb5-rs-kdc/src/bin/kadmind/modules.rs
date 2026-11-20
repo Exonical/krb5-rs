@@ -4,11 +4,13 @@
 //! `[plugins] pwqual { module = name:path }` and
 //! `[plugins] kadm5_hook { module = name:path }`.
 //!
-//! A shared-library module exports `pwqual_<name>_initvt` or
-//! `kadm5_hook_<name>_initvt`, as in MIT, but with this crate's C ABI
-//! (`include/krb5-rs/pwqual_plugin.h`, `include/krb5-rs/kadm5_hook_plugin.h`);
+//! A shared-library module exports `krb5rs_pwqual_<name>_initvt` or
+//! `krb5rs_kadm5_hook_<name>_initvt`, with this crate's C ABI
+//! (`include/krb5-rs/pwqual_plugin.h`, `include/krb5-rs/kadm5_hook_plugin.h`).
 //! MIT's ABI passes a `krb5_context` and MIT's own principal structures,
-//! which only MIT's library provides.
+//! which only MIT's library provides; the `krb5rs_` prefix means an MIT
+//! module, which exports `pwqual_<name>_initvt` or `kadm5_hook_<name>_initvt`,
+//! is skipped rather than called with the wrong arguments.
 
 use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -400,7 +402,7 @@ fn open_lib<F: Copy>(
             return None;
         }
     };
-    let sym = format!("{iface}_{name}_initvt");
+    let sym = format!("krb5rs_{iface}_{name}_initvt");
     // SAFETY: the symbol has the interface's documented initvt type.
     let f = match unsafe { lib.get::<F>(sym.as_bytes()) } {
         Ok(f) => *f,

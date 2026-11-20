@@ -748,9 +748,15 @@ configured in krb5.conf or kdc.conf like MIT's:
 
 - `module = name:path` loads `path` (relative paths are under
   `[libdefaults] plugin_base_dir`, default `/usr/local/lib/krb5/plugins`) and
-  calls its `kadm5_auth_<name>_initvt`. A module that fails to load, or whose
+  calls its `krb5rs_kadm5_auth_<name>_initvt`. A module that fails to load, or whose
   `init` returns `KRB5_PLUGIN_NO_HANDLE`, is skipped; any other `init` error
   stops kadmind.
+- **Difference from MIT:** krb5-rs modules use krb5-rs's own C ABI
+  (`crates/krb5-rs-kdc/include/krb5-rs/kadm5_auth_plugin.h`), and the
+  `krb5rs_` prefix keeps it apart from MIT's. An MIT-built module exports
+  only `kadm5_auth_<name>_initvt`, expects a `krb5_context` and MIT's
+  structures, and needs MIT's libraries, so it is skipped rather than
+  called with the wrong arguments.
 - Configured modules come first, then `acl` and `self`; the first module of
   a name wins. `disable` removes modules, and `enable_only` keeps and orders
   only the modules it names (`lib/krb5/krb/plugin.c`).
@@ -818,11 +824,13 @@ none, as `kdb5_util` does.
   principals with a policy, the realm or any component of the principal name.
   Refusals use MIT's codes (`KADM5_PASS_Q_DICT`, `KADM5_PASS_Q_TOOSHORT`) and
   messages, and kpasswd reports them as MIT's soft errors.
-- `module = name:path` loads `pwqual_<name>_initvt` or
-  `kadm5_hook_<name>_initvt`; configured modules come before the built-ins,
+- `module = name:path` loads `krb5rs_pwqual_<name>_initvt` or
+  `krb5rs_kadm5_hook_<name>_initvt`; configured modules come before the built-ins,
   and `disable` and `enable_only` apply as for kadm5_auth. A module that fails
   to load or whose `initvt` fails is skipped; a pwqual module whose `open`
-  fails or a kadm5_hook module whose `init` fails stops the program.
+  fails or a kadm5_hook module whose `init` fails stops the program. As for
+  kadm5_auth, an MIT-built module (`pwqual_<name>_initvt`,
+  `kadm5_hook_<name>_initvt`) has MIT's ABI and is skipped.
 - Hooks run before (`PRECOMMIT`) and after (`POSTCOMMIT`) addprinc, modprinc,
   delprinc, cpw, randkey, renprinc and alias creation. A precommit error
   aborts the operation with the module's code; a postcommit error is logged

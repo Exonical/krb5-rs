@@ -2,10 +2,12 @@
 //! (`auth_acl.c`) and `self` (`auth_self.c`) modules, and modules loaded from
 //! shared libraries named by `[plugins] kadm5_auth { module = name:path }`.
 //!
-//! A shared-library module exports `kadm5_auth_<name>_initvt`, as in MIT, but
-//! with this crate's C ABI ([`Vtable`]); MIT's ABI passes a `krb5_context`
-//! and MIT's own principal and entry structures, which only MIT's library
-//! provides.
+//! A shared-library module exports `krb5rs_kadm5_auth_<name>_initvt`, with
+//! this crate's C ABI ([`Vtable`]). MIT's ABI passes a `krb5_context` and
+//! MIT's own principal and entry structures, which only MIT's library
+//! provides; the `krb5rs_` prefix means an MIT module, which exports
+//! `kadm5_auth_<name>_initvt`, is skipped rather than called with the wrong
+//! arguments.
 
 use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -142,7 +144,7 @@ pub struct Restrictions {
     pub policy: *const c_char,
 }
 
-/// A module's vtable, filled in by `kadm5_auth_<name>_initvt(1, 0, vt)`.
+/// A module's vtable, filled in by `krb5rs_kadm5_auth_<name>_initvt(1, 0, vt)`.
 ///
 /// `authorize` gets MIT's `OP_*` number, the client, then the arguments of
 /// MIT's `call_module` (`auth.c:133-178`): `p1`/`p2` principals (unparsed),
@@ -401,7 +403,7 @@ fn load_dyn(name: &str, path: &Path, acl_file: &Path) -> Result<Option<DynModule
             return Ok(None);
         }
     };
-    let sym = format!("kadm5_auth_{name}_initvt");
+    let sym = format!("krb5rs_kadm5_auth_{name}_initvt");
     // SAFETY: the symbol has the documented InitVt type.
     let initvt: InitVt = match unsafe { lib.get::<InitVt>(sym.as_bytes()) } {
         Ok(f) => *f,
@@ -551,6 +553,17 @@ mod tests {
         )
         .expect("load");
         assert_eq!(m.names().collect::<Vec<_>>(), ["welcomer", "bouncer"]);
+        let mit = modules(
+            dir.path(),
+            "[plugins]\n kadm5_auth = {\n  module = mitonly:$SO\n  enable_only = mitonly\n }\n",
+        )
+        .expect("load");
+        assert_eq!(m.names().count(), 2);
+        assert_eq!(
+            mit.names().count(),
+            0,
+            "an MIT-ABI module must not be called"
+        );
         let user = name("user");
         let ok = |req: &Request<'_>| m.authorize(p(&user), req).is_some();
 

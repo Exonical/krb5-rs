@@ -87,7 +87,7 @@ combo_close(void *data)
 }
 
 int
-pwqual_combo_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
+krb5rs_pwqual_combo_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 {
     (void)min_ver;
     if (maj_ver != 1)
@@ -100,7 +100,7 @@ pwqual_combo_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 }
 
 int
-pwqual_dyn1_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
+krb5rs_pwqual_dyn1_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 {
     (void)maj_ver;
     (void)min_ver;
@@ -109,7 +109,7 @@ pwqual_dyn1_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 }
 
 int
-pwqual_dyn2_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
+krb5rs_pwqual_dyn2_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 {
     (void)maj_ver;
     (void)min_ver;
@@ -118,7 +118,7 @@ pwqual_dyn2_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 }
 
 int
-pwqual_dyn3_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
+krb5rs_pwqual_dyn3_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 {
     (void)maj_ver;
     (void)min_ver;
@@ -128,7 +128,7 @@ pwqual_dyn3_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 
 /* Fails to initialize its vtable, which skips it. */
 int
-pwqual_novt_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
+krb5rs_pwqual_novt_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 {
     (void)maj_ver;
     (void)min_ver;
@@ -146,7 +146,7 @@ fail_open(const char *dict_file, void **data)
 }
 
 int
-pwqual_badopen_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
+krb5rs_pwqual_badopen_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt)
 {
     (void)maj_ver;
     (void)min_ver;

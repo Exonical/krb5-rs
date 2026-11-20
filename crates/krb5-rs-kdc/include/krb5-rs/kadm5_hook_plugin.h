@@ -8,7 +8,7 @@
  *             module = name:path/to/module.so
  *         }
  *
- * and export kadm5_hook_<name>_initvt, which krb5-rs-kadmind and
+ * and export krb5rs_kadm5_hook_<name>_initvt, which krb5-rs-kadmind and
  * krb5-rs-kdb call with major version 1 and minor version 2 (rename and
  * alias are present).  The vtable differs from MIT's kadm5_hook_plugin.h:
  * principals are unparsed strings and no krb5_context is given.
@@ -66,7 +66,7 @@ typedef struct krb5_rs_kadm5_hook_vtable {
                  const char *target);
 } krb5_rs_kadm5_hook_vtable;
 
-int kadm5_hook_NAME_initvt(int maj_ver, int min_ver,
+int krb5rs_kadm5_hook_NAME_initvt(int maj_ver, int min_ver,
                            krb5_rs_kadm5_hook_vtable *vt);
 
 #endif
