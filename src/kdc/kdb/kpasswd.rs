@@ -406,10 +406,10 @@ pub async fn process_request<S: AdminStore>(
     admin: &AdminOps<S>,
     svc: &Service<'_>,
     local: &SocketAddr,
-    remote: &SocketAddr,
+    remote: &crate::kdc::Peer,
     req: &[u8],
 ) -> Processed {
-    let from = remote.ip();
+    let from = remote;
     let parsed = match parse_request(req) {
         Ok(p) => p,
         Err(text) => {
@@ -464,7 +464,7 @@ async fn change<S: AdminStore>(
     svc: &Service<'_>,
     req: &Request<'_>,
     auth: Authenticated,
-    from: std::net::IpAddr,
+    from: &crate::kdc::Peer,
 ) -> (u16, String, String) {
     let client_str = unparse(&auth.client, &auth.crealm);
     let (password, target) = if req.version == RFC3244_VERSION {

@@ -33,9 +33,9 @@ use krb5_rs::kdc::kdb::{master_key_from_password_named, read_stash_named, FileSt
 #[cfg(feature = "cockroach")]
 use krb5_rs::kdc::GateSubject;
 use krb5_rs::kdc::{
-    default_realm, parse_listen_addresses, serve_tcp_with, serve_udp_with, Kdc, KdcConfig,
-    KdcRealms, MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore, RealmConfig,
-    RequestLogger, ServeOptions, StoreError,
+    default_realm, parse_listen_addresses, parse_listen_paths, serve_tcp_with, serve_udp_with, Kdc,
+    KdcConfig, KdcRealms, MemoryStore, PrincipalAttributes, PrincipalEntry, PrincipalStore,
+    RealmConfig, RequestLogger, ServeOptions, StoreError,
 };
 use krb5_rs::keytab::FileKeytab;
 use krb5_rs::profile::Profile;
@@ -128,6 +128,8 @@ struct Cli {
 struct Listen {
     udp: Vec<SocketAddr>,
     tcp: Vec<SocketAddr>,
+    /// UNIX domain socket paths (the pathnames in `kdc_listen`).
+    unix: Vec<PathBuf>,
     /// `kdc_tcp_listen_backlog`.
     backlog: u32,
 }
@@ -329,6 +331,7 @@ async fn keytab_mode(
         Listen {
             udp: addrs.clone(),
             tcp: addrs,
+            unix: parse_listen_paths(&spec),
             backlog: DEFAULT_TCP_LISTEN_BACKLOG,
         },
     ))
@@ -410,11 +413,12 @@ async fn turso_mode(
     let replica = TursoReplica::open(path, options, master)
         .await
         .map_err(io_err)?;
-    let (udp, tcp) = if cli.listen.is_empty() {
-        (cfg.udp_listen, cfg.tcp_listen)
+    let (udp, tcp, unix) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen, cfg.unix_listen)
     } else {
-        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
-        (addrs.clone(), addrs)
+        let spec = cli.listen.join(",");
+        let addrs = parse_listen_addresses(&spec, 88).map_err(io_err)?;
+        (addrs.clone(), addrs, parse_listen_paths(&spec))
     };
     let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
     let kdc = Kdc::builder(cfg.kdc, DaemonStore::Turso(replica.clone(), metrics))
@@ -426,6 +430,7 @@ async fn turso_mode(
         Listen {
             udp,
             tcp,
+            unix,
             backlog: cfg.tcp_listen_backlog,
         },
         ModeParts {
@@ -504,11 +509,12 @@ async fn klmdb_mode(
         }
     };
     let store = Arc::new(store);
-    let (udp, tcp) = if cli.listen.is_empty() {
-        (cfg.udp_listen, cfg.tcp_listen)
+    let (udp, tcp, unix) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen, cfg.unix_listen)
     } else {
-        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
-        (addrs.clone(), addrs)
+        let spec = cli.listen.join(",");
+        let addrs = parse_listen_addresses(&spec, 88).map_err(io_err)?;
+        (addrs.clone(), addrs, parse_listen_paths(&spec))
     };
     let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
     let kdc = Kdc::builder(cfg.kdc, DaemonStore::Lmdb(Arc::clone(&store), metrics))
@@ -520,6 +526,7 @@ async fn klmdb_mode(
         Listen {
             udp,
             tcp,
+            unix,
             backlog: cfg.tcp_listen_backlog,
         },
         ModeParts {
@@ -548,11 +555,12 @@ async fn kldap_mode(
             Err(e) => return Err(io_err(e)),
         }
     };
-    let (udp, tcp) = if cli.listen.is_empty() {
-        (cfg.udp_listen, cfg.tcp_listen)
+    let (udp, tcp, unix) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen, cfg.unix_listen)
     } else {
-        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
-        (addrs.clone(), addrs)
+        let spec = cli.listen.join(",");
+        let addrs = parse_listen_addresses(&spec, 88).map_err(io_err)?;
+        (addrs.clone(), addrs, parse_listen_paths(&spec))
     };
     let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
     let kdc = Kdc::builder(cfg.kdc, DaemonStore::Ldap(store.clone(), metrics))
@@ -564,6 +572,7 @@ async fn kldap_mode(
         Listen {
             udp,
             tcp,
+            unix,
             backlog: cfg.tcp_listen_backlog,
         },
         ModeParts {
@@ -620,11 +629,12 @@ async fn db2_mode(
         }
     };
     let store = Arc::new(store);
-    let (udp, tcp) = if cli.listen.is_empty() {
-        (cfg.udp_listen, cfg.tcp_listen)
+    let (udp, tcp, unix) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen, cfg.unix_listen)
     } else {
-        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
-        (addrs.clone(), addrs)
+        let spec = cli.listen.join(",");
+        let addrs = parse_listen_addresses(&spec, 88).map_err(io_err)?;
+        (addrs.clone(), addrs, parse_listen_paths(&spec))
     };
     let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
     let kdc = Kdc::builder(cfg.kdc, DaemonStore::Db2(Arc::clone(&store), metrics))
@@ -636,6 +646,7 @@ async fn db2_mode(
         Listen {
             udp,
             tcp,
+            unix,
             backlog: cfg.tcp_listen_backlog,
         },
         ModeParts {
@@ -670,11 +681,12 @@ fn test_mode(
         &cfg.db_module.section,
         &cfg.kdc.realm,
     ));
-    let (udp, tcp) = if cli.listen.is_empty() {
-        (cfg.udp_listen, cfg.tcp_listen)
+    let (udp, tcp, unix) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen, cfg.unix_listen)
     } else {
-        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
-        (addrs.clone(), addrs)
+        let spec = cli.listen.join(",");
+        let addrs = parse_listen_addresses(&spec, 88).map_err(io_err)?;
+        (addrs.clone(), addrs, parse_listen_paths(&spec))
     };
     let parts = ModeParts {
         metrics_listen: metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?,
@@ -685,6 +697,7 @@ fn test_mode(
         Listen {
             udp,
             tcp,
+            unix,
             backlog: cfg.tcp_listen_backlog,
         },
         parts,
@@ -845,11 +858,12 @@ async fn cockroach_mode(
     .consistency(gate)
     .lockout_reporter(reporter.clone())
     .build();
-    let (udp, tcp) = if cli.listen.is_empty() {
-        (cfg.udp_listen, cfg.tcp_listen)
+    let (udp, tcp, unix) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen, cfg.unix_listen)
     } else {
-        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
-        (addrs.clone(), addrs)
+        let spec = cli.listen.join(",");
+        let addrs = parse_listen_addresses(&spec, 88).map_err(io_err)?;
+        (addrs.clone(), addrs, parse_listen_paths(&spec))
     };
     let metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
     let parts = ModeParts {
@@ -866,6 +880,7 @@ async fn cockroach_mode(
         Listen {
             udp,
             tcp,
+            unix,
             backlog: cfg.tcp_listen_backlog,
         },
         parts,
@@ -1025,11 +1040,12 @@ async fn config_mode(
             Err(e) => return Err(io_err(e)),
         }
     };
-    let (udp, tcp) = if cli.listen.is_empty() {
-        (cfg.udp_listen, cfg.tcp_listen)
+    let (udp, tcp, unix) = if cli.listen.is_empty() {
+        (cfg.udp_listen, cfg.tcp_listen, cfg.unix_listen)
     } else {
-        let addrs = parse_listen_addresses(&cli.listen.join(","), 88).map_err(io_err)?;
-        (addrs.clone(), addrs)
+        let spec = cli.listen.join(",");
+        let addrs = parse_listen_addresses(&spec, 88).map_err(io_err)?;
+        (addrs.clone(), addrs, parse_listen_paths(&spec))
     };
     parts.metrics_listen = metrics_listen(cli.metrics_listen, cfg.db_module.get("metrics_listen"))?;
     Ok(Some((
@@ -1040,6 +1056,7 @@ async fn config_mode(
         Listen {
             udp,
             tcp,
+            unix,
             backlog: cfg.tcp_listen_backlog,
         },
         parts,
@@ -1114,9 +1131,19 @@ struct Startup {
     start_dir: Option<PathBuf>,
 }
 
-/// Bind every UDP and TCP listen address.
-async fn bind_listeners(addrs: &Listen) -> std::io::Result<(Vec<UdpSocket>, Vec<TcpListener>)> {
+/// The KDC's UNIX domain sockets.
+#[cfg(unix)]
+type UnixSocks = Vec<tokio::net::UnixListener>;
+#[cfg(not(unix))]
+type UnixSocks = Vec<std::convert::Infallible>;
+
+/// Bind every UDP and TCP listen address, and every UNIX socket path.
+async fn bind_listeners(
+    addrs: &Listen,
+) -> std::io::Result<(Vec<UdpSocket>, Vec<TcpListener>, UnixSocks)> {
     let (mut udp, mut tcp) = (Vec::new(), Vec::new());
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut unix = UnixSocks::new();
     for addr in &addrs.udp {
         match UdpSocket::bind(addr).await {
             Ok(sock) => {
@@ -1137,7 +1164,23 @@ async fn bind_listeners(addrs: &Listen) -> std::io::Result<(Vec<UdpSocket>, Vec<
             Err(e) => return Err(io_err(format!("bind tcp {addr}: {e}"))),
         }
     }
-    Ok((udp, tcp))
+    // net-server.c:620-624: a stale socket file is removed first.
+    #[cfg(unix)]
+    for path in &addrs.unix {
+        krb5_rs::kdc::remove_stale_socket(path);
+        let l = tokio::net::UnixListener::bind(path)
+            .map_err(|e| io_err(format!("bind unix {}: {e}", path.display())))?;
+        info!("listening on {} (unix)", path.display());
+        unix.push(l);
+    }
+    #[cfg(not(unix))]
+    if let Some(path) = addrs.unix.first() {
+        return Err(io_err(format!(
+            "bind unix {}: not supported",
+            path.display()
+        )));
+    }
+    Ok((udp, tcp, unix))
 }
 
 async fn run(
@@ -1152,6 +1195,7 @@ async fn run(
     let mut addrs = Listen {
         udp: Vec::new(),
         tcp: Vec::new(),
+        unix: Vec::new(),
         backlog: DEFAULT_TCP_LISTEN_BACKLOG,
     };
     let mut prop = ModeParts::default();
@@ -1212,6 +1256,11 @@ async fn run(
                         addrs.tcp.push(x);
                     }
                 }
+                for x in a.unix {
+                    if !addrs.unix.contains(&x) {
+                        addrs.unix.push(x);
+                    }
+                }
                 prop.metrics_listen = prop.metrics_listen.or(parts.metrics_listen);
                 #[cfg(feature = "cockroach")]
                 if let Some(r) = parts.replication {
@@ -1255,7 +1304,7 @@ async fn run(
         shutdown: Some(shutdown_rx.clone()),
     };
 
-    let (udp_socks, tcp_socks) = match &st.worker_fds {
+    let (udp_socks, tcp_socks, unix_socks) = match &st.worker_fds {
         #[cfg(unix)]
         Some(spec) => {
             let socks = kdc_workers::adopt(spec)?;
@@ -1267,7 +1316,7 @@ async fn run(
         }
         _ => bind_listeners(&addrs).await?,
     };
-    if udp_socks.is_empty() && tcp_socks.is_empty() {
+    if udp_socks.is_empty() && tcp_socks.is_empty() && unix_socks.is_empty() {
         return Err(io_err("no KDC listen address could be bound"));
     }
     // daemon(0, 0), then the PID file (main.c:996-1006).
@@ -1328,7 +1377,7 @@ async fn run(
 
     #[cfg(unix)]
     if supervisor {
-        let (spec, fds) = kdc_workers::encode(&udp_socks, &tcp_socks);
+        let (spec, fds) = kdc_workers::encode(&udp_socks, &tcp_socks, &unix_socks);
         let result = kdc_workers::supervise(st.workers, &spec, &fds, st.start_dir.as_deref()).await;
         let _ = shutdown_tx.send(true);
         return result;
@@ -1338,6 +1387,24 @@ async fn run(
     }
     for listener in tcp_socks {
         tasks.spawn(serve_tcp_with(Arc::clone(&kdc), listener, options.clone()));
+    }
+    #[cfg(unix)]
+    for listener in unix_socks {
+        let path = listener
+            .local_addr()?
+            .as_pathname()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let (kdc, options) = (Arc::clone(&kdc), options.clone());
+        tasks.spawn(async move {
+            let r = krb5_rs::kdc::serve_unix_with(kdc, listener, &path, options).await;
+            let _ = std::fs::remove_file(&path);
+            r
+        });
+    }
+    #[cfg(not(unix))]
+    for l in unix_socks {
+        match l {}
     }
     // kau_kdc_start (main.c:1028), in each worker.
     for m in &audit {

@@ -8,7 +8,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket, UnixListener};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinSet;
 use tracing::{error, info};
@@ -17,11 +17,16 @@ use tracing::{error, info};
 pub const ENV: &str = "KRB5RS_KDC_WORKER_FDS";
 
 /// The [`ENV`] value for these sockets, and their descriptors.
-pub fn encode(udp: &[UdpSocket], tcp: &[TcpListener]) -> (String, Vec<RawFd>) {
+pub fn encode(
+    udp: &[UdpSocket],
+    tcp: &[TcpListener],
+    unix: &[UnixListener],
+) -> (String, Vec<RawFd>) {
     let fds: Vec<(char, RawFd)> = udp
         .iter()
         .map(|s| ('u', s.as_raw_fd()))
         .chain(tcp.iter().map(|l| ('t', l.as_raw_fd())))
+        .chain(unix.iter().map(|l| ('x', l.as_raw_fd())))
         .collect();
     let spec = fds
         .iter()
@@ -32,9 +37,9 @@ pub fn encode(udp: &[UdpSocket], tcp: &[TcpListener]) -> (String, Vec<RawFd>) {
 }
 
 /// In a worker: take over the sockets [`ENV`] names.
-pub fn adopt(spec: &str) -> io::Result<(Vec<UdpSocket>, Vec<TcpListener>)> {
+pub fn adopt(spec: &str) -> io::Result<(Vec<UdpSocket>, Vec<TcpListener>, Vec<UnixListener>)> {
     let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad {ENV} {spec:?}"));
-    let (mut udp, mut tcp) = (Vec::new(), Vec::new());
+    let (mut udp, mut tcp, mut unix) = (Vec::new(), Vec::new(), Vec::new());
     for item in spec.split(',').filter(|s| !s.is_empty()) {
         let fd: RawFd = item.get(1..).and_then(|n| n.parse().ok()).ok_or_else(bad)?;
         match item.as_bytes()[0] {
@@ -51,10 +56,16 @@ pub fn adopt(spec: &str) -> io::Result<(Vec<UdpSocket>, Vec<TcpListener>)> {
                 l.set_nonblocking(true)?;
                 tcp.push(TcpListener::from_std(l)?);
             }
+            b'x' => {
+                // SAFETY: as above, for a listening UNIX domain socket.
+                let l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+                l.set_nonblocking(true)?;
+                unix.push(UnixListener::from_std(l)?);
+            }
             _ => return Err(bad()),
         }
     }
-    Ok((udp, tcp))
+    Ok((udp, tcp, unix))
 }
 
 fn kill(pids: &[u32], sig: libc::c_int) {
@@ -153,9 +164,11 @@ mod tests {
     async fn sockets_round_trip_through_the_spec() {
         let u = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let t = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (spec, fds) = super::encode(&[u], &[t]);
-        assert_eq!(fds.len(), 2);
-        assert!(spec.starts_with('u') && spec.contains(",t"));
-        assert!(super::adopt("x3").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let x = tokio::net::UnixListener::bind(dir.path().join("kdc.sock")).unwrap();
+        let (spec, fds) = super::encode(&[u], &[t], &[x]);
+        assert_eq!(fds.len(), 3);
+        assert!(spec.starts_with('u') && spec.contains(",t") && spec.contains(",x"));
+        assert!(super::adopt("z3").is_err());
     }
 }

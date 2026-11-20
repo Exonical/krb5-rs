@@ -2457,7 +2457,7 @@ fn listen_addrs(listen: Option<String>, port: u16) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for tok in listen
         .split([',', ';', ' ', '\t'])
-        .filter(|t| !t.is_empty())
+        .filter(|t| !t.is_empty() && !t.starts_with('/'))
     {
         if let Ok(p) = tok.parse::<u16>() {
             out.extend(wild(p));
@@ -2638,6 +2638,7 @@ async fn kadmind(args: Args) {
     }
     let mut kpasswd_udp = Vec::new();
     let mut kpasswd_tcp = Vec::new();
+    let mut kpasswd_unix = Vec::new();
     if !args.proponly {
         let port = r("kpasswd_port").map_or(KPASSWD_PORT, |p| {
             p.trim()
@@ -2647,6 +2648,16 @@ async fn kadmind(args: Args) {
         let addrs = listen_addrs(r("kpasswd_listen"), port);
         bind_udp(addrs.clone(), &mut kpasswd_udp).await;
         bind_tcp(addrs, &mut kpasswd_tcp).await;
+        // ovsec_kadmd.c:160; a stale socket file is removed first
+        // (net-server.c:620-624).
+        let listen = r("kpasswd_listen").unwrap_or_default();
+        for path in krb5_rs::kdc::parse_listen_paths(&listen) {
+            krb5_rs::kdc::remove_stale_socket(&path);
+            match tokio::net::UnixListener::bind(&path) {
+                Ok(l) => kpasswd_unix.push((l, path)),
+                Err(e) => die(format!("{e} while binding {}", path.display())),
+            }
+        }
     }
     let mut kadm5_listeners = Vec::new();
     if !args.proponly {
@@ -2666,6 +2677,7 @@ async fn kadmind(args: Args) {
     if iprop_listeners.is_empty()
         && kpasswd_udp.is_empty()
         && kpasswd_tcp.is_empty()
+        && kpasswd_unix.is_empty()
         && kadm5_listeners.is_empty()
     {
         die("no sockets set up?");
@@ -2733,6 +2745,9 @@ async fn kadmind(args: Args) {
     }
     for listener in kpasswd_tcp {
         tasks.spawn_local_on(serve_kpasswd_tcp(kpasswd.clone(), listener), &local);
+    }
+    for (listener, path) in kpasswd_unix {
+        tasks.spawn_local_on(serve_kpasswd_unix(kpasswd.clone(), listener, path), &local);
     }
     if args.proponly {
         tracing::info!("starting, iprop service only");
@@ -2814,7 +2829,12 @@ struct Kpasswd {
 }
 
 impl Kpasswd {
-    async fn handle(&self, local: &SocketAddr, remote: &SocketAddr, req: &[u8]) -> Option<Vec<u8>> {
+    async fn handle(
+        &self,
+        local: &SocketAddr,
+        remote: &krb5_rs::kdc::Peer,
+        req: &[u8],
+    ) -> Option<Vec<u8>> {
         let authorize = |c: &PrincipalName, cr: &str, t: &PrincipalName, tr: &str| {
             // Not across an await: the guard drops when the closure returns.
             let _serial = auth::serialize_request();
@@ -2860,7 +2880,10 @@ async fn serve_kpasswd_udp(kpasswd: Rc<Kpasswd>, socket: UdpSocket) {
         buf.truncate(n);
         let (kpasswd, socket) = (kpasswd.clone(), socket.clone());
         tokio::task::spawn_local(async move {
-            if let Some(reply) = kpasswd.handle(&local, &from, &buf).await {
+            if let Some(reply) = kpasswd
+                .handle(&local, &krb5_rs::kdc::Peer::Inet(from), &buf)
+                .await
+            {
                 if let Err(e) = socket.send_to(&reply, from).await {
                     tracing::error!("kpasswd sendto {from}: {e}");
                 }
@@ -2871,41 +2894,75 @@ async fn serve_kpasswd_udp(kpasswd: Rc<Kpasswd>, socket: UdpSocket) {
 
 async fn serve_kpasswd_tcp(kpasswd: Rc<Kpasswd>, listener: TcpListener) {
     loop {
-        let (mut stream, from) = match listener.accept().await {
+        let (stream, from) = match listener.accept().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("accept: {e}");
                 continue;
             }
         };
-        let kpasswd = kpasswd.clone();
-        tokio::task::spawn_local(async move {
-            let Ok(local) = stream.local_addr() else {
-                return;
-            };
-            let mut len = [0u8; 4];
-            if stream.read_exact(&mut len).await.is_err() {
-                return;
+        let Ok(local) = stream.local_addr() else {
+            continue;
+        };
+        let from = krb5_rs::kdc::Peer::Inet(from);
+        tokio::task::spawn_local(serve_kpasswd_stream(kpasswd.clone(), stream, local, from));
+    }
+}
+
+/// kpasswd on a UNIX domain socket (ovsec_kadmd.c:160). MIT logs the
+/// socket's own path and replies with a directional address, since the
+/// socket has no IP address (net-server.c:1263-1271, schpw.c:289-290).
+async fn serve_kpasswd_unix(
+    kpasswd: Rc<Kpasswd>,
+    listener: tokio::net::UnixListener,
+    path: std::path::PathBuf,
+) {
+    let from = krb5_rs::kdc::Peer::Unix(path.into());
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    loop {
+        let stream = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                tracing::error!("accept: {e}");
+                continue;
             }
-            let len = u32::from_be_bytes(len) as usize;
-            if len > MAX_DGRAM_SIZE {
-                return;
-            }
-            let mut req = vec![0u8; len];
-            if stream.read_exact(&mut req).await.is_err() {
-                return;
-            }
-            if let Some(reply) = kpasswd.handle(&local, &from, &req).await {
-                let mut out = u32::try_from(reply.len())
-                    .unwrap_or(u32::MAX)
-                    .to_be_bytes()
-                    .to_vec();
-                out.extend_from_slice(&reply);
-                if stream.write_all(&out).await.is_ok() {
-                    let _ = stream.shutdown().await;
-                }
-            }
-        });
+        };
+        tokio::task::spawn_local(serve_kpasswd_stream(
+            kpasswd.clone(),
+            stream,
+            local,
+            from.clone(),
+        ));
+    }
+}
+
+async fn serve_kpasswd_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    kpasswd: Rc<Kpasswd>,
+    mut stream: S,
+    local: SocketAddr,
+    from: krb5_rs::kdc::Peer,
+) {
+    let mut len = [0u8; 4];
+    if stream.read_exact(&mut len).await.is_err() {
+        return;
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_DGRAM_SIZE {
+        return;
+    }
+    let mut req = vec![0u8; len];
+    if stream.read_exact(&mut req).await.is_err() {
+        return;
+    }
+    if let Some(reply) = kpasswd.handle(&local, &from, &req).await {
+        let mut out = u32::try_from(reply.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes()
+            .to_vec();
+        out.extend_from_slice(&reply);
+        if stream.write_all(&out).await.is_ok() {
+            let _ = stream.shutdown().await;
+        }
     }
 }
 

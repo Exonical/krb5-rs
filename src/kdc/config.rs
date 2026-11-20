@@ -226,6 +226,9 @@ pub struct RealmConfig {
     /// TCP listen addresses (`kdc_tcp_listen` / `kdc_tcp_ports`, defaulting
     /// to the UDP list as in kdc/main.c:969-971).
     pub tcp_listen: Vec<SocketAddr>,
+    /// UNIX domain socket paths: the pathnames in `kdc_listen`
+    /// (kdc/main.c:966, net-server.c:399-409).
+    pub unix_listen: Vec<PathBuf>,
     /// `[kdcdefaults] kdc_tcp_listen_backlog`, default 5
     /// (`DEFAULT_TCP_LISTEN_BACKLOG`, kdc/main.c:639-644).
     pub tcp_listen_backlog: u32,
@@ -274,6 +277,15 @@ fn listen_setting(kdc_conf: &Profile, realm: &str, new: &str, old: &str) -> Opti
         .or_else(|| at(&["realms", realm], old))
         .or_else(|| at(&["kdcdefaults"], new))
         .or_else(|| at(&["kdcdefaults"], old))
+}
+
+/// The pathnames in a listen specifier list, which name UNIX domain
+/// sockets (net-server.c:399-409).
+pub fn parse_listen_paths(s: &str) -> Vec<PathBuf> {
+    s.split([',', ';', ' '])
+        .filter(|t| t.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// Parse one MIT listen specifier list (net-server.c:381-430 with
@@ -577,6 +589,7 @@ impl RealmConfig {
             ),
             udp_listen: parse_listen_addresses(&udp_str, DEFAULT_PORT)?,
             tcp_listen: parse_listen_addresses(&tcp_str, DEFAULT_PORT)?,
+            unix_listen: parse_listen_paths(&udp_str),
             tcp_listen_backlog: u32::try_from(tcp_listen_backlog.clamp(0, i64::from(i32::MAX)))
                 .unwrap_or(5),
             db_module,
@@ -814,6 +827,25 @@ default_principal_flags = +preauth\n    }\n";
                 "10.0.0.1:99".parse().expect("c"),
             ]
         );
+    }
+
+    #[test]
+    fn unix_listen_takes_the_pathnames_in_kdc_listen_only() {
+        assert_eq!(
+            parse_listen_paths("88, /run/krb5.sock;host:750 /tmp/b.sock"),
+            [
+                PathBuf::from("/run/krb5.sock"),
+                PathBuf::from("/tmp/b.sock")
+            ]
+        );
+        let kdc = Profile::parse(
+            "[realms]\n R = {\n  kdc_listen = 1000, /run/u.sock\n  \
+             kdc_tcp_listen = /run/t.sock\n }\n",
+        )
+        .expect("profile");
+        let cfg = RealmConfig::from_profiles(&kdc, None, "R").expect("config");
+        assert_eq!(cfg.unix_listen, [PathBuf::from("/run/u.sock")]);
+        assert!(cfg.udp_listen.iter().all(|a| a.port() == 1000));
     }
 
     #[test]
