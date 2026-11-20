@@ -620,6 +620,9 @@ struct Kadm5 {
     expiration: Option<krb5_rs::types::KerberosTime>,
     /// `default_principal_flags`.
     flags: u32,
+    /// `kadmin.local`: the library without `server_stubs.c`, so no
+    /// `lockdown_keys` protection.
+    local: bool,
 }
 
 /// `stub_cleanup`'s `auth_end`, run when a kadm5 call returns.
@@ -1207,7 +1210,7 @@ impl Kadm5 {
 
     fn lockdown(&self, name: &PrincipalName, realm: &str) -> Result<bool, u32> {
         match self.store.raw_entry(name, realm) {
-            Ok(Some(e)) => Ok(e.attributes & LOCKDOWN_KEYS != 0),
+            Ok(Some(e)) => Ok(!self.local && e.attributes & LOCKDOWN_KEYS != 0),
             Ok(None) => Err(code::UNK_PRINC),
             Err(e) => Err(store_code(&e, code::UNK_PRINC)),
         }
@@ -1241,7 +1244,8 @@ impl Kadm5 {
             ),
             _ => None,
         };
-        if let Some(princ) = target {
+        // kadmin.local calls the library directly, without server_stubs.c.
+        if let Some(princ) = target.filter(|_| !self.local) {
             let c = self.stub_rec(princ.as_deref());
             if c != code::OK {
                 return match args {
@@ -1386,6 +1390,15 @@ impl Kadm5 {
         ks: &[kadm5::KeySalt],
     ) -> u32 {
         let op = "kadm5_chpass_principal";
+        // svr_principal.c:1247: the library refuses kadmin/history before
+        // looking it up; kadmin.local has no stub in front of it.
+        if self.local {
+            if let Ok((_, realm, target)) = self.name(princ) {
+                if target == format!("kadmin/history@{realm}") {
+                    return code::PROTECT_PRINCIPAL;
+                }
+            }
+        }
         let (name, realm, target, locked) = match self.keychange_auth(caller, op, princ) {
             Ok(v) => v,
             Err(c) => return c,
@@ -2003,11 +2016,14 @@ impl Kadm5 {
         }
         let modifier = caller.client_name.clone().into_bytes();
         let res = self.store.update_raw(&name, &realm, |e, _| {
-            let keep = match u16::try_from(keepkvno) {
-                Ok(k) if k > 0 => k,
-                _ => e.key_data.iter().map(|k| k.kvno).max().unwrap_or(0),
+            // svr_principal.c kadm5_purgekeys: keepkvno <= 0 keeps the
+            // current kvno; `-all` passes INT32_MAX.
+            let keep = if keepkvno > 0 {
+                i64::from(keepkvno)
+            } else {
+                i64::from(e.key_data.iter().map(|k| k.kvno).max().unwrap_or(0))
             };
-            e.key_data.retain(|k| k.kvno >= keep);
+            e.key_data.retain(|k| i64::from(k.kvno) >= keep);
             set_mod_princ(e, unix_now(), &modifier)?;
             Ok(true)
         });
@@ -2685,6 +2701,7 @@ async fn kadmind(args: Args) {
         max_rlife: cfg.admin_max_renewable_life,
         expiration: cfg.default_principal_expiration,
         flags: cfg.default_principal_flags,
+        local: false,
     });
     spawn_rpc(&mut tasks, &local, &kadm5, kadm5_listeners);
     let kpasswd = Rc::new(Kpasswd {
@@ -2789,7 +2806,7 @@ async fn open_db(cfg: &RealmConfig, realm: &str, db_args: &[String], master: Enc
             }
             Db::Ldap(
                 krb5_rs_kdb_ldap::LdapStore::open(
-                    &cfg,
+                    cfg,
                     db_args,
                     krb5_rs_kdb_ldap::config::ServerType::Admin,
                     &master,
@@ -2809,13 +2826,13 @@ async fn open_db(cfg: &RealmConfig, realm: &str, db_args: &[String], master: Enc
         )),
         #[cfg(feature = "kdb2")]
         Some("db2") => Db::Db2(Arc::new(
-            krb5_rs_kdb_db2::Db2Store::open(&cfg, &master)
+            krb5_rs_kdb_db2::Db2Store::open(cfg, &master)
                 .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
         )),
         #[cfg(not(feature = "kdb2"))]
         Some("db2") => die("db_library db2 needs a krb5-rs-kadmind built with the `kdb2` feature"),
         None | Some("klmdb") => Db::Lmdb(Arc::new(
-            LmdbStore::open(&cfg, &master)
+            LmdbStore::open(cfg, &master)
                 .unwrap_or_else(|e| die(format!("{e} while initializing database"))),
         )),
         Some(other) => die(format!(
@@ -2925,6 +2942,7 @@ pub(crate) fn local_call(
         max_rlife: cfg.admin_max_renewable_life,
         expiration: cfg.default_principal_expiration,
         flags: cfg.default_principal_flags,
+        local: true,
     };
     let client = client.clone();
     let crealm = crealm.to_string();

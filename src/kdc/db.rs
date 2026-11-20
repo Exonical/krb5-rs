@@ -44,6 +44,8 @@ bitflags! {
         const DISALLOW_SVR = 0x0000_1000;
         /// The principal is a password-change service.
         const PWCHANGE_SERVICE = 0x0000_2000;
+        /// `KRB5_KDB_SUPPORT_DESMD5`, kept for MIT compatibility.
+        const SUPPORT_DESMD5 = 0x0000_4000;
         /// Tickets for this service are marked ok-as-delegate.
         const OK_AS_DELEGATE = 0x0010_0000;
         /// The service may use S4U2Self.

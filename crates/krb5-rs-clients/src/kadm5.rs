@@ -162,7 +162,7 @@ enum Conn {
     /// RPCSEC_GSS to kadmind (`kadmin`).
     Remote {
         rt: Runtime,
-        rpc: GssClient<TcpStream>,
+        rpc: Box<GssClient<TcpStream>>,
     },
     /// The server-side library in-process (`kadmin.local`).
     Local(LocalCall),
@@ -189,7 +189,10 @@ impl Handle {
         let rt = crate::runtime();
         let rpc = rt.block_on(Self::connect(p, auth))?;
         Self::negotiate(Handle {
-            conn: Conn::Remote { rt, rpc },
+            conn: Conn::Remote {
+                rt,
+                rpc: Box::new(rpc),
+            },
             api: API_VERSION_4,
         })
     }

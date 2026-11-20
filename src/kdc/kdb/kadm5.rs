@@ -198,6 +198,10 @@ pub mod code {
 
     /// The `kadm_err.et` text for `code`, as kadmind logs it.
     pub fn message(code: u32) -> String {
+        // KRB5_KDB_ALIAS_UNSUPPORTED (kdb5_err.et), which kadmind returns.
+        if code == 2_514_958_848 + 46 {
+            return "Operation unsupported on alias principal name".into();
+        }
         match code {
             ENOMEM => "Cannot allocate memory".into(),
             EINVAL => "Invalid argument".into(),
