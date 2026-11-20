@@ -599,17 +599,27 @@ fn pkinit_settings(
     use crate::pkinit::server::ServerConfig;
     use crate::pkinit::x509::TrustStore;
 
+    // The KDC's profile is kdc.conf followed by krb5.conf, and each lookup
+    // takes the first file that has the relation (pkinit_profile.c:96-140).
+    let profiles: Vec<&Profile> = std::iter::once(kdc_conf).chain(krb5_conf).collect();
+    fn sections<'a>(realm: &'a str, key: &'a str) -> [Vec<&'a str>; 2] {
+        [vec!["realms", realm, key], vec!["kdcdefaults", key]]
+    }
     let one = |key: &str| {
-        kdc_conf
-            .get_string(&["realms", realm, key])
-            .or_else(|| kdc_conf.get_string(&["kdcdefaults", key]))
+        sections(realm, key)
+            .into_iter()
+            .find_map(|path| profiles.iter().find_map(|p| p.get_string(&path)))
     };
     let all = |key: &str| {
-        let mut v = kdc_conf.get_values(&["realms", realm, key]);
-        if v.is_empty() {
-            v = kdc_conf.get_values(&["kdcdefaults", key]);
-        }
-        v
+        sections(realm, key)
+            .into_iter()
+            .find_map(|path| {
+                profiles
+                    .iter()
+                    .map(|p| p.get_values(&path))
+                    .find(|v| !v.is_empty())
+            })
+            .unwrap_or_default()
     };
     let boolean = |key: &str| -> Result<bool, ConfigError> {
         match one(key) {
