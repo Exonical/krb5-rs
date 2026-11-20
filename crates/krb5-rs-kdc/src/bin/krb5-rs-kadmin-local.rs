@@ -2,10 +2,9 @@
 //! `kadmin` command interpreter run directly on the KDB, with the stashed
 //! master key and every privilege, without kadmind.
 
-#[allow(dead_code)]
 #[path = "../../../krb5-rs-clients/src/bin/kadmin.rs"]
 mod kadmin;
-#[allow(dead_code)]
+#[expect(dead_code, reason = "only the shared entry points are used")]
 #[path = "krb5-rs-kadmind.rs"]
 mod kadmind;
 
