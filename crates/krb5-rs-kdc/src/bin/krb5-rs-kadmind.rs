@@ -1566,9 +1566,10 @@ impl Kadm5 {
             return code::AUTH_INSUFFICIENT;
         }
         let c = match self.lockdown(&sname, &srealm) {
+            // server_stubs.c:706-710.
             Ok(true) => {
                 caller.log_unauth(op, &prime);
-                return code::AUTH_INSUFFICIENT;
+                return code::AUTH_DELETE;
             }
             Err(c) => c,
             Ok(false) if srealm != drealm => code::FAILURE,

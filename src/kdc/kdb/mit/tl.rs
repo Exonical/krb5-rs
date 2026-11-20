@@ -988,6 +988,21 @@ pub fn policy_from_entry(entry: &MitPolicy) -> Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alias_target_reads_the_nul_terminated_name() {
+        let tl = |d: &[u8]| {
+            vec![TlData {
+                kind: TL_ALIAS_TARGET,
+                data: d.to_vec(),
+            }]
+        };
+        let (n, r) = alias_target(&tl(b"canon@R\0")).unwrap().unwrap();
+        assert_eq!((n.name_string.len(), r.as_str()), (1, "R"));
+        assert!(alias_target(&tl(b"")).unwrap().is_none());
+        assert!(alias_target(&tl(b"canon@R")).is_err());
+        assert!(alias_target(&[]).unwrap().is_none());
+    }
     use crate::kdc::db::KeyEntry;
     use crate::kdc::kdb::master::{encrypt_key, master_key_from_password};
     use crate::kdc::kdb::mit::codec::encode_lockout;
