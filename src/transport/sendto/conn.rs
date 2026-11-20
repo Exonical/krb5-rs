@@ -79,6 +79,14 @@ pub(super) struct LiveConn {
     pub established: bool,
 }
 
+/// A connection still waiting when the request ends must not linger: a UDP
+/// reply task would otherwise wait on its socket forever.
+impl Drop for LiveConn {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Split a server entry into (preferred, deferred) transports for a given
 /// strategy (resolve_server, sendto_kdc.c:805-882).
 fn entry_transports(
