@@ -2233,6 +2233,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aliases_resolve_and_a_dangling_alias_can_be_deleted() {
+        use krb5_rs::kdc::kdb::mit::{TlData, TL_ALIAS_TARGET};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let config = test_config(&path);
+        let (store, _) = test_store(&path);
+        store
+            .create_principal(principal("target"), None)
+            .await
+            .expect("create target");
+        let target = PrincipalName::new_principal("target");
+        let alias = PrincipalName::new_principal("alias");
+        let mut raw = store
+            .get_raw(&target, "LMDB.TEST")
+            .expect("read target")
+            .expect("target");
+        raw.principal = alias.clone();
+        raw.tl_data = vec![TlData {
+            kind: TL_ALIAS_TARGET,
+            data: b"target@LMDB.TEST\0".to_vec(),
+        }];
+        store.create_raw(&raw).expect("create alias");
+        let lookup = |name: PrincipalName| {
+            let store = store.clone();
+            async move { store.get_record(&name, "LMDB.TEST").await.expect("lookup") }
+        };
+        assert!(lookup(alias.clone()).await.is_some());
+
+        let admin = AdminOps::new(store.clone(), config.supported_keysalts.clone());
+        admin
+            .delete_principal(&target, "LMDB.TEST")
+            .await
+            .expect("delete target");
+        assert!(lookup(alias.clone()).await.is_none());
+        admin
+            .delete_principal(&alias, "LMDB.TEST")
+            .await
+            .expect("delete dangling alias");
+        assert!(store
+            .get_raw(&alias, "LMDB.TEST")
+            .expect("read alias")
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn create_modify_delete_policies_and_reopen_persist() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("principal");
