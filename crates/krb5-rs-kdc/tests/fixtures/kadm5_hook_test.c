@@ -89,7 +89,7 @@ alias_hook(void *data, int stage, const char *alias, const char *target)
 }
 
 int
-kadm5_hook_test_initvt(int maj_ver, int min_ver,
+krb5rs_kadm5_hook_test_initvt(int maj_ver, int min_ver,
                        krb5_rs_kadm5_hook_vtable *vt)
 {
     if (maj_ver != 1)
@@ -120,7 +120,7 @@ refuse_create(void *data, int stage, const krb5_rs_kadm5_hook_princ *princ,
 }
 
 int
-kadm5_hook_refuse_initvt(int maj_ver, int min_ver,
+krb5rs_kadm5_hook_refuse_initvt(int maj_ver, int min_ver,
                          krb5_rs_kadm5_hook_vtable *vt)
 {
     (void)maj_ver; (void)min_ver;
@@ -138,7 +138,7 @@ bad_init(void **data)
 }
 
 int
-kadm5_hook_badinit_initvt(int maj_ver, int min_ver,
+krb5rs_kadm5_hook_badinit_initvt(int maj_ver, int min_ver,
                           krb5_rs_kadm5_hook_vtable *vt)
 {
     (void)maj_ver; (void)min_ver;

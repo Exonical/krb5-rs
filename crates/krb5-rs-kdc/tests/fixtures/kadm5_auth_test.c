@@ -144,7 +144,7 @@ skipped_init(const char *acl_file, void **data)
 }
 
 int
-kadm5_auth_welcomer_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
+krb5rs_kadm5_auth_welcomer_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
 {
     vt->name = "welcomer";
     vt->authorize = welcomer;
@@ -153,7 +153,7 @@ kadm5_auth_welcomer_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
 }
 
 int
-kadm5_auth_bouncer_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
+krb5rs_kadm5_auth_bouncer_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
 {
     vt->name = "bouncer";
     vt->authorize = bouncer;
@@ -161,7 +161,7 @@ kadm5_auth_bouncer_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
 }
 
 int
-kadm5_auth_limiter_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
+krb5rs_kadm5_auth_limiter_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
 {
     vt->name = "limiter";
     vt->authorize = limiter;
@@ -170,10 +170,18 @@ kadm5_auth_limiter_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
 }
 
 int
-kadm5_auth_skipped_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
+krb5rs_kadm5_auth_skipped_initvt(int maj, int min, krb5rs_kadm5_auth_vtable *vt)
 {
     vt->name = "skipped";
     vt->init = skipped_init;
     vt->authorize = welcomer;
     return 0;
+}
+
+/* MIT's symbol and signature (plugins/kadm5_auth/test/main.c); kadmind
+ * must never call it. */
+int
+kadm5_auth_mitonly_initvt(void *context, int maj, int min, void *vtable)
+{
+    abort();
 }

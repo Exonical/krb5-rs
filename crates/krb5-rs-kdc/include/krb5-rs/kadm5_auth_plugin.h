@@ -10,7 +10,7 @@
  *             disable = self
  *         }
  *
- * and export kadm5_auth_<name>_initvt, which kadmind calls with major
+ * and export krb5rs_kadm5_auth_<name>_initvt, which kadmind calls with major
  * version 1 and minor version 0.  The vtable differs from MIT's
  * kadm5_auth_plugin.h: principals are passed as unparsed strings and no
  * krb5_context is given, because krb5-rs-kadmind has no MIT library context.

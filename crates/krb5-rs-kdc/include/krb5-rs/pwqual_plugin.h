@@ -10,7 +10,7 @@
  *             disable = princ
  *         }
  *
- * and export pwqual_<name>_initvt, which krb5-rs-kadmind and krb5-rs-kdb
+ * and export krb5rs_pwqual_<name>_initvt, which krb5-rs-kadmind and krb5-rs-kdb
  * call with major version 1 and minor version 0.  The vtable differs from
  * MIT's pwqual_plugin.h: the principal is an unparsed string, no
  * krb5_context or languages are given, and the error message is written to
@@ -43,6 +43,6 @@ typedef struct krb5_rs_pwqual_vtable {
     void (*close)(void *data);
 } krb5_rs_pwqual_vtable;
 
-int pwqual_NAME_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt);
+int krb5rs_pwqual_NAME_initvt(int maj_ver, int min_ver, krb5_rs_pwqual_vtable *vt);
 
 #endif
