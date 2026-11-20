@@ -683,9 +683,9 @@ impl Caller<'_> {
 
 /// `clamp_self_keepold` (`server_stubs.c:391-399`): changing one's own keys
 /// keeps at most `MAX_SELF_KEEPOLD` key versions.
-fn clamp_keepold(caller: &Caller<'_>, name: &PrincipalName, realm: &str, keepold: bool) -> u32 {
+fn clamp_keepold(own: bool, keepold: bool) -> u32 {
     const MAX_SELF_KEEPOLD: u32 = 5;
-    match (keepold, caller.is(name, realm)) {
+    match (keepold, own) {
         (false, _) => 0,
         (true, true) => MAX_SELF_KEEPOLD,
         (true, false) => 1,
@@ -1325,7 +1325,8 @@ impl Kadm5 {
     /// `check_self_keychange` (`server_stubs.c`): a self change needs an
     /// initial ticket and respects the policy's minimum password life.
     fn check_self_keychange(&self, caller: &Caller<'_>, name: &PrincipalName, realm: &str) -> u32 {
-        if !caller.is(name, realm) {
+        // server_stubs.c only: kadmin.local has no self-change limits.
+        if self.local || !caller.is(name, realm) {
             return code::OK;
         }
         if !caller.initial {
@@ -1420,7 +1421,7 @@ impl Kadm5 {
                         &name,
                         &realm,
                         Some(pw),
-                        clamp_keepold(caller, &name, &realm, keepold),
+                        clamp_keepold(!self.local && caller.is(&name, &realm), keepold),
                     )) {
                         Ok(_) => code::OK,
                         Err(e) => store_code(&e, code::UNK_PRINC),
@@ -1478,7 +1479,7 @@ impl Kadm5 {
                 &name,
                 &realm,
                 None,
-                clamp_keepold(caller, &name, &realm, keepold),
+                clamp_keepold(!self.local && caller.is(&name, &realm), keepold),
             )) {
                 Ok(kvno) => match self.current_keys(caller, &name, &realm, kvno) {
                     Ok(k) => {
