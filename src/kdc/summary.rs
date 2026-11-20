@@ -68,6 +68,10 @@ pub struct RequestSummary {
     pub reply_etype: Option<i32>,
     /// Enctype of the issued ticket (`tkt=`).
     pub ticket_etype: Option<i32>,
+    /// The issued ticket's authtime (`authtime` in MIT's log).
+    pub authtime: Option<i64>,
+    /// The issued ticket's session key enctype (`ses=`).
+    pub session_etype: Option<i32>,
     /// The consistency gate refused the request (`KDC_ERR_SVC_UNAVAILABLE` or
     /// an `AUTHORITATIVE_` denial status): the hook for gate-rejection metrics.
     pub gate_rejected: bool,
@@ -169,6 +173,8 @@ impl RequestSummary {
             outcome,
             reply_etype,
             ticket_etype,
+            authtime: None,
+            session_etype: None,
             gate_rejected,
             store_time: Duration::ZERO,
             lookaside: None,
@@ -176,8 +182,8 @@ impl RequestSummary {
     }
 
     /// The MIT-style log line for a request from `peer`, e.g.
-    /// `AS_REQ (2 etypes {18 17}) 10.0.0.1:50000: ISSUE: user@R for krbtgt/R@R, etypes {rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18)}`
-    /// or `AS_REQ (1 etypes {18}) 10.0.0.1:50000: NEEDED_PREAUTH: user@R for krbtgt/R@R, Additional pre-authentication required`.
+    /// `AS_REQ (2 etypes {aes256-cts-hmac-sha1-96(18), aes128-cts-hmac-sha1-96(17)}) 10.0.0.1: ISSUE: authtime 1700000000, etypes {rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18), ses=aes256-cts-hmac-sha1-96(18)}, user@R for krbtgt/R@R`
+    /// or `AS_REQ (1 etypes {aes256-cts-hmac-sha1-96(18)}) 10.0.0.1: NEEDED_PREAUTH: user@R for krbtgt/R@R, Additional pre-authentication required`.
     pub fn log_line(&self, peer: SocketAddr) -> String {
         // dispatch.c:117-133.
         match self.lookaside {
@@ -208,17 +214,22 @@ impl RequestSummary {
             (None, None) => "(unparseable request)".to_string(),
         };
         let tail = match &self.outcome {
+            // log_as_req / log_tgs_req ISSUE lines with rep_etypes2str.
             Outcome::Issued => {
-                let mut s = "ISSUE".to_string();
-                s.push_str(&format!(": {who}"));
-                if let (Some(rep), Some(tkt)) = (self.reply_etype, self.ticket_etype) {
-                    s.push_str(&format!(
-                        ", etypes {{rep={}, tkt={}}}",
-                        mit_etype_label(rep),
-                        mit_etype_label(tkt)
-                    ));
+                let mut etypes = String::new();
+                if let Some(rep) = self.reply_etype {
+                    etypes = format!("etypes {{rep={}", mit_etype_label(rep));
+                    for (tag, e) in [("tkt", self.ticket_etype), ("ses", self.session_etype)] {
+                        if let Some(e) = e {
+                            etypes.push_str(&format!(", {tag}={}", mit_etype_label(e)));
+                        }
+                    }
+                    etypes.push('}');
                 }
-                s
+                format!(
+                    "ISSUE: authtime {}, {etypes}, {who}",
+                    self.authtime.unwrap_or(0)
+                )
             }
             // log_as_req / log_tgs_req failure lines (kdc_log.c).
             Outcome::Error { code, status } => {
@@ -448,7 +459,7 @@ mod tests {
         assert_eq!((s.reply_etype, s.ticket_etype), (Some(18), Some(18)));
         assert!(s
             .log_line(peer())
-            .contains("ISSUE: alice@R for krbtgt/R@R, etypes {rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18)}"));
+            .contains("etypes {rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18), ses=aes256-cts-hmac-sha1-96(18)}, alice@R for krbtgt/R@R"));
 
         let tgt = ex.credential().expect("TGT").clone();
         let mut tgs = TgsExchange::new(

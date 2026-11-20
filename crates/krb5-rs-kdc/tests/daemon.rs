@@ -258,7 +258,7 @@ async fn serves_as_and_tgs_over_udp_and_tcp_and_logs_each_request() {
     assert_eq!(count("TGS_REQ"), 2, "{lines:?}");
     assert!(
         lines.iter().any(|l| l.contains(&format!(
-            "ISSUE: alice@{REALM} for krbtgt/{REALM}@{REALM}, etypes {{rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18)}}"
+            "etypes {{rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18), ses=aes256-cts-hmac-sha1-96(18)}}, alice@{REALM} for krbtgt/{REALM}@{REALM}"
         ))),
         "{lines:?}"
     );
@@ -266,7 +266,7 @@ async fn serves_as_and_tgs_over_udp_and_tcp_and_logs_each_request() {
         lines.iter().any(
             |l| l.contains("TGS_REQ (4 etypes {18 17 20 19}) 127.0.0.1:")
                 && l.contains(&format!(
-                    "ISSUE: alice@{REALM} for HTTP/server.daemon.test@{REALM}"
+                    ", alice@{REALM} for HTTP/server.daemon.test@{REALM}"
                 ))
         ),
         "{lines:?}"
