@@ -115,6 +115,9 @@ pub struct RequestInfo<'a> {
     pub etypes: &'a [i32],
     /// The client's `pkinit_cert_match` string attribute, for `dbmatch`.
     pub cert_match: Option<&'a str>,
+    /// Certificate principals the KDC found are database aliases of the
+    /// client (MIT `match_client`'s lookup, kdc_preauth.c).
+    pub alias_matches: &'a [(PrincipalName, String)],
 }
 
 /// A failed verification with the data MIT puts in the error.
@@ -126,6 +129,9 @@ pub struct Failure {
     pub message: String,
     /// Typed e-data elements (`pkinit_create_edata`, :95-125).
     pub e_data: Vec<(i32, Vec<u8>)>,
+    /// On a client name mismatch, the certificate's principals, for the
+    /// KDC to look up as aliases of the client.
+    pub san_candidates: Vec<(PrincipalName, String)>,
 }
 
 impl Failure {
@@ -134,6 +140,7 @@ impl Failure {
             code,
             message: message.into(),
             e_data: Vec::new(),
+            san_candidates: Vec::new(),
         }
     }
 }
@@ -208,7 +215,7 @@ fn edata_for(cfg: &ServerConfig, code: i32, received: Option<&Cert>) -> Vec<(i32
 enum SanResult {
     Match,
     NoHandle,
-    Mismatch,
+    Mismatch(Vec<(PrincipalName, String)>),
 }
 
 fn names_equal(a: &PrincipalName, b: &PrincipalName) -> bool {
@@ -233,6 +240,7 @@ fn verify_client_san(
     cert: &Cert,
     client: &PrincipalName,
     realm: &str,
+    alias_matches: &[(PrincipalName, String)],
 ) -> SanResult {
     let sans = cert.sans();
     let princs: Vec<_> = sans
@@ -261,13 +269,30 @@ fn verify_client_san(
     {
         return SanResult::Match;
     }
+    let mut candidates: Vec<(PrincipalName, String)> = princs
+        .iter()
+        .map(|(p, r)| ((*p).clone(), (*r).clone()))
+        .collect();
     for upn in upns {
         let (user, urealm) = upn.rsplit_once('@').unwrap_or((upn.as_str(), realm));
         if urealm == realm && user == unparse(client) {
             return SanResult::Match;
         }
+        // pkinit_srv.c:244-245 parses the UPN as an enterprise name.
+        if !upn.chars().any(char::is_control) {
+            let mut name = PrincipalName::new_principal(upn);
+            name.name_type = 10; // KRB5_NT_ENTERPRISE_PRINCIPAL
+            candidates.push((name, realm.to_owned()));
+        }
     }
-    SanResult::Mismatch
+    if candidates.iter().any(|(p, r)| {
+        alias_matches
+            .iter()
+            .any(|(a, ar)| ar == r && names_equal(a, p))
+    }) {
+        return SanResult::Match;
+    }
+    SanResult::Mismatch(candidates)
 }
 
 /// `crypto_check_cert_eku` for a client certificate (:2499-2580).
@@ -290,6 +315,8 @@ fn authorize_cert(
     client: &PrincipalName,
     realm: &str,
     cert_match: Option<&str>,
+    alias_matches: &[(PrincipalName, String)],
+    san_candidates: &mut Vec<(PrincipalName, String)>,
 ) -> Result<(bool, Vec<String>), PkinitError> {
     use super::certauth::{CertauthModule, CERTAUTH_HWAUTH, CERTAUTH_HWAUTH_PASS};
     use crate::plugin::rpc::{ERROR_TABLE_BASE_KRB5, PLUGIN_NO_HANDLE};
@@ -299,10 +326,13 @@ fn authorize_cert(
     for m in &cfg.certauth {
         let (code, ais) = match m {
             CertauthModule::PkinitSan => (
-                match verify_client_san(cfg, cert, client, realm) {
+                match verify_client_san(cfg, cert, client, realm, alias_matches) {
                     SanResult::Match => 0,
                     SanResult::NoHandle => PLUGIN_NO_HANDLE,
-                    SanResult::Mismatch => ERROR_TABLE_BASE_KRB5 + KDC_ERR_CLIENT_NAME_MISMATCH,
+                    SanResult::Mismatch(c) => {
+                        *san_candidates = c;
+                        ERROR_TABLE_BASE_KRB5 + KDC_ERR_CLIENT_NAME_MISMATCH
+                    }
                 },
                 Vec::new(),
             ),
@@ -386,6 +416,7 @@ pub fn verify(
         e_data: edata_for(cfg, e.code, e.cert.as_deref()),
         code: e.code,
         message: e.message,
+        san_candidates: Vec::new(),
     })?;
 
     let signer = verified.signer;
@@ -393,14 +424,22 @@ pub fn verify(
     let mut certauth_indicators = Vec::new();
     match &signer {
         Some(cert) => {
-            (hw_authent, certauth_indicators) =
-                authorize_cert(cfg, cert, req.client, req.realm, req.cert_match).map_err(|e| {
-                    Failure {
-                        e_data: edata_for(cfg, e.code, Some(cert)),
-                        code: e.code,
-                        message: e.message,
-                    }
-                })?;
+            let mut san_candidates = Vec::new();
+            (hw_authent, certauth_indicators) = authorize_cert(
+                cfg,
+                cert,
+                req.client,
+                req.realm,
+                req.cert_match,
+                req.alias_matches,
+                &mut san_candidates,
+            )
+            .map_err(|e| Failure {
+                e_data: edata_for(cfg, e.code, Some(cert)),
+                code: e.code,
+                message: e.message,
+                san_candidates: std::mem::take(&mut san_candidates),
+            })?;
         }
         None if !(is_anonymous_name(req.client) && req.client_realm == ANONYMOUS_REALM) => {
             return Err(preauth(
@@ -484,6 +523,7 @@ fn dh_failure(cfg: &ServerConfig) -> Failure {
         code: KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED,
         message: "key parameters not accepted".into(),
         e_data: edata_for(cfg, KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED, None),
+        san_candidates: Vec::new(),
     }
 }
 

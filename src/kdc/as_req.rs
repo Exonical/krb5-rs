@@ -367,15 +367,45 @@ impl<S: PrincipalStore> Kdc<S> {
                     None
                 })
             } else {
-                match self.pkinit_verify(
+                let mut candidates = Vec::new();
+                let mut result = self.pkinit_verify(
                     pa,
                     request,
                     raw,
                     &pk_body_der,
                     &local_tgt,
                     client.pkinit_cert_match.as_deref(),
+                    &[],
+                    &mut candidates,
                     now,
-                ) {
+                );
+                // MIT match_client (kdc_preauth.c): a certificate principal
+                // matches if the database maps it to the client, e.g. an alias.
+                if matches!(result, Some(Err(_))) {
+                    for (name, realm) in candidates {
+                        let Ok(Some(entry)) = self.lookup(&name, &realm, "LOOKING_UP_CLIENT").await
+                        else {
+                            continue;
+                        };
+                        if entry.realm == client.realm
+                            && entry.name.name_string == client.name.name_string
+                        {
+                            result = self.pkinit_verify(
+                                pa,
+                                request,
+                                raw,
+                                &pk_body_der,
+                                &local_tgt,
+                                client.pkinit_cert_match.as_deref(),
+                                &[(name, realm)],
+                                &mut Vec::new(),
+                                now,
+                            );
+                            break;
+                        }
+                    }
+                }
+                match result {
                     None => continue,
                     Some(Ok(v)) => {
                         // pkinit_srv.c:602-603.
