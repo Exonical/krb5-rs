@@ -427,6 +427,14 @@ pub fn set_full_addrs(
 /// `ADDRTYPE_IPPORT` (krb5.h).
 const ADDRTYPE_IPPORT: i32 = 0x0101;
 
+/// An `ADDRTYPE_IPPORT` address for `krb5_auth_con_setports`.
+pub fn ipport_address(port: u16) -> krb5_rs::types::HostAddress {
+    krb5_rs::types::HostAddress {
+        addr_type: ADDRTYPE_IPPORT,
+        address: rasn::types::OctetString::from(port.to_be_bytes().to_vec()),
+    }
+}
+
 /// `LOG_DAEMON | LOG_ERR`.
 pub const LOG_DAEMON_ERR: u8 = 3 * 8 + 3;
 
