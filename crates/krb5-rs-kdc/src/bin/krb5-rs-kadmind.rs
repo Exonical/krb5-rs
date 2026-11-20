@@ -2665,6 +2665,7 @@ async fn kadmind(args: Args) {
             ));
         }
     }
+    daemonize::ready();
     let local = tokio::task::LocalSet::new();
     let mut tasks = tokio::task::JoinSet::new();
     if iprop_port.is_some() {
