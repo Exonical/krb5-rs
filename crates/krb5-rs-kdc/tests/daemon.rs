@@ -290,7 +290,7 @@ async fn failed_requests_are_logged_with_mits_status() {
     let line = daemon.wait_for_line("CLIENT_NOT_FOUND");
     assert!(
         line.contains(&format!(
-            "nobody@{REALM} for krbtgt/{REALM}@{REALM}, error 6"
+            "nobody@{REALM} for krbtgt/{REALM}@{REALM}, Client not found in Kerberos database"
         )),
         "{line}"
     );

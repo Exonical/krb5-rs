@@ -346,16 +346,26 @@ impl<S: PrincipalStore> Kdc<S> {
         auth_ctx.set_clockskew(self.config.clockskew);
         auth_ctx.set_time_offset(now - Utc::now());
         auth_ctx.set_permitted_etypes(Some(self.config.supported_enctypes.clone()));
-        let rd = auth_ctx
-            .rd_req(
-                ap_bytes,
-                Some(&ap.ticket.sname),
-                &FixedKey(header_key.clone()),
-            )
-            .map_err(|e| match e {
-                Krb5Error::Ap(a) => KdcError::new(ap_error_code(a), STATUS),
-                _ => KdcError::generic(STATUS),
-            })?;
+        let rd = match auth_ctx.rd_req(
+            ap_bytes,
+            Some(&ap.ticket.sname),
+            &FixedKey(header_key.clone()),
+        ) {
+            Ok(rd) => rd,
+            Err(e) => {
+                // krb5_rd_req_decoded leaves the decrypted header ticket in
+                // place, so the error and the log name its client
+                // (do_tgs_req.c:617-621, prepare_error_tgs).
+                if let Ok(t) = crate::protocol::ap::decrypt_ticket(&header_key, &ap.ticket) {
+                    ctx.crealm = Some(realm_string(&t.crealm));
+                    ctx.cname = Some(t.cname);
+                }
+                return Err(match e {
+                    Krb5Error::Ap(a) => KdcError::new(ap_error_code(a), STATUS),
+                    _ => KdcError::generic(STATUS),
+                });
+            }
+        };
         let header = rd.ticket;
         let auth = rd.authenticator;
         ctx.crealm = Some(realm_string(&header.crealm));

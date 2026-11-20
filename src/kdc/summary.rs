@@ -177,7 +177,7 @@ impl RequestSummary {
 
     /// The MIT-style log line for a request from `peer`, e.g.
     /// `AS_REQ (2 etypes {18 17}) 10.0.0.1:50000: ISSUE: user@R for krbtgt/R@R, etypes {rep=18 tkt=18}`
-    /// or `AS_REQ (1 etypes {18}) 10.0.0.1:50000: NEEDED_PREAUTH: user@R for krbtgt/R@R, error 25`.
+    /// or `AS_REQ (1 etypes {18}) 10.0.0.1:50000: NEEDED_PREAUTH: user@R for krbtgt/R@R, Additional pre-authentication required`.
     pub fn log_line(&self, peer: SocketAddr) -> String {
         // dispatch.c:117-133.
         match self.lookaside {
@@ -216,10 +216,20 @@ impl RequestSummary {
                 }
                 s
             }
-            Outcome::Error { code, status } => format!(
-                "{}: {who}, error {code}",
-                status.as_deref().unwrap_or("UNKNOWN_ERROR")
-            ),
+            // log_as_req / log_tgs_req failure lines (kdc_log.c).
+            Outcome::Error { code, status } => {
+                let c = self.client.as_deref().unwrap_or("<unknown client>");
+                let s = self.server.as_deref().unwrap_or("<unknown server>");
+                let emsg = crate::protocol::ErrorCode::from_i32(*code)
+                    .map_or_else(|| format!("error {code}"), |e| e.description().to_string());
+                let status = status.as_deref().unwrap_or("UNKNOWN_ERROR");
+                match self.kind {
+                    RequestKind::Tgs => format!("{status}: authtime 0,  {c} for {s}, {emsg}"),
+                    RequestKind::As => format!("{status}: {c} for {s}, {emsg}"),
+                    // MIT logs no line for a request it can't decode.
+                    RequestKind::Unknown => format!("{status}: {who}, error {code}"),
+                }
+            }
         };
         format!(
             "{kind} ({} etypes {{{}}}) {peer}: {tail}",
@@ -329,7 +339,7 @@ mod tests {
         assert_eq!(
             s.log_line(peer()),
             "AS_REQ (4 etypes {18 17 20 19}) 192.0.2.7:4000: NEEDED_PREAUTH: \
-             alice@R for krbtgt/R@R, error 25"
+             alice@R for krbtgt/R@R, Additional pre-authentication required"
         );
     }
 
