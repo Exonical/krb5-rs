@@ -52,6 +52,8 @@ const REQUIRE_AUTH: &[u8] = b"require_auth";
 const OTP: &[u8] = b"otp";
 /// The dbmatch certauth module's string attribute (pkinit_srv.c).
 const PKINIT_CERT_MATCH: &[u8] = b"pkinit_cert_match";
+/// MIT `KRB5_KDB_SK_SESSION_ENCTYPES`.
+const SESSION_ENCTYPES: &[u8] = b"session_enctypes";
 
 /// A raw MIT string-attribute key/value pair.
 pub type StringAttribute = (Vec<u8>, Vec<u8>);
@@ -661,6 +663,17 @@ pub fn cert_match_attr(tl_data: &[TlData]) -> Result<Option<String>, StoreError>
         .transpose()
 }
 
+/// The `session_enctypes` string attribute in `tl_data`, if set.
+pub fn session_enctypes_attr(tl_data: &[TlData]) -> Result<Option<String>, StoreError> {
+    attr_pairs_in(tl_data)?
+        .into_iter()
+        .find(|(key, _)| key == SESSION_ENCTYPES)
+        .map(|(_, value)| {
+            String::from_utf8(value).map_err(|_| corrupt("session_enctypes attribute is not UTF-8"))
+        })
+        .transpose()
+}
+
 /// [`record_from_entry`] without decrypting the keys (`entry.keys` empty),
 /// for stores that keep keys encrypted.
 pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreError> {
@@ -678,6 +691,7 @@ pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreErr
     let require_auth = require_auth_attr(&entry.tl_data)?;
     let otp = otp_attr(&entry.tl_data)?;
     let pkinit_cert_match = cert_match_attr(&entry.tl_data)?;
+    let session_enctypes = session_enctypes_attr(&entry.tl_data)?;
     let last_pwd_change =
         get_u32_tl(entry, LAST_PWD_CHANGE)?.map(|time| kerberos_time(i64::from(time)));
     let (mod_time, mod_by) = match mod_principal_data(entry)? {
@@ -707,6 +721,7 @@ pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreErr
             require_auth,
             otp,
             pkinit_cert_match,
+            session_enctypes,
             policy,
             security_epoch: 0,
             last_admin_unlock,
@@ -840,6 +855,7 @@ pub fn merge_record(
         (REQUIRE_AUTH, &record.entry.require_auth),
         (OTP, &record.entry.otp),
         (PKINIT_CERT_MATCH, &record.entry.pkinit_cert_match),
+        (SESSION_ENCTYPES, &record.entry.session_enctypes),
     ] {
         if value.as_deref().is_some_and(|v| v.contains('\0')) {
             return Err(StoreError::backend("NUL in string attribute"));
@@ -989,6 +1005,7 @@ mod tests {
             require_auth: None,
             otp: None,
             pkinit_cert_match: None,
+            session_enctypes: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
@@ -1328,6 +1345,7 @@ mod tests {
             require_auth: None,
             otp: None,
             pkinit_cert_match: None,
+            session_enctypes: None,
             policy: None,
             security_epoch: 0,
             last_admin_unlock: None,
@@ -1364,6 +1382,7 @@ mod tests {
                 require_auth: Some("otp".into()),
                 otp: Some("[{}]".into()),
                 pkinit_cert_match: Some("<SAN>^u@R$".into()),
+                session_enctypes: None,
                 ..record_from_entry(&test_entry(&master), &keys)
                     .expect("record")
                     .entry

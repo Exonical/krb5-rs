@@ -332,20 +332,32 @@ pub(crate) fn get_ticket_flags(
 
 /// `dbentry_supports_enctype` + `select_session_keytype`
 /// (MIT kdc_util.c:1040-1112): the first requested etype that is valid,
-/// permitted and supported by the server (aes256-sha1 is assumed
-/// supported; otherwise the server needs a key of that etype).
+/// permitted and supported by the server. A non-empty `session_enctypes`
+/// attribute lists what the server supports; without one, aes256-sha1 is
+/// assumed supported and otherwise the server needs a key of that etype.
 pub(crate) fn select_session_keytype(
     server: &PrincipalEntry,
     requested: &[i32],
     permitted: &dyn Fn(i32) -> bool,
 ) -> Option<i32> {
+    let listed = server
+        .session_enctypes
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| crate::crypto::parse_enctype_list(s, &[]))
+        .filter(|l| !l.is_empty());
     requested.iter().copied().find(|&etype| {
         find_etype(etype).is_ok()
             && permitted(etype)
-            && (etype == 18
-                || server
-                    .find_key(Some(etype), KvnoSel::Highest, permitted)
-                    .is_some())
+            && match &listed {
+                Some(l) => l.contains(&etype),
+                None => {
+                    etype == 18
+                        || server
+                            .find_key(Some(etype), KvnoSel::Highest, permitted)
+                            .is_some()
+                }
+            }
     })
 }
 
@@ -479,6 +491,7 @@ mod tests {
             require_auth: None,
             otp: None,
             pkinit_cert_match: None,
+            session_enctypes: None,
             allowed_to_delegate_to: Vec::new(),
             allowed_to_delegate_from: Vec::new(),
             policy: None,
@@ -850,6 +863,25 @@ mod tests {
         assert_eq!(select_session_keytype(&entry(), &[18], &permit), Some(18));
         assert_eq!(select_session_keytype(&entry(), &[20, 19], &permit), None);
         assert_eq!(select_session_keytype(&entry(), &[23], &permit), None);
+    }
+
+    #[test]
+    fn select_session_keytype_follows_session_enctypes() {
+        let permit = |_: i32| true;
+        let mut server = entry();
+        server.session_enctypes = Some("aes128-cts,aes256-cts".into());
+        assert_eq!(
+            select_session_keytype(&server, &[17, 18], &permit),
+            Some(17)
+        );
+        assert_eq!(
+            select_session_keytype(&server, &[20, 18], &permit),
+            Some(18)
+        );
+        server.session_enctypes = Some("aes128-cts".into());
+        assert_eq!(select_session_keytype(&server, &[18], &permit), None);
+        server.session_enctypes = Some("bogus".into());
+        assert_eq!(select_session_keytype(&server, &[18], &permit), Some(18));
     }
 
     #[test]

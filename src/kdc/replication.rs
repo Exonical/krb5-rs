@@ -377,6 +377,7 @@ impl StoredPrincipal {
             require_auth: super::kdb::mit::require_auth_attr(&self.tl_data)?,
             otp: super::kdb::mit::otp_attr(&self.tl_data)?,
             pkinit_cert_match: super::kdb::mit::cert_match_attr(&self.tl_data)?,
+            session_enctypes: super::kdb::mit::session_enctypes_attr(&self.tl_data)?,
             policy: self.policy,
             security_epoch: self.security_epoch,
             last_admin_unlock: self.last_admin_unlock.map(kerberos_time),
