@@ -757,10 +757,33 @@ impl LmdbStore {
         name: &PrincipalName,
         realm: &str,
     ) -> Result<Option<PrincipalRecord>, StoreError> {
-        self.get_raw(name, realm)?
+        self.get_resolved(name, realm)?
             .as_ref()
             .map(|entry| self.decode(entry))
             .transpose()
+    }
+
+    /// [`Self::get_raw`], following aliases like `krb5_db_get_principal`
+    /// (kdb5.c:823-837).
+    fn get_resolved(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<MitEntry>, StoreError> {
+        use krb5_rs::kdc::kdb::mit::{alias_target, MAX_ALIAS_DEPTH};
+        let mut entry = self.get_raw(name, realm)?;
+        let mut depth = 0;
+        while let Some(e) = &entry {
+            let Some((target, target_realm)) = alias_target(&e.tl_data)? else {
+                break;
+            };
+            depth += 1;
+            if depth > MAX_ALIAS_DEPTH {
+                return Ok(None);
+            }
+            entry = self.get_raw(&target, &target_realm)?;
+        }
+        Ok(entry)
     }
 
     fn list_records_sync(&self) -> Result<Vec<PrincipalRecord>, StoreError> {
@@ -2210,6 +2233,51 @@ mod tests {
             master_key_from_password("LMDB.TEST", "master password", 18).expect("master key");
         let store = LmdbStore::create(&test_config(path), &master).expect("create LMDB");
         (store, master)
+    }
+
+    #[tokio::test]
+    async fn aliases_resolve_and_a_dangling_alias_can_be_deleted() {
+        use krb5_rs::kdc::kdb::mit::{TlData, TL_ALIAS_TARGET};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("principal");
+        let config = test_config(&path);
+        let (store, _) = test_store(&path);
+        store
+            .create_principal(principal("target"), None)
+            .await
+            .expect("create target");
+        let target = PrincipalName::new_principal("target");
+        let alias = PrincipalName::new_principal("alias");
+        let mut raw = store
+            .get_raw(&target, "LMDB.TEST")
+            .expect("read target")
+            .expect("target");
+        raw.principal = alias.clone();
+        raw.tl_data = vec![TlData {
+            kind: TL_ALIAS_TARGET,
+            data: b"target@LMDB.TEST\0".to_vec(),
+        }];
+        store.create_raw(&raw).expect("create alias");
+        let lookup = |name: PrincipalName| {
+            let store = store.clone();
+            async move { store.get_record(&name, "LMDB.TEST").await.expect("lookup") }
+        };
+        assert!(lookup(alias.clone()).await.is_some());
+
+        let admin = AdminOps::new(store.clone(), config.supported_keysalts.clone());
+        admin
+            .delete_principal(&target, "LMDB.TEST")
+            .await
+            .expect("delete target");
+        assert!(lookup(alias.clone()).await.is_none());
+        admin
+            .delete_principal(&alias, "LMDB.TEST")
+            .await
+            .expect("delete dangling alias");
+        assert!(store
+            .get_raw(&alias, "LMDB.TEST")
+            .expect("read alias")
+            .is_none());
     }
 
     #[tokio::test]

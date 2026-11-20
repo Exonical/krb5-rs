@@ -663,6 +663,24 @@ pub fn cert_match_attr(tl_data: &[TlData]) -> Result<Option<String>, StoreError>
         .transpose()
 }
 
+/// MIT `KRB5_TL_ALIAS_TARGET` (`kdb.h:266`).
+pub const TL_ALIAS_TARGET: u16 = 0x000c;
+
+/// How many aliases `krb5_db_get_principal` follows (`MAX_ALIAS_DEPTH`).
+pub const MAX_ALIAS_DEPTH: usize = 10;
+
+/// The target an alias entry names (`krb5_dbe_read_alias`, kdb5.c:2873).
+pub fn alias_target(tl_data: &[TlData]) -> Result<Option<(PrincipalName, String)>, StoreError> {
+    let Some(tl) = tl_data.iter().find(|t| t.kind == TL_ALIAS_TARGET) else {
+        return Ok(None);
+    };
+    match tl.data.split_last() {
+        None => Ok(None),
+        Some((0, name)) => parse_name(name).map(Some),
+        Some(_) => Err(corrupt("alias target is not NUL-terminated")),
+    }
+}
+
 /// The `session_enctypes` string attribute in `tl_data`, if set.
 pub fn session_enctypes_attr(tl_data: &[TlData]) -> Result<Option<String>, StoreError> {
     attr_pairs_in(tl_data)?
@@ -986,6 +1004,23 @@ pub fn policy_from_entry(entry: &MitPolicy) -> Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alias_target_reads_the_nul_terminated_name() {
+        let tl = |d: &[u8]| {
+            vec![TlData {
+                kind: TL_ALIAS_TARGET,
+                data: d.to_vec(),
+            }]
+        };
+        let (n, r) = alias_target(&tl(b"canon@R\0"))
+            .expect("valid")
+            .expect("alias");
+        assert_eq!((n.name_string.len(), r.as_str()), (1, "R"));
+        assert!(alias_target(&tl(b"")).expect("empty").is_none());
+        assert!(alias_target(&tl(b"canon@R")).is_err());
+        assert!(alias_target(&[]).expect("none").is_none());
+    }
     use crate::kdc::db::KeyEntry;
     use crate::kdc::kdb::master::{encrypt_key, master_key_from_password};
     use crate::kdc::kdb::mit::codec::encode_lockout;
