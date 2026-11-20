@@ -674,7 +674,7 @@ impl Caller<'_> {
     }
 
     fn is(&self, name: &PrincipalName, realm: &str) -> bool {
-        self.client == *name && self.crealm == realm
+        self.client.name_string == name.name_string && self.crealm == realm
     }
 }
 
