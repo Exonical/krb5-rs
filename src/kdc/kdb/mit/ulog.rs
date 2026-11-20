@@ -1057,9 +1057,6 @@ fn set_tl(entry: &mut MitEntry, kind: u16, data: Vec<u8>) {
 /// attributes of `upd` to the stored entry `current`, or to an empty entry
 /// for an add. Lockout attributes are ignored, as on an `IPROP_REPLICA`.
 pub fn entry_from_update(current: Option<MitEntry>, upd: &Update) -> Result<MitEntry, StoreError> {
-    // ulog_replay's krb5_db_get_principal does not find an alias whose
-    // target is gone, so a principal replacing one starts afresh.
-    let current = current.filter(|e| !matches!(super::alias_target(&e.tl_data), Ok(Some(_))));
     let mut entry = match current {
         Some(e) => e,
         None => {
