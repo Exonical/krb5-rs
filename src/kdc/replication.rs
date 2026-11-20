@@ -262,7 +262,7 @@ impl StoredPrincipal {
         Ok(sp)
     }
 
-    /// The `require_auth`, `otp` and `pkinit_cert_match` string attributes, which the model
+    /// The `require_auth`, `otp`, `pkinit_cert_match` and `session_enctypes` string attributes, which the model
     /// carries as fields, as `krb5_dbe_set_string`.
     fn set_model_attrs(&mut self, entry: &PrincipalEntry) -> Result<(), StoreError> {
         use super::kdb::mit::set_string_attr_in;
@@ -280,6 +280,11 @@ impl StoredPrincipal {
             &mut self.tl_data,
             b"pkinit_cert_match",
             entry.pkinit_cert_match.as_deref().map(str::as_bytes),
+        )?;
+        set_string_attr_in(
+            &mut self.tl_data,
+            b"session_enctypes",
+            entry.session_enctypes.as_deref().map(str::as_bytes),
         )
     }
 
