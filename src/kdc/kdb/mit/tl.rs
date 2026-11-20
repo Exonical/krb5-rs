@@ -997,11 +997,13 @@ mod tests {
                 data: d.to_vec(),
             }]
         };
-        let (n, r) = alias_target(&tl(b"canon@R\0")).unwrap().unwrap();
+        let (n, r) = alias_target(&tl(b"canon@R\0"))
+            .expect("valid")
+            .expect("alias");
         assert_eq!((n.name_string.len(), r.as_str()), (1, "R"));
-        assert!(alias_target(&tl(b"")).unwrap().is_none());
+        assert!(alias_target(&tl(b"")).expect("empty").is_none());
         assert!(alias_target(&tl(b"canon@R")).is_err());
-        assert!(alias_target(&[]).unwrap().is_none());
+        assert!(alias_target(&[]).expect("none").is_none());
     }
     use crate::kdc::db::KeyEntry;
     use crate::kdc::kdb::master::{encrypt_key, master_key_from_password};
