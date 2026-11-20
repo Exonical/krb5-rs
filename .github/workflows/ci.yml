@@ -41,7 +41,12 @@ jobs:
 
   rpm:
     runs-on: ubuntu-latest
-    container: rockylinux:9
+    container:
+      image: rockylinux:9
+      # The image sets no PATH, so the $GITHUB_PATH entry rust-toolchain adds
+      # would otherwise replace it.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
       - run: dnf -y install bash rpm-build systemd-rpm-macros git gcc tar findutils
       - uses: actions/checkout@v7
