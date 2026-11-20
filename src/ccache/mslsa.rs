@@ -47,10 +47,12 @@ fn nofile() -> CcError {
 }
 
 /// `FileTimeToUnixTime`, truncated to a `krb5_timestamp`.
+/// MIT's `FileTimeToUnixTime`, except that an unset time (0, as the LSA
+/// gives for `RenewUntil` on a ticket that isn't renewable) stays 0 instead
+/// of wrapping to a date in 2009, and times past 2106 saturate.
 fn filetime_to_unix(ft: i64) -> u32 {
     let t = ft / 10_000_000 - 11_644_473_600;
-    let [a, b, c, d, ..] = t.to_le_bytes();
-    u32::from_le_bytes([a, b, c, d])
+    u32::try_from(t.max(0)).unwrap_or(u32::MAX)
 }
 
 /// The KDC options `GetMSCacheTicketFromCacheInfoEx{,2}` asks for, from a
@@ -89,6 +91,8 @@ mod tests {
     #[test]
     fn filetime_converts_like_mit() {
         assert_eq!(filetime_to_unix(116_444_736_000_000_000), 0);
+        assert_eq!(filetime_to_unix(0), 0);
+        assert_eq!(filetime_to_unix(i64::MAX), u32::MAX);
         assert_eq!(
             filetime_to_unix(116_444_736_000_000_000 + 10_000_000 * 86_400),
             86_400
@@ -627,7 +631,8 @@ mod imp {
             endtime: filetime_to_unix(t.end),
             renew_till: filetime_to_unix(t.renew),
             is_skey: false,
-            ticket_flags: 0,
+            // MSFlagsToMITFlags: the LSA's flags are the RFC 4120 bits.
+            ticket_flags: t.flags,
             addresses: Vec::new(),
             authdata: Vec::new(),
             ticket: t.encoded.clone(),
