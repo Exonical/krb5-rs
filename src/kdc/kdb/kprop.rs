@@ -309,18 +309,23 @@ pub fn service_port(port: &str) -> Option<u16> {
     if let Ok(n) = port.parse() {
         return Some(n);
     }
-    let services = std::fs::read_to_string("/etc/services").unwrap_or_default();
-    services_port(&services, port).or((port == KPROP_SERVICE).then_some(KPROP_PORT))
+    getservbyname(port, "tcp").or((port == KPROP_SERVICE).then_some(KPROP_PORT))
 }
 
-fn services_port(services: &str, name: &str) -> Option<u16> {
+/// `getservbyname(name, proto)`: the port of a `/etc/services` name or alias.
+pub fn getservbyname(name: &str, proto: &str) -> Option<u16> {
+    let services = std::fs::read_to_string("/etc/services").unwrap_or_default();
+    services_port(&services, name, proto)
+}
+
+fn services_port(services: &str, name: &str, want: &str) -> Option<u16> {
     services.lines().find_map(|line| {
         let line = line.split('#').next()?;
         let mut words = line.split_whitespace();
         let service = words.next()?;
         let (port, proto) = words.next()?.split_once('/')?;
         let named = service == name || words.any(|alias| alias == name);
-        (named && proto == "tcp")
+        (named && proto == want)
             .then(|| port.parse().ok())
             .flatten()
     })
@@ -835,9 +840,10 @@ mod tests {
     #[test]
     fn service_port_reads_services_then_defaults() {
         let services = "ssh 22/tcp\nkrb5_prop 17540/tcp kprop # local\nfoo 9/udp\n";
-        assert_eq!(services_port(services, "krb5_prop"), Some(17540));
-        assert_eq!(services_port(services, "kprop"), Some(17540));
-        assert_eq!(services_port(services, "foo"), None);
+        assert_eq!(services_port(services, "krb5_prop", "tcp"), Some(17540));
+        assert_eq!(services_port(services, "kprop", "tcp"), Some(17540));
+        assert_eq!(services_port(services, "foo", "tcp"), None);
+        assert_eq!(services_port(services, "foo", "udp"), Some(9));
         assert_eq!(service_port("7540"), Some(7540));
         assert_eq!(service_port("no-such-service-name"), None);
     }

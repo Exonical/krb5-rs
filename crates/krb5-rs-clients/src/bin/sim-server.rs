@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use krb5_rs::ccache::unparse_name;
 use krb5_rs::client::vfy::{default_keytab, resolve_keytab, VerifyKeytab};
-use krb5_rs::kdc::kdb::kprop::{host_address, service_port};
+use krb5_rs::kdc::kdb::kprop::{getservbyname, host_address};
 use krb5_rs::protocol::ap::AuthContext;
 use krb5_rs_clients::{ipport_address, krb5_message, sname_to_principal, Getopt};
 
@@ -74,7 +74,7 @@ fn main() {
 
     let (sprinc, _) = sname_to_principal(&rt, &profile, None, &service);
     if port == 0 {
-        match service_port(SIMPLE_PORT) {
+        match getservbyname(SIMPLE_PORT, "udp") {
             Some(p) => port = p,
             None => {
                 eprintln!("service unknown: {SIMPLE_PORT}/udp");

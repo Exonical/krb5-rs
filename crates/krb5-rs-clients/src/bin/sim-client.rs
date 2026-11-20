@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use krb5_rs::ccache::{default_cache, CcContext, Ccache};
 use krb5_rs::client::{CredsRequest, GcOptions};
-use krb5_rs::kdc::kdb::kprop::{host_address, service_port};
+use krb5_rs::kdc::kdb::kprop::{getservbyname, host_address};
 use krb5_rs::protocol::ap::{ApReqOptions, AuthContext};
 use krb5_rs_clients::{ipport_address, krb5_message, sname_to_principal};
 
@@ -112,7 +112,7 @@ fn main() {
         std::process::exit(1);
     };
     if port == 0 {
-        match service_port(SIMPLE_PORT) {
+        match getservbyname(SIMPLE_PORT, "udp") {
             Some(p) => port = p,
             None => {
                 eprintln!("service unknown: {SIMPLE_PORT}/udp");
