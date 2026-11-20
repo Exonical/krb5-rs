@@ -65,6 +65,14 @@ path = "src/bin/gss-client.rs"
 name = "krb5-rs-gss-server"
 path = "src/bin/gss-server.rs"
 
+[[bin]]
+name = "krb5-rs-kcpytkt"
+path = "src/bin/kcpytkt.rs"
+
+[[bin]]
+name = "krb5-rs-kdeltkt"
+path = "src/bin/kdeltkt.rs"
+
 [dependencies]
 krb5-rs = { path = "../..", features = ["client", "gssapi", "pkinit", "dns", "kdc"] }
 base64 = "0.22"

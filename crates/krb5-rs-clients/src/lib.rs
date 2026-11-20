@@ -27,6 +27,7 @@ pub fn progname() -> &'static str {
 pub mod gss_sample;
 pub mod kadm5;
 pub mod ss;
+pub mod tktutil;
 
 static EXTENDED_COM_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

@@ -212,6 +212,7 @@ impl Ccache for FileCcache {
 
     fn remove_cred(&mut self, flags: MatchFlags, m: &MatchCred) -> Result<(), CcError> {
         let (mut data, version, _) = self.read_all()?;
+        let mut removed_any = false;
         for (off, len, cred) in self.records()? {
             if cred.endtime == 0 && cred.authtime != 0 {
                 continue;
@@ -232,9 +233,14 @@ impl Ccache for FileCcache {
                 return Err(CcError::Format);
             }
             data[off..off + len].copy_from_slice(&bytes);
-            return crate::fsutil::write_keep_mode(&self.path, &data).map_err(CcError::Io);
+            removed_any = true;
         }
-        Err(CcError::NotFound)
+        // fcc_remove_cred (cc_file.c:1139-1164) removes every match and
+        // succeeds when there is none.
+        if removed_any {
+            crate::fsutil::write_keep_mode(&self.path, &data).map_err(CcError::Io)?;
+        }
+        Ok(())
     }
 
     fn retrieve(

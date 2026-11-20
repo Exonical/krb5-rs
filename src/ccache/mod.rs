@@ -258,7 +258,8 @@ pub trait Ccache {
     /// (endtime==0 && authtime!=0, cc_file.c:750-757).
     fn creds(&self) -> Result<Vec<CcCredential>, CcError>;
 
-    /// Remove the first credential matching `m` under `flags`.
+    /// Remove every credential matching `m` under `flags`; no match is not
+    /// an error (cc_file.c:1139-1164).
     fn remove_cred(&mut self, flags: MatchFlags, m: &MatchCred) -> Result<(), CcError>;
 
     /// Retrieve a credential (cc_retr.c:194-245). With `ktypes`, the

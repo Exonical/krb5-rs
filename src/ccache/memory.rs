@@ -41,18 +41,11 @@ impl Ccache for MemoryCcache {
     }
 
     fn remove_cred(&mut self, flags: MatchFlags, m: &MatchCred) -> Result<(), CcError> {
-        // cc_memory.c: matching entries are deleted outright.
-        match self
-            .creds
-            .iter()
-            .position(|c| super::creds_match_request(flags, m, c))
-        {
-            Some(i) => {
-                self.creds.remove(i);
-                Ok(())
-            }
-            None => Err(CcError::NotFound),
-        }
+        // krb5_mcc_remove_cred (cc_memory.c:640-656): every match is deleted
+        // and no match is not an error.
+        self.creds
+            .retain(|c| !super::creds_match_request(flags, m, c));
+        Ok(())
     }
 
     fn retrieve(
