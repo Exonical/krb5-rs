@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     container: rockylinux:9
     steps:
-      - run: dnf -y install rpm-build systemd-rpm-macros git gcc tar
+      - run: dnf -y install bash curl rpm-build systemd-rpm-macros git gcc tar findutils
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build the RPMs
