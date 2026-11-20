@@ -61,6 +61,7 @@ jobs:
           rpm -qlp target/rpmbuild/RPMS/*/krb5-server-rs-*.rpm | grep -qx /usr/sbin/krb5kdc
           rpm -qlp target/rpmbuild/RPMS/*/krb5-workstation-rs-*.rpm | grep -qx /usr/bin/kinit
           rpm -qlp target/rpmbuild/RPMS/*/krb5-kdcproxy-rs-*.rpm | grep -qx /usr/sbin/kdcproxy
+          rpm -qlp target/rpmbuild/RPMS/*/krb5-server-rs-*.rpm | grep -qx /usr/sbin/kadmin.local
       - uses: actions/upload-artifact@v4
         with:
           name: rpms
