@@ -65,9 +65,6 @@ mod metrics;
 #[path = "kdc/plugins.rs"]
 mod plugins;
 
-/// MIT's default kdc.conf location (`DEFAULT_KDC_PROFILE`).
-const DEFAULT_KDC_PROFILE: &str = "/usr/local/var/krb5kdc/kdc.conf";
-
 #[derive(Parser)]
 #[command(
     name = "krb5-rs-kdc",
@@ -933,7 +930,7 @@ async fn config_mode(
     let conf = cli
         .config
         .clone()
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_KDC_PROFILE));
+        .unwrap_or_else(krb5_rs::kdc::default_kdc_profile);
     let kdc_conf =
         Profile::load(&conf).map_err(|e| io_err(format!("reading {}: {e}", conf.display())))?;
     let krb5 = match &cli.krb5_config {
@@ -1098,7 +1095,7 @@ fn load_plugins(cli: &Cli, krb5_conf_explicit: bool) -> std::io::Result<plugins:
     let conf = cli
         .config
         .clone()
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_KDC_PROFILE));
+        .unwrap_or_else(krb5_rs::kdc::default_kdc_profile);
     if let Some(p) = &cli.krb5_config {
         if krb5_conf_explicit || p.exists() {
             profiles.push(
@@ -1523,7 +1520,7 @@ async fn daemon_main(cli: Cli, st: Startup, krb5_conf_explicit: bool, config_exp
     let conf = cli
         .config
         .clone()
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_KDC_PROFILE));
+        .unwrap_or_else(krb5_rs::kdc::default_kdc_profile);
     if cli.keytab.is_some() {
         profiles.extend(Profile::load(&conf).ok());
     } else {

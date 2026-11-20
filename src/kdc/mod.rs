@@ -21,6 +21,7 @@ mod as_req;
 mod authdata;
 mod cammac;
 mod config;
+pub use config::{default_kdc_profile, KDC_DIR};
 mod cookie;
 mod db;
 mod error;

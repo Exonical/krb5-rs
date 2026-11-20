@@ -26,7 +26,7 @@ use krb5_rs_kdb_lmdb::LmdbStore;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
-const KDC_DIR: &str = "/usr/local/var/krb5kdc";
+use krb5_rs::kdc::KDC_DIR;
 const DEFAULT_KEYTAB: &str = "/etc/krb5.keytab";
 const CLOCKSKEW: Duration = Duration::from_secs(300);
 const IPROP_PROG: u32 = 100_423;

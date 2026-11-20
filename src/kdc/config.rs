@@ -14,7 +14,17 @@ use crate::types::KerberosTime;
 const DEFAULT_SUPPORTED_ENCTYPES: &str =
     "aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal";
 /// MIT `KDC_DIR` (osconf.hin:72, the default `LOCALSTATEDIR` is `/usr/local/var`).
-const KDC_DIR: &str = "/usr/local/var/krb5kdc";
+/// Packagers set `KRB5RS_KDC_DIR` at build time, as distributions configure
+/// MIT with `--localstatedir` (RHEL: `/var/kerberos/krb5kdc`).
+pub const KDC_DIR: &str = match option_env!("KRB5RS_KDC_DIR") {
+    Some(dir) => dir,
+    None => "/usr/local/var/krb5kdc",
+};
+
+/// MIT `DEFAULT_KDC_PROFILE` (osconf.hin): `KDC_DIR/kdc.conf`.
+pub fn default_kdc_profile() -> PathBuf {
+    std::path::Path::new(KDC_DIR).join("kdc.conf")
+}
 /// MIT `DEFAULT_KDC_PORTLIST` (osconf.hin:99).
 const DEFAULT_KDC_PORTLIST: &str = "88";
 /// MIT `KRB5_DEFAULT_PORT`.
@@ -774,11 +784,11 @@ default_principal_flags = +preauth\n    }\n";
         assert_eq!(cfg.kdc.supported_enctypes, vec![18, 17, 20, 19]);
         assert_eq!(
             cfg.database_name,
-            PathBuf::from("/usr/local/var/krb5kdc/principal")
+            PathBuf::from(format!("{KDC_DIR}/principal"))
         );
         assert_eq!(
             cfg.key_stash_file,
-            PathBuf::from("/usr/local/var/krb5kdc/.k5.R")
+            PathBuf::from(format!("{KDC_DIR}/.k5.R"))
         );
         assert_eq!(cfg.supported_keysalts.len(), 2);
     }

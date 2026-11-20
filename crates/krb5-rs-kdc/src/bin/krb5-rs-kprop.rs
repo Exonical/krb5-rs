@@ -15,7 +15,6 @@ use krb5_rs::types::{EncryptionKey, PrincipalName};
 use krb5_rs::Krb5Error;
 use tokio::net::TcpStream;
 
-const DEFAULT_FILE: &str = "/usr/local/var/krb5kdc/replica_datatrans";
 const DEFAULT_KEYTAB: &str = "/etc/krb5.keytab";
 const CLOCKSKEW: Duration = Duration::from_secs(300);
 
@@ -53,7 +52,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
 fn parse_args() -> Args {
     let mut args = Args {
         realm: None,
-        file: PathBuf::from(DEFAULT_FILE),
+        file: std::path::Path::new(krb5_rs::kdc::KDC_DIR).join("replica_datatrans"),
         debug: false,
         port: KPROP_SERVICE.to_string(),
         keytab: None,
