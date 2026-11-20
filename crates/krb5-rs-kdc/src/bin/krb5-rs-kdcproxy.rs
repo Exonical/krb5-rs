@@ -27,6 +27,8 @@ mod config;
 const MAX_LENGTH: usize = 128 * 1024;
 const MAX_HEADER: usize = 16 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on one forwarded exchange, across every server tried.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "krb5-rs-kdcproxy", version, about = "MS-KKDCP KDC proxy")]
@@ -145,31 +147,37 @@ fn entries(uris: &[String]) -> Vec<ServerEntry> {
 impl Proxy {
     /// `Application.__call__` after the request is read.
     async fn handle(&self, method: &str, body: Result<Vec<u8>, Response>) -> Response {
-        if method != "POST" {
-            return text(405, format!("Method not allowed ({method})."));
-        }
         let body = match body {
             Ok(b) => b,
             Err(r) => return r,
         };
+        if method != "POST" {
+            return text(405, format!("Method not allowed ({method})."));
+        }
         let req = match codec::decode(&body) {
             Ok(r) => r,
             Err(e) => return text(400, e),
         };
         let kpasswd = matches!(req.kind, codec::Kind::Kpasswd(_));
         let uris = match &req.realm {
-            Some(realm) => self.config.lookup(
-                realm,
-                kpasswd,
-                self.dns.as_ref().map(|d| d as &dyn DnsResolver),
-            ),
+            // HickoryResolver blocks while it resolves.
+            Some(realm) => tokio::task::block_in_place(|| {
+                self.config.lookup(
+                    realm,
+                    kpasswd,
+                    self.dns.as_ref().map(|d| d as &dyn DnsResolver),
+                )
+            }),
             None => return text(400, "Request has no target-domain."),
         };
         let servers = entries(&uris);
         if servers.is_empty() {
             return text(503, format!("Can't find remote ({req})."));
         }
-        let cfg = SendtoConfig::default();
+        let cfg = SendtoConfig {
+            request_timeout: Some(FORWARD_TIMEOUT),
+            ..SendtoConfig::default()
+        };
         match sendto(
             &servers,
             &req.message[4..],
@@ -377,7 +385,7 @@ mod tests {
         out
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn persistent_connection() {
         let req = "POST /KdcProxy HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
         let out = exchange(format!("{req}{req}").as_bytes()).await;
@@ -385,7 +393,7 @@ mod tests {
         assert!(out.contains("Connection: keep-alive"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn status_codes() {
         let out = exchange(b"GET /KdcProxy HTTP/1.1\r\n\r\nPOST / HTTP/1.1\r\n\r\n").await;
         assert!(out.starts_with("HTTP/1.1 405 "), "{out}");
