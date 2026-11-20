@@ -16,13 +16,10 @@ under MIT's names. A source build (`cargo build --release`) names them
 |---|---|
 | `krb5kdc` | `krb5-rs-kdc` |
 | `kadmind` | `krb5-rs-kadmind` |
+| `kadmin.local` | `krb5-rs-kadmin-local` |
 | `kdb5_util` | `krb5-rs-kdb` |
 | `kprop`, `kpropd`, `kproplog` | `krb5-rs-kprop`, `krb5-rs-kpropd`, `krb5-rs-kproplog` |
 | `kinit`, `klist`, `kadmin` | `krb5-rs-kinit`, `krb5-rs-klist`, `krb5-rs-kadmin` |
-
-There is no `kadmin.local`. `kdb5_util` also takes its principal and
-policy commands (`addprinc`, `ktadd`, `listprincs`, `addpol` and so on),
-and opens the database directly, as `kadmin.local` does.
 
 The RPMs keep the KDC files in `/var/kerberos/krb5kdc`, as RHEL does. A
 source build reads `/usr/local/var/krb5kdc/kdc.conf`, MIT's default. Either
@@ -133,12 +130,12 @@ krb5.conf paths.
    The file uses MIT's format, including permission letters such as
    `admcil`, target principals and restrictions.
 
-6. Create the first admin principal. `kdb5_util addprinc` opens the
-   database directly, like `kadmin.local`, and reads the password from
-   standard input:
+6. Create the first admin principal. `kadmin.local` opens the database
+   directly with the stash file, so it needs neither kadmind nor
+   credentials:
 
    ```
-   # kdb5_util addprinc admin/admin
+   # kadmin.local -q "addprinc admin/admin"
    ```
 
 7. Start the KDC and kadmind, and enable them at boot:

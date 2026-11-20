@@ -150,10 +150,22 @@ fn is_fallback(e: &Error) -> bool {
 
 /// An open kadm5 connection (`kadm5_server_handle_t`).
 pub struct Handle {
-    rt: Runtime,
-    rpc: GssClient<TcpStream>,
+    conn: Conn,
     /// The negotiated `KADM5_API_VERSION_*`.
     pub api: u32,
+}
+
+/// A local call: kadm5 procedure and XDR arguments to the XDR reply.
+pub type LocalCall = Box<dyn FnMut(u32, &[u8]) -> Result<Vec<u8>, Error>>;
+
+enum Conn {
+    /// RPCSEC_GSS to kadmind (`kadmin`).
+    Remote {
+        rt: Runtime,
+        rpc: Box<GssClient<TcpStream>>,
+    },
+    /// The server-side library in-process (`kadmin.local`).
+    Local(LocalCall),
 }
 
 /// The parameters `kadm5_init` needs.
@@ -176,11 +188,26 @@ impl Handle {
     pub fn init(p: &InitParams<'_>, auth: &Auth) -> Result<Handle, Error> {
         let rt = crate::runtime();
         let rpc = rt.block_on(Self::connect(p, auth))?;
-        let mut h = Handle {
-            rt,
-            rpc,
+        Self::negotiate(Handle {
+            conn: Conn::Remote {
+                rt,
+                rpc: Box::new(rpc),
+            },
             api: API_VERSION_4,
-        };
+        })
+    }
+
+    /// A handle on the server-side kadm5 library, as `kadmin.local` links
+    /// libkadm5srv: every call goes to `call` instead of kadmind.
+    pub fn local(call: LocalCall) -> Result<Handle, Error> {
+        Self::negotiate(Handle {
+            conn: Conn::Local(call),
+            api: API_VERSION_4,
+        })
+    }
+
+    /// The `INIT` API version negotiation (client_init.c:300-330).
+    fn negotiate(mut h: Handle) -> Result<Handle, Error> {
         loop {
             let reply = h.call(proc_::INIT, &ReadArgs::Api(h.api).encode())?;
             match h.check(decode_generic_ret(&reply)) {
@@ -306,9 +333,12 @@ impl Handle {
     }
 
     fn call(&mut self, proc_: u32, args: &[u8]) -> Result<Vec<u8>, Error> {
-        self.rt
-            .block_on(self.rpc.call(proc_, args))
-            .map_err(|_| Error::Kadm5(code::RPC_ERROR))
+        match &mut self.conn {
+            Conn::Remote { rt, rpc } => rt
+                .block_on(rpc.call(proc_, args))
+                .map_err(|_| Error::Kadm5(code::RPC_ERROR)),
+            Conn::Local(call) => call(proc_, args),
+        }
     }
 
     fn check<T>(&self, r: Result<Ret<T>, XdrError>) -> Result<Option<T>, Error> {

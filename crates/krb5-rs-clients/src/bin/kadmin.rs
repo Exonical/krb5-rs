@@ -16,7 +16,7 @@ use krb5_rs::kdc::kdb::mit::TlData;
 use krb5_rs::kdc::PrincipalAttributes;
 use krb5_rs::keytab::KeytabEntry;
 use krb5_rs::profile::string_to_deltat;
-use krb5_rs::types::EncryptionKey;
+use krb5_rs::types::{EncryptionKey, PrincipalName};
 use krb5_rs_clients::kadm5::{Auth, Error, Handle, InitParams};
 use krb5_rs_clients::ss::{Exec, Request, Subsystem};
 use krb5_rs_clients::{now, Getopt};
@@ -246,8 +246,31 @@ fn os_user() -> Option<String> {
         .find_map(|v| std::env::var(v).ok().filter(|u| !u.is_empty()))
 }
 
-/// `kadmin_startup` and `main` (kadmin.c:288-610, ss_wrapper.c).
+/// What `kadmin.local` hands its server-side library (`kadm5_init` with
+/// the local args).
+#[allow(dead_code)]
+pub(crate) struct LocalParams<'a> {
+    pub realm: &'a str,
+    /// `-x` and `-d` (as `dbname=`).
+    pub db_args: &'a [String],
+    /// `-m`: the master key password read from the keyboard.
+    pub master_password: Option<&'a str>,
+    /// `-e`.
+    pub keysalts: Option<&'a str>,
+    pub client: (&'a PrincipalName, &'a str),
+}
+
+/// `kadmin.local`'s `kadm5_init`: a handle on the KDB itself.
+pub(crate) type LocalInit = dyn Fn(&LocalParams<'_>) -> Result<Handle, String>;
+
+#[allow(dead_code)]
 fn main() {
+    run(None)
+}
+
+/// `kadmin_startup` and `main` (kadmin.c:288-610, ss_wrapper.c); `local`
+/// is set in `kadmin.local`.
+pub(crate) fn run(local: Option<&LocalInit>) {
     krb5_rs_clients::set_extended_com_err();
     let argv: Vec<String> = std::env::args().collect();
     let whoami = argv
@@ -262,10 +285,22 @@ fn main() {
     let (mut realm, mut princstr, mut ccache_name, mut keytab_name) = (None, None, None, None);
     let (mut password, mut query, mut server) = (None, None, None);
     let (mut use_keytab, mut use_anon, mut old_auth) = (false, false, false);
+    let (mut db_args, mut mkey_from_kbd, mut keysalts) = (Vec::new(), false, None);
     for (c, v) in &mut g {
         match c {
-            // Local-mode options; the client library ignores them.
-            'x' | 'd' | 'm' | 'e' | 'N' => {}
+            // Local args; the client library ignores them.
+            'x' => db_args.extend(v),
+            'd' => db_args.extend(v.map(|d| format!("dbname={d}"))),
+            'm' => mkey_from_kbd = true,
+            'e' => {
+                if let Some(e) = &v {
+                    if let Err(err) = parse_keysalt_list(e) {
+                        die(&whoami, err, &format!("while parsing keysalts {e}"));
+                    }
+                }
+                keysalts = v;
+            }
+            'N' => {}
             'r' => realm = v,
             'p' => princstr = v,
             'c' => ccache_name = v,
@@ -344,59 +379,79 @@ fn main() {
     let Some((cname, crealm)) = parse_principal(&princstr, Some(&def_realm)) else {
         die(&whoami, MALFORMED, "while parsing principal name")
     };
-    let auth = if ccache_name.is_some() {
-        if !script_mode {
-            println!("Authenticating as principal {princstr} with existing credentials.")
-        };
-        Auth::Ccache(cc)
-    } else if use_anon {
-        if !script_mode {
-            println!("Authenticating as principal {princstr} with password; anonymous requested.")
-        };
-        Auth::Anonymous
-    } else if use_keytab {
-        match &keytab_name {
-            Some(k) => {
-                if !script_mode {
-                    println!("Authenticating as principal {princstr} with keytab {k}.")
-                }
-            }
-            None => {
-                if !script_mode {
-                    println!("Authenticating as principal {princstr} with default keytab.")
-                }
-            }
-        }
-        Auth::Keytab(keytab_name.clone())
-    } else {
+    let init_ctx = format!("while initializing {whoami} interface");
+    let h = if let Some(local) = local {
         if !script_mode {
             println!("Authenticating as principal {princstr} with password.")
         };
-        let pw = match password {
-            Some(p) => p,
-            None => krb5_rs_clients::prompt_password(&format!("Password for {princstr}"))
-                .unwrap_or_else(|e| {
-                    die(
-                        &whoami,
-                        e,
-                        &format!("while initializing {whoami} interface"),
-                    )
-                }),
+        let mkey = mkey_from_kbd.then(|| {
+            krb5_rs_clients::prompt_password("Enter KDC database master key")
+                .unwrap_or_else(|e| die(&whoami, e, &init_ctx))
+        });
+        local(&LocalParams {
+            realm: &def_realm,
+            db_args: &db_args,
+            master_password: mkey.as_deref(),
+            keysalts: keysalts.as_deref(),
+            client: (&cname, &crealm),
+        })
+        .unwrap_or_else(|e| die(&whoami, e, &init_ctx))
+    } else {
+        let auth = if ccache_name.is_some() {
+            if !script_mode {
+                println!("Authenticating as principal {princstr} with existing credentials.")
+            };
+            Auth::Ccache(cc)
+        } else if use_anon {
+            if !script_mode {
+                println!(
+                    "Authenticating as principal {princstr} with password; anonymous requested."
+                )
+            };
+            Auth::Anonymous
+        } else if use_keytab {
+            match &keytab_name {
+                Some(k) => {
+                    if !script_mode {
+                        println!("Authenticating as principal {princstr} with keytab {k}.")
+                    }
+                }
+                None => {
+                    if !script_mode {
+                        println!("Authenticating as principal {princstr} with default keytab.")
+                    }
+                }
+            }
+            Auth::Keytab(keytab_name.clone())
+        } else {
+            if !script_mode {
+                println!("Authenticating as principal {princstr} with password.")
+            };
+            let pw = match password {
+                Some(p) => p,
+                None => krb5_rs_clients::prompt_password(&format!("Password for {princstr}"))
+                    .unwrap_or_else(|e| {
+                        die(
+                            &whoami,
+                            e,
+                            &format!("while initializing {whoami} interface"),
+                        )
+                    }),
+            };
+            Auth::Password(pw)
         };
-        Auth::Password(pw)
+        let (host, port) =
+            krb5_rs_clients::kadm5::admin_server(&profile, &def_realm, server.as_deref())
+                .unwrap_or_else(|e| die(&whoami, e, &init_ctx));
+        let params = InitParams {
+            profile: &profile,
+            client: (&cname, &crealm),
+            realm: &def_realm,
+            server: (&host, port),
+            service: old_auth.then_some("kadmin/admin"),
+        };
+        Handle::init(&params, &auth).unwrap_or_else(|e| die(&whoami, e, &init_ctx))
     };
-    let init_ctx = format!("while initializing {whoami} interface");
-    let (host, port) =
-        krb5_rs_clients::kadm5::admin_server(&profile, &def_realm, server.as_deref())
-            .unwrap_or_else(|e| die(&whoami, e, &init_ctx));
-    let params = InitParams {
-        profile: &profile,
-        client: (&cname, &crealm),
-        realm: &def_realm,
-        server: (&host, port),
-        service: old_auth.then_some("kadmin/admin"),
-    };
-    let h = Handle::init(&params, &auth).unwrap_or_else(|e| die(&whoami, e, &init_ctx));
     let mut st = Kadmin {
         h,
         whoami: whoami.clone(),

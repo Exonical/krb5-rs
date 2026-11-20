@@ -29,7 +29,7 @@ Conflicts:      krb5-server
 %{?systemd_requires}
 
 %description -n krb5-server-rs
-krb5kdc, kadmind, kdb5_util, kprop, kpropd and kproplog from krb5-rs, under
+krb5kdc, kadmind, kadmin.local, kdb5_util, kprop, kpropd and kproplog from krb5-rs, under
 MIT krb5's names, with systemd units like RHEL's krb5-server.
 
 %package -n krb5-server-ldap-rs
@@ -65,6 +65,7 @@ for p in kinit klist kdestroy kvno kswitch kpasswd kadmin ktutil kcpytkt kdeltkt
 done
 install -Dpm0755 $b/krb5-rs-kdc %{buildroot}%{_sbindir}/krb5kdc
 install -Dpm0755 $b/krb5-rs-kadmind %{buildroot}%{_sbindir}/kadmind
+install -Dpm0755 $b/krb5-rs-kadmin-local %{buildroot}%{_sbindir}/kadmin.local
 install -Dpm0755 $b/krb5-rs-kdb %{buildroot}%{_sbindir}/kdb5_util
 install -Dpm0755 $b/krb5-rs-kprop %{buildroot}%{_sbindir}/kprop
 install -Dpm0755 $b/krb5-rs-kpropd %{buildroot}%{_sbindir}/kpropd
@@ -124,6 +125,7 @@ install -pm0600 $r/kdc.conf $r/kadm5.acl %{buildroot}%{_localstatedir}/kerberos/
 %license LICENSE*
 %{_sbindir}/krb5kdc
 %{_sbindir}/kadmind
+%{_sbindir}/kadmin.local
 %{_sbindir}/kdb5_util
 %{_sbindir}/kprop
 %{_sbindir}/kpropd

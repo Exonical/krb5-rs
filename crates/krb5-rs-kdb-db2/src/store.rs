@@ -646,13 +646,23 @@ impl Db2Store {
     pub fn create_raw(&self, raw: &MitEntry) -> Result<(), StoreError> {
         let (key, _) = encode_entry(raw)?;
         let held = self.lock_ulog()?;
-        {
+        let replaced = {
             let mut g = self.write()?;
-            if get_entry(&mut g, &key)?.is_some() {
-                return Err(exists_error(&key));
-            }
+            let replaced = match get_entry(&mut g, &key)? {
+                Some(old) if resolves(|k| get_entry(&mut g, k), old.clone())? => {
+                    return Err(exists_error(&key));
+                }
+                old => old.is_some(),
+            };
             put_entry(&mut g, raw)?;
             g.commit().map_err(|e| io_err("writing principal", e))?;
+            replaced
+        };
+        // Replicas merge an update into the entry they hold, so delete the
+        // replaced alias there first.
+        if replaced {
+            let name = unparse_name(&raw.principal, &raw.realm);
+            self.log_held(held.as_ref(), Update::deletion(name))?;
         }
         self.log_held(held.as_ref(), update_from_entry(None, raw))
     }
@@ -666,21 +676,30 @@ impl Db2Store {
         let src_name = unparse_name(name, realm);
         let src = db_key(&src_name);
         let held = self.lock_ulog()?;
-        let renamed = {
+        let (renamed, replaced) = {
             let mut g = self.write()?;
             let entry = get_entry(&mut g, &src)?.ok_or_else(|| {
                 StoreError::not_found(format!("Principal {name}@{realm} does not exist"))
             })?;
             let renamed = f(entry, &keys)?;
             let (dest, _) = encode_entry(&renamed)?;
-            if get_entry(&mut g, &dest)?.is_some() {
-                return Err(exists_error(&dest));
-            }
+            let replaced = match get_entry(&mut g, &dest)? {
+                Some(old) if resolves(|k| get_entry(&mut g, k), old.clone())? => {
+                    return Err(exists_error(&dest));
+                }
+                old => old.is_some(),
+            };
             put_entry(&mut g, &renamed)?;
             delete_entry(&mut g, &src)?;
             g.commit().map_err(|e| io_err("writing principal", e))?;
-            renamed
+            (renamed, replaced)
         };
+        // Replicas merge an update into the entry they hold, so delete the
+        // replaced alias there first.
+        if replaced {
+            let name = unparse_name(&renamed.principal, &renamed.realm);
+            self.log_held(held.as_ref(), Update::deletion(name))?;
+        }
         self.log_held(held.as_ref(), update_from_entry(None, &renamed))?;
         self.log_held(held.as_ref(), Update::deletion(src_name))
     }
@@ -1279,4 +1298,24 @@ impl AdminStore for CallerStore {
     ) -> impl std::future::Future<Output = Result<Vec<Policy>, StoreError>> + Send {
         self.store.list_policies()
     }
+}
+
+/// Whether `e` is an entry or an alias that resolves to one. A
+/// non-resolving alias does not block a new principal or a rename onto its
+/// name, as MIT's `krb5_db_get_principal` does not find it.
+fn resolves(
+    mut get: impl FnMut(&[u8]) -> Result<Option<MitEntry>, StoreError>,
+    mut e: MitEntry,
+) -> Result<bool, StoreError> {
+    use krb5_rs::kdc::kdb::mit::{alias_target, MAX_ALIAS_DEPTH};
+    for _ in 0..=MAX_ALIAS_DEPTH {
+        let Some((target, realm)) = alias_target(&e.tl_data)? else {
+            return Ok(true);
+        };
+        match get(&db_key(&unparse_name(&target, &realm)))? {
+            Some(next) => e = next,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
 }

@@ -199,6 +199,8 @@ const FLAG_TABLE: &[(&str, u32, bool)] = &[
     ("password_changing_service", 0x2000, false),
     ("pwchange_service", 0x2000, false),
     ("pwservice", 0x2000, false),
+    ("md5", 0x4000, false),
+    ("support_desmd5", 0x4000, false),
     ("ok_as_delegate", 0x10_0000, false),
     ("ok_to_auth_as_delegate", 0x20_0000, false),
     ("no_auth_data_required", 0x40_0000, false),
@@ -558,6 +560,18 @@ impl<S: AdminStore> AdminOps<S> {
             .entry
             .current_kvno()
             .ok_or_else(|| err("History entry contains no key data"))?;
+        // server_kdb.c kdb_get_hist_key: KADM5_BAD_HIST_KEY.
+        if record
+            .entry
+            .keys
+            .iter()
+            .any(|k| crate::crypto::find_etype(k.key.keytype).is_err())
+        {
+            return Err(err(super::kadm5::code::message(
+                super::kadm5::code::BAD_HIST_KEY,
+            ))
+            .with_code(super::kadm5::code::BAD_HIST_KEY));
+        }
         Ok((record.entry.keys.into_iter().map(|k| k.key).collect(), kvno))
     }
 
@@ -651,9 +665,17 @@ impl<S: AdminStore> AdminOps<S> {
         if let Some(pw) = password {
             self.passwd_check(pw, policy.as_ref(), name, realm)?;
         }
+        // svr_principal.c: KADM5_KEY_DATA with no password (`-nokey`)
+        // creates the principal with no keys.
+        let nokey = self
+            .request_mask
+            .is_some_and(|m| m & super::kadm5::mask::KEY_DATA != 0);
         let keys = match password {
-            Some(pw) => keys_from_password(name, realm, pw, 1, &self.keysalts),
-            None => random_keys(1, &self.etypes()),
+            _ if nokey && password.is_none() => Ok(Vec::new()),
+            Some(pw) => {
+                keys_from_password(name, realm, pw, 1, &self.policy_keysalts(policy.as_ref())?)
+            }
+            None => random_keys(1, &etypes_of(&self.policy_keysalts(policy.as_ref())?)),
         }
         .map_err(|e| err(e.to_string()))?;
         let mut entry = PrincipalEntry {
@@ -696,14 +718,29 @@ impl<S: AdminStore> AdminOps<S> {
         Ok(())
     }
 
-    fn etypes(&self) -> Vec<i32> {
-        let mut e: Vec<i32> = Vec::new();
-        for &(etype, _) in &self.keysalts {
-            if !e.contains(&etype) {
-                e.push(etype);
-            }
+    /// `apply_keysalt_policy` (svr_principal.c:128-230): the policy's
+    /// `allowed_keysalts` limit the requested tuples, keeping the policy's
+    /// order, and replace the realm defaults when none were requested.
+    fn policy_keysalts(&self, policy: Option<&Policy>) -> Result<Vec<(i32, SaltType)>, StoreError> {
+        let Some(allowed) = policy.and_then(|p| p.allowed_keysalts.as_deref()) else {
+            return Ok(self.keysalts.clone());
+        };
+        let bad = || err(code::message(code::BAD_KEYSALTS)).with_code(code::BAD_KEYSALTS);
+        let allowed = crate::crypto::parse_keysalt_list(allowed).map_err(|_| bad())?;
+        // A policy naming nothing usable must not leave a principal keyless.
+        if allowed.is_empty() {
+            return Err(bad());
         }
-        e
+        if self.requested_ks.is_empty() {
+            return Ok(allowed);
+        }
+        if self.keysalts.iter().any(|k| !allowed.contains(k)) {
+            return Err(bad());
+        }
+        Ok(allowed
+            .into_iter()
+            .filter(|k| self.keysalts.contains(k))
+            .collect())
     }
 
     /// `delprinc`.
@@ -714,6 +751,12 @@ impl<S: AdminStore> AdminOps<S> {
     ) -> Result<(), StoreError> {
         // svr_principal.c:520-549: no lookup first, so an alias whose
         // target is gone can still be deleted.
+        // svr_principal.c:532-534: deleting K/M is mostly unrecoverable.
+        if super::master::master_principal_named("K/M")
+            .is_ok_and(|m| m.name_string == name.name_string)
+        {
+            return Err(StoreError::rejected(PROTECT_PRINCIPAL).with_code(code::PROTECT_PRINCIPAL));
+        }
         let hooks = &self.modules.hooks;
         let princ = unparse(name, realm);
         hooks.remove(Stage::Precommit, &princ)?;
@@ -778,8 +821,8 @@ impl<S: AdminStore> AdminOps<S> {
         hooks.chpass(Stage::Precommit, &princ, keep_old > 0, &ks, password)?;
         let hook_password = password.map(str::to_owned);
 
-        let keysalts = self.keysalts.clone();
-        let mut etypes = self.etypes();
+        let keysalts = self.policy_keysalts(policy.as_ref())?;
+        let mut etypes = etypes_of(&keysalts);
         if history_target {
             etypes.truncate(1);
         }
@@ -1337,17 +1380,34 @@ pub fn attribute_names(attrs: PrincipalAttributes) -> String {
         (0x200, "REQUIRES_PWCHANGE"),
         (0x1000, "DISALLOW_SVR"),
         (0x2000, "PWCHANGE_SERVICE"),
+        (0x4000, "SUPPORT_DESMD5"),
+        (0x8000, "NEW_PRINC"),
         (0x10_0000, "OK_AS_DELEGATE"),
         (0x20_0000, "OK_TO_AUTH_AS_DELEGATE"),
         (0x40_0000, "NO_AUTH_DATA_REQUIRED"),
         (0x80_0000, "LOCKDOWN_KEYS"),
     ];
-    NAMES
-        .iter()
-        .filter(|(b, _)| attrs.bits() & b != 0)
-        .map(|(_, n)| *n)
+    // Bits without a name print as hex (str_conv.c:205-216).
+    (0..32)
+        .map(|n| 1u32 << n)
+        .filter(|b| attrs.bits() & b != 0)
+        .map(|b| match NAMES.iter().find(|(v, _)| *v == b) {
+            Some((_, n)) => (*n).to_string(),
+            None => format!("0x{b:08x}"),
+        })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The distinct enctypes of `keysalts`, in order.
+fn etypes_of(keysalts: &[(i32, SaltType)]) -> Vec<i32> {
+    let mut e: Vec<i32> = Vec::new();
+    for &(etype, _) in keysalts {
+        if !e.contains(&etype) {
+            e.push(etype);
+        }
+    }
+    e
 }
 
 #[cfg(test)]
