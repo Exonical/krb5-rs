@@ -74,19 +74,27 @@ The examples use primary `kdc1.example.com` and secondary
 
    Listing both KDCs lets you swap roles later without editing the file.
 
-5. On the secondary, start `kpropd` and the KDC, and open the kprop port:
+5. On the secondary, let the KDC start before it has a database. Until
+   its first propagation the secondary has none, so set this in
+   `/etc/sysconfig/krb5kdc`:
+
+   ```
+   KRB5KDC_ARGS=--wait-for-database
+   ```
+
+   The KDC then keeps retrying until the database arrives instead of
+   exiting.
+
+6. On the secondary, start `kpropd` and the KDC, and open the Kerberos and
+   kprop ports:
 
    ```
    # systemctl enable --now kprop krb5kdc
-   # firewall-cmd --permanent --add-port=754/tcp
+   # firewall-cmd --permanent --add-service=kerberos --add-port=754/tcp
    # firewall-cmd --reload
    ```
 
-   Until it gets its first copy, the secondary has no database. The
-   `krb5kdc` unit passes `--wait-for-database`, so the KDC keeps retrying
-   until the database arrives instead of exiting.
-
-6. Do a first full propagation from the primary:
+7. Do a first full propagation from the primary:
 
    ```
    # kdb5_util dump /var/kerberos/krb5kdc/replica_datatrans
@@ -94,7 +102,7 @@ The examples use primary `kdc1.example.com` and secondary
    Database propagation to kdc2.example.com: SUCCEEDED
    ```
 
-7. Check the secondary. Put only `kdc2` in a test krb5.conf and get a
+8. Check the secondary. Put only `kdc2` in a test krb5.conf and get a
    ticket:
 
    ```
@@ -163,7 +171,6 @@ above isn't needed.
    ```
 
    ```
-   # systemctl restart kadmin
    # firewall-cmd --permanent --add-port=2121/tcp
    # firewall-cmd --reload
    ```
@@ -171,15 +178,28 @@ above isn't needed.
    `iprop_master_ulogsize` is how many changes the update log keeps. A
    secondary that falls further behind gets a full dump instead.
 
-2. On the primary, create the `kiprop` principal for each secondary, and
-   add it to `kadm5.acl` with the `p` (propagate) permission:
+2. On the primary, create a `kiprop` principal for the primary itself and
+   one for each secondary. Secondaries request tickets for the primary's
+   `kiprop` principal. kadmind reads that key from the database, like
+   MIT's `KDB:` keytab, so it needs no keytab entry:
 
    ```
+   # kadmin -p admin/admin -q "addprinc -randkey kiprop/kdc1.example.com"
    # kadmin -p admin/admin -q "addprinc -randkey kiprop/kdc2.example.com"
    ```
 
+   Give each secondary's `kiprop` principal the `p` (propagate)
+   permission in `kadm5.acl`:
+
    ```
    kiprop/kdc2.example.com@EXAMPLE.COM    p
+   ```
+
+   Then restart kadmind, which reads `kdc.conf` and `kadm5.acl` only at
+   startup:
+
+   ```
+   # systemctl restart kadmin
    ```
 
 3. On the secondary, add the same `iprop_enable` and `iprop_port` settings
@@ -226,7 +246,6 @@ If the primary is lost:
 
 ## Differences from MIT
 
-- The `krb5kdc` systemd unit uses `--wait-for-database` on a secondary
-  (step 5). MIT's KDC exits if the database is missing.
+- A secondary's KDC uses `--wait-for-database` (step 5). MIT's KDC exits if the database is missing.
 - With `db_library = krb5-rs-cockroach`, every KDC reads one replicated
   CockroachDB or Turso database, so kprop and iprop aren't needed.
