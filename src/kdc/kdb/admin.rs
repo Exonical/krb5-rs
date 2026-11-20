@@ -727,6 +727,10 @@ impl<S: AdminStore> AdminOps<S> {
         };
         let bad = || err(code::message(code::BAD_KEYSALTS)).with_code(code::BAD_KEYSALTS);
         let allowed = crate::crypto::parse_keysalt_list(allowed).map_err(|_| bad())?;
+        // A policy naming nothing usable must not leave a principal keyless.
+        if allowed.is_empty() {
+            return Err(bad());
+        }
         if self.requested_ks.is_empty() {
             return Ok(allowed);
         }
