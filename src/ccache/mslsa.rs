@@ -798,6 +798,17 @@ mod imp {
         name.map(|(n, r)| unparse_name(n, r)).unwrap_or_default()
     }
 
+    fn purge_name(principal: Option<&(PrincipalName, String)>) -> (String, &str) {
+        principal.map_or_else(
+            || (String::new(), ""),
+            |(name, realm)| {
+                let mut name = unparse_name(name, "");
+                name.pop();
+                (name, realm.as_str())
+            },
+        )
+    }
+
     impl Ccache for MslsaCcache {
         /// `krb5_lcc_initialize`: purge the client's tickets.
         fn initialize(&mut self, client: &PrincipalName, realm: &str) -> Result<(), CcError> {
@@ -854,10 +865,8 @@ mod imp {
 
         /// `krb5_lcc_remove_cred` (`PurgeTicketEx`).
         fn remove_cred(&mut self, flags: MatchFlags, m: &MatchCred) -> Result<(), CcError> {
-            let client = unparse(m.client.as_ref());
-            let server = unparse(m.server.as_ref());
-            let crealm = m.client.as_ref().map_or("", |(_, r)| r.as_str());
-            let srealm = m.server.as_ref().map_or("", |(_, r)| r.as_str());
+            let (client, crealm) = purge_name(m.client.as_ref());
+            let (server, srealm) = purge_name(m.server.as_ref());
             if self
                 .lsa
                 .purge_ex([&client, crealm, &server, srealm], m.etype, flags.bits())

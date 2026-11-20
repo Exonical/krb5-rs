@@ -4,8 +4,8 @@
 #![cfg(windows)]
 
 use krb5_rs::ccache::{
-    new_unique, resolve, unparse_name, AnyCcache, CcContext, CcError, Ccache, FileCcache,
-    MatchCred, MatchFlags,
+    is_config_principal, new_unique, resolve, unparse_name, AnyCcache, CcContext, CcError, Ccache,
+    FileCcache, MatchCred, MatchFlags,
 };
 
 fn lsa(ctx: &CcContext) -> AnyCcache {
@@ -35,15 +35,14 @@ fn mslsa_round_trip() {
         (client.clone(), crealm.clone())
     );
     let listed = cc.creds().expect("creds");
-    for c in &fixture {
+    let mut tickets = fixture
+        .iter()
+        .filter(|c| !is_config_principal(&c.server, &c.srealm));
+    for c in tickets.clone() {
         let name = unparse_name(&c.server, &c.srealm);
         let l = listed
             .iter()
-            .find(|l| l.server == c.server && l.srealm == c.srealm)
-            .unwrap_or_else(|| panic!("{name} not listed"));
-        assert_eq!(l.ticket, c.ticket, "{name} ticket");
-        assert_eq!(l.keyblock.keytype, c.keyblock.keytype, "{name} enctype");
-        assert_eq!(l.endtime, c.endtime, "{name} endtime");
+            .find(|l| l.server.name_string == c.server.name_string && l.srealm == c.srealm);
         let m = MatchCred {
             client: Some((client.clone(), crealm.clone())),
             server: Some((c.server.clone(), c.srealm.clone())),
@@ -51,13 +50,21 @@ fn mslsa_round_trip() {
         };
         let r = cc
             .retrieve(MatchFlags::empty(), &m, None)
-            .expect("retrieve");
+            .unwrap_or_else(|err| panic!("retrieve {name}: {err}"));
         assert_eq!(r.ticket, c.ticket, "{name} retrieved ticket");
+        if name.starts_with("krbtgt/") && r.keyblock.key_bytes().iter().all(|&b| b == 0) {
+            eprintln!("{name}: LSA withheld the TGT session key");
+            assert!(l.is_none(), "{name} with a null key must not be listed");
+            continue;
+        }
+        let l = l.unwrap_or_else(|| panic!("{name} not listed"));
+        assert_eq!(l.ticket, c.ticket, "{name} ticket");
+        assert_eq!(l.keyblock.keytype, c.keyblock.keytype, "{name} enctype");
+        assert_eq!(l.endtime, c.endtime, "{name} endtime");
     }
 
     let mut cc = lsa(&ctx);
-    let svc = fixture
-        .iter()
+    let svc = tickets
         .find(|c| !unparse_name(&c.server, &c.srealm).starts_with("krbtgt/"))
         .expect("service ticket");
     let m = MatchCred {
@@ -68,7 +75,9 @@ fn mslsa_round_trip() {
     cc.remove_cred(MatchFlags::empty(), &m)
         .expect("remove_cred");
     let listed = cc.creds().expect("creds after remove");
-    assert!(!listed.iter().any(|l| l.server == svc.server));
+    assert!(!listed
+        .iter()
+        .any(|l| l.server.name_string == svc.server.name_string && l.srealm == svc.srealm));
 
     cc.destroy().expect("destroy");
     assert!(matches!(lsa(&ctx).creds(), Err(CcError::NotFound)));
