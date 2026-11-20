@@ -46,6 +46,14 @@ name = "krb5-rs-sclient"
 path = "src/bin/sclient.rs"
 
 [[bin]]
+name = "krb5-rs-sim-client"
+path = "src/bin/sim-client.rs"
+
+[[bin]]
+name = "krb5-rs-sim-server"
+path = "src/bin/sim-server.rs"
+
+[[bin]]
 name = "krb5-rs-sserver"
 path = "src/bin/sserver.rs"
 

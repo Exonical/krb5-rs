@@ -18,6 +18,8 @@ const GSSCLIENT: &str = env!("CARGO_BIN_EXE_krb5-rs-gss-client");
 const GSSSERVER: &str = env!("CARGO_BIN_EXE_krb5-rs-gss-server");
 const SCLIENT: &str = env!("CARGO_BIN_EXE_krb5-rs-sclient");
 const SSERVER: &str = env!("CARGO_BIN_EXE_krb5-rs-sserver");
+const SIMCLIENT: &str = env!("CARGO_BIN_EXE_krb5-rs-sim-client");
+const SIMSERVER: &str = env!("CARGO_BIN_EXE_krb5-rs-sim-server");
 const UUCLIENT: &str = env!("CARGO_BIN_EXE_krb5-rs-uu-client");
 const UUSERVER: &str = env!("CARGO_BIN_EXE_krb5-rs-uu-server");
 
@@ -476,5 +478,104 @@ fn user_to_user() {
     );
     assert!(stdout(&srv).contains(&format!(
         "uu-server: client principal is \"alice@{REALM}\"."
+    )));
+}
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .expect("free port")
+        .port()
+}
+
+/// Waits for a UDP sample server, failing instead of hanging if a datagram
+/// was lost.
+fn wait_udp_server(mut server: Child) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while server.try_wait().expect("try_wait").is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = server.kill();
+            let out = server.wait_with_output().expect("sim-server");
+            panic!("sim-server did not exit: {}{}", stdout(&out), stderr(&out));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    server.wait_with_output().expect("sim-server")
+}
+
+fn sim_exchange(message: Option<&str>) -> (std::process::Output, std::process::Output) {
+    let realm = Realm::start();
+    let port = free_udp_port().to_string();
+    let kt = format!("FILE:{}", realm.keytab().display());
+    let server = realm.server(SIMSERVER, &["-p", &port, "-S", &kt], "bob", "starting...");
+    let mut args = vec!["-p", port.as_str()];
+    if let Some(m) = message {
+        args.extend(["-m", m]);
+    }
+    args.push(&realm.host);
+    let out = realm
+        .run(SIMCLIENT, &args, "alice", None)
+        .expect("sim-client");
+    (out, wait_udp_server(server))
+}
+
+/// t_simple.py.
+#[test]
+fn simple_sample() {
+    let (out, srv) = sim_exchange(None);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Got credentials for sample."), "{text}");
+    assert!(text.contains("Sent checksummed message:"), "{text}");
+    assert!(text.contains("Sent encrypted message:"), "{text}");
+    assert!(srv.status.success(), "{}{}", stdout(&srv), stderr(&srv));
+    let text = stdout(&srv);
+    assert!(
+        text.contains(&format!("Got authentication info from alice@{REALM}\n")),
+        "{text}"
+    );
+    assert!(text.contains("Safe message is: 'hi there!'\n"), "{text}");
+    assert!(
+        text.contains("Decrypted message is: 'hi there!'\n"),
+        "{text}"
+    );
+}
+
+/// sim_client -m.
+#[test]
+fn simple_sample_message() {
+    let (out, srv) = sim_exchange(Some("other text"));
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let text = stdout(&srv);
+    assert!(text.contains("Safe message is: 'other text'\n"), "{text}");
+    assert!(
+        text.contains("Decrypted message is: 'other text'\n"),
+        "{text}"
+    );
+}
+
+/// sim_client without a host, and with a bad option.
+#[test]
+fn simple_sample_usage() {
+    let out = Command::new(SIMCLIENT).output().expect("sim-client");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "You must specify a hostname to contact.\n\nusage: {SIMCLIENT} [-p port] [-h host] [-m message] [-s service] [host]\n"
+        )
+    );
+    let out = Command::new(SIMCLIENT)
+        .arg("-x")
+        .output()
+        .expect("sim-client");
+    assert_eq!(out.status.code(), Some(1));
+    let out = Command::new(SIMSERVER)
+        .arg("-x")
+        .output()
+        .expect("sim-server");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).ends_with(&format!(
+        "usage: {SIMSERVER} [-p port] [-s service] [-S keytab]\n"
     )));
 }
