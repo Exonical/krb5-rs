@@ -820,6 +820,7 @@ mod imp {
     impl Ccache for MslsaCcache {
         /// `krb5_lcc_initialize`: purge the client's tickets.
         fn initialize(&mut self, client: &PrincipalName, realm: &str) -> Result<(), CcError> {
+            self.princ = Some((client.clone(), realm.to_string()));
             let creds = match self.all() {
                 Ok(c) => c,
                 Err(CcError::NotFound) => return Ok(()),
@@ -827,7 +828,7 @@ mod imp {
             };
             for c in creds
                 .iter()
-                .filter(|c| &c.client == client && c.crealm == realm)
+                .filter(|c| c.client.name_string == client.name_string && c.crealm == realm)
             {
                 let m = MatchCred {
                     client: Some((c.client.clone(), c.crealm.clone())),
@@ -837,7 +838,6 @@ mod imp {
                 };
                 let _ = self.remove_cred(MatchFlags::empty(), &m);
             }
-            self.princ = Some((client.clone(), realm.to_string()));
             Ok(())
         }
 
