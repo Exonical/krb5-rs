@@ -387,11 +387,22 @@ impl<S: PrincipalStore> Kdc<S> {
         now: DateTime<Utc>,
         peer: Option<std::net::SocketAddr>,
     ) -> Vec<u8> {
+        self.handle_logged(request, now, peer).await.0
+    }
+
+    /// [`Kdc::handle_from_at`], plus the issued ticket's authtime and
+    /// session enctype for the request log.
+    async fn handle_logged(
+        &self,
+        request: &[u8],
+        now: DateTime<Utc>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> (Vec<u8>, Option<(i64, i32)>) {
         match self.dispatch(request, now, peer).await {
-            Ok(reply) => reply,
+            Ok(issued) => issued,
             // A discarded request gets no reply (do_as_req.c:372).
-            Err(f) if f.err.code == securid_sam2::KDC_ERR_DISCARD => Vec::new(),
-            Err(f) => build_krb_error(&f.err, &f.ctx, now),
+            Err(f) if f.err.code == securid_sam2::KDC_ERR_DISCARD => (Vec::new(), None),
+            Err(f) => (build_krb_error(&f.err, &f.ctx, now), None),
         }
     }
 
@@ -463,14 +474,14 @@ impl<S: PrincipalStore> Kdc<S> {
         #[cfg(feature = "tokio")]
         let timer = std::sync::Arc::new(AtomicU64::new(0));
         #[cfg(feature = "tokio")]
-        let reply = STORE_TIME_NANOS
+        let (reply, issued) = STORE_TIME_NANOS
             .scope(
                 std::sync::Arc::clone(&timer),
-                self.handle_from_at(request, now, peer),
+                self.handle_logged(request, now, peer),
             )
             .await;
         #[cfg(not(feature = "tokio"))]
-        let reply = self.handle_from_at(request, now, peer).await;
+        let (reply, issued) = self.handle_logged(request, now, peer).await;
         if reply.is_empty() {
             // finish_dispatch_cache (dispatch.c:76-79) keeps the null entry
             // of a discarded request, so its retransmits are dropped too.
@@ -479,7 +490,11 @@ impl<S: PrincipalStore> Kdc<S> {
             pending.finish(&reply, self.now().timestamp());
         }
         let reply = datagram(reply);
-        let summary = RequestSummary::new(request, &reply, transport);
+        let mut summary = RequestSummary::new(request, &reply, transport);
+        if let (Outcome::Issued, Some((authtime, ses))) = (&summary.outcome, issued) {
+            summary.authtime = Some(authtime);
+            summary.session_etype = Some(ses);
+        }
         #[cfg(feature = "tokio")]
         let summary = {
             let mut summary = summary;
@@ -508,7 +523,7 @@ impl<S: PrincipalStore> Kdc<S> {
         request: &[u8],
         now: DateTime<Utc>,
         peer: Option<std::net::SocketAddr>,
-    ) -> Result<Vec<u8>, Box<Failure>> {
+    ) -> Result<(Vec<u8>, Option<(i64, i32)>), Box<Failure>> {
         let local = self.local_context();
         let fail = |err: KdcError, ctx: &ErrorContext| {
             Box::new(Failure {
@@ -554,7 +569,13 @@ impl<S: PrincipalStore> Kdc<S> {
         if let Some(st) = audit_seed {
             self.kau_request(is_as, &decoded, &ctx, st, &result);
         }
-        result.map_err(|err| Box::new(Failure { err, ctx }))
+        let issued = ctx
+            .audit_tkt
+            .as_ref()
+            .map(|t| (t.authtime.timestamp(), t.key.keytype));
+        result
+            .map(|reply| (reply, issued))
+            .map_err(|err| Box::new(Failure { err, ctx }))
     }
 
     /// `kau_as_req`, `kau_tgs_req`, `kau_s4u2self`, `kau_s4u2proxy` and
