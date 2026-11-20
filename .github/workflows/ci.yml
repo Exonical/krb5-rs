@@ -39,6 +39,27 @@ jobs:
       - name: Client tools build on Windows
         run: cargo clippy -p krb5-rs-clients --all-targets -- -D warnings
 
+  rpm:
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - run: dnf -y install rpm-build systemd-rpm-macros git gcc tar
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the RPMs
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          packaging/rpm/build.sh --define "cargo $(command -v cargo)"
+      - name: Check package contents
+        run: |
+          for p in target/rpmbuild/RPMS/*/*.rpm; do echo "== $p"; rpm -qlp "$p"; done
+          rpm -qlp target/rpmbuild/RPMS/*/krb5-server-rs-*.rpm | grep -qx /usr/sbin/krb5kdc
+          rpm -qlp target/rpmbuild/RPMS/*/krb5-workstation-rs-*.rpm | grep -qx /usr/bin/kinit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpms
+          path: target/rpmbuild/RPMS/*/*.rpm
+
   clippy:
     runs-on: ubuntu-latest
     steps:
