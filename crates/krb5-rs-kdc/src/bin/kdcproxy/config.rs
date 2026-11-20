@@ -20,13 +20,16 @@ type Ini = Vec<(String, HashMap<String, String>)>;
 pub fn parse_ini(text: &str, ini: &mut Ini) -> Result<(), String> {
     let mut cur: Option<usize> = None;
     let mut last_key: Option<String> = None;
+    let mut key_indent = 0;
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim_end();
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
             continue;
         }
-        if line.starts_with([' ', '\t']) {
+        let indent = line.len() - trimmed.len();
+        // configparser: only a line indented deeper than its key continues it.
+        if indent > key_indent {
             if let (Some(i), Some(k)) = (cur, &last_key) {
                 let v = ini[i].1.entry(k.clone()).or_default();
                 v.push('\n');
@@ -44,6 +47,7 @@ pub fn parse_ini(text: &str, ini: &mut Ini) -> Result<(), String> {
             };
             cur = Some(i);
             last_key = None;
+            key_indent = indent;
             continue;
         }
         let Some(i) = cur else {
@@ -56,6 +60,7 @@ pub fn parse_ini(text: &str, ini: &mut Ini) -> Result<(), String> {
         let value = trimmed[sep + 1..].trim().to_string();
         ini[i].1.insert(key.clone(), value);
         last_key = Some(key);
+        key_indent = indent;
     }
     Ok(())
 }
@@ -259,8 +264,12 @@ impl Config {
 
     /// MS-KKDCP 2.2.2: target-domain "is not case-sensitive".
     fn section(&self, name: &str) -> Option<&Section> {
-        get_ci(&self.sections, name)
-            .filter(|_| !name.eq_ignore_ascii_case(GLOBAL) || name == GLOBAL)
+        self.sections.get(name).or_else(|| {
+            self.sections
+                .iter()
+                .find(|(k, _)| k.as_str() != GLOBAL && k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+        })
     }
 
     /// Exact realm section, then `*suffix` sections from the longest.
@@ -430,6 +439,18 @@ mod tests {
     }
 
     #[test]
+    fn indented_keys() {
+        let mut ini = Vec::new();
+        parse_ini(
+            "[R]\n  kerberos = kerberos://a\n    kerberos://b\n  kpasswd = kpasswd://a\n",
+            &mut ini,
+        )
+        .unwrap();
+        assert_eq!(ini[0].1["kerberos"], "kerberos://a\nkerberos://b");
+        assert_eq!(ini[0].1["kpasswd"], "kpasswd://a");
+    }
+
+    #[test]
     fn realm_case_insensitive() {
         let mut ini = Vec::new();
         parse_ini(
@@ -447,6 +468,10 @@ mod tests {
             ["kerberos://dc1.contoso.com"]
         );
         assert!(!c.param(Some("eu.corp.com"), |s| s.use_dns, true));
+        let mut ini = Vec::new();
+        parse_ini("[GLOBAL]\nkerberos = kerberos://g\n", &mut ini).unwrap();
+        let c = Config::new(&ini, || Profile::parse("").unwrap()).unwrap();
+        assert_eq!(c.lookup("GLOBAL", false, None), ["kerberos://g"]);
     }
 
     #[test]
