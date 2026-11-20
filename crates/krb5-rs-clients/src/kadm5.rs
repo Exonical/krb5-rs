@@ -197,9 +197,11 @@ impl Handle {
 
     async fn connect(p: &InitParams<'_>, auth: &Auth) -> Result<GssClient<TcpStream>, Error> {
         let cred = Self::get_init_creds(p, auth).await?;
+        // connect_to_server (client_init.c:521-560): no address accepting
+        // the connection is KADM5_RPC_ERROR.
         let stream = TcpStream::connect(p.server)
             .await
-            .map_err(|e| Error::Msg(io_message(&e)))?;
+            .map_err(|_| Error::Kadm5(code::RPC_ERROR))?;
         let init = Krb5Initiator::new(cred, None, GssFlags::MUTUAL | GssFlags::REPLAY, None)
             .map_err(Error::Krb)?;
         let xid = std::time::SystemTime::now()

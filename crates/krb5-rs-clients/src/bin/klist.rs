@@ -181,7 +181,10 @@ fn do_keytab(o: &Opts, profile: &krb5_rs::profile::Profile, name: Option<&str>) 
     println!("Keytab name: {}", keytab_full_name(&ktname));
     // krb5_kt_start_seq_get on a missing FILE keytab is KRB5_KT_NOTFOUND.
     let full = keytab_full_name(&ktname);
-    if let Some(path) = full.strip_prefix("FILE:").or_else(|| full.strip_prefix("WRFILE:")) {
+    if let Some(path) = full
+        .strip_prefix("FILE:")
+        .or_else(|| full.strip_prefix("WRFILE:"))
+    {
         if !std::path::Path::new(path).exists() {
             fail(
                 format!("Key table file '{path}' not found"),

@@ -106,3 +106,61 @@ fn kvno_usage() {
     assert!(out.ends_with("[--cached-only] [--no-store] [--out-cache] service1 service2 ...\n"));
     assert_eq!(rc, 1);
 }
+
+const KCPYTKT: &str = env!("CARGO_BIN_EXE_krb5-rs-kcpytkt");
+const KDELTKT: &str = env!("CARGO_BIN_EXE_krb5-rs-kdeltkt");
+const K5SRVUTIL: &str = env!("CARGO_BIN_EXE_krb5-rs-k5srvutil");
+
+#[test]
+fn kcpytkt_kdeltkt_usage() {
+    let (out, rc) = run(KCPYTKT, &["FILE:/tmp/x"]);
+    assert!(out.starts_with("xusage: "), "{out}");
+    assert!(out
+        .ends_with(" [-c from_ccache] [-e etype] [-f flags] dest_ccache service1 service2 ...\n"));
+    assert_eq!(rc, 1);
+    let (out, rc) = run(KDELTKT, &["-h", "svc"]);
+    assert!(out.ends_with(" [-c ccache] [-e etype] [-f flags] service1 service2 ...\n"));
+    assert_eq!(rc, 1);
+    // kdeltkt.c: a missing cache fails reading its principal, without the
+    // extended "(filename: ...)" message; com_err with no hook ends in "\r\n".
+    let (out, rc) = run(KDELTKT, &["svc"]);
+    assert!(
+        out.ends_with(": No credentials cache found while getting client principal name\r\n"),
+        "{out}"
+    );
+    assert_eq!(rc, 1);
+    let (out, rc) = run(KDELTKT, &["-e", "bogus", "svc"]);
+    assert!(
+        out.ends_with(": Invalid argument while converting etype\r\n"),
+        "{out}"
+    );
+    assert_eq!(rc, 1);
+}
+
+#[test]
+fn k5srvutil_options() {
+    let usage = " [-i] [-f file] [-e keysalts] list|change|delete|delold\n";
+    let (out, rc) = run(K5SRVUTIL, &[]);
+    assert!(out.starts_with("Usage: ") && out.ends_with(usage), "{out}");
+    assert_eq!(rc, 0);
+    let (out, rc) = run(K5SRVUTIL, &["list", "change"]);
+    assert!(
+        out.starts_with("Only one command can be specified\nUsage: "),
+        "{out}"
+    );
+    assert_eq!(rc, 1);
+    let (out, rc) = run(K5SRVUTIL, &["-x"]);
+    assert!(out.starts_with("Illegal option: -x\nUsage: "), "{out}");
+    assert_eq!(rc, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let kt = dir.path().join("none.kt");
+    let kt = kt.to_str().unwrap();
+    let (out, rc) = run(K5SRVUTIL, &["-f", kt, "list"]);
+    assert_eq!(
+        out,
+        format!(
+            "Keytab name: FILE:{kt}\nkrb5-rs-klist: Key table file '{kt}' not found while starting keytab scan\n"
+        )
+    );
+    assert_eq!(rc, 1);
+}
