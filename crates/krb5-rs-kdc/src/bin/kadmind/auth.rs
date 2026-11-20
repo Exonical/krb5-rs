@@ -531,7 +531,9 @@ mod tests {
     }
 
     fn name(s: &str) -> PrincipalName {
-        super::super::parse_name_with_default(s, "R").expect("name").0
+        super::super::parse_name_with_default(s, "R")
+            .expect("name")
+            .0
     }
 
     fn p(n: &PrincipalName) -> Princ<'_> {
