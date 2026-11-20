@@ -723,8 +723,8 @@ impl Kadm5 {
         let (name, realm) = princ
             .and_then(|p| self.parse(p))
             .ok_or((api, code::BAD_PRINCIPAL))?;
-        match self.store.raw_entry(&name, &realm) {
-            Ok(Some(e)) => Ok((api, name, realm, e)),
+        match self.store.resolved_entry(&name, &realm) {
+            Ok(Some((name, realm, e))) => Ok((api, name, realm, e)),
             Ok(None) => Err((api, code::UNK_PRINC)),
             Err(e) => {
                 tracing::error!("reading {}: {e}", unparse(&name, &realm));
@@ -1171,6 +1171,20 @@ impl Kadm5 {
         .with_modules(self.modules.clone())
     }
 
+    /// [`Self::name`], resolved through aliases to the canonical name, as
+    /// `stub_setup` does with `rec_out` (server_stubs.c:296-300).
+    fn canon(&self, princ: Option<&str>) -> Result<(PrincipalName, String, String), u32> {
+        let (n, r, t) = self.name(princ)?;
+        match self.store.resolved_entry(&n, &r) {
+            Ok(Some((cn, cr, _))) => {
+                let ct = unparse(&cn, &cr);
+                Ok((cn, cr, ct))
+            }
+            Ok(None) => Ok((n, r, t)),
+            Err(e) => Err(store_code(&e, code::UNK_PRINC)),
+        }
+    }
+
     fn name(&self, princ: Option<&str>) -> Result<(PrincipalName, String, String), u32> {
         let (n, r) = princ
             .and_then(|p| self.parse(p))
@@ -1182,7 +1196,7 @@ impl Kadm5 {
     /// `check_lockdown_by_princ`: whether `name` has `lockdown_keys`.
     /// `stub_setup` with `rec_out`: `KADM5_UNK_PRINC` for a missing target.
     fn stub_rec(&self, princ: Option<&str>) -> u32 {
-        match self.name(princ) {
+        match self.canon(princ) {
             Ok((name, realm, _)) => match self.lockdown(&name, &realm) {
                 Ok(_) => code::OK,
                 Err(c) => c,
@@ -1347,7 +1361,7 @@ impl Kadm5 {
         op: &str,
         princ: Option<&str>,
     ) -> Result<(PrincipalName, String, String, bool), u32> {
-        let (name, realm, target) = self.name(princ)?;
+        let (name, realm, target) = self.canon(princ)?;
         let locked = self.lockdown(&name, &realm)?;
         let own = caller.is(&name, &realm);
         let target_p = auth_princ(&name, &realm);
@@ -1484,7 +1498,7 @@ impl Kadm5 {
         kvno: u32,
     ) -> (u32, Vec<kadm5::KeyData>) {
         let op = "kadm5_get_principal_keys";
-        let (name, realm, target) = match self.name(princ) {
+        let (name, realm, target) = match self.canon(princ) {
             Ok(v) => v,
             Err(c) => return (c, Vec::new()),
         };
@@ -1743,7 +1757,7 @@ impl Kadm5 {
         use kmask as m;
         let op = "kadm5_modify_principal";
         let princ = rec.principal.as_deref().map(String::from_utf8_lossy);
-        let (name, realm, target) = match self.name(princ.as_deref()) {
+        let (name, realm, target) = match self.canon(princ.as_deref()) {
             Ok(v) => v,
             Err(c) => return c,
         };
@@ -1822,7 +1836,7 @@ impl Kadm5 {
         keys: kadm5::SetKeys,
     ) -> u32 {
         let op = "kadm5_setkey_principal";
-        let (name, realm, target) = match self.name(princ) {
+        let (name, realm, target) = match self.canon(princ) {
             Ok(v) => v,
             Err(c) => return c,
         };
@@ -1961,7 +1975,7 @@ impl Kadm5 {
     /// `kadm5_purgekeys` (`svr_principal.c:2008-2071`).
     fn purgekeys(&self, caller: &Caller<'_>, princ: Option<&str>, keepkvno: i32) -> u32 {
         let op = "kadm5_purgekeys";
-        let (name, realm, target) = match self.name(princ) {
+        let (name, realm, target) = match self.canon(princ) {
             Ok(v) => v,
             Err(c) => return c,
         };
@@ -2035,7 +2049,7 @@ impl Kadm5 {
         value: Option<&str>,
     ) -> u32 {
         let op = "kadm5_mod_strings";
-        let (name, realm, target) = match self.name(princ) {
+        let (name, realm, target) = match self.canon(princ) {
             Ok(v) => v,
             Err(c) => return c,
         };

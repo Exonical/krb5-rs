@@ -97,6 +97,27 @@ impl Db {
         }
     }
 
+    /// `kdb_get_entry`: [`Self::raw_entry`] following aliases like
+    /// `krb5_db_get_principal` (kdb5.c:823-837), with the canonical name.
+    pub fn resolved_entry(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<(PrincipalName, String, MitEntry)>, StoreError> {
+        use krb5_rs::kdc::kdb::mit::{alias_target, MAX_ALIAS_DEPTH};
+        let (mut name, mut realm) = (name.clone(), realm.to_owned());
+        for _ in 0..=MAX_ALIAS_DEPTH {
+            let Some(e) = self.raw_entry(&name, &realm)? else {
+                return Ok(None);
+            };
+            match alias_target(&e.tl_data)? {
+                Some((n, r)) => (name, realm) = (n, r),
+                None => return Ok(Some((name, realm, e))),
+            }
+        }
+        Ok(None)
+    }
+
     pub fn raw_policy(&self, name: &str) -> Result<Option<MitPolicy>, StoreError> {
         match self {
             Db::Lmdb(s) => s.raw_policy(name),

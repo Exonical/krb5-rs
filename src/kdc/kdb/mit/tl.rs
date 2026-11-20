@@ -661,6 +661,24 @@ pub fn cert_match_attr(tl_data: &[TlData]) -> Result<Option<String>, StoreError>
         .transpose()
 }
 
+/// MIT `KRB5_TL_ALIAS_TARGET` (`kdb.h:266`).
+pub const TL_ALIAS_TARGET: u16 = 0x000c;
+
+/// How many aliases `krb5_db_get_principal` follows (`MAX_ALIAS_DEPTH`).
+pub const MAX_ALIAS_DEPTH: usize = 10;
+
+/// The target an alias entry names (`krb5_dbe_read_alias`, kdb5.c:2873).
+pub fn alias_target(tl_data: &[TlData]) -> Result<Option<(PrincipalName, String)>, StoreError> {
+    let Some(tl) = tl_data.iter().find(|t| t.kind == TL_ALIAS_TARGET) else {
+        return Ok(None);
+    };
+    match tl.data.split_last() {
+        None => Ok(None),
+        Some((0, name)) => parse_name(name).map(Some),
+        Some(_) => Err(corrupt("alias target is not NUL-terminated")),
+    }
+}
+
 /// [`record_from_entry`] without decrypting the keys (`entry.keys` empty),
 /// for stores that keep keys encrypted.
 pub fn record_without_keys(entry: &MitEntry) -> Result<PrincipalRecord, StoreError> {

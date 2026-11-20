@@ -515,10 +515,33 @@ impl Db2Store {
         name: &PrincipalName,
         realm: &str,
     ) -> Result<Option<PrincipalRecord>, StoreError> {
-        self.get_raw(name, realm)?
+        self.get_resolved(name, realm)?
             .as_ref()
             .map(|e| self.decode(e))
             .transpose()
+    }
+
+    /// [`Self::get_raw`], following aliases like `krb5_db_get_principal`
+    /// (kdb5.c:823-837).
+    fn get_resolved(
+        &self,
+        name: &PrincipalName,
+        realm: &str,
+    ) -> Result<Option<MitEntry>, StoreError> {
+        use krb5_rs::kdc::kdb::mit::{alias_target, MAX_ALIAS_DEPTH};
+        let mut entry = self.get_raw(name, realm)?;
+        let mut depth = 0;
+        while let Some(e) = &entry {
+            let Some((target, target_realm)) = alias_target(&e.tl_data)? else {
+                break;
+            };
+            depth += 1;
+            if depth > MAX_ALIAS_DEPTH {
+                return Ok(None);
+            }
+            entry = self.get_raw(&target, &target_realm)?;
+        }
+        Ok(entry)
     }
 
     fn list_records_sync(&self) -> Result<Vec<PrincipalRecord>, StoreError> {
