@@ -73,6 +73,10 @@ path = "src/bin/kcpytkt.rs"
 name = "krb5-rs-kdeltkt"
 path = "src/bin/kdeltkt.rs"
 
+[[bin]]
+name = "krb5-rs-k5srvutil"
+path = "src/bin/k5srvutil.rs"
+
 [dependencies]
 krb5-rs = { path = "../..", features = ["client", "gssapi", "pkinit", "dns", "kdc"] }
 base64 = "0.22"
