@@ -1,10 +1,9 @@
-# Built by packaging/rpm/build.sh, which passes pkg_version from Cargo.toml.
+# packaging/rpm/build.sh fills in @VERSION@ from Cargo.toml.
 %global debug_package %{nil}
-%{!?pkg_version: %global pkg_version 0.0.0}
 %{!?cargo: %global cargo cargo}
 
 Name:           krb5-rs
-Version:        %{pkg_version}
+Version:        @VERSION@
 Release:        1%{?dist}
 Summary:        Pure Rust Kerberos V5, compatible with MIT krb5
 License:        Apache-2.0
