@@ -63,8 +63,9 @@ fn unparse_no_realm(name: &PrincipalName) -> String {
             out.push('/');
         }
         for ch in String::from_utf8_lossy(c.as_bytes()).chars() {
+            // unparse.c:99-107: NO_REALM leaves '@' unescaped.
             match ch {
-                '/' | '@' | '\\' => {
+                '/' | '\\' => {
                     out.push('\\');
                     out.push(ch);
                 }
@@ -441,6 +442,17 @@ impl PrincipalStore for TestStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unparse_no_realm_leaves_at_signs_like_mit() {
+        let mut upn = PrincipalName::new_principal("user@krbtest.com");
+        upn.name_type = 10;
+        assert_eq!(unparse_no_realm(&upn), "user@krbtest.com");
+        assert_eq!(
+            unparse_no_realm(&PrincipalName::new_srv_hst("a/b", "h")),
+            "a\\/b/h"
+        );
+    }
 
     const CONF: &str = "[dbmodules]\n test = {\n  alias = {\n   alias1 = user\n   fuser = @FOREIGN\n  }\n  \
         princs = {\n   krbtgt/KRBTEST.COM = {\n    keys = aes128-cts\n   }\n   user = {\n    \

@@ -150,6 +150,8 @@ mod imp {
             body_der: &[u8],
             local_tgt: &PrincipalEntry,
             cert_match: Option<&str>,
+            alias_matches: &[(crate::types::PrincipalName, String)],
+            san_candidates: &mut Vec<(crate::types::PrincipalName, String)>,
             now: DateTime<Utc>,
         ) -> Option<Result<Verified, KdcError>> {
             if pa.padata_type != PA_PK_AS_REQ {
@@ -175,6 +177,7 @@ mod imp {
                 nonce: body.nonce,
                 etypes: &body.etype,
                 cert_match,
+                alias_matches,
             };
             let skew = i64::try_from(self.config.clockskew.as_secs()).unwrap_or(i64::MAX);
             let result =
@@ -182,6 +185,7 @@ mod imp {
                     self.freshness_valid(local_tgt, token, now)
                 });
             Some(result.map_err(|f| {
+                san_candidates.clone_from(&f.san_candidates);
                 let code = filter_preauth_error(f.code);
                 let mut err = KdcError::new(code, "PREAUTH_FAILED");
                 if code == f.code && !f.e_data.is_empty() {
@@ -234,6 +238,7 @@ mod imp {
                 nonce: body.nonce,
                 etypes: &body.etype,
                 cert_match: None,
+                alias_matches: &[],
             };
             let (value, key) = server::reply(cfg, verified, &info)
                 .map_err(|e| KdcError::new(filter_preauth_error(e.code), "PREAUTH_FAILED"))?;
@@ -283,6 +288,8 @@ mod imp {
             _body_der: &[u8],
             _local_tgt: &PrincipalEntry,
             _cert_match: Option<&str>,
+            _alias_matches: &[(crate::types::PrincipalName, String)],
+            _san_candidates: &mut Vec<(crate::types::PrincipalName, String)>,
             _now: DateTime<Utc>,
         ) -> Option<Result<Verified, KdcError>> {
             None
