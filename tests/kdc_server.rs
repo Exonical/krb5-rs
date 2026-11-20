@@ -306,16 +306,13 @@ async fn shutdown_stops_the_udp_server() {
 #[cfg(unix)]
 #[test]
 fn remove_stale_socket_spares_regular_files() {
-    let dir = std::env::temp_dir().join(format!("krb5-rs-stale-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("dir");
-    let file = dir.join("file");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("file");
     std::fs::write(&file, b"keep").expect("write");
     krb5_rs::kdc::remove_stale_socket(&file);
     assert!(file.exists());
-    let sock = dir.join("kdc.sock");
-    let _ = std::fs::remove_file(&sock);
+    let sock = dir.path().join("kdc.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
     krb5_rs::kdc::remove_stale_socket(&sock);
     assert!(!sock.exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
