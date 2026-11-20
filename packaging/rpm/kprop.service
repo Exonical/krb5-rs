@@ -7,7 +7,6 @@ After=syslog.target network.target network-online.target
 Type=forking
 EnvironmentFile=-/etc/sysconfig/kprop
 ExecStart=/usr/sbin/kpropd $KPROPD_ARGS
-ExecReload=/bin/kill -HUP $MAINPID
 
 [Install]
 WantedBy=multi-user.target
