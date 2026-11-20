@@ -1939,6 +1939,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "krb5-rs-kdb-db2"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "krb5-rs",
+ "rustix 1.1.5",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "krb5-rs-kdb-ldap"
 version = "0.1.0"
 dependencies = [
@@ -1996,6 +2007,7 @@ dependencies = [
  "clap",
  "krb5-rs",
  "krb5-rs-kdb-cockroach",
+ "krb5-rs-kdb-db2",
  "krb5-rs-kdb-ldap",
  "krb5-rs-kdb-lmdb",
  "krb5-rs-kdb-turso",

@@ -41,6 +41,8 @@ use krb5_rs::kdc::{
     default_realm, AdminStore, IpropConfig, RealmConfig, StoreError, StoreErrorKind,
 };
 use krb5_rs::profile::Profile;
+#[cfg(feature = "kdb2")]
+use krb5_rs_kdb_db2::Db2Store;
 #[cfg(feature = "klmdb")]
 use krb5_rs_kdb_lmdb::LmdbStore;
 
@@ -616,6 +618,18 @@ fn run() {
             &realm,
             master_password_file.as_deref(),
             &raw_db_args,
+        );
+        return;
+    }
+
+    if cfg.db_module.library.as_deref() == Some("db2") {
+        db2_command(
+            &cmd,
+            args,
+            &cfg,
+            &realm,
+            master_password_file.as_deref(),
+            db_args.merge_nra,
         );
         return;
     }
@@ -1367,6 +1381,188 @@ fn klmdb_command(
     fail("db_library klmdb needs a krb5-rs-kdb built with the `klmdb` feature");
 }
 
+#[cfg(feature = "kdb2")]
+fn db2_command(
+    cmd: &str,
+    args: Vec<String>,
+    cfg: &RealmConfig,
+    realm: &str,
+    global_master_password_file: Option<&str>,
+    merge_nra: bool,
+) {
+    if matches!(cmd, "database" | "replication") {
+        fail(format!("`{cmd}` needs db_library = krb5-rs-cockroach"));
+    }
+    let rt = runtime();
+    let iprop = cfg.iprop.enabled.then_some(&cfg.iprop);
+    match cmd {
+        "init" => {
+            let mut master_file = None;
+            let mut stash = false;
+            let mut randkeys = Vec::new();
+            let mut passwords = Vec::new();
+            let mut it = args.into_iter();
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--master-password-file" => master_file = Some(next(&mut it)),
+                    "--stash" => stash = true,
+                    "--randkey" => randkeys.push(next(&mut it)),
+                    "--password" => {
+                        let spec = next(&mut it);
+                        let Some((name, file)) = spec.split_once('=') else {
+                            fail("--password expects NAME=FILE");
+                        };
+                        passwords.push((name.to_string(), file.to_string()));
+                    }
+                    _ => usage(),
+                }
+            }
+            let master_file = master_file
+                .as_deref()
+                .or(global_master_password_file)
+                .unwrap_or_else(|| fail("init requires --master-password-file"));
+            let master = master_key(cfg, realm, Some(master_file));
+            let store = if cfg.database_name.exists() {
+                ok(Db2Store::open(cfg, &master))
+            } else {
+                create_db2(runtime(), cfg, realm, &master);
+                println!("Database {} created.", cfg.database_name.display());
+                ok(Db2Store::open(cfg, &master))
+            };
+            if stash && !cfg.key_stash_file.exists() {
+                ok(write_stash_named(
+                    &cfg.key_stash_file,
+                    realm,
+                    &cfg.master_key_name,
+                    &master,
+                ));
+                println!("Stash {} written.", cfg.key_stash_file.display());
+            }
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
+            add_admin_princs(&admin, realm);
+            ensure_init_principals(&admin, realm, &randkeys, &passwords);
+        }
+        "create" => {
+            let stash = match args.as_slice() {
+                [] => false,
+                [flag] if flag == "-s" => true,
+                _ => usage(),
+            };
+            let master = create_master_key(cfg, realm, global_master_password_file);
+            create_db2(rt, cfg, realm, &master);
+            if stash {
+                ok(write_stash_named(
+                    &cfg.key_stash_file,
+                    realm,
+                    &cfg.master_key_name,
+                    &master,
+                ));
+            }
+        }
+        "stash" => {
+            require_db2(cfg);
+            let (keyfile, store) =
+                stash_source(&args, cfg, realm, global_master_password_file, |k| {
+                    Db2Store::open(cfg, k)
+                });
+            let keys = ok(store.master_key_list());
+            ok(write_stash_list_named(
+                &keyfile,
+                realm,
+                &cfg.master_key_name,
+                &keys.keys,
+            ));
+        }
+        "add_mkey" | "use_mkey" | "list_mkeys" | "purge_mkeys" | "update_princ_encryption" => {
+            require_db2(cfg);
+            mkey_command(cmd, args, cfg, realm, global_master_password_file, |k| {
+                Db2Store::open(cfg, k)
+            });
+        }
+        "dump" => {
+            require_db2(cfg);
+            let store = match fetch_master(cfg, realm, global_master_password_file) {
+                Some(key) => match Db2Store::open(cfg, &key) {
+                    Ok(store) => Some(store),
+                    Err(e) if no_master_list(&e) => None,
+                    Err(e) => fail(e),
+                },
+                None => None,
+            };
+            let valid_master_key = store.is_some();
+            // Without a master key MIT still dumps: the keys stay encrypted.
+            let store = store.unwrap_or_else(|| ok(Db2Store::open_without_master(cfg)));
+            let etype = cfg.master_key_type;
+            dump_command(args, iprop, realm, &cfg.master_key_name, etype, |convert| {
+                let keys = match (convert, valid_master_key) {
+                    (false, _) => None,
+                    (true, true) => Some(store.master_key_list()?),
+                    // The environment is already open, so verify the key
+                    // against its K/M rather than opening it again.
+                    (true, false) => {
+                        Some(keyboard_master(realm, &cfg.master_key_name, etype, |k| {
+                            let km = store
+                                .raw_entry(&km_principal(&cfg.master_key_name), realm)?
+                                .ok_or_else(|| StoreError::backend(BAD_MASTER))?;
+                            MasterKeys::fetch(&km, k)
+                        }))
+                    }
+                };
+                Ok((store.dump_entries()?, keys))
+            });
+        }
+        "load" => {
+            // `kdb5_util load -hash` passes `hash=true` to the module.
+            let mut cfg = cfg.clone();
+            cfg.db_module.db2_hash |= args.iter().any(|a| a == "-hash");
+            let cfg = &cfg;
+            load_command(
+                args,
+                iprop,
+                |entries, policies, update, iprop_load, log_from| {
+                    Db2Store::load_dump(
+                        cfg,
+                        entries,
+                        policies,
+                        update,
+                        iprop_load || merge_nra,
+                        log_from,
+                    )
+                },
+            )
+        }
+        _ => {
+            require_db2(cfg);
+            let master = master_key(cfg, realm, global_master_password_file);
+            let store = ok(Db2Store::open(cfg, &master));
+            let admin = Blocking::new(
+                rt,
+                store,
+                cfg.supported_keysalts.clone(),
+                cfg.master_key_type,
+            );
+            run_admin(&admin, cmd, args, realm);
+        }
+    }
+}
+
+#[cfg(not(feature = "kdb2"))]
+fn db2_command(
+    _cmd: &str,
+    _args: Vec<String>,
+    _cfg: &RealmConfig,
+    _realm: &str,
+    _global_master_password_file: Option<&str>,
+    _merge_nra: bool,
+) {
+    fail("db_library db2 needs a krb5-rs-kdb built with the `kdb2` feature");
+}
+
 /// `krb5_db_open` in `open_db_and_mkey` (`kdb5_util.c:378-383`): the
 /// database must exist before the master key is read.
 #[cfg(feature = "klmdb")]
@@ -1536,6 +1732,47 @@ fn create_klmdb(
     );
     if cfg.iprop.enabled {
         ok(Ulog::map(&cfg.iprop.logfile, cfg.iprop.ulogsize));
+    }
+}
+
+#[cfg(feature = "kdb2")]
+fn create_db2(
+    rt: tokio::runtime::Runtime,
+    cfg: &RealmConfig,
+    realm: &str,
+    master: &krb5_rs::types::EncryptionKey,
+) {
+    let mut unlogged = cfg.clone();
+    unlogged.iprop.enabled = false;
+    let store = Db2Store::create(&unlogged, master).unwrap_or_else(|e| {
+        fail(format!(
+            "{e} while creating database '{}'",
+            cfg.database_name.display()
+        ))
+    });
+    add_admin_princs(
+        &Blocking::new(
+            rt,
+            store,
+            cfg.supported_keysalts.clone(),
+            cfg.master_key_type,
+        ),
+        realm,
+    );
+    if cfg.iprop.enabled {
+        ok(Ulog::map(&cfg.iprop.logfile, cfg.iprop.ulogsize));
+    }
+}
+
+/// `krb5_db2_open` (`kdb_db2.c`): the principal database must exist before
+/// the master key is read.
+#[cfg(feature = "kdb2")]
+fn require_db2(cfg: &RealmConfig) {
+    if !cfg.database_name.exists() {
+        fail(format!(
+            "Cannot open DB2 database '{}': No such file or directory while initializing database",
+            cfg.database_name.display()
+        ));
     }
 }
 
@@ -2339,6 +2576,27 @@ impl MkeyStore for LmdbStore {
         F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send,
     {
         LmdbStore::update_raw(self, name, realm, f)
+    }
+}
+
+#[cfg(feature = "kdb2")]
+impl MkeyStore for Db2Store {
+    fn master_key_list(&self) -> Result<MasterKeys, StoreError> {
+        Db2Store::master_key_list(self)
+    }
+    fn raw_entries(&self) -> Result<Vec<MitEntry>, StoreError> {
+        Db2Store::raw_entries(self)
+    }
+    fn update_raw<F>(
+        &self,
+        name: &krb5_rs::types::PrincipalName,
+        realm: &str,
+        f: F,
+    ) -> Result<bool, StoreError>
+    where
+        F: FnMut(&mut MitEntry, &MasterKeys) -> Result<bool, StoreError> + Send,
+    {
+        Db2Store::update_raw(self, name, realm, f)
     }
 }
 

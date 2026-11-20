@@ -379,16 +379,31 @@ fn sample_standalone() {
 #[test]
 fn sample_inetd() {
     let realm = Realm::start();
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+    // sclient connects to the host name, which need not resolve to loopback.
+    let listener = TcpListener::bind("0.0.0.0:0").expect("listen");
+    listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("addr").port().to_string();
-    let accept = std::thread::spawn(move || listener.accept().expect("accept").0);
-    let client = realm
+    let mut client = realm
         .cmd(SCLIENT, &[&realm.host, &port], "alice")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("sclient");
-    let conn = accept.join().expect("accepted");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let conn = loop {
+        match listener.accept() {
+            Ok((c, _)) => break c,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("accept: {e}"),
+        }
+        if client.try_wait().expect("sclient").is_some() || std::time::Instant::now() > deadline {
+            let _ = client.kill();
+            let out = client.wait_with_output().expect("sclient");
+            panic!("sclient never connected: {}", stderr(&out));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    conn.set_nonblocking(false).expect("blocking");
     let server = realm
         .cmd(SSERVER, &[], "bob")
         .stdin(Stdio::from(OwnedFd::from(conn)))

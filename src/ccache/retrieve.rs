@@ -75,11 +75,7 @@ pub fn creds_match_request(flags: MatchFlags, m: &MatchCred, c: &CcCredential) -
         }
     }
 
-    if flags.contains(MatchFlags::KTYPE) && m.etype != c.keyblock.keytype {
-        return false;
-    }
-
-    true
+    !(flags.contains(MatchFlags::KTYPE) && m.etype != c.keyblock.keytype)
 }
 
 /// krb5_cc_retrieve_cred_seq (cc_retr.c:195-251): first match, or with

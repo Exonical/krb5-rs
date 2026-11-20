@@ -695,6 +695,8 @@ fn replay(
         )?
         .with_iprop(&cfg.iprop)?
         .replay_updates(updates),
+        #[cfg(feature = "kdb2")]
+        Some("db2") => krb5_rs_kdb_db2::Db2Store::open(cfg, master)?.replay_updates(updates),
         None | Some("klmdb") => LmdbStore::open(cfg, master)?.replay_updates(updates),
         Some(other) => Err(StoreError::backend(
             cfg.db_module.unknown_library_error(other),

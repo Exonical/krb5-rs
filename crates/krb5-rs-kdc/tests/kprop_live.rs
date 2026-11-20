@@ -34,6 +34,17 @@ fn container_run(args: &[&str], stdin: &str) -> std::process::Output {
 #[test]
 #[ignore = "requires the MIT container of the Compose stack"]
 fn mit_and_krb5_rs_kprop_interoperate_both_ways() {
+    kprop_interop("klmdb");
+}
+
+#[test]
+#[ignore = "requires the MIT container of the Compose stack"]
+fn mit_kprop_loads_into_db2() {
+    kprop_interop("db2");
+}
+
+/// The krb5-rs replica's database is `db_library = library`.
+fn kprop_interop(library: &str) {
     let c = container();
     let mkdir = container_run(&["exec", &c, "mkdir", "-p", "/tmp/kprop-live/bin"], "");
     assert!(mkdir.status.success(), "{mkdir:?}");
@@ -46,7 +57,8 @@ fn mit_and_krb5_rs_kprop_interoperate_both_ways() {
         let out = container_run(&["cp", path, &dest], "");
         assert!(out.status.success(), "cp {name}: {out:?}");
     }
-    let out = container_run(&["exec", "-i", &c, "bash", "-s"], SCRIPT);
+    let script = format!("RLIB={library}\n{SCRIPT}");
+    let out = container_run(&["exec", "-i", &c, "bash", "-s"], &script);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("KPROP_LIVE_OK"),
@@ -86,7 +98,7 @@ EOF
 }
 realm_conf "$B/mit.conf" "$B/mit" db2
 realm_conf "$B/mitrep.conf" "$B/mitrep" db2
-realm_conf "$B/rsrep.conf" "$B/rsrep" klmdb
+realm_conf "$B/rsrep.conf" "$B/rsrep" "$RLIB"
 cat > "$B/krb5.conf" <<EOF
 [libdefaults]
  default_realm = $R

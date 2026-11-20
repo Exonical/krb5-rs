@@ -91,6 +91,9 @@ pub struct DbModuleConfig {
     /// The `[dbmodules]` subsection name (`database_module`, default the
     /// realm name).
     pub section: String,
+    /// db2's `-x hash=` argument: create the principal database as a hash
+    /// file instead of a btree (`kdb_db2.c:237-238`).
+    pub db2_hash: bool,
 }
 
 impl DbModuleConfig {
@@ -336,7 +339,10 @@ impl RealmConfig {
         if self.db_module.library.as_deref() == Some("kldap") {
             return Ok(DbArgs::default());
         }
-        let db2 = self.db_module.library.as_deref() == Some("krb5-rs-file");
+        let db2 = matches!(
+            self.db_module.library.as_deref(),
+            Some("krb5-rs-file" | "db2")
+        );
         let mut flags = DbArgs::default();
         for arg in args {
             // `get_db_opt`: an option is the text before `=`.
@@ -348,7 +354,8 @@ impl RealmConfig {
                 (Some("dbname"), path) => self.database_name = PathBuf::from(path),
                 (None, "temporary") => flags.temporary = true,
                 (None, "merge_nra") => flags.merge_nra = true,
-                (Some("hash"), _) | (None, "unlockiter" | "lockiter") if db2 => {}
+                (Some("hash"), _) if db2 => self.db_module.db2_hash = true,
+                (None, "unlockiter" | "lockiter") if db2 => {}
                 _ if db2 => {
                     return Err(format!(
                         "Unsupported argument \"{}\" for db2",
@@ -501,6 +508,7 @@ impl RealmConfig {
         reject_removed_kprop_keys(kdc_conf, realm)?;
         let db_module = DbModuleConfig {
             section: module.clone(),
+            db2_hash: false,
             library: module_value("db_library").or_else(|| Some("klmdb".to_string())),
             options: DBMODULE_OPTION_KEYS
                 .iter()

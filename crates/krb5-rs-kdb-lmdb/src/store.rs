@@ -2109,6 +2109,7 @@ mod tests {
             library: Some("klmdb".into()),
             module_dirs: Vec::new(),
             section: String::new(),
+            db2_hash: false,
             options: [
                 ("mapsize".into(), "256".into()),
                 ("max_readers".into(), "80".into()),
