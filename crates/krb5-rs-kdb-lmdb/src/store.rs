@@ -928,13 +928,13 @@ impl LmdbStore {
             .main_env
             .write_txn()
             .map_err(|e| backend("opening principal write transaction", e))?;
-        let taken = match self
+        let (replaced, taken) = match self
             .inner
             .principal_db
             .get(&txn, &key)
             .map_err(|e| backend("checking principal", e))?
         {
-            None => false,
+            None => (false, false),
             Some(old) => resolves(
                 |k: &[u8]| {
                     self.inner
@@ -945,7 +945,8 @@ impl LmdbStore {
                         .transpose()
                 },
                 MitEntry::decode(&key, old)?,
-            )?,
+            )
+            .map(|t| (!t, t))?,
         };
         if taken {
             return Err(StoreError::conflict(format!(
@@ -977,6 +978,11 @@ impl LmdbStore {
         }
         txn.commit()
             .map_err(|e| backend("committing principal", e))?;
+        // Replicas merge an update into the entry they hold, so delete the
+        // replaced alias there first.
+        if replaced {
+            self.log_held(held.as_ref(), Update::deletion(key.clone()))?;
+        }
         self.log_held(held.as_ref(), update_from_entry(None, &raw))
     }
 
@@ -1039,13 +1045,13 @@ impl LmdbStore {
             .to_vec();
         let renamed = f(MitEntry::decode(&src, &value)?, &keys)?;
         let (dest, value) = renamed.encode()?;
-        let taken = match self
+        let (replaced, taken) = match self
             .inner
             .principal_db
             .get(&txn, &dest)
             .map_err(|e| backend("checking principal", e))?
         {
-            None => false,
+            None => (false, false),
             Some(old) => resolves(
                 |k: &[u8]| {
                     self.inner
@@ -1056,7 +1062,8 @@ impl LmdbStore {
                         .transpose()
                 },
                 MitEntry::decode(&dest, old)?,
-            )?,
+            )
+            .map(|t| (!t, t))?,
         };
         if taken {
             return Err(StoreError::conflict(format!(
@@ -1082,6 +1089,11 @@ impl LmdbStore {
             lockout_txn
                 .commit()
                 .map_err(|e| backend("committing lockout record", e))?;
+        }
+        // Replicas merge an update into the entry they hold, so delete the
+        // replaced alias there first.
+        if replaced {
+            self.log_held(held.as_ref(), Update::deletion(dest.clone()))?;
         }
         self.log_held(held.as_ref(), update_from_entry(None, &renamed))?;
         self.log_held(held.as_ref(), Update::deletion(src))
