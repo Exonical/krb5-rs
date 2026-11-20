@@ -41,6 +41,15 @@ Conflicts:      krb5-server-ldap
 kdb5_ldap_util from krb5-rs. The KDC and kadmind in krb5-server-rs already
 include the LDAP database module (db_library = kldap).
 
+%package -n krb5-kdcproxy-rs
+Summary:        Kerberos KDC proxy, MS-KKDCP over HTTPS (krb5-rs)
+%{?systemd_requires}
+
+%description -n krb5-kdcproxy-rs
+kdcproxy from krb5-rs: an MS-KKDCP proxy that forwards Kerberos and kpasswd
+requests sent over HTTPS to the realm's KDCs, configured like
+python-kdcproxy through /etc/kdcproxy.conf.
+
 %prep
 %autosetup
 
@@ -60,6 +69,7 @@ install -Dpm0755 $b/krb5-rs-kdb %{buildroot}%{_sbindir}/kdb5_util
 install -Dpm0755 $b/krb5-rs-kprop %{buildroot}%{_sbindir}/kprop
 install -Dpm0755 $b/krb5-rs-kpropd %{buildroot}%{_sbindir}/kpropd
 install -Dpm0755 $b/krb5-rs-kproplog %{buildroot}%{_sbindir}/kproplog
+install -Dpm0755 $b/krb5-rs-kdcproxy %{buildroot}%{_sbindir}/kdcproxy
 install -Dpm0755 $b/krb5-rs-kdb5-ldap-util %{buildroot}%{_sbindir}/kdb5_ldap_util
 # kadmind, kprop and kpropd run these helpers from their own directory.
 ln -s kdb5_util %{buildroot}%{_sbindir}/krb5-rs-kdb
@@ -70,6 +80,9 @@ for u in krb5kdc kadmin kprop; do
     install -Dpm0644 $r/$u.service %{buildroot}%{_unitdir}/$u.service
     install -Dpm0644 $r/$u.sysconfig %{buildroot}%{_sysconfdir}/sysconfig/$u
 done
+install -Dpm0644 $r/kdcproxy.service %{buildroot}%{_unitdir}/kdcproxy.service
+install -Dpm0644 $r/kdcproxy.sysconfig %{buildroot}%{_sysconfdir}/sysconfig/kdcproxy
+install -Dpm0644 $r/kdcproxy.conf %{buildroot}%{_sysconfdir}/kdcproxy.conf
 install -Dpm0644 $r/krb5-rs.tmpfiles %{buildroot}%{_tmpfilesdir}/krb5-rs.conf
 install -d -m0700 %{buildroot}%{_localstatedir}/kerberos/krb5kdc
 install -pm0600 $r/kdc.conf $r/kadm5.acl %{buildroot}%{_localstatedir}/kerberos/krb5kdc/
@@ -82,6 +95,15 @@ install -pm0600 $r/kdc.conf $r/kadm5.acl %{buildroot}%{_localstatedir}/kerberos/
 
 %postun -n krb5-server-rs
 %systemd_postun_with_restart krb5kdc.service kadmin.service kprop.service
+
+%post -n krb5-kdcproxy-rs
+%systemd_post kdcproxy.service
+
+%preun -n krb5-kdcproxy-rs
+%systemd_preun kdcproxy.service
+
+%postun -n krb5-kdcproxy-rs
+%systemd_postun_with_restart kdcproxy.service
 
 %files -n krb5-workstation-rs
 %license LICENSE*
@@ -122,3 +144,10 @@ install -pm0600 $r/kdc.conf $r/kadm5.acl %{buildroot}%{_localstatedir}/kerberos/
 
 %files -n krb5-server-ldap-rs
 %{_sbindir}/kdb5_ldap_util
+
+%files -n krb5-kdcproxy-rs
+%license LICENSE*
+%{_sbindir}/kdcproxy
+%{_unitdir}/kdcproxy.service
+%config(noreplace) %{_sysconfdir}/sysconfig/kdcproxy
+%config(noreplace) %{_sysconfdir}/kdcproxy.conf

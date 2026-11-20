@@ -10,6 +10,7 @@ documentation mostly applies as written.
 | [Configuring the primary KDC](primary-kdc.md) | krb5.conf, kdc.conf, the database, kadm5.acl, kadmind, firewall |
 | [Setting up secondary KDCs](secondary-kdc.md) | host keytabs, kpropd.acl, full `kprop` propagation, incremental propagation (iprop) |
 | [Adjusting the performance of the KDC](tuning.md) | listen backlog, per-realm settings, worker processes |
+| [Configuring a KDC proxy (KKDCP)](kkdcp-proxy.md) | Kerberos and kpasswd over HTTPS, `kdcproxy.conf`, client settings |
 
 Kubernetes deployment is covered separately; see [`deploy/helm`](../../../deploy/helm)
 and [`deploy/podman`](../../../deploy/podman).
@@ -21,6 +22,7 @@ and [`deploy/podman`](../../../deploy/podman).
 | `krb5-workstation-rs` | client tools: `kinit`, `klist`, `kdestroy`, `kvno`, `kswitch`, `kpasswd`, `kadmin`, `ktutil`, `ksu`, `k5srvutil` and more |
 | `krb5-server-rs` | `krb5kdc`, `kadmind`, `kdb5_util`, `kprop`, `kpropd`, `kproplog` and their systemd units |
 | `krb5-server-ldap-rs` | `kdb5_ldap_util` |
+| `krb5-kdcproxy-rs` | `kdcproxy`, the KDC proxy, and its systemd unit |
 
 ## Encryption types
 

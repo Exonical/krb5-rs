@@ -1,0 +1,20 @@
+[Unit]
+Description=Kerberos KDC Proxy, MS-KKDCP over HTTPS (krb5-rs)
+Wants=network-online.target
+After=network.target network-online.target
+
+[Service]
+EnvironmentFile=-/etc/sysconfig/kdcproxy
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LoadCredential=cert.pem:/etc/pki/tls/certs/kdcproxy.pem
+LoadCredential=key.pem:/etc/pki/tls/private/kdcproxy.key
+ExecStart=/usr/sbin/kdcproxy --cert ${CREDENTIALS_DIRECTORY}/cert.pem --key ${CREDENTIALS_DIRECTORY}/key.pem $KDCPROXY_ARGS
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
