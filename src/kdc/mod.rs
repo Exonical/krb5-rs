@@ -59,7 +59,7 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "tokio")]
 pub use otp::TokenType as OtpTokenType;
 #[cfg(unix)]
-pub use server::serve_unix_with;
+pub use server::{remove_stale_socket, serve_unix_with};
 pub use server::{
     serve_tcp, serve_tcp_with, serve_udp, serve_udp_with, KdcRealms, KdcService, Peer,
     RequestLogger, ServeOptions,

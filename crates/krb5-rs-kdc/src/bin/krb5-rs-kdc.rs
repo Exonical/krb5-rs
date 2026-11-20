@@ -1167,7 +1167,7 @@ async fn bind_listeners(
     // net-server.c:620-624: a stale socket file is removed first.
     #[cfg(unix)]
     for path in &addrs.unix {
-        let _ = std::fs::remove_file(path);
+        krb5_rs::kdc::remove_stale_socket(path);
         let l = tokio::net::UnixListener::bind(path)
             .map_err(|e| io_err(format!("bind unix {}: {e}", path.display())))?;
         info!("listening on {} (unix)", path.display());

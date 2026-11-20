@@ -2637,7 +2637,7 @@ async fn kadmind(args: Args) {
         // (net-server.c:620-624).
         let listen = r("kpasswd_listen").unwrap_or_default();
         for path in krb5_rs::kdc::parse_listen_paths(&listen) {
-            let _ = std::fs::remove_file(&path);
+            krb5_rs::kdc::remove_stale_socket(&path);
             match tokio::net::UnixListener::bind(&path) {
                 Ok(l) => kpasswd_unix.push((l, path)),
                 Err(e) => die(format!("{e} while binding {}", path.display())),

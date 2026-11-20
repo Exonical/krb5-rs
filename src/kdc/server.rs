@@ -301,6 +301,17 @@ pub async fn serve_unix_with<K: KdcService>(
     serve_stream_with(kdc, StreamListener::Unix(listener, path.into()), options).await
 }
 
+/// Remove a stale UNIX socket file at `path` before binding it, as MIT does
+/// (net-server.c:620-624). Unlike MIT, anything that is not a socket is
+/// left alone, so a mistyped path can't delete a regular file.
+#[cfg(unix)]
+pub fn remove_stale_socket(path: &std::path::Path) {
+    use std::os::unix::fs::FileTypeExt;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// A connected stream client.
 trait Conn: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Conn for T {}
