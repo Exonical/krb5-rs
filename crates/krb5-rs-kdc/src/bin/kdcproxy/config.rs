@@ -139,7 +139,7 @@ impl MitConfig {
     }
 
     fn lookup(&self, realm: &str, kpasswd: bool) -> Vec<String> {
-        let Some(r) = self.realms.get(realm) else {
+        let Some(r) = get_ci(&self.realms, realm) else {
             return Vec::new();
         };
         if kpasswd {
@@ -257,6 +257,12 @@ impl Config {
         })
     }
 
+    /// MS-KKDCP 2.2.2: target-domain "is not case-sensitive".
+    fn section(&self, name: &str) -> Option<&Section> {
+        get_ci(&self.sections, name)
+            .filter(|_| !name.eq_ignore_ascii_case(GLOBAL) || name == GLOBAL)
+    }
+
     /// Exact realm section, then `*suffix` sections from the longest.
     fn realm_rules(realm: &str) -> impl Iterator<Item = String> + '_ {
         let labels: Vec<&str> = realm.split('.').collect();
@@ -265,11 +271,11 @@ impl Config {
     }
 
     fn realm_configured(&self, realm: &str) -> bool {
-        Self::realm_rules(realm).any(|r| self.sections.contains_key(&r))
+        Self::realm_rules(realm).any(|r| self.section(&r).is_some())
             || self
                 .mit
                 .as_ref()
-                .is_some_and(|m| m.realms.contains_key(realm))
+                .is_some_and(|m| get_ci(&m.realms, realm).is_some())
     }
 
     /// `KDCProxyConfig.param`: realm, wildcard, global, then the default.
@@ -278,7 +284,7 @@ impl Config {
             .into_iter()
             .flat_map(Self::realm_rules)
             .chain(std::iter::once(GLOBAL.to_string()))
-            .find_map(|r| self.sections.get(&r).and_then(get))
+            .find_map(|r| self.section(&r).and_then(get))
             .unwrap_or(default)
     }
 
@@ -288,8 +294,7 @@ impl Config {
             return Vec::new();
         }
         let from_conf = self
-            .sections
-            .get(realm)
+            .section(realm)
             .map(|s| {
                 if kpasswd {
                     s.kpasswd.clone()
@@ -367,6 +372,15 @@ fn dns_lookup(dns: &dyn DnsResolver, realm: &str, kpasswd: bool, silenced: bool)
     out
 }
 
+/// `map[name]`, else the entry whose key matches `name` ignoring case.
+fn get_ci<'a, V>(map: &'a HashMap<String, V>, name: &str) -> Option<&'a V> {
+    map.get(name).or_else(|| {
+        map.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +427,26 @@ mod tests {
         assert_eq!(c.lookup("EXAMPLE.COM", true, None), ["kpasswd://kdc1"]);
         assert!(c.lookup("OTHER.COM", false, Some(&Dns)).is_empty());
         assert!(c.lookup("global", false, None).is_empty());
+    }
+
+    #[test]
+    fn realm_case_insensitive() {
+        let mut ini = Vec::new();
+        parse_ini(
+            "[global]\nconfigs = mit\n[EXAMPLE.COM]\nkerberos = kerberos://kdc1\n[*CORP.COM]\nuse_dns = false\n",
+            &mut ini,
+        )
+        .unwrap();
+        let c = Config::new(&ini, || {
+            Profile::parse("[realms]\nAD.CONTOSO.COM = {\n kdc = dc1.contoso.com\n}\n").unwrap()
+        })
+        .unwrap();
+        assert_eq!(c.lookup("example.com", false, None), ["kerberos://kdc1"]);
+        assert_eq!(
+            c.lookup("ad.contoso.com", false, None),
+            ["kerberos://dc1.contoso.com"]
+        );
+        assert!(!c.param(Some("eu.corp.com"), |s| s.use_dns, true));
     }
 
     #[test]

@@ -163,7 +163,7 @@ impl Proxy {
                 kpasswd,
                 self.dns.as_ref().map(|d| d as &dyn DnsResolver),
             ),
-            None => Vec::new(),
+            None => return text(400, "Request has no target-domain."),
         };
         let servers = entries(&uris);
         if servers.is_empty() {
@@ -188,18 +188,24 @@ impl Proxy {
     }
 }
 
-/// Read one request: the method and the body (or the error response).
+/// Read one request into `buf` (which keeps any pipelined bytes): the
+/// method, whether the client keeps the connection open, and the body or
+/// the error response.
 async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
-) -> Option<(String, Result<Vec<u8>, Response>)> {
-    let mut buf = Vec::new();
+    buf: &mut Vec<u8>,
+) -> Option<(String, bool, Result<Vec<u8>, Response>)> {
     let mut chunk = [0u8; 4096];
     let head_end = loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break i;
         }
         if buf.len() > MAX_HEADER {
-            return Some((String::new(), Err(text(431, "Request header too large."))));
+            return Some((
+                String::new(),
+                false,
+                Err(text(431, "Request header too large.")),
+            ));
         }
         let n = s.read(&mut chunk).await.ok()?;
         if n == 0 {
@@ -208,63 +214,86 @@ async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(
         buf.extend_from_slice(&chunk[..n]);
     };
     let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    buf.drain(..head_end + 4);
     let mut lines = head.split("\r\n");
-    let method = lines.next()?.split(' ').next()?.to_uppercase();
+    let mut request_line = lines.next()?.split(' ');
+    let method = request_line.next()?.to_uppercase();
+    let mut keep_alive = request_line.nth(1) == Some("HTTP/1.1");
     let mut length: Option<i64> = None;
     let mut expect_continue = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        let (name, value) = (name.trim(), value.trim());
+        let (name, value) = (name.trim(), value.trim().to_ascii_lowercase());
         if name.eq_ignore_ascii_case("content-length") {
             length = value.parse().ok();
-        } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
-        {
+        } else if name.eq_ignore_ascii_case("expect") && value == "100-continue" {
             expect_continue = true;
+        } else if name.eq_ignore_ascii_case("connection") {
+            if value.contains("close") {
+                keep_alive = false;
+            } else if value.contains("keep-alive") {
+                keep_alive = true;
+            }
         }
     }
     if method != "POST" {
-        return Some((method, Err(text(405, ""))));
+        return Some((method, false, Err(text(405, ""))));
     }
     let length = match length {
         Some(l) if l >= 0 => l as usize,
-        _ => return Some((method, Err(text(411, "Length required.")))),
+        _ => return Some((method, false, Err(text(411, "Length required.")))),
     };
     if length > MAX_LENGTH {
-        return Some((method, Err(text(413, "Request entity too large."))));
+        return Some((method, false, Err(text(413, "Request entity too large."))));
     }
-    if expect_continue {
+    if expect_continue && buf.len() < length {
         s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.ok()?;
     }
-    let mut body = buf.split_off(head_end + 4);
-    while body.len() < length {
+    while buf.len() < length {
         let n = s.read(&mut chunk).await.ok()?;
         if n == 0 {
             return None;
         }
-        body.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(&chunk[..n]);
     }
-    body.truncate(length);
-    Some((method, Ok(body)))
+    let body = buf.drain(..length).collect();
+    Some((method, keep_alive, Ok(body)))
 }
 
+/// Serve requests on one connection; Windows clients reuse it (HTTP/1.1
+/// persistent connections) for the AS and TGS exchanges of a logon.
 async fn serve<S: AsyncRead + AsyncWrite + Unpin>(proxy: &Proxy, mut s: S) {
-    let resp = match tokio::time::timeout(READ_TIMEOUT, read_request(&mut s)).await {
-        Ok(Some((method, body))) => proxy.handle(&method, body).await,
-        Ok(None) => return,
-        Err(_) => text(408, "Request timeout."),
-    };
-    let Response(code, ctype, body) = resp;
-    let mut out = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        reason(code),
-        body.len()
-    )
-    .into_bytes();
-    out.extend_from_slice(&body);
-    let _ = s.write_all(&out).await;
-    let _ = s.shutdown().await;
+    let mut buf = Vec::new();
+    loop {
+        let (resp, keep_alive) =
+            match tokio::time::timeout(READ_TIMEOUT, read_request(&mut s, &mut buf)).await {
+                Ok(Some((method, keep_alive, body))) => {
+                    let keep_alive = keep_alive && body.is_ok();
+                    (proxy.handle(&method, body).await, keep_alive)
+                }
+                Ok(None) => return,
+                Err(_) if buf.is_empty() => return,
+                Err(_) => (text(408, "Request timeout."), false),
+            };
+        let Response(code, ctype, body) = resp;
+        let mut out = format!(
+            "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+            reason(code),
+            body.len(),
+            if keep_alive { "keep-alive" } else { "close" },
+        )
+        .into_bytes();
+        out.extend_from_slice(&body);
+        if s.write_all(&out).await.is_err() || s.flush().await.is_err() {
+            return;
+        }
+        if !keep_alive {
+            let _ = s.shutdown().await;
+            return;
+        }
+    }
 }
 
 #[tokio::main]
@@ -327,5 +356,45 @@ async fn main() {
     }
     for t in tasks {
         let _ = t.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn exchange(input: &[u8]) -> String {
+        let proxy = Proxy {
+            config: config::Config::new(&Vec::new(), || Profile::parse("").unwrap()).unwrap(),
+            dns: None,
+        };
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        client.write_all(input).await.unwrap();
+        client.shutdown().await.unwrap();
+        serve(&proxy, server).await;
+        let mut out = String::new();
+        client.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn persistent_connection() {
+        let req = "POST /KdcProxy HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+        let out = exchange(format!("{req}{req}").as_bytes()).await;
+        assert_eq!(out.matches("HTTP/1.1 400 Bad Request").count(), 2, "{out}");
+        assert!(out.contains("Connection: keep-alive"));
+    }
+
+    #[tokio::test]
+    async fn status_codes() {
+        let out = exchange(b"GET /KdcProxy HTTP/1.1\r\n\r\nPOST / HTTP/1.1\r\n\r\n").await;
+        assert!(out.starts_with("HTTP/1.1 405 "), "{out}");
+        assert_eq!(out.matches("HTTP/1.1").count(), 1);
+        let out = exchange(b"POST / HTTP/1.1\r\n\r\n").await;
+        assert!(out.starts_with("HTTP/1.1 411 "), "{out}");
+        let out = exchange(b"POST / HTTP/1.0\r\nContent-Length: 200000\r\n\r\n").await;
+        assert!(out.starts_with("HTTP/1.1 413 "), "{out}");
+        let out = exchange(b"POST / HTTP/1.0\r\nContent-Length: 1\r\n\r\nx").await;
+        assert!(out.contains("Connection: close"), "{out}");
     }
 }
