@@ -562,7 +562,7 @@ fn run() {
         }
     }
 
-    let config = config.unwrap_or_else(|| PathBuf::from("/usr/local/var/krb5kdc/kdc.conf"));
+    let config = config.unwrap_or_else(krb5_rs::kdc::default_kdc_profile);
     // A missing kdc.conf leaves the defaults, as in MIT's profile library.
     let kdc_conf = if config.exists() {
         ok(Profile::load(&config).map_err(|e| format!("reading {}: {e}", config.display())))

@@ -280,7 +280,7 @@ pub(crate) fn main() {
     let config = g
         .config
         .clone()
-        .unwrap_or_else(|| PathBuf::from("/usr/local/var/krb5kdc/kdc.conf"));
+        .unwrap_or_else(krb5_rs::kdc::default_kdc_profile);
     let kdc_conf = if config.exists() {
         ok(Profile::load(&config).map_err(|e| format!("reading {}: {e}", config.display())))
     } else {

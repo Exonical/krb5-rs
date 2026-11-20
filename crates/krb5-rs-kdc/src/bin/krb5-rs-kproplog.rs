@@ -258,10 +258,8 @@ fn print_str_line(prefix: &str, s: &[u8]) {
 }
 
 fn config() -> RealmConfig {
-    let kdc_conf = std::env::var_os("KRB5_KDC_PROFILE").map_or_else(
-        || PathBuf::from("/usr/local/var/krb5kdc/kdc.conf"),
-        PathBuf::from,
-    );
+    let kdc_conf = std::env::var_os("KRB5_KDC_PROFILE")
+        .map_or_else(krb5_rs::kdc::default_kdc_profile, PathBuf::from);
     let krb5_conf = std::env::var_os("KRB5_CONFIG")
         .map_or_else(|| PathBuf::from("/etc/krb5.conf"), PathBuf::from);
     let Ok(kdc) = Profile::load(&kdc_conf) else {

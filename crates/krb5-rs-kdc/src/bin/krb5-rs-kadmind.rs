@@ -54,7 +54,7 @@ mod modules;
 use db::{CallerDb, Db};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-const KDC_DIR: &str = "/usr/local/var/krb5kdc";
+use krb5_rs::kdc::KDC_DIR;
 const IPROP_PROG: u32 = 100_423;
 const IPROP_VERS: u32 = 1;
 const IPROP_NULL: u32 = 0;

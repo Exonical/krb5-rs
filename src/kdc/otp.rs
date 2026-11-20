@@ -21,7 +21,10 @@ use crate::types::{EncryptionKey, PaData, PaEncTsEnc};
 pub const DEFAULT_TYPE_NAME: &str = "DEFAULT";
 /// MIT `KDC_RUN_DIR` (osconf.hin:73, `RUNSTATEDIR` defaulting to
 /// `$(localstatedir)/run`).
-pub const KDC_RUN_DIR: &str = "/usr/local/var/run/krb5kdc";
+pub const KDC_RUN_DIR: &str = match option_env!("KRB5RS_KDC_RUN_DIR") {
+    Some(dir) => dir,
+    None => "/usr/local/var/run/krb5kdc",
+};
 const DEFAULT_TIMEOUT: i64 = 5;
 const DEFAULT_RETRIES: i64 = 3;
 const MAX_SECRET_LEN: usize = 1024;
