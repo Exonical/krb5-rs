@@ -648,8 +648,10 @@ impl Db2Store {
         let held = self.lock_ulog()?;
         {
             let mut g = self.write()?;
-            if get_entry(&mut g, &key)?.is_some() {
-                return Err(exists_error(&key));
+            if let Some(old) = get_entry(&mut g, &key)? {
+                if resolves(|k| get_entry(&mut g, k), old)? {
+                    return Err(exists_error(&key));
+                }
             }
             put_entry(&mut g, raw)?;
             g.commit().map_err(|e| io_err("writing principal", e))?;
@@ -673,8 +675,10 @@ impl Db2Store {
             })?;
             let renamed = f(entry, &keys)?;
             let (dest, _) = encode_entry(&renamed)?;
-            if get_entry(&mut g, &dest)?.is_some() {
-                return Err(exists_error(&dest));
+            if let Some(old) = get_entry(&mut g, &dest)? {
+                if resolves(|k| get_entry(&mut g, k), old)? {
+                    return Err(exists_error(&dest));
+                }
             }
             put_entry(&mut g, &renamed)?;
             delete_entry(&mut g, &src)?;
@@ -1279,4 +1283,24 @@ impl AdminStore for CallerStore {
     ) -> impl std::future::Future<Output = Result<Vec<Policy>, StoreError>> + Send {
         self.store.list_policies()
     }
+}
+
+/// Whether `e` is an entry or an alias that resolves to one. A
+/// non-resolving alias does not block a new principal or a rename onto its
+/// name, as MIT's `krb5_db_get_principal` does not find it.
+fn resolves(
+    mut get: impl FnMut(&[u8]) -> Result<Option<MitEntry>, StoreError>,
+    mut e: MitEntry,
+) -> Result<bool, StoreError> {
+    use krb5_rs::kdc::kdb::mit::{alias_target, MAX_ALIAS_DEPTH};
+    for _ in 0..=MAX_ALIAS_DEPTH {
+        let Some((target, realm)) = alias_target(&e.tl_data)? else {
+            return Ok(true);
+        };
+        match get(&db_key(&unparse_name(&target, &realm)))? {
+            Some(next) => e = next,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
 }

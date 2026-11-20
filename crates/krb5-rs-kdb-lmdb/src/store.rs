@@ -928,13 +928,26 @@ impl LmdbStore {
             .main_env
             .write_txn()
             .map_err(|e| backend("opening principal write transaction", e))?;
-        if self
+        let taken = match self
             .inner
             .principal_db
             .get(&txn, &key)
             .map_err(|e| backend("checking principal", e))?
-            .is_some()
         {
+            None => false,
+            Some(old) => resolves(
+                |k: &[u8]| {
+                    self.inner
+                        .principal_db
+                        .get(&txn, k)
+                        .map_err(|e| backend("checking principal", e))?
+                        .map(|v| MitEntry::decode(k, v))
+                        .transpose()
+                },
+                MitEntry::decode(&key, old)?,
+            )?,
+        };
+        if taken {
             return Err(StoreError::conflict(format!(
                 "Principal or policy already exists: {}",
                 String::from_utf8_lossy(&key)
@@ -1026,13 +1039,26 @@ impl LmdbStore {
             .to_vec();
         let renamed = f(MitEntry::decode(&src, &value)?, &keys)?;
         let (dest, value) = renamed.encode()?;
-        if self
+        let taken = match self
             .inner
             .principal_db
             .get(&txn, &dest)
             .map_err(|e| backend("checking principal", e))?
-            .is_some()
         {
+            None => false,
+            Some(old) => resolves(
+                |k: &[u8]| {
+                    self.inner
+                        .principal_db
+                        .get(&txn, k)
+                        .map_err(|e| backend("checking principal", e))?
+                        .map(|v| MitEntry::decode(k, v))
+                        .transpose()
+                },
+                MitEntry::decode(&dest, old)?,
+            )?,
+        };
+        if taken {
             return Err(StoreError::conflict(format!(
                 "Principal or policy already exists: {}",
                 String::from_utf8_lossy(&dest)
@@ -2098,6 +2124,26 @@ impl AdminStore for CallerStore {
     ) -> impl std::future::Future<Output = Result<Vec<Policy>, StoreError>> + Send {
         self.store.list_policies()
     }
+}
+
+/// Whether `e` is an entry or an alias that resolves to one. A
+/// non-resolving alias does not block a new principal or a rename onto its
+/// name, as MIT's `krb5_db_get_principal` does not find it.
+fn resolves(
+    get: impl Fn(&[u8]) -> Result<Option<MitEntry>, StoreError>,
+    mut e: MitEntry,
+) -> Result<bool, StoreError> {
+    use krb5_rs::kdc::kdb::mit::{alias_target, MAX_ALIAS_DEPTH};
+    for _ in 0..=MAX_ALIAS_DEPTH {
+        let Some((target, realm)) = alias_target(&e.tl_data)? else {
+            return Ok(true);
+        };
+        match get(&unparse_name(&target, &realm))? {
+            Some(next) => e = next,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
